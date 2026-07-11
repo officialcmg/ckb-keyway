@@ -52,3 +52,18 @@ h1 {
   border-radius: 50%;
   background: #42a541;
 }
+
+.auth { margin-top: 2rem; max-width: 28rem; }
+.signed-in { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
+button {
+  border: 1px solid var(--ink);
+  background: var(--signal);
+  color: var(--ink);
+  padding: 0.8rem 1rem;
+  font: 700 0.75rem "Courier New", monospace;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+button.quiet { background: transparent; }
+code { width: 100%; overflow-wrap: anywhere; }
+.error { color: #9e291f; }

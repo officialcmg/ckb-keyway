@@ -1,3 +1,5 @@
+import { AuthPanel } from "./auth-panel";
+
 export default function Home() {
   return (
     <main>
@@ -6,7 +8,7 @@ export default function Home() {
       <p className="lede">
         Recover a stable CKB identity with email and use it to fund Fiber channels without handling a CKB private key.
       </p>
-      <div className="status"><span /> Lit signing integration configured</div>
+      <AuthPanel />
     </main>
   );
 }
