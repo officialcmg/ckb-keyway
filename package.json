@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "exports": {
+    "./browser": "./src/sdk/browser/index.ts",
+    "./server": "./src/sdk/server/index.ts"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -12,6 +16,8 @@
     "verify:lit": "node --experimental-strip-types --env-file=.env.local scripts/verify-lit.ts"
   },
   "dependencies": {
+    "@fiber-pay/sdk": "^0.2.7",
+    "@nervosnetwork/fiber-js": "^0.9.0-rc7",
     "@stytch/nextjs": "^22.0.11",
     "next": "16.2.10",
     "react": "19.2.7",
