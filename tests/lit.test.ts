@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { signCkbDigest } from "../src/server/lit.ts";
+import { decryptFiberKey, encryptFiberKey, signCkbDigest } from "../src/server/lit.ts";
 
 const config = { apiKey: "test", actionCid: "QmTest" };
 const pkpId = `0x${"11".repeat(20)}`;
@@ -33,6 +33,36 @@ test("executes only the configured CID with the supplied PKP and digest", async 
 
   try {
     assert.equal((await signCkbDigest(digest, pkpId, config)).recoveryParam, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("round-trips Fiber key transport through pinned Lit Actions", async () => {
+  const originalFetch = globalThis.fetch;
+  const fiberKey = new Uint8Array(32).fill(7);
+  const encryptedConfig = { apiKey: "test", actionCid: "QmEncrypt" };
+  const decryptedConfig = { apiKey: "test", actionCid: "QmDecrypt" };
+
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body));
+    if (request.ipfs_id === encryptedConfig.actionCid) {
+      assert.equal(request.js_params.fiberKey, Buffer.from(fiberKey).toString("base64"));
+      return Response.json({ has_error: false, logs: "", response: { ciphertext: "encrypted" } });
+    }
+    assert.equal(request.ipfs_id, decryptedConfig.actionCid);
+    assert.equal(request.js_params.ciphertext, "encrypted");
+    return Response.json({
+      has_error: false,
+      logs: "",
+      response: { fiberKey: Buffer.from(fiberKey).toString("base64") },
+    });
+  };
+
+  try {
+    const ciphertext = await encryptFiberKey(fiberKey, pkpId, encryptedConfig);
+    assert.equal(ciphertext, "encrypted");
+    assert.deepEqual(await decryptFiberKey(ciphertext, pkpId, decryptedConfig), fiberKey);
   } finally {
     globalThis.fetch = originalFetch;
   }
