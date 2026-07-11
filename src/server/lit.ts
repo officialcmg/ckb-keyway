@@ -101,6 +101,7 @@ function isSignature(value: unknown): value is LitSignature {
 }
 
 function readApiError(value: unknown, fallback: string): string {
+  if (typeof value === "string" && value) return value;
   if (!value || typeof value !== "object") return fallback;
   const candidate = value as { message?: unknown; error?: unknown; fix?: unknown };
   return [candidate.message, candidate.error, candidate.fix].filter((item): item is string => typeof item === "string").join(". ") || fallback;

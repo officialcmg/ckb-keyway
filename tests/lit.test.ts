@@ -67,3 +67,17 @@ test("round-trips Fiber key transport through pinned Lit Actions", async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test("preserves Chipotle string errors", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => Response.json("cache miss", { status: 400 });
+
+  try {
+    await assert.rejects(
+      () => encryptFiberKey(new Uint8Array(32), pkpId, { apiKey: "test", actionCid: "QmEncrypt" }),
+      /cache miss/,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
