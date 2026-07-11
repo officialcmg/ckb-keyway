@@ -1,0 +1,54 @@
+:root {
+  --ink: #172019;
+  --paper: #f3f0e5;
+  --signal: #e6ff54;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at 85% 15%, rgba(230, 255, 84, 0.7), transparent 28rem),
+    repeating-linear-gradient(90deg, transparent 0 79px, rgba(23, 32, 25, 0.05) 80px),
+    var(--paper);
+  font-family: Georgia, "Times New Roman", serif;
+}
+
+main {
+  min-height: 100vh;
+  display: grid;
+  align-content: center;
+  padding: clamp(2rem, 8vw, 8rem);
+  max-width: 74rem;
+}
+
+.eyebrow, .status {
+  font: 700 0.75rem/1.4 "Courier New", monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+h1 {
+  margin: 0.1em 0;
+  font-size: clamp(4rem, 15vw, 11rem);
+  line-height: 0.82;
+  letter-spacing: -0.07em;
+}
+
+.lede {
+  max-width: 42rem;
+  font-size: clamp(1.25rem, 2.5vw, 2rem);
+  line-height: 1.25;
+}
+
+.status { margin-top: 2rem; }
+.status span {
+  display: inline-block;
+  width: 0.7rem;
+  height: 0.7rem;
+  margin-right: 0.5rem;
+  border-radius: 50%;
+  background: #42a541;
+}

@@ -3,6 +3,7 @@ node_modules/
 .next/
 dist/
 coverage/
+*.tsbuildinfo
 
 # Local configuration and credentials
 .env
