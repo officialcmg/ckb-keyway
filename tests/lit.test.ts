@@ -81,3 +81,23 @@ test("preserves Chipotle string errors", async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test("submits inline Action source when provided", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input, init) => {
+    const request = JSON.parse(String(init?.body));
+    assert.equal(request.code, "async function main() {}");
+    assert.equal(request.ipfs_id, undefined);
+    return Response.json({ has_error: false, logs: "", response: { ciphertext: "encrypted" } });
+  };
+
+  try {
+    await encryptFiberKey(new Uint8Array(32), pkpId, {
+      apiKey: "test",
+      actionCid: "QmRegistered",
+      actionCode: "async function main() {}",
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

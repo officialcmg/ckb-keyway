@@ -11,6 +11,7 @@ export type LitSignature = {
 export type LitRuntimeConfig = {
   apiKey: string;
   actionCid: string;
+  actionCode?: string;
 };
 
 type LitActionResponse = {
@@ -26,21 +27,10 @@ export async function signCkbDigest(
 ): Promise<LitSignature> {
   if (!HEX_32.test(digest)) throw new Error("CKB digest must be a 0x-prefixed 32-byte hex string");
   if (!EVM_ADDRESS.test(pkpId)) throw new Error("Lit PKP ID must be a 20-byte EVM address");
-  if (!config.apiKey || !config.actionCid) throw new Error("Lit runtime configuration is incomplete");
+  const signature = await executeAction(config, { pkpId, digest });
+  if (!isSignature(signature)) throw new Error("Lit Action returned an invalid signature");
 
-  const response = await fetch(CHIPOTLE_ACTION_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Api-Key": config.apiKey },
-    body: JSON.stringify({ ipfs_id: config.actionCid, js_params: { pkpId, digest } }),
-  });
-  const body: unknown = await response.json().catch(() => null);
-
-  if (!response.ok) throw new Error(readApiError(body, `Lit returned HTTP ${response.status}`));
-  if (!isActionResponse(body)) throw new Error("Lit returned an invalid Action response");
-  if (body.has_error) throw new Error(`Lit Action failed${body.logs ? `: ${body.logs}` : ""}`);
-  if (!isSignature(body.response)) throw new Error("Lit Action returned an invalid signature");
-
-  return body.response;
+  return signature;
 }
 
 export async function encryptFiberKey(
@@ -74,10 +64,11 @@ export async function decryptFiberKey(
 
 async function executeAction(config: LitRuntimeConfig, js_params: Record<string, unknown>): Promise<unknown> {
   if (!config.apiKey || !config.actionCid) throw new Error("Lit runtime configuration is incomplete");
+  const action = config.actionCode ? { code: config.actionCode } : { ipfs_id: config.actionCid };
   const response = await fetch(CHIPOTLE_ACTION_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Api-Key": config.apiKey },
-    body: JSON.stringify({ ipfs_id: config.actionCid, js_params }),
+    body: JSON.stringify({ ...action, js_params }),
   });
   const body: unknown = await response.json().catch(() => null);
   if (!response.ok) throw new Error(readApiError(body, `Lit returned HTTP ${response.status}`));
