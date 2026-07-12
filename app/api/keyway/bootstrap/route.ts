@@ -12,6 +12,7 @@ export async function POST(request: Request) {
     return Response.json(await bootstrap(user, deviceIdHash, fiberKey));
   } catch (error) {
     const message = error instanceof Error ? error.message : "Bootstrap failed";
+    console.error("[keyway/bootstrap]", message);
     const unauthorized = /session/i.test(message);
     return Response.json({ error: message }, { status: unauthorized ? 401 : 400 });
   }
