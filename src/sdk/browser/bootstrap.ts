@@ -65,6 +65,18 @@ export async function loadFiberKey(sessionJwt: string, leaseId: string): Promise
   return fiberKey;
 }
 
+export async function markChannelOpened(sessionJwt: string): Promise<void> {
+  const response = await fetch("/api/keyway/channel-state", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${sessionJwt}` },
+    body: JSON.stringify({ deviceIdHash: await getDeviceIdHash() }),
+  });
+  if (!response.ok) {
+    const result = await response.json().catch(() => ({}));
+    throw new Error(result.error ?? "Could not protect Fiber channel recovery state");
+  }
+}
+
 async function requestBootstrap(
   sessionJwt: string,
   body: { deviceIdHash: string; fiberKey?: string },

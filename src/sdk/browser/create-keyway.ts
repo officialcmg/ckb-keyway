@@ -9,6 +9,7 @@ import { KeyWayCredentialProvider, type FiberKeyLoader } from "./credential-prov
 import { acquireDeviceLock, type DeviceLock } from "./device-lock";
 import { acquireDeviceLease, type DeviceLease } from "./device-lease";
 import { RemoteCkbSigner, type ConfirmFunding } from "./remote-ckb-signer";
+import { markChannelOpened } from "./bootstrap";
 
 export type KeyWayFundingParams = Omit<
   OpenChannelWithExternalFundingParams,
@@ -73,7 +74,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   async function openFundedChannel(params: KeyWayFundingParams) {
     if (!node.isRunning) throw new Error("Start the Fiber node before opening a channel");
     const funding = await resolveExternalFunding(undefined);
-    return openChannelWithExternalFundingFlow({
+    const result = await openChannelWithExternalFundingFlow({
       node,
       params: {
         ...params,
@@ -83,6 +84,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       },
       signFundingTx: funding.signFundingTx,
     });
+    await markChannelOpened(options.sessionJwt);
+    return result;
   }
 
   return {

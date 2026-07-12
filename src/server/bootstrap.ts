@@ -3,7 +3,14 @@ import { addPkpToGroup, createPkp, findGroupId } from "./chipotle";
 import { loadLitAction } from "./lit-actions";
 import { encryptFiberKey } from "./lit";
 import { derivePkpIdentity } from "./pkp-identity";
-import { readWallet, saveWallet, type KeyWayWallet, type ReadyWallet } from "./user-wallet";
+import { readActiveLease } from "./device-lease";
+import {
+  readWallet,
+  rebindReadyWallet,
+  saveWallet,
+  type KeyWayWallet,
+  type ReadyWallet,
+} from "./user-wallet";
 
 const BASE64_KEY = /^[A-Za-z0-9+/]{43}=$/;
 const DEVICE_ID_HASH = /^[0-9a-f]{64}$/;
@@ -15,7 +22,11 @@ export type BootstrapResult =
 export async function bootstrap(user: User, deviceIdHash: string, encodedFiberKey?: string): Promise<BootstrapResult> {
   if (!DEVICE_ID_HASH.test(deviceIdHash)) throw new Error("Device ID hash must be 32-byte lowercase hex");
   let wallet = readWallet(user);
-  if (wallet?.status === "ready") return publicResult(wallet, false);
+  if (wallet?.status === "ready") {
+    const rebound = rebindReadyWallet(wallet, deviceIdHash, readActiveLease(user)?.deviceIdHash);
+    if (rebound !== wallet) await saveWallet(user, rebound);
+    return publicResult(rebound, false);
+  }
   if (!wallet && !encodedFiberKey) return { needsFiberKey: true };
   if (encodedFiberKey && !BASE64_KEY.test(encodedFiberKey)) throw new Error("Fiber key must be base64-encoded 32 bytes");
 
