@@ -24,6 +24,9 @@ export function AuthPanel() {
   const [wallet, setWallet] = useState<PublicWallet>();
   const [nodeStatus, setNodeStatus] = useState<string>();
   const [nodePubkey, setNodePubkey] = useState<string>();
+  const [peerPubkey, setPeerPubkey] = useState("");
+  const [fundingCkb, setFundingCkb] = useState("100");
+  const [fundingResult, setFundingResult] = useState<string>();
   const [error, setError] = useState<string>();
   const keyway = useRef<KeyWay | undefined>(undefined);
 
@@ -62,6 +65,11 @@ export function AuthPanel() {
       keyway.current ??= createKeyWay({
         identifier: wallet.litPkpId,
         sessionJwt: jwt,
+        ckbPublicKey: wallet.litPublicKey,
+        confirmFunding: (preview) => window.confirm(
+          `Open a ${preview.amountCkb} CKB Fiber channel?\n\n` +
+          `Fee: ${preview.feeCkb} CKB\nDestination: ${preview.destination}`,
+        ),
         loadFiberKey: (leaseId) => loadFiberKey(jwt, leaseId),
       });
       const info = await keyway.current.start();
@@ -70,6 +78,24 @@ export function AuthPanel() {
     } catch (cause) {
       setNodeStatus(undefined);
       setError(cause instanceof Error ? cause.message : "Fiber node failed to start");
+    }
+  }
+
+  async function openChannel() {
+    setError(undefined);
+    setFundingResult(undefined);
+    if (!keyway.current?.isRunning) return setError("Start the Fiber node first");
+    if (!/^0x[0-9a-fA-F]{66}$/.test(peerPubkey)) return setError("Peer public key must be 33-byte hex");
+    try {
+      const fundingAmount = parseCkb(fundingCkb);
+      const result = await keyway.current.openFundedChannel({
+        pubkey: peerPubkey as `0x${string}`,
+        funding_amount: `0x${fundingAmount.toString(16)}`,
+        public: true,
+      });
+      setFundingResult(`Channel ${result.channelId} funded by ${result.fundingTxHash}`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Channel funding failed");
     }
   }
 
@@ -103,7 +129,25 @@ export function AuthPanel() {
       {wallet && <code>{wallet.ckbAddress}</code>}
       {nodeStatus && <p className="node-status">{nodeStatus}</p>}
       {nodePubkey && <code>{nodePubkey}</code>}
+      {nodePubkey && (
+        <div className="funding-controls">
+          <label>Peer public key<input value={peerPubkey} onChange={(event) => setPeerPubkey(event.target.value)} /></label>
+          <label>Funding (CKB)<input value={fundingCkb} onChange={(event) => setFundingCkb(event.target.value)} /></label>
+          <button onClick={openChannel}>Open funded channel</button>
+        </div>
+      )}
+      {fundingResult && <code>{fundingResult}</code>}
       {error && <p className="error">{error}</p>}
     </section>
   );
+}
+
+function parseCkb(value: string): bigint {
+  const match = /^(\d{1,4})(?:\.(\d{1,8}))?$/.exec(value.trim());
+  if (!match) throw new Error("Funding amount must use at most 8 decimal places");
+  const shannons = BigInt(match[1]) * 100_000_000n + BigInt((match[2] ?? "").padEnd(8, "0") || "0");
+  if (shannons <= 0n || shannons > 100_000_000_000n) {
+    throw new Error("Funding amount must be between 0 and 1000 CKB");
+  }
+  return shannons;
 }
