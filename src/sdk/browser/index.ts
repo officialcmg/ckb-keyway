@@ -17,7 +17,7 @@ export { acquireDeviceLease, type DeviceLease } from "./device-lease";
 export { RemoteCkbSigner, type ConfirmFunding, type FundingPreview } from "./remote-ckb-signer";
 export {
   connectKeyWay,
-  TESTNET_RELAYS,
   type ConnectedKeyWay,
 } from "./connect-keyway";
+export { connectTestnetPeers, TESTNET_RELAYS } from "./testnet-peers";
 export { normalizeFiberPubkey } from "./fiber-pubkey";
