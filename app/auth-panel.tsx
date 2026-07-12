@@ -16,6 +16,11 @@ const config = {
   sessionOptions: { sessionDurationMinutes: 60 },
 };
 
+const TESTNET_RELAYS = [
+  "/dns4/thrall.fiber.channel/tcp/443/wss/p2p/Qmes1EBD4yNo9Ywkfe6eRw9tG1nVNGLDmMud1xJMsoYFKy",
+  "/dns4/onyxia.fiber.channel/tcp/443/wss/p2p/QmdyQWjPtbK4NWWsvy8s69NGJaQULwgeQDT5ZpNDrTNaeV",
+];
+
 export function AuthPanel() {
   const stytch = useStytch();
   const { session, isInitialized } = useStytchSession();
@@ -111,6 +116,25 @@ export function AuthPanel() {
     }
   }
 
+  async function connectRelay() {
+    setError(undefined);
+    if (!keyway.current?.isRunning) return setError("Start the Fiber node first");
+    for (const address of TESTNET_RELAYS) {
+      try {
+        await keyway.current.connectPeer({ address, save: true });
+        const { peers } = await keyway.current.listPeers();
+        const peer = peers[0];
+        if (!peer) continue;
+        setPeerPubkey(peer.pubkey);
+        setNodeStatus(`Fiber node connected to ${peers.length} peer(s)`);
+        return;
+      } catch {
+        // Try the next public testnet relay.
+      }
+    }
+    setError("Could not connect to a public Fiber testnet relay");
+  }
+
   async function logOut() {
     await keyway.current?.stop();
     keyway.current = undefined;
@@ -131,6 +155,7 @@ export function AuthPanel() {
       {nodePubkey && <code>{nodePubkey}</code>}
       {nodePubkey && (
         <div className="funding-controls">
+          <button className="quiet" onClick={connectRelay}>Connect testnet relay</button>
           <label>Peer public key<input value={peerPubkey} onChange={(event) => setPeerPubkey(event.target.value)} /></label>
           <label>Funding (CKB)<input value={fundingCkb} onChange={(event) => setFundingCkb(event.target.value)} /></label>
           <button onClick={openChannel}>Open funded channel</button>
