@@ -10,9 +10,17 @@ function getClient() {
 }
 
 export async function authenticateBearer(authorization: string | null): Promise<string> {
+  return (await authenticateUser(authorization)).user_id;
+}
+
+export async function authenticateUser(authorization: string | null) {
   if (!authorization?.startsWith("Bearer ")) throw new Error("Missing bearer session");
   const session_jwt = authorization.slice(7);
   if (!session_jwt) throw new Error("Missing bearer session");
   const response = await getClient().sessions.authenticate({ session_jwt });
-  return response.user.user_id;
+  return response.user;
+}
+
+export async function updateTrustedMetadata(userId: string, trustedMetadata: Record<string, unknown>) {
+  return (await getClient().users.update({ user_id: userId, trusted_metadata: trustedMetadata })).user;
 }

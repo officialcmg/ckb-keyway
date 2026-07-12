@@ -2,6 +2,7 @@
 
 import { Products, StytchLogin, useStytch, useStytchSession, useStytchUser } from "@stytch/nextjs";
 import { useState } from "react";
+import { bootstrapKeyWay, type PublicWallet } from "@/src/sdk/browser";
 
 const config = {
   products: [Products.otp],
@@ -14,6 +15,7 @@ export function AuthPanel() {
   const { session, isInitialized } = useStytchSession();
   const { user } = useStytchUser();
   const [verifiedUserId, setVerifiedUserId] = useState<string>();
+  const [wallet, setWallet] = useState<PublicWallet>();
   const [error, setError] = useState<string>();
 
   if (!isInitialized) return <p className="status">Loading authentication...</p>;
@@ -30,12 +32,25 @@ export function AuthPanel() {
     setVerifiedUserId(body.userId);
   }
 
+  async function initializeWallet() {
+    setError(undefined);
+    const jwt = stytch.session.getTokens()?.session_jwt;
+    if (!jwt) return setError("No active Stytch session");
+    try {
+      setWallet((await bootstrapKeyWay(jwt)).wallet);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Wallet initialization failed");
+    }
+  }
+
   return (
     <section className="auth signed-in">
       <p className="status"><span /> Email identity recovered</p>
       <button onClick={verifyBackendSession}>Verify backend session</button>
+      <button onClick={initializeWallet}>Initialize KeyWay</button>
       <button className="quiet" onClick={() => stytch.session.revoke()}>Log out</button>
       {verifiedUserId && <code>{verifiedUserId}</code>}
+      {wallet && <code>{wallet.ckbAddress}</code>}
       {error && <p className="error">{error}</p>}
     </section>
   );

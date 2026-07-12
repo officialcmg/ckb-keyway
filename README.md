@@ -5,11 +5,11 @@ Email-authenticated wallet infrastructure for Fiber Network. The included Next.j
 ## Browser SDK
 
 ```ts
-import { createKeyWay } from "@ckb-keyway/sdk/browser";
+import { createKeyWay, loadFiberKey } from "@ckb-keyway/sdk/browser";
 
 const keyway = createKeyWay({
   identifier: stytchUserId,
-  loadFiberKey: () => authenticatedApi.getFiberKey(),
+  loadFiberKey: () => loadFiberKey(stytchSessionJwt),
 });
 
 await keyway.start();
