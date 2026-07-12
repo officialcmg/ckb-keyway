@@ -1,7 +1,9 @@
 import * as ccc from "@ckb-ccc/core";
 import {
   createCccExternalFundingResolver,
+  cccScriptToFiberScript,
   FiberBrowserNode,
+  getLockBalanceShannons,
   openChannelWithExternalFundingFlow,
   type OpenChannelWithExternalFundingParams,
 } from "@fiber-pay/sdk/browser";
@@ -42,6 +44,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     knownScripts: [ccc.KnownScript.Secp256k1Blake160],
     ckbRpcUrl: "https://testnet.ckb.dev/",
   });
+  const ckbRpcUrl = "https://testnet.ckbapp.dev/";
 
   async function start() {
     if (node.isRunning) return node.nodeInfo();
@@ -88,6 +91,11 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     return result;
   }
 
+  async function getCkbBalance(): Promise<bigint> {
+    const address = await fundingSigner.getRecommendedAddressObj();
+    return getLockBalanceShannons(ckbRpcUrl, cccScriptToFiberScript(address.script));
+  }
+
   return {
     start,
     stop,
@@ -95,12 +103,15 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     connectPeer: node.connectPeer.bind(node),
     listPeers: node.listPeers.bind(node),
     listChannels: node.listChannels.bind(node),
+    waitForChannelReady: node.waitForChannelReady.bind(node),
     newInvoice: node.newInvoice.bind(node),
+    getInvoice: node.getInvoice.bind(node),
     parseInvoice: node.parseInvoice.bind(node),
     sendPayment: node.sendPayment.bind(node),
     getPayment: node.getPayment.bind(node),
     waitForPayment: node.waitForPayment.bind(node),
     openFundedChannel,
+    getCkbBalance,
     openChannelWithExternalFunding: node.openChannelWithExternalFunding.bind(node),
     submitSignedFundingTx: node.submitSignedFundingTx.bind(node),
     get state() { return node.state; },
