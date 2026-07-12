@@ -6,6 +6,7 @@ import { derivePkpIdentity } from "./pkp-identity";
 import { readActiveLease } from "./device-lease";
 import {
   readWallet,
+  rebindProvisioningWallet,
   rebindReadyWallet,
   saveWallet,
   type KeyWayWallet,
@@ -43,7 +44,11 @@ export async function bootstrap(user: User, deviceIdHash: string, encodedFiberKe
     await saveWallet(user, wallet);
   }
 
-  if (wallet.primaryDeviceIdHash !== deviceIdHash) throw new Error("Fiber wallet is bound to another device");
+  if (wallet.primaryDeviceIdHash !== deviceIdHash) {
+    const rebound = rebindProvisioningWallet(wallet, deviceIdHash, readActiveLease(user)?.deviceIdHash);
+    await saveWallet(user, rebound);
+    wallet = rebound;
+  }
   if (!encodedFiberKey) return { needsFiberKey: true };
 
   await addPkpToGroup(

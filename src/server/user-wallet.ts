@@ -53,6 +53,18 @@ export function rebindReadyWallet(
   return { ...wallet, primaryDeviceIdHash: deviceIdHash, updatedAt: new Date().toISOString() };
 }
 
+export function rebindProvisioningWallet(
+  wallet: ProvisioningWallet,
+  deviceIdHash: string,
+  activeLeaseDeviceIdHash?: string,
+): ProvisioningWallet {
+  if (wallet.primaryDeviceIdHash === deviceIdHash) return wallet;
+  if (activeLeaseDeviceIdHash && activeLeaseDeviceIdHash !== deviceIdHash) {
+    throw new Error("Fiber identity is currently running on another device");
+  }
+  return { ...wallet, primaryDeviceIdHash: deviceIdHash };
+}
+
 export async function markChannelOpened(user: User, deviceIdHash: string): Promise<ReadyWallet> {
   const wallet = readWallet(user);
   if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
