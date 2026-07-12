@@ -93,13 +93,22 @@ export async function signFundingTransaction(
   }
 
   const witness = validated.transaction.getWitnessArgsAt(info.position) ?? ccc.WitnessArgs.from({});
-  witness.lock = `${signature.r}${signature.s.slice(2)}${signature.recoveryParam.toString(16).padStart(2, "0")}`;
+  witness.lock = formatCkbSignature(signature);
   validated.transaction.setWitnessArgsAt(info.position, witness);
   return validated.transaction;
 }
 
 export function serializeTransaction(transaction: ccc.Transaction): Record<string, unknown> {
   return JSON.parse(ccc.stringify(transaction)) as Record<string, unknown>;
+}
+
+export function formatCkbSignature(signature: { r: string; s: string; recoveryParam: 0 | 1 }): ccc.Hex {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(signature.r) || !/^0x[0-9a-fA-F]{64}$/.test(signature.s)) {
+    throw new Error("Lit returned malformed signature components");
+  }
+  return ccc.hexFrom(
+    `${signature.r}${signature.s.slice(2)}${signature.recoveryParam.toString(16).padStart(2, "0")}`,
+  );
 }
 
 function formatCkb(shannons: bigint): string {
