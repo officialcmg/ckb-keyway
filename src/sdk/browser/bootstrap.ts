@@ -46,12 +46,12 @@ export async function getDeviceIdHash(): Promise<string> {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-export async function loadFiberKey(sessionJwt: string): Promise<Uint8Array> {
+export async function loadFiberKey(sessionJwt: string, leaseId: string): Promise<Uint8Array> {
   if (!sessionJwt) throw new Error("Authenticated Stytch session is required");
   const response = await fetch("/api/keyway/fiber-key", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${sessionJwt}` },
-    body: JSON.stringify({ deviceIdHash: await getDeviceIdHash() }),
+    body: JSON.stringify({ deviceIdHash: await getDeviceIdHash(), leaseId }),
   });
   if (!response.ok) {
     const result = await response.json().catch(() => ({}));

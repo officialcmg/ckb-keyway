@@ -65,5 +65,7 @@ button {
   cursor: pointer;
 }
 button.quiet { background: transparent; }
+button:disabled { cursor: not-allowed; opacity: 0.45; }
 code { width: 100%; overflow-wrap: anywhere; }
+.node-status { width: 100%; margin: 0.5rem 0 0; }
 .error { color: #9e291f; }
