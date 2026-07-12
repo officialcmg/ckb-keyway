@@ -13,3 +13,4 @@ coverage/
 # Local tools and logs
 *.log
 .DS_Store
+.vercel
