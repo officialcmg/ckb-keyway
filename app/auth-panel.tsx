@@ -4,6 +4,7 @@ import { Products, StytchLogin, useStytch, useStytchSession, useStytchUser } fro
 import { useEffect, useRef, useState } from "react";
 import {
   connectKeyWay,
+  formatFiberOutpoint,
   friendlyKeyWayError,
   type ConnectedKeyWay,
   type FundingPreview,
@@ -71,7 +72,7 @@ export function AuthPanel() {
       setChannelReady(Boolean(readyChannel));
       setChannelEvidence(readyChannel ? {
         channelId: readyChannel.channel_id,
-        fundingOutpoint: formatOutpoint(readyChannel.channel_outpoint),
+        fundingOutpoint: formatFiberOutpoint(readyChannel.channel_outpoint),
       } : undefined);
       setPhase("ready");
     } catch (cause) {
@@ -101,7 +102,7 @@ export function AuthPanel() {
       setChannelReady(true);
       setChannelEvidence({
         channelId: result.channelId,
-        fundingOutpoint: formatOutpoint(readyChannel?.channel_outpoint ?? null, result.fundingTxHash),
+        fundingOutpoint: formatFiberOutpoint(readyChannel?.channel_outpoint ?? null, result.fundingTxHash),
       });
       setPhase("ready");
     } catch (cause) {
@@ -327,10 +328,6 @@ function toHex(value: bigint): `0x${string}` {
 
 function shorten(value: string): string {
   return value.length <= 22 ? value : `${value.slice(0, 12)}…${value.slice(-8)}`;
-}
-
-function formatOutpoint(outpoint: { tx_hash: string; index: string } | null, fallback = "Unavailable"): string {
-  return outpoint ? `${outpoint.tx_hash}:${outpoint.index}` : fallback;
 }
 
 function friendlyError(value: string): string {

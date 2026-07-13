@@ -22,3 +22,4 @@ export {
 export { connectTestnetPeers, TESTNET_RELAYS } from "./testnet-peers";
 export { normalizeFiberPubkey } from "./fiber-pubkey";
 export { friendlyKeyWayError } from "./friendly-error";
+export { formatFiberOutpoint } from "./channel-evidence";
