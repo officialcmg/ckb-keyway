@@ -53,7 +53,10 @@ export async function connectChannelPeers(
 
 function eligiblePeers(nodes: GraphNodesResult["nodes"], fundingAmount: bigint): ChannelPeer[] {
   return nodes
-    .filter((node) => BigInt(node.auto_accept_min_ckb_funding_amount) <= fundingAmount)
+    .filter((node) => {
+      const minimum = BigInt(node.auto_accept_min_ckb_funding_amount);
+      return minimum > 0n && minimum <= fundingAmount;
+    })
     .filter((node) => node.addresses.some(isBrowserAddress))
     .sort((left, right) => {
       const leftMinimum = BigInt(left.auto_accept_min_ckb_funding_amount);

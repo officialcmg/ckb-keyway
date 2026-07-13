@@ -38,7 +38,7 @@ test("connects only browser-reachable peers that accept the funding amount", asy
       nodes: [
         graphNode(tooExpensive, "0x174876e800", "/dns4/expensive/tcp/443/wss/p2p/expensive"),
         graphNode(eligible, "0x2540be400", "/dns4/eligible/tcp/443/wss/p2p/eligible"),
-        graphNode(`02${"44".repeat(32)}`, "0x0", "/ip4/127.0.0.1/tcp/8228/p2p/local"),
+        graphNode(`02${"44".repeat(32)}`, "0x0", "/dns4/disabled/tcp/443/wss/p2p/disabled"),
       ],
     }),
     connectPeer: async ({ pubkey }) => { connected = pubkey === `0x${eligible}`; },
