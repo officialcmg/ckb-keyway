@@ -23,5 +23,6 @@ export {
 } from "./connect-keyway";
 export { connectTestnetPeers, TESTNET_RELAYS } from "./testnet-peers";
 export { normalizeFiberPubkey } from "./fiber-pubkey";
+export { KeyWayApiClient, type KeyWayApiClientOptions } from "./api-client";
 export { friendlyKeyWayError } from "./friendly-error";
 export { formatFiberOutpoint } from "./channel-evidence";

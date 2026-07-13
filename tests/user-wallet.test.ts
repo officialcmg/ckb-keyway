@@ -1,16 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { User } from "stytch";
 import {
-  readWallet,
+  parseWallet,
   rebindProvisioningWallet,
   rebindReadyWallet,
 } from "../src/server/user-wallet.ts";
-
-const user = (keyway: unknown) => ({
-  user_id: "user-test",
-  trusted_metadata: { existing: true, keyway },
-}) as unknown as User;
 
 test("reads valid ready wallet metadata without exposing unrelated metadata", () => {
   const wallet = {
@@ -25,15 +19,15 @@ test("reads valid ready wallet metadata without exposing unrelated metadata", ()
     createdAt: "2026-07-12T00:00:00.000Z",
     updatedAt: "2026-07-12T00:00:00.000Z",
   } as const;
-  assert.deepEqual(readWallet(user(wallet)), wallet);
+  assert.deepEqual(parseWallet(wallet), wallet);
 });
 
 test("rejects incomplete ready wallet metadata", () => {
-  assert.equal(readWallet(user({ version: 1, status: "ready", litPkpId: "0x1", primaryDeviceIdHash: "a" })), undefined);
+  assert.equal(parseWallet({ version: 1, status: "ready", litPkpId: "0x1", primaryDeviceIdHash: "a" }), undefined);
 });
 
 test("rebinds a channel-free wallet when the previous device is inactive", () => {
-  const wallet = readWallet(user({
+  const wallet = parseWallet({
     version: 1,
     status: "ready",
     litPkpId: "0x1111111111111111111111111111111111111111",
@@ -44,7 +38,7 @@ test("rebinds a channel-free wallet when the previous device is inactive", () =>
     hasOpenedChannel: false,
     createdAt: "2026-07-12T00:00:00.000Z",
     updatedAt: "2026-07-12T00:00:00.000Z",
-  }))!;
+  })!;
   assert.equal(wallet.status, "ready");
   if (wallet.status !== "ready") throw new Error("Expected ready wallet");
   assert.equal(rebindReadyWallet(wallet, "b".repeat(64)).primaryDeviceIdHash, "b".repeat(64));

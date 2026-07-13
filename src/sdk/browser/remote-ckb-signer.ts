@@ -1,5 +1,6 @@
 import * as ccc from "@ckb-ccc/core";
 import { serializeCccTransaction } from "./ccc-transaction";
+import { KeyWayApiClient } from "./api-client";
 
 export type FundingPreview = {
   amountCkb: string;
@@ -16,6 +17,7 @@ export class RemoteCkbSigner extends ccc.SignerCkbPublicKey {
     publicKey: ccc.HexLike,
     private readonly confirmFunding: ConfirmFunding,
     client: ccc.Client = new ccc.ClientPublicTestnet(),
+    private readonly api = new KeyWayApiClient(),
   ) {
     super(client, publicKey);
   }
@@ -39,14 +41,7 @@ export class RemoteCkbSigner extends ccc.SignerCkbPublicKey {
   }
 
   private async request(body: Record<string, unknown>): Promise<unknown> {
-    const response = await fetch("/api/keyway/sign-transaction", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${this.sessionJwt}` },
-      body: JSON.stringify(body),
-    });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.error ?? "KeyWay transaction signing failed");
-    return result;
+    return this.api.signTransaction(this.sessionJwt, body);
   }
 }
 

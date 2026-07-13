@@ -1,42 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { User } from "stytch";
-import { readActiveLease, requireLease, type StoredDeviceLease } from "../src/server/device-lease.ts";
+import { acquireLease, heartbeatLease, releaseLease, requireLease } from "../src/server/device-lease.ts";
 
-function userWithLease(lease: Partial<StoredDeviceLease>): User {
-  return {
-    user_id: "user-test",
-    trusted_metadata: { keywayDeviceLease: lease },
-  } as unknown as User;
-}
-
-test("accepts only the active lease for the authenticated user and device", () => {
-  const user = userWithLease({
-    stytchUserId: "user-test",
-    deviceIdHash: "device-a",
-    leaseId: "lease-a",
-    expiresAt: new Date(Date.now() + 30_000).toISOString(),
-  });
-
-  assert.equal(requireLease(user, "device-a", "lease-a").leaseId, "lease-a");
-  assert.throws(() => requireLease(user, "device-b", "lease-a"), /active device lease/);
-  assert.throws(() => requireLease(user, "device-a", "lease-b"), /active device lease/);
-});
-
-test("rejects expired and cross-user lease records", () => {
-  const expired = userWithLease({
-    stytchUserId: "user-test",
-    deviceIdHash: "device-a",
-    leaseId: "lease-a",
-    expiresAt: new Date(Date.now() - 1).toISOString(),
-  });
-  const crossUser = userWithLease({
-    stytchUserId: "another-user",
-    deviceIdHash: "device-a",
-    leaseId: "lease-a",
-    expiresAt: new Date(Date.now() + 30_000).toISOString(),
-  });
-
-  assert.equal(readActiveLease(expired), undefined);
-  assert.equal(readActiveLease(crossUser), undefined);
+test("enforces one active device lease atomically", { skip: !process.env.DATABASE_URL }, async () => {
+  const user = { user_id: `lease-test-${crypto.randomUUID()}` } as User;
+  const lease = await acquireLease(user, "device-a");
+  assert.equal((await requireLease(user, "device-a", lease.leaseId)).leaseId, lease.leaseId);
+  await assert.rejects(acquireLease(user, "device-b"), /another device/);
+  assert.equal((await heartbeatLease(user, "device-a", lease.leaseId)).deviceIdHash, "device-a");
+  await releaseLease(user, "device-a", lease.leaseId);
+  await assert.rejects(requireLease(user, "device-a", lease.leaseId), /active device lease/);
 });

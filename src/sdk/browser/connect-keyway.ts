@@ -3,6 +3,7 @@ import { bootstrapKeyWay, loadFiberKey, type PublicWallet } from "./bootstrap";
 import { createKeyWay, type KeyWay } from "./create-keyway";
 import type { ConfirmFunding } from "./remote-ckb-signer";
 import { connectTestnetPeers } from "./testnet-peers";
+import { KeyWayApiClient } from "./api-client";
 
 export type ConnectedKeyWay = {
   keyway: KeyWay;
@@ -15,14 +16,17 @@ export type ConnectedKeyWay = {
 export async function connectKeyWay(options: {
   sessionJwt: string;
   confirmFunding: ConfirmFunding;
+  apiBaseUrl?: string;
 }): Promise<ConnectedKeyWay> {
-  const { wallet } = await bootstrapKeyWay(options.sessionJwt);
+  const apiClient = new KeyWayApiClient({ apiBaseUrl: options.apiBaseUrl });
+  const { wallet } = await bootstrapKeyWay(options.sessionJwt, apiClient);
   const keyway = createKeyWay({
     identifier: wallet.litPkpId,
     sessionJwt: options.sessionJwt,
     ckbPublicKey: wallet.litPublicKey,
     confirmFunding: options.confirmFunding,
-    loadFiberKey: (leaseId) => loadFiberKey(options.sessionJwt, leaseId),
+    loadFiberKey: (leaseId) => loadFiberKey(options.sessionJwt, leaseId, apiClient),
+    apiClient,
   });
 
   try {

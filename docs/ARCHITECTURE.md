@@ -17,7 +17,7 @@ The Fiber key is never derived from the PKP, an OTP, or an ECDSA signature.
 Stytch email OTP
        |
        v
-authenticated KeyWay backend ---- Stytch trusted wallet metadata
+authenticated KeyWay backend ---- Railway Postgres wallet metadata
        |                                  |
        |                                  +-- one Lit PKP per user
        |                                  +-- encrypted Fiber key
@@ -54,7 +54,7 @@ Peer-owned inputs and peer change are expected because Fiber funding is collabor
 
 The Stytch identity, PKP, CKB address, and encrypted Fiber key can be recovered after login. The channel database cannot yet be safely moved between browsers. Once a wallet has opened a channel, a different device receives `CHANNEL_STATE_DEVICE_BOUND` and cannot start that Fiber identity.
 
-Within the primary browser, a Web Lock and `BroadcastChannel` prevent duplicate tabs. A short server lease prevents a second browser process from using the same identity concurrently.
+Within the primary browser, a Web Lock and `BroadcastChannel` prevent duplicate tabs. A short atomic Postgres lease prevents a second browser process from using the same identity concurrently.
 
 ## Trust boundaries
 

@@ -16,6 +16,7 @@ import { RemoteCkbSigner, type ConfirmFunding } from "./remote-ckb-signer";
 import { markChannelOpened } from "./bootstrap";
 import { connectChannelPeers, type ChannelPeer } from "./channel-peers";
 import { normalizeFiberPubkey } from "./fiber-pubkey";
+import { KeyWayApiClient } from "./api-client";
 
 export type KeyWayFundingParams = Omit<
   OpenChannelWithExternalFundingParams,
@@ -29,6 +30,7 @@ export type CreateKeyWayOptions = {
   confirmFunding: ConfirmFunding;
   loadFiberKey: (leaseId: string) => ReturnType<FiberKeyLoader>;
   network?: "testnet" | "mainnet";
+  apiClient?: KeyWayApiClient;
 };
 
 export type ActivationStage = "connecting" | "negotiating" | "confirming" | "signing" | "broadcasting" | "waiting";
@@ -45,6 +47,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     credential,
   });
   let deviceLock: DeviceLock | undefined;
+  const api = options.apiClient ?? new KeyWayApiClient();
   let activationProgress: ActivationProgress | undefined;
   let preparedPeers: Promise<ChannelPeer[]> | undefined;
   let preparedFundingAmount: bigint | undefined;
@@ -53,7 +56,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     const approved = await options.confirmFunding(preview);
     if (approved) activationProgress?.("signing");
     return approved;
-  });
+  }, undefined, api);
   const resolveExternalFunding = createCccExternalFundingResolver({
     signer: fundingSigner,
     knownScripts: [ccc.KnownScript.Secp256k1Blake160],
@@ -67,7 +70,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     if (node.isRunning) return node.nodeInfo();
     deviceLock = await acquireDeviceLock(options.identifier);
     try {
-      deviceLease = await acquireDeviceLease(options.sessionJwt);
+      deviceLease = await acquireDeviceLease(options.sessionJwt, api);
       return await node.start();
     } catch (error) {
       await releaseGuards();
@@ -106,7 +109,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       },
       signFundingTx: funding.signFundingTx,
     });
-    await markChannelOpened(options.sessionJwt);
+    await markChannelOpened(options.sessionJwt, api);
     return result;
   }
 

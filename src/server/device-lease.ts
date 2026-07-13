@@ -1,8 +1,7 @@
 import type { User } from "stytch";
-import { updateTrustedMetadata } from "./stytch.ts";
+import { database, type DatabaseSql } from "./database.ts";
 
 const LEASE_TTL_MS = 45_000;
-const METADATA_KEY = "keywayDeviceLease";
 
 export type StoredDeviceLease = {
   stytchUserId: string;
@@ -11,17 +10,28 @@ export type StoredDeviceLease = {
   expiresAt: string;
 };
 
+type LeaseRow = {
+  stytch_user_id: string;
+  device_id_hash: string;
+  lease_id: string;
+  expires_at: Date;
+};
+
 export async function acquireLease(user: User, deviceIdHash: string): Promise<StoredDeviceLease> {
-  const current = readActiveLease(user);
-  if (current && current.deviceIdHash !== deviceIdHash) {
-    throw new Error("Fiber identity is active on another device");
-  }
-  return saveLease(user, {
-    stytchUserId: user.user_id,
-    deviceIdHash,
-    leaseId: current?.leaseId ?? crypto.randomUUID(),
-    expiresAt: expiry(),
-  });
+  const sql = await database();
+  const rows = await sql<LeaseRow[]>`
+    insert into keyway_device_leases (stytch_user_id, device_id_hash, lease_id, expires_at)
+    values (${user.user_id}, ${deviceIdHash}, ${crypto.randomUUID()}, ${expiry()})
+    on conflict (stytch_user_id) do update set
+      device_id_hash = excluded.device_id_hash,
+      lease_id = excluded.lease_id,
+      expires_at = excluded.expires_at
+    where keyway_device_leases.expires_at <= now()
+       or keyway_device_leases.device_id_hash = excluded.device_id_hash
+    returning stytch_user_id, device_id_hash, lease_id::text, expires_at
+  `;
+  if (!rows[0]) throw new Error("Fiber identity is active on another device");
+  return publicLease(rows[0]);
 }
 
 export async function heartbeatLease(
@@ -29,42 +39,60 @@ export async function heartbeatLease(
   deviceIdHash: string,
   leaseId: string,
 ): Promise<StoredDeviceLease> {
-  const lease = requireLease(user, deviceIdHash, leaseId);
-  return saveLease(user, { ...lease, expiresAt: expiry() });
+  const sql = await database();
+  const rows = await sql<LeaseRow[]>`
+    update keyway_device_leases set expires_at = ${expiry()}
+    where stytch_user_id = ${user.user_id}
+      and device_id_hash = ${deviceIdHash}
+      and lease_id = ${leaseId}
+      and expires_at > now()
+    returning stytch_user_id, device_id_hash, lease_id::text, expires_at
+  `;
+  if (!rows[0]) throw new Error("An active device lease is required");
+  return publicLease(rows[0]);
 }
 
 export async function releaseLease(user: User, deviceIdHash: string, leaseId: string): Promise<void> {
-  requireLease(user, deviceIdHash, leaseId);
-  const metadata = { ...(user.trusted_metadata ?? {}) };
-  delete metadata[METADATA_KEY];
-  await updateTrustedMetadata(user.user_id, metadata);
+  const sql = await database();
+  await sql`
+    delete from keyway_device_leases
+    where stytch_user_id = ${user.user_id}
+      and device_id_hash = ${deviceIdHash}
+      and lease_id = ${leaseId}
+  `;
 }
 
-export function requireLease(user: User, deviceIdHash: string, leaseId: string): StoredDeviceLease {
-  const lease = readActiveLease(user);
-  if (!lease || lease.leaseId !== leaseId || lease.deviceIdHash !== deviceIdHash) {
-    throw new Error("An active device lease is required");
-  }
-  return lease;
+export async function requireLease(user: User, deviceIdHash: string, leaseId: string): Promise<StoredDeviceLease> {
+  const sql = await database();
+  const rows = await sql<LeaseRow[]>`
+    select stytch_user_id, device_id_hash, lease_id::text, expires_at
+    from keyway_device_leases
+    where stytch_user_id = ${user.user_id}
+      and device_id_hash = ${deviceIdHash}
+      and lease_id = ${leaseId}
+      and expires_at > now()
+  `;
+  if (!rows[0]) throw new Error("An active device lease is required");
+  return publicLease(rows[0]);
 }
 
-export function readActiveLease(user: User): StoredDeviceLease | undefined {
-  const value = user.trusted_metadata?.[METADATA_KEY];
-  if (!value || typeof value !== "object") return undefined;
-  const lease = value as Partial<StoredDeviceLease>;
-  if (
-    lease.stytchUserId !== user.user_id ||
-    typeof lease.deviceIdHash !== "string" ||
-    typeof lease.leaseId !== "string" ||
-    typeof lease.expiresAt !== "string" ||
-    Date.parse(lease.expiresAt) <= Date.now()
-  ) return undefined;
-  return lease as StoredDeviceLease;
+export async function readActiveLease(user: User, connection?: DatabaseSql): Promise<StoredDeviceLease | undefined> {
+  const sql = connection ?? await database();
+  const rows = await sql<LeaseRow[]>`
+    select stytch_user_id, device_id_hash, lease_id::text, expires_at
+    from keyway_device_leases
+    where stytch_user_id = ${user.user_id} and expires_at > now()
+  `;
+  return rows[0] ? publicLease(rows[0]) : undefined;
 }
 
-async function saveLease(user: User, lease: StoredDeviceLease): Promise<StoredDeviceLease> {
-  await updateTrustedMetadata(user.user_id, { ...(user.trusted_metadata ?? {}), [METADATA_KEY]: lease });
-  return lease;
+function publicLease(row: LeaseRow): StoredDeviceLease {
+  return {
+    stytchUserId: row.stytch_user_id,
+    deviceIdHash: row.device_id_hash,
+    leaseId: row.lease_id,
+    expiresAt: row.expires_at.toISOString(),
+  };
 }
 
 function expiry(): string {

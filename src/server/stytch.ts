@@ -5,8 +5,10 @@ let client: stytch.Client | undefined;
 function getClient() {
   const project_id = process.env.STYTCH_PROJECT_ID;
   const secret = process.env.STYTCH_SECRET;
+  const environment = process.env.STYTCH_ENVIRONMENT ?? "test";
   if (!project_id || !secret) throw new Error("Stytch server configuration is incomplete");
-  return client ??= new stytch.Client({ project_id, secret, env: stytch.envs.test });
+  if (environment !== "test" && environment !== "live") throw new Error("STYTCH_ENVIRONMENT must be test or live");
+  return client ??= new stytch.Client({ project_id, secret, env: stytch.envs[environment] });
 }
 
 export async function authenticateBearer(authorization: string | null): Promise<string> {

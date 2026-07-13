@@ -61,6 +61,7 @@ export function AuthPanel() {
     try {
       const next = await connectKeyWay({
         sessionJwt: jwt,
+        apiBaseUrl: process.env.NEXT_PUBLIC_KEYWAY_API_URL,
         confirmFunding: (preview) => new Promise<boolean>((resolve) => {
           confirmation.current = resolve;
           setFundingPreview(preview);

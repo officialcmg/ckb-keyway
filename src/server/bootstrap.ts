@@ -4,6 +4,7 @@ import { loadLitAction } from "./lit-actions";
 import { encryptFiberKey } from "./lit";
 import { derivePkpIdentity } from "./pkp-identity";
 import { readActiveLease } from "./device-lease";
+import { withUserLock, type DatabaseSql } from "./database";
 import {
   readWallet,
   rebindProvisioningWallet,
@@ -22,10 +23,19 @@ export type BootstrapResult =
 
 export async function bootstrap(user: User, deviceIdHash: string, encodedFiberKey?: string): Promise<BootstrapResult> {
   if (!DEVICE_ID_HASH.test(deviceIdHash)) throw new Error("Device ID hash must be 32-byte lowercase hex");
-  let wallet = readWallet(user);
+  return withUserLock(user.user_id, (sql) => bootstrapLocked(user, deviceIdHash, encodedFiberKey, sql));
+}
+
+async function bootstrapLocked(
+  user: User,
+  deviceIdHash: string,
+  encodedFiberKey: string | undefined,
+  sql: DatabaseSql,
+): Promise<BootstrapResult> {
+  let wallet = await readWallet(user, sql);
   if (wallet?.status === "ready") {
-    const rebound = rebindReadyWallet(wallet, deviceIdHash, readActiveLease(user)?.deviceIdHash);
-    if (rebound !== wallet) await saveWallet(user, rebound);
+    const rebound = rebindReadyWallet(wallet, deviceIdHash, (await readActiveLease(user, sql))?.deviceIdHash);
+    if (rebound !== wallet) await saveWallet(user, rebound, sql);
     return publicResult(rebound, false);
   }
   if (!wallet && !encodedFiberKey) return { needsFiberKey: true };
@@ -41,12 +51,12 @@ export async function bootstrap(user: User, deviceIdHash: string, encodedFiberKe
       primaryDeviceIdHash: deviceIdHash,
       createdAt: new Date().toISOString(),
     };
-    await saveWallet(user, wallet);
+    await saveWallet(user, wallet, sql);
   }
 
   if (wallet.primaryDeviceIdHash !== deviceIdHash) {
-    const rebound = rebindProvisioningWallet(wallet, deviceIdHash, readActiveLease(user)?.deviceIdHash);
-    await saveWallet(user, rebound);
+    const rebound = rebindProvisioningWallet(wallet, deviceIdHash, (await readActiveLease(user, sql))?.deviceIdHash);
+    await saveWallet(user, rebound, sql);
     wallet = rebound;
   }
   if (!encodedFiberKey) return { needsFiberKey: true };
@@ -75,7 +85,7 @@ export async function bootstrap(user: User, deviceIdHash: string, encodedFiberKe
       hasOpenedChannel: false,
       updatedAt: now,
     };
-    await saveWallet(user, ready);
+    await saveWallet(user, ready, sql);
     return publicResult(ready, true);
   } finally {
     fiberKey.fill(0);

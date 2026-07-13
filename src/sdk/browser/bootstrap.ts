@@ -16,17 +16,20 @@ type BootstrapResponse =
 
 const DEVICE_STORAGE_KEY = "ckb-keyway:device-id";
 
-export async function bootstrapKeyWay(sessionJwt: string): Promise<{ provisioned: boolean; wallet: PublicWallet }> {
+export async function bootstrapKeyWay(
+  sessionJwt: string,
+  api = new KeyWayApiClient(),
+): Promise<{ provisioned: boolean; wallet: PublicWallet }> {
   if (!sessionJwt) throw new Error("Authenticated Stytch session is required");
   return navigator.locks.request("ckb-keyway:bootstrap", async () => {
     const deviceIdHash = await getDeviceIdHash();
-    const existing = await requestBootstrap(sessionJwt, { deviceIdHash });
+    const existing = await requestBootstrap(api, sessionJwt, { deviceIdHash });
     if (!existing.needsFiberKey) return existing;
 
     const fiberKey = crypto.getRandomValues(new Uint8Array(32));
     let encodedFiberKey = bytesToBase64(fiberKey);
     try {
-      const provisioned = await requestBootstrap(sessionJwt, { deviceIdHash, fiberKey: encodedFiberKey });
+      const provisioned = await requestBootstrap(api, sessionJwt, { deviceIdHash, fiberKey: encodedFiberKey });
       if (provisioned.needsFiberKey) throw new Error("Fiber key provisioning did not complete");
       return provisioned;
     } finally {
@@ -46,18 +49,13 @@ export async function getDeviceIdHash(): Promise<string> {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-export async function loadFiberKey(sessionJwt: string, leaseId: string): Promise<Uint8Array> {
+export async function loadFiberKey(
+  sessionJwt: string,
+  leaseId: string,
+  api = new KeyWayApiClient(),
+): Promise<Uint8Array> {
   if (!sessionJwt) throw new Error("Authenticated Stytch session is required");
-  const response = await fetch("/api/keyway/fiber-key", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${sessionJwt}` },
-    body: JSON.stringify({ deviceIdHash: await getDeviceIdHash(), leaseId }),
-  });
-  if (!response.ok) {
-    const result = await response.json().catch(() => ({}));
-    throw new Error(result.error ?? "Could not unlock Fiber credentials");
-  }
-  const fiberKey = new Uint8Array(await response.arrayBuffer());
+  const fiberKey = await api.loadFiberKey(sessionJwt, { deviceIdHash: await getDeviceIdHash(), leaseId });
   if (fiberKey.length !== 32) {
     fiberKey.fill(0);
     throw new Error("Backend returned an invalid Fiber key");
@@ -65,30 +63,16 @@ export async function loadFiberKey(sessionJwt: string, leaseId: string): Promise
   return fiberKey;
 }
 
-export async function markChannelOpened(sessionJwt: string): Promise<void> {
-  const response = await fetch("/api/keyway/channel-state", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${sessionJwt}` },
-    body: JSON.stringify({ deviceIdHash: await getDeviceIdHash() }),
-  });
-  if (!response.ok) {
-    const result = await response.json().catch(() => ({}));
-    throw new Error(result.error ?? "Could not protect Fiber channel recovery state");
-  }
+export async function markChannelOpened(sessionJwt: string, api = new KeyWayApiClient()): Promise<void> {
+  await api.markChannelOpened(sessionJwt, { deviceIdHash: await getDeviceIdHash() });
 }
 
 async function requestBootstrap(
+  api: KeyWayApiClient,
   sessionJwt: string,
   body: { deviceIdHash: string; fiberKey?: string },
 ): Promise<BootstrapResponse> {
-  const response = await fetch("/api/keyway/bootstrap", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${sessionJwt}` },
-    body: JSON.stringify(body),
-  });
-  const result = await response.json();
-  if (!response.ok) throw new Error(result.error ?? "KeyWay bootstrap failed");
-  return result as BootstrapResponse;
+  return await api.bootstrap(sessionJwt, body) as BootstrapResponse;
 }
 
 function bytesToBase64(value: Uint8Array): string {
@@ -96,3 +80,4 @@ function bytesToBase64(value: Uint8Array): string {
   for (const byte of value) binary += String.fromCharCode(byte);
   return btoa(binary);
 }
+import { KeyWayApiClient } from "./api-client";

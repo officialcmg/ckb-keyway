@@ -2,12 +2,14 @@
 
 CKB KeyWay is reusable email-authenticated wallet infrastructure for Fiber Network. It combines Stytch email OTP, a Lit Chipotle PKP, CCC transaction construction, and a browser Fiber node so an application can recover a stable CKB identity and externally fund Fiber channels without exporting the PKP private key.
 
-The repository contains two deliverables:
+The repository contains two independent deliverables:
 
 - A browser/server SDK under `src/sdk`.
-- A deployed Next.js reference wallet demonstrating login, recovery, channel activation, invoices, and payments.
+- A standalone Node/Postgres backend and a Next.js reference wallet demonstrating login, recovery, channel activation, invoices, and payments.
 
 Live testnet demo: [ckb-keyway.vercel.app](https://ckb-keyway.vercel.app)
+
+Standalone API: [keyway-api-production.up.railway.app](https://keyway-api-production.up.railway.app/healthz)
 
 ## Working flow
 
@@ -37,10 +39,11 @@ Configure Stytch email OTP and allow `http://localhost:3000` as an SDK domain. R
 `connectKeyWay` is the high-level entry point used by the reference app. It bootstraps the authenticated wallet, acquires the device lock and lease, starts Fiber without a CKB secret key, connects testnet relays, and returns the wallet balance.
 
 ```ts
-import { connectKeyWay } from "@ckb-keyway/sdk/browser";
+import { connectKeyWay } from "ckb-keyway/browser";
 
 const connected = await connectKeyWay({
   sessionJwt: stytchSessionJwt,
+  apiBaseUrl: "https://your-keyway-api.up.railway.app",
   confirmFunding: ({ amountCkb, feeCkb }) =>
     showConfirmation(`Lock ${amountCkb} CKB with a ${feeCkb} CKB fee?`),
 });
@@ -58,14 +61,24 @@ await connected.keyway.waitForPayment(payment.payment_hash);
 await connected.keyway.stop();
 ```
 
-See [`examples/browser-wallet.ts`](examples/browser-wallet.ts) for a complete minimal lifecycle. The package is intentionally private during the hackathon; its `./browser` and `./server` exports are ready to be split or published after the API stabilizes.
+`apiBaseUrl` points at the standalone KeyWay backend. The consuming application does not need Next.js and may use any UI framework.
+
+Build the distributable browser and server entrypoints with:
+
+```sh
+npm run build:sdk
+```
+
+The standalone backend runs with `npm run api` and requires `DATABASE_URL`, `KEYWAY_ALLOWED_ORIGINS`, Stytch server credentials, and the Lit server credentials from `.env.example`.
+
+See [`examples/browser-wallet.ts`](examples/browser-wallet.ts) for a complete minimal lifecycle. `npm pack` produces an installable package with compiled `./browser` and `./server` exports.
 
 ## Security model
 
 - The Lit PKP private key is not returned to the browser or KeyWay backend.
 - The backend accepts a complete CKB transaction, enforces testnet funding and fee limits, computes CCC's exact sighash, and invokes only a pinned Lit Action.
 - The stored Fiber identity key is encrypted at rest. The MVP backend can observe it during recovery, and it necessarily exists in browser/WASM memory while Fiber runs.
-- Web Locks, `BroadcastChannel`, and a short authenticated backend lease enforce one active browser node.
+- Web Locks, `BroadcastChannel`, and an atomic Postgres lease enforce one active browser node.
 - Channel data remains in that browser's IndexedDB. The CKB identity can be recovered elsewhere, but Fiber startup is blocked after channel use until safe database transfer exists.
 - Email compromise can authorize recovery. This testnet prototype is experimental, unaudited, and not production custody software.
 
