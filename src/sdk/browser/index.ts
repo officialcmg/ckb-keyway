@@ -21,3 +21,4 @@ export {
 } from "./connect-keyway";
 export { connectTestnetPeers, TESTNET_RELAYS } from "./testnet-peers";
 export { normalizeFiberPubkey } from "./fiber-pubkey";
+export { friendlyKeyWayError } from "./friendly-error";

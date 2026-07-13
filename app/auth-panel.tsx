@@ -4,6 +4,7 @@ import { Products, StytchLogin, useStytch, useStytchSession, useStytchUser } fro
 import { useEffect, useRef, useState } from "react";
 import {
   connectKeyWay,
+  friendlyKeyWayError,
   type ConnectedKeyWay,
   type FundingPreview,
 } from "@/src/sdk/browser";
@@ -26,6 +27,7 @@ export function AuthPanel() {
   const [phase, setPhase] = useState<Phase>("recovering");
   const [connected, setConnected] = useState<ConnectedKeyWay>();
   const [channelReady, setChannelReady] = useState(false);
+  const [channelEvidence, setChannelEvidence] = useState<{ channelId: string; fundingOutpoint: string }>();
   const [fundingPreview, setFundingPreview] = useState<FundingPreview>();
   const [fundingResult, setFundingResult] = useState<string>();
   const [invoiceToPay, setInvoiceToPay] = useState("");
@@ -63,9 +65,14 @@ export function AuthPanel() {
       });
       if (run !== connectionRun.current) return void next.keyway.stop();
       const { channels } = await next.keyway.listChannels({ include_closed: false });
+      const readyChannel = channels.find(({ state }) => state.state_name === "CHANNEL_READY");
       connection.current = next;
       setConnected(next);
-      setChannelReady(channels.some(({ state }) => state.state_name === "CHANNEL_READY"));
+      setChannelReady(Boolean(readyChannel));
+      setChannelEvidence(readyChannel ? {
+        channelId: readyChannel.channel_id,
+        fundingOutpoint: formatOutpoint(readyChannel.channel_outpoint),
+      } : undefined);
       setPhase("ready");
     } catch (cause) {
       if (run !== connectionRun.current) return;
@@ -89,7 +96,13 @@ export function AuthPanel() {
       const result = await current.keyway.activateCkbChannel(parseCkb("1000"));
       setFundingResult(result.fundingTxHash);
       await current.keyway.waitForChannelReady(result.channelId, { timeout: 180_000, interval: 3_000 });
+      const { channels } = await current.keyway.listChannels({ include_closed: false });
+      const readyChannel = channels.find(({ channel_id }) => channel_id === result.channelId);
       setChannelReady(true);
+      setChannelEvidence({
+        channelId: result.channelId,
+        fundingOutpoint: formatOutpoint(readyChannel?.channel_outpoint ?? null, result.fundingTxHash),
+      });
       setPhase("ready");
     } catch (cause) {
       setPhase("ready");
@@ -239,6 +252,8 @@ export function AuthPanel() {
           <dt>CKB address</dt><dd>{connected.wallet.ckbAddress}</dd>
           <dt>Fiber node</dt><dd>{connected.node.pubkey}</dd>
           <dt>Connected peers</dt><dd>{connected.peers.length}</dd>
+          {channelEvidence && <><dt>Channel ID</dt><dd>{channelEvidence.channelId}</dd></>}
+          {channelEvidence && <><dt>Funding outpoint</dt><dd>{channelEvidence.fundingOutpoint}</dd></>}
           <dt>Identity storage</dt><dd>This browser</dd>
         </dl>
       </details>
@@ -314,8 +329,10 @@ function shorten(value: string): string {
   return value.length <= 22 ? value : `${value.slice(0, 12)}…${value.slice(-8)}`;
 }
 
+function formatOutpoint(outpoint: { tx_hash: string; index: string } | null, fallback = "Unavailable"): string {
+  return outpoint ? `${outpoint.tx_hash}:${outpoint.index}` : fallback;
+}
+
 function friendlyError(value: string): string {
-  if (value.includes("CHANNEL_STATE_DEVICE_BOUND")) return "This wallet has channel history in another browser. Transfer its Fiber data before continuing here.";
-  if (value.includes("currently running on another device")) return "This wallet is open in another browser. Close it and try again in about a minute.";
-  return value;
+  return friendlyKeyWayError(value);
 }
