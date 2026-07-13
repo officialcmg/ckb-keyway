@@ -74,6 +74,7 @@ See [`examples/browser-wallet.ts`](examples/browser-wallet.ts) for a complete mi
 On July 13, 2026, a disposable KeyWay wallet recovered after logout, resumed its persisted `ChannelReady` state, and settled an independent 1 CKB Fiber invoice.
 
 - Funding transaction: [`0x6cbe309c362fca8df9d9d57359ccedb5f31691e265abbfc32d3a4c5e5527c319`](https://testnet.explorer.nervos.org/transaction/0x6cbe309c362fca8df9d9d57359ccedb5f31691e265abbfc32d3a4c5e5527c319)
+- Channel ID: `0xfb2ed16a558fd89565c6b3d14596eff90228e11c91a579c25a58c5ae8d4a0ed9`
 - Funding output: index `0x0`, 1,250 CKB collaborative channel capacity
 - Fiber payment hash: `0x705dae6371d3b2b10e417bf18b9cac0235e654eb59ffd8a1432e0cf3250d472b`
 - Sender result: settled
