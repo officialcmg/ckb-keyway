@@ -1,6 +1,8 @@
 export {
   createKeyWay,
   type CreateKeyWayOptions,
+  type ActivationProgress,
+  type ActivationStage,
   type KeyWay,
   type KeyWayFundingParams,
 } from "./create-keyway";

@@ -14,7 +14,7 @@ import { acquireDeviceLease, type DeviceLease } from "./device-lease";
 import { serializeCccTransaction } from "./ccc-transaction";
 import { RemoteCkbSigner, type ConfirmFunding } from "./remote-ckb-signer";
 import { markChannelOpened } from "./bootstrap";
-import { connectChannelPeers } from "./channel-peers";
+import { connectChannelPeers, type ChannelPeer } from "./channel-peers";
 import { normalizeFiberPubkey } from "./fiber-pubkey";
 
 export type KeyWayFundingParams = Omit<
@@ -31,6 +31,9 @@ export type CreateKeyWayOptions = {
   network?: "testnet" | "mainnet";
 };
 
+export type ActivationStage = "connecting" | "negotiating" | "confirming" | "signing" | "broadcasting" | "waiting";
+export type ActivationProgress = (stage: ActivationStage) => void;
+
 export function createKeyWay(options: CreateKeyWayOptions) {
   let deviceLease: DeviceLease | undefined;
   const credential = new KeyWayCredentialProvider(options.identifier, () => {
@@ -42,7 +45,15 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     credential,
   });
   let deviceLock: DeviceLock | undefined;
-  const fundingSigner = new RemoteCkbSigner(options.sessionJwt, options.ckbPublicKey, options.confirmFunding);
+  let activationProgress: ActivationProgress | undefined;
+  let preparedPeers: Promise<ChannelPeer[]> | undefined;
+  let preparedFundingAmount: bigint | undefined;
+  const fundingSigner = new RemoteCkbSigner(options.sessionJwt, options.ckbPublicKey, async (preview) => {
+    activationProgress?.("confirming");
+    const approved = await options.confirmFunding(preview);
+    if (approved) activationProgress?.("signing");
+    return approved;
+  });
   const resolveExternalFunding = createCccExternalFundingResolver({
     signer: fundingSigner,
     knownScripts: [ccc.KnownScript.Secp256k1Blake160],
@@ -68,6 +79,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     try {
       await node.stop();
     } finally {
+      preparedPeers = undefined;
+      preparedFundingAmount = undefined;
       await releaseGuards();
     }
   }
@@ -97,23 +110,45 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     return result;
   }
 
-  async function activateCkbChannel(fundingAmount: bigint) {
-    const candidates = await connectChannelPeers(node, fundingAmount);
-    let lastAbort: unknown;
-    for (const candidate of candidates) {
-      try {
-        return await openFundedChannel({
-          pubkey: normalizeFiberPubkey(candidate.pubkey),
-          funding_amount: `0x${fundingAmount.toString(16)}`,
-          public: true,
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (!shouldDiagnoseFundingAbortError(message)) throw error;
-        lastAbort = error;
+  function prepareCkbChannel(fundingAmount: bigint): Promise<ChannelPeer[]> {
+    if (preparedFundingAmount !== fundingAmount) preparedPeers = undefined;
+    preparedFundingAmount = fundingAmount;
+    preparedPeers ??= connectChannelPeers(node, fundingAmount).catch((error) => {
+      preparedPeers = undefined;
+      preparedFundingAmount = undefined;
+      throw error;
+    });
+    return preparedPeers;
+  }
+
+  async function activateCkbChannel(fundingAmount: bigint, onProgress?: ActivationProgress) {
+    activationProgress = onProgress;
+    activationProgress?.("connecting");
+    try {
+      const candidates = await prepareCkbChannel(fundingAmount);
+      let lastAbort: unknown;
+      for (const candidate of candidates) {
+        try {
+          activationProgress?.("negotiating");
+          const result = await openFundedChannel({
+            pubkey: normalizeFiberPubkey(candidate.pubkey),
+            funding_amount: `0x${fundingAmount.toString(16)}`,
+            public: true,
+          });
+          activationProgress?.("broadcasting");
+          return result;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (!shouldDiagnoseFundingAbortError(message)) throw error;
+          lastAbort = error;
+        }
       }
+      preparedPeers = undefined;
+      preparedFundingAmount = undefined;
+      throw new Error("Available Fiber peers declined the channel funding request", { cause: lastAbort });
+    } finally {
+      activationProgress = undefined;
     }
-    throw new Error("Available Fiber peers declined the channel funding request", { cause: lastAbort });
   }
 
   async function getCkbBalance(): Promise<bigint> {
@@ -137,6 +172,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     getPayment: node.getPayment.bind(node),
     waitForPayment: node.waitForPayment.bind(node),
     openFundedChannel,
+    prepareCkbChannel,
     activateCkbChannel,
     getCkbBalance,
     openChannelWithExternalFunding: node.openChannelWithExternalFunding.bind(node),

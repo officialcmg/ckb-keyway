@@ -8,6 +8,7 @@ import {
   friendlyKeyWayError,
   type ConnectedKeyWay,
   type FundingPreview,
+  type ActivationStage,
 } from "@/src/sdk/browser";
 
 const authConfig = {
@@ -31,6 +32,7 @@ export function AuthPanel() {
   const [channelEvidence, setChannelEvidence] = useState<{ channelId: string; fundingOutpoint: string }>();
   const [fundingPreview, setFundingPreview] = useState<FundingPreview>();
   const [fundingResult, setFundingResult] = useState<string>();
+  const [activationStage, setActivationStage] = useState<ActivationStage>();
   const [invoiceToPay, setInvoiceToPay] = useState("");
   const [paymentPreview, setPaymentPreview] = useState<{ amountCkb: string }>();
   const [paymentResult, setPaymentResult] = useState<string>();
@@ -75,6 +77,7 @@ export function AuthPanel() {
         fundingOutpoint: formatFiberOutpoint(readyChannel.channel_outpoint),
       } : undefined);
       setPhase("ready");
+      if (!readyChannel) void next.keyway.prepareCkbChannel(parseCkb("1000")).catch(() => undefined);
     } catch (cause) {
       if (run !== connectionRun.current) return;
       setPhase("error");
@@ -92,10 +95,12 @@ export function AuthPanel() {
     const current = connection.current;
     if (!current) return;
     setPhase("activating");
+    setActivationStage("connecting");
     setError(undefined);
     try {
-      const result = await current.keyway.activateCkbChannel(parseCkb("1000"));
+      const result = await current.keyway.activateCkbChannel(parseCkb("1000"), setActivationStage);
       setFundingResult(result.fundingTxHash);
+      setActivationStage("waiting");
       await current.keyway.waitForChannelReady(result.channelId, { timeout: 180_000, interval: 3_000 });
       const { channels } = await current.keyway.listChannels({ include_closed: false });
       const readyChannel = channels.find(({ channel_id }) => channel_id === result.channelId);
@@ -105,8 +110,10 @@ export function AuthPanel() {
         fundingOutpoint: formatFiberOutpoint(readyChannel?.channel_outpoint ?? null, result.fundingTxHash),
       });
       setPhase("ready");
+      setActivationStage(undefined);
     } catch (cause) {
       setPhase("ready");
+      setActivationStage(undefined);
       setError(cause instanceof Error ? cause.message : "Fiber activation failed");
     }
   }
@@ -215,8 +222,9 @@ export function AuthPanel() {
           <h2>Activate instant payments</h2>
           <p>Lock 1,000 testnet CKB in your Fiber channel. You still own it, and normal payments happen off-chain.</p>
           <button onClick={activatePayments} disabled={busy || connected.balanceShannons < parseCkb("1100")}>
-            {phase === "activating" ? "Activating..." : "Activate Fiber payments"}
+            {phase === "activating" ? activationLabel(activationStage) : "Activate Fiber payments"}
           </button>
+          {phase === "activating" && activationStage && <p className="hint" role="status">{activationDetail(activationStage)}</p>}
           {connected.balanceShannons < parseCkb("1100") && <p className="hint">Add testnet CKB before activating.</p>}
           {fundingResult && <p className="hint">Funding submitted: {shorten(fundingResult)}</p>}
         </section>
@@ -302,6 +310,24 @@ export function AuthPanel() {
 
 function WalletProgress({ label }: { label: string }) {
   return <p className="status loading"><span /> {label}</p>;
+}
+
+function activationLabel(stage?: ActivationStage): string {
+  if (stage === "confirming") return "Review the transaction";
+  if (stage === "signing") return "Authorizing...";
+  if (stage === "broadcasting") return "Submitting...";
+  if (stage === "waiting") return "Confirming on CKB...";
+  if (stage === "negotiating") return "Preparing transaction...";
+  return "Connecting to Fiber...";
+}
+
+function activationDetail(stage: ActivationStage): string {
+  if (stage === "connecting") return "Connecting to an official Fiber testnet channel provider.";
+  if (stage === "negotiating") return "Fiber is agreeing the channel details and building the exact CKB transaction.";
+  if (stage === "confirming") return "Review the exact funding amount and network fee.";
+  if (stage === "signing") return "Lit is authorizing the transaction you approved.";
+  if (stage === "waiting") return "The channel transaction was submitted. CKB testnet is confirming it now.";
+  return "The signed channel transaction is being submitted to CKB testnet.";
 }
 
 function OutputCard({ label, value }: { label: string; value: string }) {

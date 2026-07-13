@@ -43,34 +43,52 @@ export async function connectChannelPeers(
 ): Promise<ChannelPeer[]> {
   const intervalMs = options.intervalMs ?? 1_000;
   const maxCandidates = options.maxCandidates ?? 3;
-  const graph = await client.graphNodes({ limit: "0x100" });
-  const candidates = deduplicatePeers([
-    ...(options.seedPeers ?? TESTNET_CHANNEL_PEERS),
-    ...eligibleGraphPeers(graph.nodes),
-  ])
+  const seedCandidates = deduplicatePeers(options.seedPeers ?? TESTNET_CHANNEL_PEERS)
     .filter(({ minimumFunding }) => minimumFunding > 0n && minimumFunding <= fundingAmount)
     .slice(0, maxCandidates);
-
-  if (candidates.length === 0) {
-    throw new Error("No browser-reachable Fiber node currently accepts this channel amount");
-  }
-
   const connected = new Set((await client.listPeers()).peers.map(({ pubkey }) => normalizeFiberPubkey(pubkey)));
-  const reachable: ChannelPeer[] = [];
-  for (const candidate of candidates) {
-    if (!connected.has(candidate.pubkey)) {
-      await Promise.allSettled(candidate.addresses.map((address) => client.connectPeer({ address, save: true })));
-      const deadline = Date.now() + (options.timeoutMs ?? 10_000);
-      if (!await waitForPeer(client, candidate.pubkey, deadline, intervalMs)) continue;
-      connected.add(candidate.pubkey);
-    }
-    reachable.push(candidate);
-  }
+  const connectedSeeds = seedCandidates.filter(({ pubkey }) => connected.has(pubkey));
+  if (connectedSeeds.length > 0) return connectedSeeds;
+
+  const reachableSeeds = await connectCandidates(client, seedCandidates, options.timeoutMs ?? 10_000, intervalMs);
+  if (reachableSeeds.length > 0) return reachableSeeds;
+
+  // Gossip is a fallback. A new browser node may not have synchronized it yet,
+  // and waiting for it before trying the official nodes makes activation slow.
+  const graph = await client.graphNodes({ limit: "0x100" });
+  const graphCandidates = deduplicatePeers(eligibleGraphPeers(graph.nodes))
+    .filter(({ minimumFunding }) => minimumFunding > 0n && minimumFunding <= fundingAmount)
+    .filter(({ pubkey }) => !seedCandidates.some((seed) => seed.pubkey === pubkey))
+    .slice(0, maxCandidates);
+  const connectedGraphPeers = graphCandidates.filter(({ pubkey }) => connected.has(pubkey));
+  if (connectedGraphPeers.length > 0) return connectedGraphPeers;
+
+  const reachable = await connectCandidates(client, graphCandidates, options.timeoutMs ?? 10_000, intervalMs);
 
   if (reachable.length === 0) {
     throw new Error("Could not connect to a Fiber node that accepts new channels");
   }
   return reachable;
+}
+
+async function connectCandidates(
+  client: Pick<ChannelPeerClient, "connectPeer" | "listPeers">,
+  candidates: readonly ChannelPeer[],
+  timeoutMs: number,
+  intervalMs: number,
+): Promise<ChannelPeer[]> {
+  if (candidates.length === 0) return [];
+  await Promise.allSettled(candidates.flatMap((candidate) =>
+    candidate.addresses.map((address) => client.connectPeer({ address, save: true }))
+  ));
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const connected = new Set((await client.listPeers()).peers.map(({ pubkey }) => normalizeFiberPubkey(pubkey)));
+    const reachable = candidates.filter(({ pubkey }) => connected.has(pubkey));
+    if (reachable.length > 0) return reachable;
+    await delay(intervalMs);
+  }
+  return [];
 }
 
 function eligibleGraphPeers(nodes: GraphNodesResult["nodes"]): ChannelPeer[] {
@@ -86,20 +104,6 @@ function eligibleGraphPeers(nodes: GraphNodesResult["nodes"]): ChannelPeer[] {
 
 function deduplicatePeers(peers: readonly ChannelPeer[]): ChannelPeer[] {
   return Array.from(new Map(peers.map((peer) => [peer.pubkey, peer])).values());
-}
-
-async function waitForPeer(
-  client: Pick<ChannelPeerClient, "listPeers">,
-  pubkey: string,
-  deadline: number,
-  intervalMs: number,
-): Promise<boolean> {
-  while (Date.now() < deadline) {
-    const peers = await client.listPeers();
-    if (peers.peers.some((peer) => normalizeFiberPubkey(peer.pubkey) === pubkey)) return true;
-    await delay(intervalMs);
-  }
-  return false;
 }
 
 function isBrowserAddress(address: string): boolean {
