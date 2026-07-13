@@ -1,4 +1,5 @@
 import * as ccc from "@ckb-ccc/core";
+import { serializeCccTransaction } from "./ccc-transaction";
 
 export type FundingPreview = {
   amountCkb: string;
@@ -21,7 +22,7 @@ export class RemoteCkbSigner extends ccc.SignerCkbPublicKey {
 
   async signOnlyTransaction(transactionLike: ccc.TransactionLike): Promise<ccc.Transaction> {
     const transaction = ccc.Transaction.from(transactionLike);
-    const serialized = JSON.parse(ccc.stringify(transaction)) as Record<string, unknown>;
+    const serialized = serializeCccTransaction(transaction);
     const preview = await this.request({ operation: "preview", transaction: serialized });
     if (!isPreviewResponse(preview)) throw new Error("KeyWay returned an invalid funding preview");
     if (!await this.confirmFunding(preview.preview)) throw new Error("Funding transaction was not confirmed");
