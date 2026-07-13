@@ -5,6 +5,7 @@ import {
   FiberBrowserNode,
   getLockBalanceShannons,
   openChannelWithExternalFundingFlow,
+  shouldDiagnoseFundingAbortError,
   type OpenChannelWithExternalFundingParams,
 } from "@fiber-pay/sdk/browser";
 import { KeyWayCredentialProvider, type FiberKeyLoader } from "./credential-provider";
@@ -12,6 +13,8 @@ import { acquireDeviceLock, type DeviceLock } from "./device-lock";
 import { acquireDeviceLease, type DeviceLease } from "./device-lease";
 import { RemoteCkbSigner, type ConfirmFunding } from "./remote-ckb-signer";
 import { markChannelOpened } from "./bootstrap";
+import { connectChannelPeers } from "./channel-peers";
+import { normalizeFiberPubkey } from "./fiber-pubkey";
 
 export type KeyWayFundingParams = Omit<
   OpenChannelWithExternalFundingParams,
@@ -91,6 +94,25 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     return result;
   }
 
+  async function activateCkbChannel(fundingAmount: bigint) {
+    const candidates = await connectChannelPeers(node, fundingAmount);
+    let lastAbort: unknown;
+    for (const candidate of candidates) {
+      try {
+        return await openFundedChannel({
+          pubkey: normalizeFiberPubkey(candidate.pubkey),
+          funding_amount: `0x${fundingAmount.toString(16)}`,
+          public: false,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!shouldDiagnoseFundingAbortError(message)) throw error;
+        lastAbort = error;
+      }
+    }
+    throw new Error("Available Fiber peers declined the channel funding request", { cause: lastAbort });
+  }
+
   async function getCkbBalance(): Promise<bigint> {
     const address = await fundingSigner.getRecommendedAddressObj();
     return getLockBalanceShannons(ckbRpcUrl, cccScriptToFiberScript(address.script));
@@ -103,6 +125,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     connectPeer: node.connectPeer.bind(node),
     listPeers: node.listPeers.bind(node),
     listChannels: node.listChannels.bind(node),
+    graphNodes: node.graphNodes.bind(node),
     waitForChannelReady: node.waitForChannelReady.bind(node),
     newInvoice: node.newInvoice.bind(node),
     getInvoice: node.getInvoice.bind(node),
@@ -111,6 +134,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     getPayment: node.getPayment.bind(node),
     waitForPayment: node.waitForPayment.bind(node),
     openFundedChannel,
+    activateCkbChannel,
     getCkbBalance,
     openChannelWithExternalFunding: node.openChannelWithExternalFunding.bind(node),
     submitSignedFundingTx: node.submitSignedFundingTx.bind(node),

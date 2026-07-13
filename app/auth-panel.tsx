@@ -4,7 +4,6 @@ import { Products, StytchLogin, useStytch, useStytchSession, useStytchUser } fro
 import { useEffect, useRef, useState } from "react";
 import {
   connectKeyWay,
-  normalizeFiberPubkey,
   type ConnectedKeyWay,
   type FundingPreview,
 } from "@/src/sdk/browser";
@@ -83,16 +82,11 @@ export function AuthPanel() {
 
   async function activatePayments() {
     const current = connection.current;
-    const peer = current?.peers[0];
-    if (!current || !peer) return;
+    if (!current) return;
     setPhase("activating");
     setError(undefined);
     try {
-      const result = await current.keyway.openFundedChannel({
-        pubkey: normalizeFiberPubkey(peer.pubkey),
-        funding_amount: toHex(parseCkb("1000")),
-        public: true,
-      });
+      const result = await current.keyway.activateCkbChannel(parseCkb("1000"));
       setFundingResult(result.fundingTxHash);
       await current.keyway.waitForChannelReady(result.channelId, { timeout: 180_000, interval: 3_000 });
       setChannelReady(true);
