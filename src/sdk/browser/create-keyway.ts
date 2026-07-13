@@ -102,7 +102,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
         return await openFundedChannel({
           pubkey: normalizeFiberPubkey(candidate.pubkey),
           funding_amount: `0x${fundingAmount.toString(16)}`,
-          public: false,
+          public: true,
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);

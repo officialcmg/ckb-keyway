@@ -41,12 +41,25 @@ test("connects only browser-reachable peers that accept the funding amount", asy
         graphNode(`02${"44".repeat(32)}`, "0x0", "/dns4/disabled/tcp/443/wss/p2p/disabled"),
       ],
     }),
-    connectPeer: async ({ pubkey }) => { connected = pubkey === `0x${eligible}`; },
+    connectPeer: async ({ address }) => { connected = address?.includes("eligible") ?? false; },
     listPeers: async () => ({ peers: connected ? [{ pubkey: `0x${eligible}` as const, address: "connected" }] : [] }),
-  }, 1000n * 100_000_000n, { timeoutMs: 100, intervalMs: 1 });
+  }, 1000n * 100_000_000n, { timeoutMs: 100, intervalMs: 1, seedPeers: [] });
 
   assert.equal(peers.length, 1);
   assert.equal(peers[0].pubkey, `0x${eligible}`);
+});
+
+test("uses official channel peers before gossip has synchronized", async () => {
+  let connectedPubkey = "";
+  const peers = await connectChannelPeers({
+    graphNodes: async () => ({ last_cursor: "0x0", nodes: [] }),
+    connectPeer: async ({ address }) => {
+      if (address?.includes("bottle.fiber.channel")) connectedPubkey = "0x02b6d4e3ab86a2ca2fad6fae0ecb2e1e559e0b911939872a90abdda6d20302be71";
+    },
+    listPeers: async () => ({ peers: connectedPubkey ? [{ pubkey: connectedPubkey as `0x${string}`, address: "connected" }] : [] }),
+  }, 1000n * 100_000_000n, { timeoutMs: 20, intervalMs: 1, maxCandidates: 1 });
+
+  assert.equal(peers[0].nodeName, "fiber-testnet-public-bottle");
 });
 
 function graphNode(pubkey: string, minimum: string, address: string) {
