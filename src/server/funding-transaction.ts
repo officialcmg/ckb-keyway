@@ -8,6 +8,7 @@ import type { ReadyWallet } from "./user-wallet.ts";
 const SHANNONS_PER_CKB = 100_000_000n;
 const MAX_FUNDING = 1_000n * SHANNONS_PER_CKB;
 const MAX_FEE = SHANNONS_PER_CKB;
+const TESTNET_FUNDING_LOCK_CODE_HASH = "0x6c67887fe201ee0c7853f1682c0b77c0e6214044c156c7558269390a8afa6d7c";
 
 export type FundingPreview = {
   amountCkb: string;
@@ -35,12 +36,15 @@ export async function previewFundingTransaction(wallet: ReadyWallet, input: unkn
   const signer = new ccc.SignerCkbPublicKey(client, wallet.litPublicKey);
   const signerScript = (await signer.getRecommendedAddressObj()).script;
   const inputCells = await Promise.all(transaction.inputs.map((input) => input.getCell(client)));
-  if (inputCells.some(({ cellOutput }) => !cellOutput.lock.eq(signerScript))) {
-    throw new Error("Every funding input must be controlled by this KeyWay wallet");
+  const ownedInputs = inputCells.filter(({ cellOutput }) => cellOutput.lock.eq(signerScript));
+  if (ownedInputs.length === 0) {
+    throw new Error("Funding transaction has no input controlled by this KeyWay wallet");
   }
 
-  const externalOutputs = transaction.outputs.filter(({ lock }) => !lock.eq(signerScript));
-  if (externalOutputs.length !== 1) throw new Error("Funding transaction must contain exactly one channel output");
+  const fundingOutputs = transaction.outputs.filter(({ lock }) => (
+    lock.codeHash.toLowerCase() === TESTNET_FUNDING_LOCK_CODE_HASH && lock.hashType === "type"
+  ));
+  if (fundingOutputs.length !== 1) throw new Error("Funding transaction must contain exactly one channel output");
   if (transaction.outputs.some((output) => output.type !== undefined)) {
     throw new Error("Only CKB channel funding is allowed");
   }
@@ -48,13 +52,13 @@ export async function previewFundingTransaction(wallet: ReadyWallet, input: unkn
     throw new Error("Unexpected funding output data");
   }
 
-  const fundingOutput = externalOutputs[0];
-  if (fundingOutput.capacity <= 0n || fundingOutput.capacity > MAX_FUNDING) {
-    throw new Error("Channel funding exceeds the KeyWay testnet limit");
-  }
-  const inputCapacity = inputCells.reduce((sum, { cellOutput }) => sum + cellOutput.capacity, 0n);
-  const fee = inputCapacity - transaction.getOutputsCapacity();
-  if (fee < 0n || fee > MAX_FEE) throw new Error("Funding transaction fee exceeds the KeyWay limit");
+  const fundingOutput = fundingOutputs[0];
+  const spend = calculateFundingSpend({
+    ownedInputCapacity: sumCapacities(ownedInputs.map(({ cellOutput }) => cellOutput.capacity)),
+    ownedChangeCapacity: sumCapacities(transaction.outputs.filter(({ lock }) => lock.eq(signerScript)).map(({ capacity }) => capacity)),
+    totalInputCapacity: sumCapacities(inputCells.map(({ cellOutput }) => cellOutput.capacity)),
+    totalOutputCapacity: transaction.getOutputsCapacity(),
+  });
 
   const related = await signer.getRelatedScripts(transaction);
   if (related.length !== 1 || !related[0].script.eq(signerScript)) {
@@ -66,12 +70,29 @@ export async function previewFundingTransaction(wallet: ReadyWallet, input: unkn
     signer,
     script: related[0].script,
     preview: {
-      amountCkb: formatCkb(fundingOutput.capacity),
-      feeCkb: formatCkb(fee),
+      amountCkb: formatCkb(spend.fundingAmount),
+      feeCkb: formatCkb(spend.fee),
       destination: `${fundingOutput.lock.codeHash}:${fundingOutput.lock.args}`,
       transactionHash: transaction.hash(),
     },
   };
+}
+
+export function calculateFundingSpend(capacities: {
+  ownedInputCapacity: bigint;
+  ownedChangeCapacity: bigint;
+  totalInputCapacity: bigint;
+  totalOutputCapacity: bigint;
+}): { fundingAmount: bigint; fee: bigint } {
+  const fee = capacities.totalInputCapacity - capacities.totalOutputCapacity;
+  if (fee < 0n || fee > MAX_FEE) throw new Error("Funding transaction fee exceeds the KeyWay limit");
+
+  const ownedDebit = capacities.ownedInputCapacity - capacities.ownedChangeCapacity;
+  const fundingAmount = ownedDebit - fee;
+  if (fundingAmount <= 0n || fundingAmount > MAX_FUNDING) {
+    throw new Error("Channel funding exceeds the KeyWay testnet limit");
+  }
+  return { fundingAmount, fee };
 }
 
 export async function signFundingTransaction(
@@ -115,6 +136,10 @@ function formatCkb(shannons: bigint): string {
   const whole = shannons / SHANNONS_PER_CKB;
   const fraction = (shannons % SHANNONS_PER_CKB).toString().padStart(8, "0").replace(/0+$/, "");
   return fraction ? `${whole}.${fraction}` : whole.toString();
+}
+
+function sumCapacities(capacities: readonly bigint[]): bigint {
+  return capacities.reduce((sum, capacity) => sum + capacity, 0n);
 }
 
 function requiredEnv(name: string): string {
