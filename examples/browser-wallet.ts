@@ -3,10 +3,10 @@ import { connectKeyWay, type FundingPreview } from "../src/sdk/browser/index";
 const SHANNONS_PER_CKB = 100_000_000n;
 
 export async function openKeyWayWallet(
-  sessionJwt: string,
+  authToken: string,
   confirmFunding: (preview: FundingPreview) => boolean | Promise<boolean>,
 ) {
-  const connected = await connectKeyWay({ sessionJwt, confirmFunding });
+  const connected = await connectKeyWay({ authToken, confirmFunding });
   const opened = await connected.keyway.activateCkbChannel(1_000n * SHANNONS_PER_CKB);
   await connected.keyway.waitForChannelReady(opened.channelId, {
     timeout: 180_000,

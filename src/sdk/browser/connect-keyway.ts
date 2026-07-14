@@ -14,19 +14,20 @@ export type ConnectedKeyWay = {
 };
 
 export async function connectKeyWay(options: {
-  sessionJwt: string;
+  authToken: string;
   confirmFunding: ConfirmFunding;
-  apiBaseUrl?: string;
+  onLeaseLost?: (error: Error) => void;
 }): Promise<ConnectedKeyWay> {
-  const apiClient = new KeyWayApiClient({ apiBaseUrl: options.apiBaseUrl });
-  const { wallet } = await bootstrapKeyWay(options.sessionJwt, apiClient);
+  const apiClient = new KeyWayApiClient();
+  const { wallet } = await bootstrapKeyWay(options.authToken, apiClient);
   const keyway = createKeyWay({
     identifier: wallet.litPkpId,
-    sessionJwt: options.sessionJwt,
+    authToken: options.authToken,
     ckbPublicKey: wallet.litPublicKey,
     confirmFunding: options.confirmFunding,
-    loadFiberKey: (leaseId) => loadFiberKey(options.sessionJwt, leaseId, apiClient),
+    loadFiberKey: (leaseId) => loadFiberKey(options.authToken, leaseId, apiClient),
     apiClient,
+    onLeaseLost: options.onLeaseLost,
   });
 
   try {

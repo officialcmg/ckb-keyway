@@ -13,7 +13,7 @@ export type ConfirmFunding = (preview: FundingPreview) => boolean | Promise<bool
 
 export class RemoteCkbSigner extends ccc.SignerCkbPublicKey {
   constructor(
-    public readonly sessionJwt: string,
+    public readonly authToken: string,
     publicKey: ccc.HexLike,
     private readonly confirmFunding: ConfirmFunding,
     client: ccc.Client = new ccc.ClientPublicTestnet(),
@@ -41,7 +41,7 @@ export class RemoteCkbSigner extends ccc.SignerCkbPublicKey {
   }
 
   private async request(body: Record<string, unknown>): Promise<unknown> {
-    return this.api.signTransaction(this.sessionJwt, body);
+    return this.api.signTransaction(this.authToken, body);
   }
 }
 

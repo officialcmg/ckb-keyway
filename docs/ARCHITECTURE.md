@@ -14,10 +14,12 @@ The Fiber key is never derived from the PKP, an OTP, or an ECDSA signature.
 ## Runtime path
 
 ```text
-Stytch email OTP
+KeyWay React OTP modal
        |
        v
-authenticated KeyWay backend ---- Railway Postgres wallet metadata
+managed KeyWay backend -- server-side Stytch OTP/session
+       |
+       +------------------------ Railway Postgres wallet metadata
        |                                  |
        |                                  +-- one Lit PKP per user
        |                                  +-- encrypted Fiber key
@@ -38,6 +40,10 @@ FiberBrowserNode / fiber-js / IndexedDB
        +-- channels, invoices, routes, and payments
 ```
 
+The public SDK targets `https://keyway-api-production.up.railway.app` internally. Consumers neither provide an API URL nor import server code; CKB KeyWay operates this backend as part of the service.
+
+The Next.js reference app imports only the public React entry in `src/sdk/react`, which re-exports the lower-level browser API. It contains no `app/api` routes and is not the backend. `server/index.ts` and `src/server` build and deploy independently to Railway; neither is included in the npm package.
+
 ## External funding boundary
 
 1. Fiber negotiates a collaborative transaction with the selected peer.
@@ -52,13 +58,21 @@ Peer-owned inputs and peer change are expected because Fiber funding is collabor
 
 ## Recovery and concurrency
 
-The Stytch identity, PKP, CKB address, and encrypted Fiber key can be recovered after login. The channel database cannot yet be safely moved between browsers. Once a wallet has opened a channel, a different device receives `CHANNEL_STATE_DEVICE_BOUND` and cannot start that Fiber identity.
+The Stytch-backed identity, PKP, CKB address, and encrypted Fiber key can be recovered after login. The browser never receives Stytch credentials or configures a domain with Stytch; it calls KeyWay's `send-code`, `verify-code`, `session`, and `logout` API routes. The channel database cannot yet be safely moved between browsers. Once a wallet has opened a channel, a different device receives `CHANNEL_STATE_DEVICE_BOUND` and cannot start that Fiber identity.
 
 Within the primary browser, a Web Lock and `BroadcastChannel` prevent duplicate tabs. A short atomic Postgres lease prevents a second browser process from using the same identity concurrently.
 
+`KeyWayProvider` starts Fiber automatically after OTP when `autoConnect` is true. Startup recovers the wallet, acquires the browser lock and backend lease, decrypts the Fiber key, starts the WASM node, connects testnet relays, and reads the initial CKB balance. `disconnect()`, logout, provider unmount, and page refresh stop the running instance; the browser process also disappears when its tab closes, while IndexedDB channel state remains. A rejected lease heartbeat now stops the node and surfaces an SDK error instead of leaving a stale instance running.
+
+Relay connections provide P2P reachability and gossip; they are not payment channels. The reference activation flow opens a public channel with an official browser-reachable testnet channel provider (`bottle` or `bracer`). Each node builds routes from its gossiped network graph, so two KeyWay users can pay through a shared routing provider without having a direct channel. The exact balance split of remote channels is not globally reliable, so `dry_run` can test a requested amount but cannot promise a stable sender-to-recipient maximum.
+
+`listChannels` exposes local, remote, offered-TLC, and received-TLC balances for channels known to the browser node. A channel's `channel_outpoint` is the CKB funding cell reference (`tx_hash` plus output `index`) that anchors the off-chain state. Cooperative or forced `shutdownChannel` eventually consumes that funding cell and creates settlement cells from the latest enforceable allocation; forced settlement may remain pending for the negotiated commitment delay.
+
+The reference wallet lives at `/app`; `/` is the pitch-oriented project landing page. The wallet treats ready-channel `local_balance` values as the user's Fiber balance and displays the on-chain CKB cell balance separately. Its transit-map channel list includes every non-closed channel and renders `local_balance` as "You" and `remote_balance` as "Peer", so pending lifecycle states and both sides of each channel remain visible.
+
 ## Trust boundaries
 
-- Stytch proves control of the configured email account.
+- Stytch proves control of the configured email account behind the managed backend.
 - The KeyWay backend is trusted to map users to PKPs, enforce transaction policy, hold provider credentials, and authorize Lit calls.
 - Lit protects PKP key material and executes only configured Actions for the permitted account resources.
 - The backend can observe the Fiber key during the current decrypt flow.

@@ -17,19 +17,19 @@ type BootstrapResponse =
 const DEVICE_STORAGE_KEY = "ckb-keyway:device-id";
 
 export async function bootstrapKeyWay(
-  sessionJwt: string,
+  authToken: string,
   api = new KeyWayApiClient(),
 ): Promise<{ provisioned: boolean; wallet: PublicWallet }> {
-  if (!sessionJwt) throw new Error("Authenticated Stytch session is required");
+  if (!authToken) throw new Error("Authenticated KeyWay session is required");
   return navigator.locks.request("ckb-keyway:bootstrap", async () => {
     const deviceIdHash = await getDeviceIdHash();
-    const existing = await requestBootstrap(api, sessionJwt, { deviceIdHash });
+    const existing = await requestBootstrap(api, authToken, { deviceIdHash });
     if (!existing.needsFiberKey) return existing;
 
     const fiberKey = crypto.getRandomValues(new Uint8Array(32));
     let encodedFiberKey = bytesToBase64(fiberKey);
     try {
-      const provisioned = await requestBootstrap(api, sessionJwt, { deviceIdHash, fiberKey: encodedFiberKey });
+      const provisioned = await requestBootstrap(api, authToken, { deviceIdHash, fiberKey: encodedFiberKey });
       if (provisioned.needsFiberKey) throw new Error("Fiber key provisioning did not complete");
       return provisioned;
     } finally {
@@ -50,12 +50,12 @@ export async function getDeviceIdHash(): Promise<string> {
 }
 
 export async function loadFiberKey(
-  sessionJwt: string,
+  authToken: string,
   leaseId: string,
   api = new KeyWayApiClient(),
 ): Promise<Uint8Array> {
-  if (!sessionJwt) throw new Error("Authenticated Stytch session is required");
-  const fiberKey = await api.loadFiberKey(sessionJwt, { deviceIdHash: await getDeviceIdHash(), leaseId });
+  if (!authToken) throw new Error("Authenticated KeyWay session is required");
+  const fiberKey = await api.loadFiberKey(authToken, { deviceIdHash: await getDeviceIdHash(), leaseId });
   if (fiberKey.length !== 32) {
     fiberKey.fill(0);
     throw new Error("Backend returned an invalid Fiber key");
@@ -63,16 +63,16 @@ export async function loadFiberKey(
   return fiberKey;
 }
 
-export async function markChannelOpened(sessionJwt: string, api = new KeyWayApiClient()): Promise<void> {
-  await api.markChannelOpened(sessionJwt, { deviceIdHash: await getDeviceIdHash() });
+export async function markChannelOpened(authToken: string, api = new KeyWayApiClient()): Promise<void> {
+  await api.markChannelOpened(authToken, { deviceIdHash: await getDeviceIdHash() });
 }
 
 async function requestBootstrap(
   api: KeyWayApiClient,
-  sessionJwt: string,
+  authToken: string,
   body: { deviceIdHash: string; fiberKey?: string },
 ): Promise<BootstrapResponse> {
-  return await api.bootstrap(sessionJwt, body) as BootstrapResponse;
+  return await api.bootstrap(authToken, body) as BootstrapResponse;
 }
 
 function bytesToBase64(value: Uint8Array): string {

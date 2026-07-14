@@ -1,0 +1,37 @@
+{
+  "name": "@ckb-keyway/react",
+  "description": "Email-authenticated CKB wallet and Fiber payment infrastructure",
+  "keywords": [
+    "ckb",
+    "fiber-network",
+    "nervos",
+    "react",
+    "wallet"
+  ],
+  "homepage": "https://ckb-keyway.vercel.app",
+  "license": "MIT",
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/react/index.d.ts",
+      "import": "./dist/react/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dependencies": {
+    "@ckb-ccc/core": "^1.16.1",
+    "@fiber-pay/sdk": "^0.2.7",
+    "@nervosnetwork/fiber-js": "^0.9.0-rc7",
+    "@noble/curves": "^2.0.1",
+    "@noble/hashes": "^2.0.1"
+  },
+  "peerDependencies": {
+    "react": ">=18.2.0"
+  }
+}

@@ -1,6 +1,12 @@
 import { bootstrap } from "./bootstrap.ts";
 import { markChannelOpened, readWallet } from "./user-wallet.ts";
-import { authenticateUser } from "./stytch.ts";
+import {
+  authenticateUser,
+  publicUser,
+  revokeSession,
+  sendEmailCode,
+  verifyEmailCode,
+} from "./stytch.ts";
 import { acquireLease, heartbeatLease, releaseLease, requireLease } from "./device-lease.ts";
 import { loadLitAction } from "./lit-actions.ts";
 import { decryptFiberKey } from "./lit.ts";
@@ -28,7 +34,11 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
 
   try {
     const path = new URL(request.url).pathname;
-    const response = path === "/api/keyway/bootstrap" ? await bootstrapRequest(request)
+    const response = path === "/api/keyway/auth/send-code" ? await sendCodeRequest(request)
+      : path === "/api/keyway/auth/verify-code" ? await verifyCodeRequest(request)
+      : path === "/api/keyway/auth/session" ? await sessionRequest(request)
+      : path === "/api/keyway/auth/logout" ? await logoutRequest(request)
+      : path === "/api/keyway/bootstrap" ? await bootstrapRequest(request)
       : path === "/api/keyway/fiber-key" ? await fiberKeyRequest(request)
       : path === "/api/keyway/channel-state" ? await channelStateRequest(request)
       : path === "/api/keyway/device-lease" ? await deviceLeaseRequest(request)
@@ -42,6 +52,30 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
     console.error("[keyway]", message);
     return jsonError(message, unauthorized ? 401 : 400, cors);
   }
+}
+
+async function sendCodeRequest(request: Request): Promise<Response> {
+  const { email } = await objectBody(request, "Invalid email OTP request");
+  if (typeof email !== "string" || !/^\S+@\S+\.\S+$/.test(email) || email.length > 254) {
+    throw new Error("A valid email address is required");
+  }
+  return Response.json({ methodId: await sendEmailCode(email) });
+}
+
+async function verifyCodeRequest(request: Request): Promise<Response> {
+  const { methodId, code } = await objectBody(request, "Invalid email OTP verification");
+  if (typeof methodId !== "string" || !methodId) throw new Error("OTP method is required");
+  if (typeof code !== "string" || !/^\d{6}$/.test(code)) throw new Error("Enter the six-digit code");
+  return Response.json(await verifyEmailCode(methodId, code));
+}
+
+async function sessionRequest(request: Request): Promise<Response> {
+  return Response.json({ user: publicUser(await authenticateUser(request.headers.get("authorization"))) });
+}
+
+async function logoutRequest(request: Request): Promise<Response> {
+  await revokeSession(request.headers.get("authorization"));
+  return new Response(null, { status: 204 });
 }
 
 async function bootstrapRequest(request: Request): Promise<Response> {

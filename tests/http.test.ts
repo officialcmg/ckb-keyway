@@ -19,3 +19,14 @@ test("rejects unconfigured browser origins", async () => {
   }));
   assert.equal(response.status, 403);
 });
+
+test("rejects malformed OTP requests before calling the provider", async () => {
+  process.env.KEYWAY_ALLOWED_ORIGINS = "https://wallet.example";
+  const response = await handleKeyWayRequest(new Request("https://api.example/api/keyway/auth/send-code", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: "https://wallet.example" },
+    body: JSON.stringify({ email: "not-an-email" }),
+  }));
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: "A valid email address is required" });
+});

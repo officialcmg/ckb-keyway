@@ -25,12 +25,13 @@ export type KeyWayFundingParams = Omit<
 
 export type CreateKeyWayOptions = {
   identifier: string;
-  sessionJwt: string;
+  authToken: string;
   ckbPublicKey: string;
   confirmFunding: ConfirmFunding;
   loadFiberKey: (leaseId: string) => ReturnType<FiberKeyLoader>;
   network?: "testnet" | "mainnet";
   apiClient?: KeyWayApiClient;
+  onLeaseLost?: (error: Error) => void;
 };
 
 export type ActivationStage = "connecting" | "negotiating" | "confirming" | "signing" | "broadcasting" | "waiting";
@@ -51,7 +52,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   let activationProgress: ActivationProgress | undefined;
   let preparedPeers: Promise<ChannelPeer[]> | undefined;
   let preparedFundingAmount: bigint | undefined;
-  const fundingSigner = new RemoteCkbSigner(options.sessionJwt, options.ckbPublicKey, async (preview) => {
+  const fundingSigner = new RemoteCkbSigner(options.authToken, options.ckbPublicKey, async (preview) => {
     activationProgress?.("confirming");
     const approved = await options.confirmFunding(preview);
     if (approved) activationProgress?.("signing");
@@ -70,7 +71,10 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     if (node.isRunning) return node.nodeInfo();
     deviceLock = await acquireDeviceLock(options.identifier);
     try {
-      deviceLease = await acquireDeviceLease(options.sessionJwt, api);
+      deviceLease = await acquireDeviceLease(options.authToken, api, (cause) => {
+        const error = cause instanceof Error ? cause : new Error("The active KeyWay device lease expired");
+        void stop().finally(() => options.onLeaseLost?.(error));
+      });
       return await node.start();
     } catch (error) {
       await releaseGuards();
@@ -109,7 +113,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       },
       signFundingTx: funding.signFundingTx,
     });
-    await markChannelOpened(options.sessionJwt, api);
+    await markChannelOpened(options.authToken, api);
     return result;
   }
 
@@ -166,12 +170,16 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     connectPeer: node.connectPeer.bind(node),
     listPeers: node.listPeers.bind(node),
     listChannels: node.listChannels.bind(node),
+    shutdownChannel: node.shutdownChannel.bind(node),
     graphNodes: node.graphNodes.bind(node),
+    graphChannels: node.graphChannels.bind(node),
     waitForChannelReady: node.waitForChannelReady.bind(node),
     newInvoice: node.newInvoice.bind(node),
     getInvoice: node.getInvoice.bind(node),
     parseInvoice: node.parseInvoice.bind(node),
     sendPayment: node.sendPayment.bind(node),
+    buildRouter: node.buildRouter.bind(node),
+    sendPaymentWithRouter: node.sendPaymentWithRouter.bind(node),
     getPayment: node.getPayment.bind(node),
     waitForPayment: node.waitForPayment.bind(node),
     openFundedChannel,
