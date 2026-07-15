@@ -1,0 +1,114 @@
+---
+title: "Quickstart"
+description: "Add CKB KeyWay to a React or Next.js application."
+icon: "rocket"
+---
+
+## 1. Install the SDK
+
+<CodeGroup>
+```bash npm
+npm install @ckb-keyway/react
+```
+
+```bash pnpm
+pnpm add @ckb-keyway/react
+```
+
+```bash yarn
+yarn add @ckb-keyway/react
+```
+</CodeGroup>
+
+## 2. Enable cross-origin isolation
+
+Fiber runs a multithreaded WASM node in the browser. A Next.js application must send these headers:
+
+```ts next.config.ts
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  async headers() {
+    return [
+      {
+        source: "/(.*)",
+        headers: [
+          { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
+          { key: "Cross-Origin-Embedder-Policy", value: "require-corp" },
+        ],
+      },
+    ];
+  },
+};
+
+export default nextConfig;
+```
+
+After deployment, `window.crossOriginIsolated` must be `true`.
+
+## 3. Add the provider
+
+Render `KeyWayProvider` in a client component above every component that uses KeyWay.
+
+```tsx app/providers.tsx
+"use client";
+
+import { KeyWayProvider } from "@ckb-keyway/react";
+
+export function Providers({ children }: { children: React.ReactNode }) {
+  return (
+    <KeyWayProvider appName="Acme Pay" theme="light">
+      {children}
+    </KeyWayProvider>
+  );
+}
+```
+
+```tsx app/layout.tsx
+import { Providers } from "./providers";
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <body><Providers>{children}</Providers></body>
+    </html>
+  );
+}
+```
+
+## 4. Add login and wallet state
+
+```tsx app/wallet.tsx
+"use client";
+
+import { KeyWayLoginButton, useKeyWay } from "@ckb-keyway/react";
+
+export function Wallet() {
+  const { ready, authenticated, connection, status, error } = useKeyWay();
+
+  if (!ready) return <p>Loading login...</p>;
+
+  return (
+    <section>
+      <KeyWayLoginButton />
+      {authenticated && status === "connecting" ? <p>Recovering wallet...</p> : null}
+      {connection ? <p>CKB address: {connection.wallet.ckbAddress}</p> : null}
+      {error ? <p role="alert">{error.message}</p> : null}
+    </section>
+  );
+}
+```
+
+`autoConnect` defaults to `true`. After OTP verification, the provider recovers the wallet, starts the Fiber node, connects testnet relays, and then sets `connection`.
+
+<Warning>
+  The managed API currently uses an origin allowlist. A new application will receive a CORS error until its exact production and development origins are registered with KeyWay.
+</Warning>
+
+## 5. Open the application
+
+Select **Log in**, enter an email address, and submit the six-digit code. The same email recovers the same CKB account.
+
+<Card title="Next: activate Fiber payments" icon="arrow-right" href="/fiber-payments">
+  Open a channel and make the account ready to send and receive.
+</Card>

@@ -1,7 +1,7 @@
 import Link from "next/link";
 
 const developerSteps = [
-  ["01", "Authenticate", "Email OTP opens the wallet without a seed phrase."],
+  ["01", "Authenticate", "Email OTP opens a CKB account with no wallet setup."],
   ["02", "Recover", "The same email recovers the same CKB and Fiber identity."],
   ["03", "Route", "Create channels, invoices, and routed Fiber payments from React."],
 ] as const;
@@ -11,15 +11,15 @@ export default function Home() {
     <main className="landing-page">
       <nav className="landing-nav">
         <Brand />
-        <div><a href="#sdk">SDK</a><a href="#security">Security</a><Link className="nav-cta" href="/app">Launch demo</Link></div>
+        <div><a href="#sdk">SDK</a><a href="#security">Security</a><a href="https://ckb-keyway-docs.vercel.app">Docs</a><a href="https://www.npmjs.com/package/@ckb-keyway/react">npm</a><Link className="nav-cta" href="/app">Launch demo</Link></div>
       </nav>
 
       <section className="landing-hero">
         <div className="hero-copy">
           <p className="eyebrow">Wallet infrastructure for CKB Fiber</p>
           <h1>Email in.<br /><span>Fiber ready.</span></h1>
-          <p className="hero-lede">Give any React app an email-authenticated CKB wallet and instant Fiber payments without asking users to handle private keys.</p>
-          <div className="hero-actions"><Link className="primary-link" href="/app">Try the live wallet</Link><a className="secondary-link" href="#sdk">See the SDK flow</a></div>
+          <p className="hero-lede">Give any React app email-native CKB accounts and instant Fiber payments, so users can start with the identity they already have.</p>
+          <div className="hero-actions"><Link className="primary-link" href="/app">Try the live wallet</Link><a className="secondary-link" href="https://ckb-keyway-docs.vercel.app">Read the docs</a></div>
           <p className="testnet-note"><span /> Running on CKB testnet</p>
         </div>
         <div className="route-visual" aria-label="CKB KeyWay product flow">
@@ -62,7 +62,7 @@ await connection.keyway.sendPayment({
       </section>
 
       <section className="landing-cta"><div><p className="eyebrow">Live proof, not slides</p><h2>Open a wallet. Fund a channel. Pay an invoice.</h2></div><Link className="primary-link dark" href="/app">Launch CKB KeyWay</Link></section>
-      <footer className="landing-footer"><Brand /><span>MIT licensed · Testnet prototype</span><a href="https://github.com/officialchrismg" target="_blank" rel="noreferrer">GitHub</a></footer>
+      <footer className="landing-footer"><Brand /><span>MIT licensed · Testnet prototype</span><span><a href="https://ckb-keyway-docs.vercel.app">Docs</a> · <a href="https://www.npmjs.com/package/@ckb-keyway/react">npm</a></span></footer>
     </main>
   );
 }

@@ -9,11 +9,11 @@ export default function WalletApp() {
           <span className="brand-mark" aria-hidden="true">K</span>
           <div><strong>CKB KeyWay</strong><span>Live Fiber wallet</span></div>
         </Link>
-        <div className="network-pill"><span /> CKB testnet</div>
+        <div className="app-links"><a href="https://ckb-keyway-docs.vercel.app">Docs</a><a href="https://www.npmjs.com/package/@ckb-keyway/react">npm</a><div className="network-pill"><span /> CKB testnet</div></div>
       </header>
       <section className="app-intro"><div><p className="eyebrow">Live SDK demo</p><h1>Move CKB through Fiber.</h1></div><p>Email-authenticated wallet recovery, channel liquidity, and routed payments in one reference app.</p></section>
       <AuthPanel />
-      <footer className="site-footer"><span>CKB KeyWay</span><Link href="/">Project overview</Link><span>MIT licensed · Testnet prototype</span></footer>
+      <footer className="site-footer"><span>CKB KeyWay</span><Link href="/">Project overview</Link><a href="https://ckb-keyway-docs.vercel.app">Docs</a><a href="https://www.npmjs.com/package/@ckb-keyway/react">npm</a></footer>
     </main>
   );
 }

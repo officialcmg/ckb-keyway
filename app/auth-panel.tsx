@@ -8,7 +8,7 @@ import {
   type ActivationStage,
   type KeyWay,
   useKeyWay,
-} from "@/src/sdk/react";
+} from "@ckb-keyway/react";
 
 type Phase = "recovering" | "ready" | "activating" | "paying" | "receiving" | "error";
 type FiberChannel = Awaited<ReturnType<KeyWay["listChannels"]>>["channels"][number];
@@ -188,8 +188,8 @@ function WalletPanel() {
     return (
       <section className="activation-card auth">
         <p className="step-label">Email-secured wallet</p>
-        <h2>Enter Fiber without the seed phrase.</h2>
-        <p>Use a one-time email code. KeyWay recovers the same CKB identity automatically.</p>
+        <h2>Enter Fiber with just your email.</h2>
+        <p>Use a one-time email code. No wallet extension or crypto onboarding required.</p>
         <button onClick={login}>Log in with email</button>
       </section>
     );

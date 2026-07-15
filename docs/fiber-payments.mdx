@@ -1,0 +1,137 @@
+---
+title: "Fiber payments"
+description: "Activate a channel, inspect balances, create invoices, and settle payments."
+icon: "bolt"
+---
+
+All Fiber operations are available through `connection.keyway`. Wait for `connection` before calling them.
+
+```ts
+const { connection } = useKeyWay();
+if (!connection) return;
+
+const keyway = connection.keyway;
+```
+
+## Activate a channel
+
+A Fiber channel locks CKB on-chain and makes that capacity available for off-chain payments. Amounts use shannons: `1 CKB = 100,000,000 shannons`.
+
+```ts
+const SHANNONS_PER_CKB = 100_000_000n;
+const fundingAmount = 1_000n * SHANNONS_PER_CKB;
+
+const result = await connection.keyway.activateCkbChannel(
+  fundingAmount,
+  (stage) => console.log(stage),
+);
+
+await connection.keyway.waitForChannelReady(result.channelId, {
+  timeout: 180_000,
+  interval: 3_000,
+});
+```
+
+### Confirm the funding transaction
+
+`confirmFunding` is an optional `KeyWayProvider` callback for approving the on-chain transaction that opens a Fiber channel:
+
+```ts
+type ConfirmFunding = (preview: {
+  amountCkb: string;
+  feeCkb: string;
+  destination: string;
+  transactionHash: string;
+}) => boolean | Promise<boolean>;
+```
+
+The callback runs after KeyWay has built and validated the exact funding transaction, but before it requests the Lit-authorized signature. Return `true` to approve signing or `false` to abort.
+
+Most applications should omit this prop. KeyWay will display its styled funding confirmation modal, showing the channel amount, network fee, and testnet network. It uses the same rounded panel, theme, typography, and backdrop as the email login modal.
+
+Supply `confirmFunding` only when the application needs to render its own confirmation interface:
+
+```tsx
+<KeyWayProvider
+  confirmFunding={async (preview) => {
+    return openYourConfirmationScreen(preview);
+  }}
+>
+  <App />
+</KeyWayProvider>
+```
+
+<Info>
+  `confirmFunding` only approves channel-opening transactions on CKB. Ordinary Fiber invoice payments use the application's payment confirmation flow instead.
+</Info>
+
+## Read channels and balances
+
+```ts
+const onchainShannons = await connection.keyway.getCkbBalance();
+const { channels } = await connection.keyway.listChannels({
+  include_closed: false,
+});
+
+const readyChannels = channels.filter(
+  (channel) => channel.state.state_name === "CHANNEL_READY",
+);
+
+const fiberShannons = readyChannels.reduce(
+  (total, channel) => total + BigInt(channel.local_balance),
+  0n,
+);
+```
+
+`local_balance` is the spendable capacity on the user's side. `remote_balance` is capacity on the peer's side. Their sum is the channel's total capacity.
+
+## Create an invoice
+
+```ts
+function toHex(value: bigint) {
+  return `0x${value.toString(16)}`;
+}
+
+const created = await connection.keyway.newInvoice({
+  amount: toHex(1n * SHANNONS_PER_CKB),
+  currency: "Fibt",
+  description: "Order 42",
+  expiry: "0x36ee80",
+});
+
+console.log(created.invoice_address);
+```
+
+## Pay an invoice
+
+```ts
+const payment = await connection.keyway.sendPayment({
+  invoice,
+  timeout: "0x1d4c0",
+  max_fee_amount: toHex(1n * SHANNONS_PER_CKB),
+});
+
+const settled = await connection.keyway.waitForPayment(
+  payment.payment_hash,
+  { timeout: 120_000 },
+);
+
+if (settled.status !== "Success") {
+  throw new Error(settled.failed_error ?? "Fiber payment failed");
+}
+```
+
+The sender does not need a direct channel to the receiver. Fiber uses its public channel graph to find a multi-hop route whose channels have enough outbound liquidity.
+
+<Info>
+  A newly opened public channel may need time to propagate through Fiber gossip before other nodes can route through it.
+</Info>
+
+## Stop the browser node
+
+Call `disconnect()` from `useKeyWay` when your application intentionally wants to stop Fiber. This stops the browser node; it does not close or settle channels on-chain.
+
+```ts
+const { disconnect } = useKeyWay();
+await disconnect();
+```

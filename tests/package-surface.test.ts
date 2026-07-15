@@ -25,3 +25,13 @@ test("exports React and headless KeyWay APIs from one public entrypoint", async 
   assert.equal(typeof sdk.useKeyWay, "function");
   assert.equal(typeof sdk.connectKeyWay, "function");
 });
+
+test("the reference app consumes the published SDK package", async () => {
+  const repositoryPackage = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  const referenceApp = await readFile(new URL("../app/auth-panel.tsx", import.meta.url), "utf8");
+
+  assert.equal(repositoryPackage.name, "ckb-keyway");
+  assert.equal(repositoryPackage.dependencies["@ckb-keyway/react"], repositoryPackage.version);
+  assert.match(referenceApp, /from "@ckb-keyway\/react"/);
+  assert.doesNotMatch(referenceApp, /src\/sdk\/react/);
+});

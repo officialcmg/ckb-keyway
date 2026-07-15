@@ -1,0 +1,64 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "luma",
+  "name": "CKB KeyWay",
+  "description": "React SDK documentation for email-native CKB accounts and Fiber payments.",
+  "colors": {
+    "primary": "#2457D6",
+    "light": "#4F7DF0",
+    "dark": "#4F7DF0"
+  },
+  "logo": {
+    "light": "/logo-light.svg",
+    "dark": "/logo-dark.svg",
+    "href": "/"
+  },
+  "favicon": "/favicon.svg",
+  "navbar": {
+    "links": [
+      {
+        "label": "npm",
+        "href": "https://www.npmjs.com/package/@ckb-keyway/react",
+        "icon": "box"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Open demo",
+      "href": "https://ckb-keyway.vercel.app/app"
+    }
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get started",
+        "pages": ["index", "quickstart"]
+      },
+      {
+        "group": "Build",
+        "pages": ["authentication", "fiber-payments", "core-concepts"]
+      },
+      {
+        "group": "Reference",
+        "pages": ["react-sdk", "troubleshooting"]
+      }
+    ]
+  },
+  "footer": {
+    "links": [
+      {
+        "header": "CKB KeyWay",
+        "items": [
+          {
+            "label": "Live demo",
+            "href": "https://ckb-keyway.vercel.app/app"
+          },
+          {
+            "label": "npm package",
+            "href": "https://www.npmjs.com/package/@ckb-keyway/react"
+          }
+        ]
+      }
+    ]
+  }
+}

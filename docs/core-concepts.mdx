@@ -1,0 +1,48 @@
+---
+title: "Core concepts"
+description: "The minimum CKB and Fiber model needed to use KeyWay correctly."
+icon: "diagram-project"
+---
+
+## Account, node, and channel
+
+These are separate pieces of state:
+
+| Concept | What it is | Where it lives |
+| --- | --- | --- |
+| CKB account | The on-chain identity and cells controlled through the Lit PKP. | Recoverable from the authenticated email identity. |
+| Fiber node | The networking process that creates invoices, finds routes, and updates channels. | Runs as WASM in the browser. |
+| Channel database | The latest off-chain state for the user's Fiber channels. | IndexedDB in the browser profile. |
+
+Logging in recovers the CKB identity. Starting Fiber also requires the device-bound Fiber identity and local channel database.
+
+## Relays are not channels
+
+When KeyWay starts, it connects to public testnet relays. Relay connections provide network reachability and gossip; they do not lock funds and do not give the user payment capacity.
+
+`activateCkbChannel()` separately negotiates and funds a channel with an available channel peer. That channel places capacity into the Fiber graph.
+
+## On-chain and Fiber balances
+
+- **On-chain balance** is the sum of live CKB cells controlled by the account's lock script.
+- **Fiber balance** is the sum of `local_balance` across ready channels.
+- Opening a channel moves capacity from ordinary CKB cells into a channel funding cell.
+- Fiber payments update channel states off-chain rather than broadcasting one CKB transaction per payment.
+
+## Routed payments
+
+A payment can cross several public channels:
+
+```text
+sender -> channel peer -> other public nodes -> receiver's channel peer -> receiver
+```
+
+Every hop must have enough outbound liquidity. A route may exist for `1 CKB` and fail for `999 CKB` because route existence and route capacity are different questions.
+
+## Browser ownership
+
+Version `0.0.1` uses a browser-local Fiber node. One user therefore has both an account identity and a node identity. Closing the tab stops the running node, while its channel database remains in that browser for the next session.
+
+<Warning>
+  Do not treat IndexedDB as disposable cache. It contains the off-chain channel state needed to resume the node safely.
+</Warning>

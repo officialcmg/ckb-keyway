@@ -1,0 +1,109 @@
+---
+title: "React SDK"
+description: "Reference for the provider, hook, components, and connected KeyWay client."
+icon: "code"
+---
+
+## `KeyWayProvider`
+
+Wrap the part of the React tree that uses KeyWay.
+
+```tsx
+<KeyWayProvider
+  appName="Your app"
+  theme="light"
+  autoConnect
+  onError={(error) => console.error(error)}
+>
+  <App />
+</KeyWayProvider>
+```
+
+<ParamField path="appName" type="string" default="CKB KeyWay">
+  Name displayed in the embedded login UI. Limited to 64 characters.
+</ParamField>
+
+<ParamField path="theme" type='"light" | "dark"' default="light">
+  Appearance of KeyWay's login and funding confirmation modals.
+</ParamField>
+
+<ParamField path="autoConnect" type="boolean" default="true">
+  Recover the wallet and start Fiber automatically after authentication.
+</ParamField>
+
+<ParamField path="confirmFunding" type="ConfirmFunding">
+  Optional callback for approving the validated on-chain channel funding transaction. Return `true` to continue to Lit-authorized signing or `false` to abort. When omitted, KeyWay renders its styled built-in confirmation modal.
+</ParamField>
+
+<ParamField path="onError" type="(error: Error) => void">
+  Receives connection and device-lease failures.
+</ParamField>
+
+## `useKeyWay()`
+
+```ts
+const {
+  ready,
+  authenticated,
+  user,
+  connection,
+  status,
+  error,
+  login,
+  logout,
+  connect,
+  disconnect,
+} = useKeyWay();
+```
+
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `ready` | `boolean` | Stored session validation has finished. |
+| `authenticated` | `boolean` | The user has a valid KeyWay session. |
+| `user` | `{ id: string }` | Stable authenticated user identity. |
+| `connection` | `ConnectedKeyWay \| undefined` | Recovered wallet and running Fiber client. |
+| `status` | `KeyWayStatus` | `idle`, `authenticating`, `connecting`, `connected`, `disconnecting`, or `error`. |
+| `error` | `Error \| undefined` | Latest provider connection error. |
+| `login()` | `() => void` | Open the email OTP modal. |
+| `logout()` | `() => Promise<void>` | Stop Fiber, clear the session, and log out. |
+| `connect()` | `() => Promise<ConnectedKeyWay>` | Recover and start KeyWay manually. |
+| `disconnect()` | `() => Promise<void>` | Stop Fiber without logging out. |
+
+## `connection`
+
+```ts
+type ConnectedKeyWay = {
+  keyway: KeyWay;
+  wallet: PublicWallet;
+  node: NodeInfoResult;
+  peers: ListPeersResult["peers"];
+  balanceShannons: bigint;
+};
+```
+
+Use `connection.wallet.ckbAddress` for the recovered address and `connection.keyway` for Fiber operations.
+
+### Recommended client methods
+
+| Method | Purpose |
+| --- | --- |
+| `getCkbBalance()` | Read indexed on-chain capacity in shannons. |
+| `activateCkbChannel(amount, onProgress?)` | Connect a channel peer and fund a public CKB channel. |
+| `waitForChannelReady(channelId, options?)` | Wait until a funding transaction becomes a usable channel. |
+| `listChannels(options)` | Read channels, state, local balance, and remote balance. |
+| `newInvoice(params)` | Create a Fiber invoice. |
+| `parseInvoice(params)` | Decode and validate an invoice before payment. |
+| `sendPayment(params)` | Start a routed Fiber payment. |
+| `waitForPayment(paymentHash, options?)` | Wait for payment success or failure. |
+| `listPeers()` | Inspect connected Fiber peers. |
+| `nodeInfo()` | Read the local Fiber node identity. |
+| `stop()` | Stop the node and release browser/device guards. Prefer provider `disconnect()`. |
+
+## Buttons
+
+`KeyWayLoginButton` toggles login/logout. `KeyWayConnectButton` starts or stops Fiber and opens login first when needed. Both accept normal button attributes and label overrides.
+
+```tsx
+<KeyWayLoginButton loginLabel="Continue with email" />
+<KeyWayConnectButton connectLabel="Start payments" />
+```

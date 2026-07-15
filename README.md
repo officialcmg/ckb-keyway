@@ -11,6 +11,10 @@ Project overview: [ckb-keyway.vercel.app](https://ckb-keyway.vercel.app)
 
 Live testnet wallet: [ckb-keyway.vercel.app/app](https://ckb-keyway.vercel.app/app)
 
+React SDK documentation: [ckb-keyway-docs.vercel.app](https://ckb-keyway-docs.vercel.app)
+
+npm package: [@ckb-keyway/react](https://www.npmjs.com/package/@ckb-keyway/react)
+
 Standalone API: [keyway-api-production.up.railway.app](https://keyway-api-production.up.railway.app/healthz)
 
 ## Working flow
@@ -137,7 +141,7 @@ Build the distributable React SDK with:
 npm run build:package
 ```
 
-The private standalone backend runs with `npm run api` and requires `DATABASE_URL`, `KEYWAY_ALLOWED_ORIGINS`, Stytch server credentials, and the Lit server credentials from `.env.example`. It is deployed by CKB KeyWay and is not exported by the public SDK. The Next.js reference app has no API routes: both it and external consumers use the same SDK-managed Railway endpoint.
+The private standalone backend runs with `npm run api` and requires `DATABASE_URL`, `KEYWAY_ALLOWED_ORIGINS`, Stytch server credentials, and the Lit server credentials from `.env.example`. It is deployed by CKB KeyWay and is not exported by the public SDK. The Next.js reference app has no API routes: it imports the published `@ckb-keyway/react@0.0.1` package, and both it and external consumers use the same SDK-managed Railway endpoint.
 
 See [`examples/browser-wallet.ts`](examples/browser-wallet.ts) for a complete minimal lifecycle. The repository package is private. `npm run pack:sdk` stages and packs only `package.sdk.json`, the React/browser build, README, and license. Server-only `postgres` and `stytch` dependencies, Railway code, and Lit Actions are excluded. Publish only with `npm run publish:sdk`.
 

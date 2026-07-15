@@ -42,7 +42,7 @@ FiberBrowserNode / fiber-js / IndexedDB
 
 The public SDK targets `https://keyway-api-production.up.railway.app` internally. Consumers neither provide an API URL nor import server code; CKB KeyWay operates this backend as part of the service.
 
-The Next.js reference app imports only the public React entry in `src/sdk/react`, which re-exports the lower-level browser API. It contains no `app/api` routes and is not the backend. `server/index.ts` and `src/server` build and deploy independently to Railway; neither is included in the npm package.
+The Next.js reference app imports only the published `@ckb-keyway/react` package, which re-exports the lower-level browser API. It contains no `app/api` routes and is not the backend. `server/index.ts` and `src/server` build and deploy independently to Railway; neither is included in the npm package.
 
 ## External funding boundary
 

@@ -1,0 +1,77 @@
+---
+title: "CKB KeyWay"
+description: "Email-native CKB accounts and Fiber payments for React applications."
+icon: "route"
+---
+
+CKB KeyWay gives a React application email OTP login, a recoverable CKB testnet account, and a browser-based Fiber node through one SDK.
+
+```bash
+npm install @ckb-keyway/react
+```
+
+```tsx
+"use client";
+
+import {
+  KeyWayLoginButton,
+  KeyWayProvider,
+  useKeyWay,
+} from "@ckb-keyway/react";
+
+export function Providers({ children }: { children: React.ReactNode }) {
+  return <KeyWayProvider appName="Your app">{children}</KeyWayProvider>;
+}
+
+export function WalletStatus() {
+  const { ready, authenticated, connection } = useKeyWay();
+
+  if (!ready) return <p>Loading...</p>;
+
+  return (
+    <div>
+      <KeyWayLoginButton />
+      {authenticated && !connection ? <p>Recovering wallet...</p> : null}
+      {connection ? <p>{connection.wallet.ckbAddress}</p> : null}
+    </div>
+  );
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install the SDK and recover your first wallet.
+  </Card>
+  <Card title="Fiber payments" icon="bolt" href="/fiber-payments">
+    Fund a channel, create invoices, and send payments.
+  </Card>
+  <Card title="React SDK" icon="brackets-curly" href="/react-sdk">
+    Provider, hook, components, and client methods.
+  </Card>
+  <Card title="Live demo" icon="arrow-up-right-from-square" href="https://ckb-keyway.vercel.app/app">
+    Test the complete flow on CKB testnet.
+  </Card>
+</CardGroup>
+
+<Info>
+  Version `0.0.1` is a testnet preview. Consumer origins must currently be allowed by the managed KeyWay API before browser requests will succeed.
+</Info>
+
+## What the SDK handles
+
+- Email OTP UI and session recovery
+- Stable CKB account recovery through Lit
+- Browser Fiber node startup and testnet peer connection
+- Externally funded Fiber channel activation
+- Fiber invoices, routed payments, channels, and balances
+
+## Requirements
+
+- React 18.2 or newer
+- A browser with WebAssembly, Web Locks, IndexedDB, and Web Crypto
+- Cross-origin isolation headers for Fiber's multithreaded WASM runtime
+- CKB testnet funds when opening a channel
+
+<Card title="View on npm" icon="box" href="https://www.npmjs.com/package/@ckb-keyway/react">
+  Package metadata, dependencies, and published versions.
+</Card>

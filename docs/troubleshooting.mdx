@@ -1,0 +1,55 @@
+---
+title: "Troubleshooting"
+description: "Resolve common integration, browser, channel, and routing failures."
+icon: "wrench"
+---
+
+## Browser requests fail with CORS
+
+Version `0.0.1` uses the managed KeyWay API and an origin allowlist. Register the exact origin, including scheme and port for development. This is KeyWay API configuration, not a Stytch dashboard requirement for SDK consumers.
+
+## `SharedArrayBuffer` or WASM startup fails
+
+Check that the page sends:
+
+```text
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+Then verify `window.crossOriginIsolated === true`. Browser extensions or third-party resources without compatible cross-origin resource policy headers can also break isolation.
+
+## `An active device lease is required`
+
+The account's Fiber lease expired or another device took it. Call `connect()` again. Avoid running the same account's channels concurrently in multiple browser profiles.
+
+## `Fiber wallet is bound to another device`
+
+The account already opened channels using another browser device identity. Return to the original browser profile. Cross-device channel database migration is not available in `0.0.1`.
+
+## A payment has no route
+
+The public graph did not contain a route with enough outbound liquidity for the requested amount.
+
+- Try a smaller payment.
+- Confirm both sender and receiver have ready public channels.
+- Allow a newly opened channel time to propagate through gossip.
+- Keep both browser nodes online while testing the payment.
+
+## CKB balance updates slowly
+
+CKB does not store an account balance field. The SDK asks an indexer to sum live cells for the account's lock script. Faucet and newly mined cells may appear after an indexing delay.
+
+## Channel activation takes time
+
+Activation includes peer connection, collaborative funding construction, user confirmation, Lit authorization, CKB transaction broadcast, and on-chain confirmation. Use the progress callback to show the current stage rather than presenting one indefinite loading state.
+
+```ts
+await connection.keyway.activateCkbChannel(amount, (stage) => {
+  console.log(stage);
+});
+```
+
+## Supported scope
+
+The current package supports CKB testnet, CKB-funded Fiber channels, invoices, and routed payments. Mainnet, UDT payments, channel database backup, and self-hosted KeyWay infrastructure are not supported in `0.0.1`.

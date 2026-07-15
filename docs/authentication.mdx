@@ -1,0 +1,71 @@
+---
+title: "Authentication"
+description: "Understand email OTP, sessions, recovery, and device behavior."
+icon: "envelope"
+---
+
+`KeyWayProvider` includes the complete email OTP flow. Your application opens it with `login()` or `KeyWayLoginButton`.
+
+```tsx
+import { useKeyWay } from "@ckb-keyway/react";
+
+function SignIn() {
+  const { authenticated, login, logout } = useKeyWay();
+
+  return authenticated
+    ? <button onClick={() => void logout()}>Log out</button>
+    : <button onClick={login}>Log in with email</button>;
+}
+```
+
+## Login lifecycle
+
+<Steps>
+  <Step title="Send a one-time code">
+    The SDK requests an OTP from the managed KeyWay API. Backend email credentials never enter the browser.
+  </Step>
+  <Step title="Create a KeyWay session">
+    A valid code returns a KeyWay session tied to a stable backend user ID.
+  </Step>
+  <Step title="Recover the account">
+    The user ID maps to the same Lit PKP and CKB address on future logins.
+  </Step>
+  <Step title="Start Fiber">
+    With `autoConnect` enabled, the SDK recovers the device's Fiber identity and starts the browser node.
+  </Step>
+</Steps>
+
+## Session state
+
+The SDK stores the KeyWay session in browser `localStorage` and validates it when the provider mounts. Use `ready` before reading authentication state.
+
+```tsx
+const { ready, authenticated, user, status } = useKeyWay();
+```
+
+| Value | Meaning |
+| --- | --- |
+| `ready` | Stored session validation has completed. |
+| `authenticated` | A valid KeyWay session exists. |
+| `user.id` | Stable backend identity for the email account. |
+| `status` | Current authentication or connection lifecycle state. |
+
+## Device behavior
+
+Channel state belongs to the browser profile that opened the channel. KeyWay permits one active Fiber device lease per account and fails closed if another device takes the lease.
+
+<Warning>
+  Clearing site data removes the browser-local Fiber database. Version `0.0.1` does not include encrypted channel database backup or device migration.
+</Warning>
+
+## Branding
+
+`appName` changes the name shown in KeyWay's modal. `theme` selects the built-in light or dark appearance.
+
+```tsx
+<KeyWayProvider appName="Acme Pay" theme="dark">
+  <App />
+</KeyWayProvider>
+```
+
+The OTP email sender and template are managed by KeyWay in this preview; `appName` does not currently change the email itself.
