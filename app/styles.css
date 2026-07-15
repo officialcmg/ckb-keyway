@@ -66,6 +66,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, a:focus-visib
 .code-card > div span:nth-child(3) { background: #63d27e; }
 .code-card small { margin-left: auto; color: #9ca6bd; font-family: monospace; }
 .code-card pre { overflow: auto; margin: 0; padding: 1.6rem; color: #e4e7ff; font: 0.84rem/1.75 "SFMono-Regular", Consolas, monospace; }
+.code-card .syntax-tag { color: #7dd3fc; }
+.code-card .syntax-attr { color: #f9a8d4; }
+.code-card .syntax-string { color: #bef264; }
+.code-card .syntax-keyword { color: #fb7185; }
+.code-card .syntax-variable { color: #fde68a; }
+.code-card .syntax-function { color: #c4b5fd; }
+.code-card .syntax-property { color: #67e8f9; }
 .trust-section { align-items: start; background: var(--blue); color: white; }
 .trust-section .eyebrow { color: var(--yellow); }
 .trust-grid { display: grid; gap: 0.75rem; }

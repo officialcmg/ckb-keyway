@@ -40,15 +40,7 @@ export default function Home() {
         <div className="section-copy"><p className="eyebrow">Built for developers</p><h2>Fiber functionality behind one React provider.</h2><p>KeyWay owns the difficult path from authentication to wallet recovery, browser-node startup, channel funding, and routed payments. Your app keeps control of its product experience.</p></div>
         <div className="code-card">
           <div><span /><span /><span /><small>app.tsx</small></div>
-          <pre><code>{`<KeyWayProvider appName="Your app">
-  <YourApp />
-</KeyWayProvider>
-
-const { login, connection } = useKeyWay();
-
-await connection.keyway.sendPayment({
-  invoice,
-});`}</code></pre>
+          <pre><code><span className="syntax-tag">&lt;KeyWayProvider</span> <span className="syntax-attr">appName</span>=<span className="syntax-string">&quot;Your app&quot;</span><span className="syntax-tag">&gt;</span>{`\n  `}<span className="syntax-tag">&lt;YourApp /&gt;</span>{`\n`}<span className="syntax-tag">&lt;/KeyWayProvider&gt;</span>{`\n\n`}<span className="syntax-keyword">const</span>{` { `}<span className="syntax-variable">login</span>{`, `}<span className="syntax-variable">connection</span>{` } = `}<span className="syntax-function">useKeyWay</span>{`();\n\n`}<span className="syntax-keyword">await</span>{` `}<span className="syntax-variable">connection</span>.<span className="syntax-property">keyway</span>.<span className="syntax-function">sendPayment</span>{`({\n  `}<span className="syntax-property">invoice</span>{`,\n});`}</code></pre>
         </div>
       </section>
 
