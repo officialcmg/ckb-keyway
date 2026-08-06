@@ -13,10 +13,12 @@ import { acquireDeviceLock, type DeviceLock } from "./device-lock";
 import { acquireDeviceLease, type DeviceLease } from "./device-lease";
 import { serializeCccTransaction } from "./ccc-transaction";
 import { RemoteCkbSigner, type ConfirmFunding } from "./remote-ckb-signer";
-import { markChannelOpened } from "./bootstrap";
+import { getDeviceIdHash, markChannelOpened } from "./bootstrap";
 import { connectChannelPeers, type ChannelPeer } from "./channel-peers";
 import { normalizeFiberPubkey } from "./fiber-pubkey";
 import { KeyWayApiClient } from "./api-client";
+import { createEncryptedNodeBackup, restoreEncryptedNodeBackup } from "./node-backup";
+import { backUpBeforeLogout, restoreBeforeStart } from "./node-migration";
 
 export type KeyWayFundingParams = Omit<
   OpenChannelWithExternalFundingParams,
@@ -31,6 +33,7 @@ export type CreateKeyWayOptions = {
   loadFiberKey: (leaseId: string) => ReturnType<FiberKeyLoader>;
   network?: "testnet" | "mainnet";
   apiClient?: KeyWayApiClient;
+  restoreRequired?: boolean;
   onLeaseLost?: (error: Error) => void;
 };
 
@@ -66,6 +69,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     signFundingTxOptions: { toRpcTransaction: serializeCccTransaction },
   });
   const ckbRpcUrl = "https://testnet.ckbapp.dev/";
+  const databasePrefix = `/wasm-${options.identifier}`;
+  let restoreRequired = options.restoreRequired ?? false;
 
   async function start() {
     if (node.isRunning) return node.nodeInfo();
@@ -75,6 +80,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
         const error = cause instanceof Error ? cause : new Error("The active KeyWay device lease expired");
         void stop().finally(() => options.onLeaseLost?.(error));
       });
+      if (restoreRequired) await restoreClaimedBackup();
       return await node.start();
     } catch (error) {
       await releaseGuards();
@@ -90,6 +96,43 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       preparedFundingAmount = undefined;
       await releaseGuards();
     }
+  }
+
+  async function stopForLogout() {
+    if (!deviceLease) {
+      await stop();
+      return;
+    }
+    const lease = deviceLease;
+    const deviceIdHash = await getDeviceIdHash();
+    await backUpBeforeLogout({
+      loadFiberKey: () => options.loadFiberKey(lease.leaseId),
+      stopNode: () => node.stop(),
+      createBackup: (fiberKey) => createEncryptedNodeBackup(databasePrefix, fiberKey),
+      saveBackup: (backup) => api.saveNodeBackup(options.authToken, {
+        deviceIdHash,
+        leaseId: lease.leaseId,
+        backup,
+      }),
+      releaseOwnership: releaseGuards,
+    });
+  }
+
+  async function restoreClaimedBackup() {
+    if (!deviceLease) throw new Error("An active device lease is required to restore Fiber state");
+    const deviceIdHash = await getDeviceIdHash();
+    const leaseId = deviceLease.leaseId;
+    await restoreBeforeStart({
+      loadFiberKey: () => options.loadFiberKey(leaseId),
+      loadBackup: () => api.loadNodeBackup(options.authToken, { deviceIdHash, leaseId }),
+      restoreBackup: (backup, fiberKey) => restoreEncryptedNodeBackup(backup, databasePrefix, fiberKey),
+      confirmRestore: (generation) => api.confirmNodeBackup(options.authToken, {
+        deviceIdHash,
+        leaseId,
+        generation,
+      }),
+    });
+    restoreRequired = false;
   }
 
   async function releaseGuards() {
@@ -166,6 +209,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   return {
     start,
     stop,
+    stopForLogout,
     nodeInfo: () => node.nodeInfo(),
     connectPeer: node.connectPeer.bind(node),
     listPeers: node.listPeers.bind(node),

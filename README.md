@@ -27,6 +27,7 @@ Standalone API: [keyway-api-production.up.railway.app](https://keyway-api-produc
 6. The backend validates the complete transaction and computes only the KeyWay lock group's CKB sighash.
 7. A pinned Lit Action signs that digest. KeyWay verifies the recovered public key and inserts only its witness.
 8. Fiber submits the signed transaction, waits for `ChannelReady`, and can send or receive invoices.
+9. Explicit logout stops Fiber, encrypts its wallet-scoped IndexedDB state in the browser, and uploads only ciphertext for restoration before the next device starts Fiber.
 
 KeyWay connects each browser node to the official testnet relays for network reachability and gossip. Its convenience activation flow then prefers the browser-reachable Bottle or Bracer channel providers, falling back to eligible nodes discovered from the Fiber graph. The 400 CKB value in `channel-peers.ts` is the minimum request KeyWay will send to those providers, not their contribution. In the verified 1,250 CKB testnet channel below, KeyWay requested 1,000 CKB and the accepting peer contributed the remaining 250 CKB; applications should read the negotiated `local_balance` and `remote_balance` rather than assume that split for every channel.
 
@@ -90,7 +91,9 @@ The SDK uses CKB KeyWay's managed backend automatically. `appName` brands the SD
 
 `appName` does not alter the sender or contents of the OTP email. Stytch email templates are configured server-side. Per-application email branding requires a registered KeyWay application whose verified identity maps to an approved template; this would be a future feature.
 
-With the default `autoConnect`, successful OTP immediately recovers the wallet, starts its browser Fiber node, connects testnet relays, and fetches an initial CKB balance. Use `autoConnect={false}` with `connect()` and `disconnect()` when an application wants explicit node lifecycle control. Logout and provider cleanup stop the node but deliberately preserve its IndexedDB channel state.
+With the default `autoConnect`, successful OTP immediately recovers the wallet, restores any claimed cross-device backup, starts its browser Fiber node, connects testnet relays, and fetches an initial CKB balance. Use `autoConnect={false}` with `connect()` and `disconnect()` when an application wants explicit node lifecycle control.
+
+Explicit `logout()` is transactional after a Fiber connection exists: KeyWay stops the node while retaining its device lease, snapshots only that wallet's IndexedDB databases, derives an AES-256-GCM backup key from the Lit-recovered Fiber key with HKDF-SHA256, and uploads ciphertext to the managed backend. Authentication and ownership are cleared only after the backend independently verifies and stores the ciphertext. A new device claims and restores that one-use backup before Fiber starts. If backup or restoration fails, KeyWay does not release or consume the only recoverable state.
 
 The same package exports the headless connection API:
 
@@ -151,7 +154,7 @@ See [`examples/browser-wallet.ts`](examples/browser-wallet.ts) for a complete mi
 - The backend accepts a complete CKB transaction, enforces testnet funding and fee limits, computes CCC's exact sighash, and invokes only a pinned Lit Action.
 - The stored Fiber identity key is encrypted at rest. The MVP backend can observe it during recovery, and it necessarily exists in browser/WASM memory while Fiber runs.
 - Web Locks, `BroadcastChannel`, and an atomic Postgres lease enforce one active browser node.
-- Channel data remains in that browser's IndexedDB. The CKB identity can be recovered elsewhere, but Fiber startup is blocked after channel use until safe database transfer exists.
+- Fiber state backups are encrypted in the browser and stored as ciphertext. Explicit logout can hand the latest IndexedDB state to one subsequent device while the backend lease prevents concurrent Fiber nodes.
 - Email compromise can authorize recovery. This testnet prototype is experimental, unaudited, and not production custody software.
 
 ## Verified testnet result
@@ -180,7 +183,8 @@ The production deployment also sends `Cross-Origin-Opener-Policy: same-origin` a
 ## Current limitations
 
 - Testnet CKB only; UDTs, swaps, merchant checkout, and mainnet are out of scope.
-- Fiber channel state is same-browser only and has no migration UI yet.
+- Cross-device Fiber state migration currently requires explicit logout. A crash, lost device, force-closed tab, or interrupted browser cannot create a fresh checkpoint, so background snapshots still need an upstream-safe database flush boundary.
+- The migration path is covered by browser archive, cryptography, lifecycle, and Postgres integration tests but has not yet been deployed or verified with two real Fiber testnet browser sessions.
 - Channel balances and raw channel shutdown are available through `connection.keyway`; the reference wallet renders balances and channels but does not yet provide a close-channel screen.
 - The backend is trusted to authorize Lit operations and can observe the decrypted Fiber key.
 - The reference wallet uses fixed activation and maximum-payment-fee limits for a predictable demo.

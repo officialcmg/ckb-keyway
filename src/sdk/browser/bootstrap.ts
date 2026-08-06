@@ -12,14 +12,14 @@ export type PublicWallet = {
 
 type BootstrapResponse =
   | { needsFiberKey: true }
-  | { needsFiberKey: false; provisioned: boolean; wallet: PublicWallet };
+  | { needsFiberKey: false; provisioned: boolean; restoreRequired: boolean; wallet: PublicWallet };
 
 const DEVICE_STORAGE_KEY = "ckb-keyway:device-id";
 
 export async function bootstrapKeyWay(
   authToken: string,
   api = new KeyWayApiClient(),
-): Promise<{ provisioned: boolean; wallet: PublicWallet }> {
+): Promise<{ provisioned: boolean; restoreRequired: boolean; wallet: PublicWallet }> {
   if (!authToken) throw new Error("Authenticated KeyWay session is required");
   return navigator.locks.request("ckb-keyway:bootstrap", async () => {
     const deviceIdHash = await getDeviceIdHash();

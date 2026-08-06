@@ -2,6 +2,17 @@ export type KeyWayApiClientOptions = {
   fetch?: typeof globalThis.fetch;
 };
 
+export type NodeBackupPayload = {
+  formatVersion: 1;
+  databasePrefix: string;
+  salt: string;
+  iv: string;
+  ciphertext: string;
+  digest: string;
+};
+
+export type ClaimedNodeBackup = NodeBackupPayload & { generation: number };
+
 const KEYWAY_API_BASE_URL = "https://keyway-api-production.up.railway.app";
 
 export class KeyWayApiClient {
@@ -56,6 +67,28 @@ export class KeyWayApiClient {
 
   signTransaction(authToken: string, body: Record<string, unknown>) {
     return this.json("/api/keyway/sign-transaction", authToken, body);
+  }
+
+  saveNodeBackup(
+    authToken: string,
+    body: { deviceIdHash: string; leaseId: string; backup: NodeBackupPayload },
+  ): Promise<{ generation: number; digest: string }> {
+    return this.json("/api/keyway/node-backup/save", authToken, body);
+  }
+
+  loadNodeBackup(
+    authToken: string,
+    body: { deviceIdHash: string; leaseId: string },
+  ): Promise<ClaimedNodeBackup> {
+    return this.json("/api/keyway/node-backup/load", authToken, body);
+  }
+
+  async confirmNodeBackup(
+    authToken: string,
+    body: { deviceIdHash: string; leaseId: string; generation: number },
+  ): Promise<void> {
+    const response = await this.request("/api/keyway/node-backup/confirm", authToken, body);
+    if (!response.ok) throw new Error(await responseError(response, "Could not confirm Fiber state restoration"));
   }
 
   private async publicJson<T>(path: string, body: unknown): Promise<T> {

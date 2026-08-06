@@ -32,3 +32,31 @@ test("keeps OTP public and protects session requests with the KeyWay token", asy
   assert.equal(new Headers(requests[0].headers).has("authorization"), false);
   assert.equal(new Headers(requests[1].headers).get("authorization"), "Bearer keyway-session");
 });
+
+test("uploads and confirms encrypted node backups through authenticated endpoints", async () => {
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  const api = new KeyWayApiClient({
+    fetch: async (input, init) => {
+      requests.push({ url: String(input), init });
+      if (String(input).endsWith("/save")) return Response.json({ generation: 2, digest: "ab".repeat(32) });
+      return new Response(null, { status: 204 });
+    },
+  });
+  const backup = {
+    formatVersion: 1 as const,
+    databasePrefix: "/wasm-wallet",
+    salt: "salt",
+    iv: "iv",
+    ciphertext: "ciphertext",
+    digest: "ab".repeat(32),
+  };
+  await api.saveNodeBackup("session", { deviceIdHash: "00".repeat(32), leaseId: "lease", backup });
+  await api.confirmNodeBackup("session", {
+    deviceIdHash: "00".repeat(32),
+    leaseId: "lease",
+    generation: 2,
+  });
+  assert.match(requests[0].url, /node-backup\/save$/);
+  assert.match(requests[1].url, /node-backup\/confirm$/);
+  assert.equal(new Headers(requests[0].init?.headers).get("authorization"), "Bearer session");
+});

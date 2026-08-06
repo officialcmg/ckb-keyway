@@ -19,7 +19,7 @@ export async function connectKeyWay(options: {
   onLeaseLost?: (error: Error) => void;
 }): Promise<ConnectedKeyWay> {
   const apiClient = new KeyWayApiClient();
-  const { wallet } = await bootstrapKeyWay(options.authToken, apiClient);
+  const { wallet, restoreRequired } = await bootstrapKeyWay(options.authToken, apiClient);
   const keyway = createKeyWay({
     identifier: wallet.litPkpId,
     authToken: options.authToken,
@@ -27,6 +27,7 @@ export async function connectKeyWay(options: {
     confirmFunding: options.confirmFunding,
     loadFiberKey: (leaseId) => loadFiberKey(options.authToken, leaseId, apiClient),
     apiClient,
+    restoreRequired,
     onLeaseLost: options.onLeaseLost,
   });
 

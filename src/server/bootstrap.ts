@@ -4,6 +4,7 @@ import { loadLitAction } from "./lit-actions";
 import { encryptFiberKey } from "./lit";
 import { derivePkpIdentity } from "./pkp-identity";
 import { readActiveLease } from "./device-lease";
+import { prepareBackupForDevice } from "./node-backup";
 import { withUserLock, type DatabaseSql } from "./database";
 import {
   readWallet,
@@ -19,7 +20,12 @@ const DEVICE_ID_HASH = /^[0-9a-f]{64}$/;
 
 export type BootstrapResult =
   | { needsFiberKey: true }
-  | { needsFiberKey: false; provisioned: boolean; wallet: Omit<ReadyWallet, "encryptedFiberKey"> };
+  | {
+      needsFiberKey: false;
+      provisioned: boolean;
+      restoreRequired: boolean;
+      wallet: Omit<ReadyWallet, "encryptedFiberKey">;
+    };
 
 export async function bootstrap(user: User, deviceIdHash: string, encodedFiberKey?: string): Promise<BootstrapResult> {
   if (!DEVICE_ID_HASH.test(deviceIdHash)) throw new Error("Device ID hash must be 32-byte lowercase hex");
@@ -34,9 +40,19 @@ async function bootstrapLocked(
 ): Promise<BootstrapResult> {
   let wallet = await readWallet(user, sql);
   if (wallet?.status === "ready") {
-    const rebound = rebindReadyWallet(wallet, deviceIdHash, (await readActiveLease(user, sql))?.deviceIdHash);
+    const activeLeaseDevice = (await readActiveLease(user, sql))?.deviceIdHash;
+    const migration = await prepareBackupForDevice(
+      user,
+      wallet.primaryDeviceIdHash,
+      deviceIdHash,
+      activeLeaseDevice,
+      sql,
+    );
+    const rebound = wallet.primaryDeviceIdHash !== deviceIdHash && wallet.hasOpenedChannel && migration.canRebind
+      ? { ...wallet, primaryDeviceIdHash: deviceIdHash, updatedAt: new Date().toISOString() }
+      : rebindReadyWallet(wallet, deviceIdHash, activeLeaseDevice);
     if (rebound !== wallet) await saveWallet(user, rebound, sql);
-    return publicResult(rebound, false);
+    return publicResult(rebound, false, migration.restoreRequired);
   }
   if (!wallet && !encodedFiberKey) return { needsFiberKey: true };
   if (encodedFiberKey && !BASE64_KEY.test(encodedFiberKey)) throw new Error("Fiber key must be base64-encoded 32 bytes");
@@ -86,15 +102,15 @@ async function bootstrapLocked(
       updatedAt: now,
     };
     await saveWallet(user, ready, sql);
-    return publicResult(ready, true);
+    return publicResult(ready, true, false);
   } finally {
     fiberKey.fill(0);
   }
 }
 
-function publicResult(wallet: ReadyWallet, provisioned: boolean): BootstrapResult {
+function publicResult(wallet: ReadyWallet, provisioned: boolean, restoreRequired: boolean): BootstrapResult {
   const { encryptedFiberKey: _encrypted, ...publicWallet } = wallet;
-  return { needsFiberKey: false, provisioned, wallet: publicWallet };
+  return { needsFiberKey: false, provisioned, restoreRequired, wallet: publicWallet };
 }
 
 function requiredEnv(name: string): string {
