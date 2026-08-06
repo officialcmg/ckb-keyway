@@ -17,6 +17,7 @@ import {
 } from "./funding-transaction.ts";
 import { consumeConfirmation, issueConfirmation } from "./signing-confirmation.ts";
 import { database } from "./database.ts";
+import { confirmNodeBackupRestored, readClaimedNodeBackup, saveNodeBackup } from "./node-backup.ts";
 
 export async function handleKeyWayRequest(request: Request): Promise<Response> {
   const cors = corsHeaders(request);
@@ -42,6 +43,9 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
       : path === "/api/keyway/fiber-key" ? await fiberKeyRequest(request)
       : path === "/api/keyway/channel-state" ? await channelStateRequest(request)
       : path === "/api/keyway/device-lease" ? await deviceLeaseRequest(request)
+      : path === "/api/keyway/node-backup/save" ? await saveNodeBackupRequest(request)
+      : path === "/api/keyway/node-backup/load" ? await loadNodeBackupRequest(request)
+      : path === "/api/keyway/node-backup/confirm" ? await confirmNodeBackupRequest(request)
       : path === "/api/keyway/sign-transaction" ? await signTransactionRequest(request)
       : jsonError("Not found", 404);
     for (const [name, value] of cors) response.headers.set(name, value);
@@ -138,6 +142,50 @@ async function deviceLeaseRequest(request: Request): Promise<Response> {
   throw new Error("Unsupported lease operation");
 }
 
+async function saveNodeBackupRequest(request: Request): Promise<Response> {
+  const user = await authenticateUser(request.headers.get("authorization"));
+  const { deviceIdHash, leaseId, backup } = await objectBody(request, "Invalid Fiber node backup request");
+  if (typeof deviceIdHash !== "string" || typeof leaseId !== "string") {
+    throw new Error("Device ID hash and lease ID are required");
+  }
+  const wallet = await readWallet(user);
+  if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
+  if (wallet.primaryDeviceIdHash !== deviceIdHash) throw new Error("Fiber wallet is bound to another device");
+  await requireLease(user, deviceIdHash, leaseId);
+  const parsed = parseNodeBackup(backup);
+  if (parsed.databasePrefix !== `/wasm-${wallet.litPkpId}`) {
+    throw new Error("Fiber node backup does not belong to this wallet");
+  }
+  return Response.json(await saveNodeBackup(user, deviceIdHash, parsed));
+}
+
+async function loadNodeBackupRequest(request: Request): Promise<Response> {
+  const user = await authenticateUser(request.headers.get("authorization"));
+  const { deviceIdHash, leaseId } = await objectBody(request, "Invalid Fiber node backup request");
+  if (typeof deviceIdHash !== "string" || typeof leaseId !== "string") {
+    throw new Error("Device ID hash and lease ID are required");
+  }
+  const wallet = await readWallet(user);
+  if (!wallet || wallet.status !== "ready" || wallet.primaryDeviceIdHash !== deviceIdHash) {
+    throw new Error("Fiber wallet is bound to another device");
+  }
+  await requireLease(user, deviceIdHash, leaseId);
+  const backup = await readClaimedNodeBackup(user, deviceIdHash);
+  const { sourceDeviceIdHash: _source, status: _status, claimedDeviceIdHash: _claimed, ...publicBackup } = backup;
+  return Response.json(publicBackup, { headers: { "Cache-Control": "no-store" } });
+}
+
+async function confirmNodeBackupRequest(request: Request): Promise<Response> {
+  const user = await authenticateUser(request.headers.get("authorization"));
+  const { deviceIdHash, leaseId, generation } = await objectBody(request, "Invalid Fiber node backup confirmation");
+  if (typeof deviceIdHash !== "string" || typeof leaseId !== "string" || !Number.isSafeInteger(generation)) {
+    throw new Error("Device ID hash, lease ID, and backup generation are required");
+  }
+  await requireLease(user, deviceIdHash, leaseId);
+  await confirmNodeBackupRestored(user, deviceIdHash, generation as number);
+  return new Response(null, { status: 204 });
+}
+
 async function signTransactionRequest(request: Request): Promise<Response> {
   const user = await authenticateUser(request.headers.get("authorization"));
   const { operation, transaction, confirmationNonce } = await objectBody(request, "Invalid signing request");
@@ -163,6 +211,29 @@ async function objectBody(request: Request, message: string): Promise<Record<str
   const body: unknown = await request.json();
   if (!body || typeof body !== "object") throw new Error(message);
   return body as Record<string, unknown>;
+}
+
+function parseNodeBackup(value: unknown) {
+  if (!value || typeof value !== "object") throw new Error("Encrypted Fiber node backup is required");
+  const backup = value as Record<string, unknown>;
+  if (
+    backup.formatVersion !== 1 ||
+    typeof backup.databasePrefix !== "string" || !backup.databasePrefix.startsWith("/wasm-") ||
+    typeof backup.salt !== "string" || Buffer.from(backup.salt, "base64").length !== 32 ||
+    typeof backup.iv !== "string" || Buffer.from(backup.iv, "base64").length !== 12 ||
+    typeof backup.ciphertext !== "string" || Buffer.from(backup.ciphertext, "base64").length > 12_000_000 ||
+    typeof backup.digest !== "string" || !/^[0-9a-f]{64}$/.test(backup.digest)
+  ) {
+    throw new Error("Encrypted Fiber node backup is invalid");
+  }
+  return {
+    formatVersion: 1 as const,
+    databasePrefix: backup.databasePrefix,
+    salt: backup.salt,
+    iv: backup.iv,
+    ciphertext: backup.ciphertext,
+    digest: backup.digest,
+  };
 }
 
 function corsHeaders(request: Request): Headers | Response {

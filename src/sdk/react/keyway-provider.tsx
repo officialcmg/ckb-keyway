@@ -144,12 +144,28 @@ export function KeyWayProvider({
   }
 
   async function logout() {
-    await disconnect();
     const token = authToken;
-    clearStoredSession();
-    setAuthToken(undefined);
-    setUser(undefined);
-    if (token) await new KeyWayApiClient().logout(token).catch(() => undefined);
+    const current = connectionRef.current;
+    setStatus("disconnecting");
+    setError(undefined);
+    try {
+      if (current) await current.keyway.stopForLogout();
+      if (token) await new KeyWayApiClient().logout(token);
+      ++runRef.current;
+      connectionRef.current = undefined;
+      setConnection(undefined);
+      clearStoredSession();
+      setAuthToken(undefined);
+      setUser(undefined);
+      setStatus("idle");
+    } catch (cause) {
+      const logoutError = cause instanceof Error ? cause : new Error("Could not safely back up and log out");
+      if (current) await connect().catch(() => undefined);
+      setError(logoutError);
+      setStatus("error");
+      callbacksRef.current.onError?.(logoutError);
+      throw logoutError;
+    }
   }
 
   useEffect(() => {
