@@ -9,6 +9,10 @@
     "wallet"
   ],
   "homepage": "https://ckb-keyway.vercel.app",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/officialcmg/ckb-keyway.git"
+  },
   "license": "MIT",
   "type": "module",
   "publishConfig": {
