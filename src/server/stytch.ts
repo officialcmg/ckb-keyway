@@ -11,10 +11,15 @@ function getClient() {
   return client ??= new stytch.Client({ project_id, secret, env: stytch.envs[environment] });
 }
 
-export async function sendEmailCode(email: string): Promise<string> {
+export async function sendEmailCode(
+  email: string,
+  templates: { loginTemplateId?: string; signupTemplateId?: string } = {},
+): Promise<string> {
   const response = await getClient().otps.email.loginOrCreate({
     email: email.trim().toLowerCase(),
     expiration_minutes: 10,
+    login_template_id: templates.loginTemplateId,
+    signup_template_id: templates.signupTemplateId,
   });
   return response.email_id;
 }

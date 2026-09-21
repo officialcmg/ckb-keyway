@@ -18,9 +18,21 @@ import {
 import { consumeConfirmation, issueConfirmation } from "./signing-confirmation.ts";
 import { database } from "./database.ts";
 import { confirmNodeBackupRestored, readClaimedNodeBackup, saveNodeBackup } from "./node-backup.ts";
+import {
+  addApplicationOrigin,
+  applicationAllowsOrigin,
+  createApplication,
+  listApplications,
+  prepareOtpSend,
+  recordOtpResult,
+  recordOtpVerification,
+  removeApplicationOrigin,
+  updateApplication,
+  verifyOtpApplication,
+} from "./applications.ts";
 
 export async function handleKeyWayRequest(request: Request): Promise<Response> {
-  const cors = corsHeaders(request);
+  const cors = await corsHeaders(request);
   if (cors instanceof Response) return cors;
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
   if (request.method === "GET" && new URL(request.url).pathname === "/healthz") {
@@ -47,14 +59,16 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
       : path === "/api/keyway/node-backup/load" ? await loadNodeBackupRequest(request)
       : path === "/api/keyway/node-backup/confirm" ? await confirmNodeBackupRequest(request)
       : path === "/api/keyway/sign-transaction" ? await signTransactionRequest(request)
+      : path === "/api/keyway/developer/apps" ? await developerAppsRequest(request)
       : jsonError("Not found", 404);
     for (const [name, value] of cors) response.headers.set(name, value);
     return response;
   } catch (error) {
     const message = error instanceof Error ? error.message : "KeyWay request failed";
     const unauthorized = /session|bearer/i.test(message);
+    const rateLimited = /too many/i.test(message);
     console.error("[keyway]", message);
-    return jsonError(message, unauthorized ? 401 : 400, cors);
+    return jsonError(message, unauthorized ? 401 : rateLimited ? 429 : 400, cors);
   }
 }
 
@@ -63,14 +77,34 @@ async function sendCodeRequest(request: Request): Promise<Response> {
   if (typeof email !== "string" || !/^\S+@\S+\.\S+$/.test(email) || email.length > 254) {
     throw new Error("A valid email address is required");
   }
-  return Response.json({ methodId: await sendEmailCode(email) });
+  const context = await prepareOtpSend({
+    appId: applicationId(request),
+    email,
+    ipAddress: requestIp(request),
+  });
+  try {
+    const methodId = await sendEmailCode(email, context);
+    await recordOtpResult(context, "sent", methodId);
+    return Response.json({ methodId });
+  } catch (error) {
+    await recordOtpResult(context, "send_failed");
+    throw error;
+  }
 }
 
 async function verifyCodeRequest(request: Request): Promise<Response> {
   const { methodId, code } = await objectBody(request, "Invalid email OTP verification");
   if (typeof methodId !== "string" || !methodId) throw new Error("OTP method is required");
   if (typeof code !== "string" || !/^\d{6}$/.test(code)) throw new Error("Enter the six-digit code");
-  return Response.json(await verifyEmailCode(methodId, code));
+  const context = await verifyOtpApplication(methodId, applicationId(request));
+  try {
+    const result = await verifyEmailCode(methodId, code);
+    await recordOtpVerification(context, "verified");
+    return Response.json(result);
+  } catch (error) {
+    await recordOtpVerification(context, "verify_failed");
+    throw error;
+  }
 }
 
 async function sessionRequest(request: Request): Promise<Response> {
@@ -207,6 +241,47 @@ async function signTransactionRequest(request: Request): Promise<Response> {
   return Response.json({ transaction: serializeTransaction(signed) });
 }
 
+async function developerAppsRequest(request: Request): Promise<Response> {
+  const user = await authenticateUser(request.headers.get("authorization"));
+  const body = await objectBody(request, "Invalid developer application request");
+  const operation = body.operation;
+  if (operation === "list") return Response.json({ applications: await listApplications(user) });
+  if (operation === "create") {
+    if (typeof body.name !== "string") throw new Error("Application name is required");
+    return Response.json(await createApplication(user, {
+      name: body.name,
+      otpLimitPerMinute: optionalNumber(body.otpLimitPerMinute),
+    }));
+  }
+  if (typeof body.appId !== "string") throw new Error("Application ID is required");
+  if (operation === "update") {
+    return Response.json(await updateApplication(user, {
+      appId: body.appId,
+      name: optionalString(body.name),
+      disabled: optionalBoolean(body.disabled),
+      otpLoginTemplateId: optionalNullableString(body.otpLoginTemplateId),
+      otpSignupTemplateId: optionalNullableString(body.otpSignupTemplateId),
+      otpLimitPerMinute: optionalNumber(body.otpLimitPerMinute),
+    }));
+  }
+  if (operation === "add-origin") {
+    if (typeof body.origin !== "string") throw new Error("Application origin is required");
+    if (body.environment !== "development" && body.environment !== "production") {
+      throw new Error("Origin environment must be development or production");
+    }
+    return Response.json(await addApplicationOrigin(user, {
+      appId: body.appId,
+      origin: body.origin,
+      environment: body.environment,
+    }));
+  }
+  if (operation === "remove-origin") {
+    if (typeof body.origin !== "string") throw new Error("Application origin is required");
+    return Response.json(await removeApplicationOrigin(user, { appId: body.appId, origin: body.origin }));
+  }
+  throw new Error("Unsupported developer application operation");
+}
+
 async function objectBody(request: Request, message: string): Promise<Record<string, unknown>> {
   const body: unknown = await request.json();
   if (!body || typeof body !== "object") throw new Error(message);
@@ -236,19 +311,56 @@ function parseNodeBackup(value: unknown) {
   };
 }
 
-function corsHeaders(request: Request): Headers | Response {
+async function corsHeaders(request: Request): Promise<Headers | Response> {
   const origin = request.headers.get("origin");
   const allowed = (process.env.KEYWAY_ALLOWED_ORIGINS ?? "").split(",").map((value) => value.trim()).filter(Boolean);
-  if (origin && origin !== new URL(request.url).origin && !allowed.includes(origin)) {
-    return jsonError("Origin is not allowed", 403);
+  if (origin && request.method !== "OPTIONS" && origin !== new URL(request.url).origin) {
+    const appId = applicationId(request);
+    const permitted = appId ? await applicationAllowsOrigin(appId, origin) : allowed.includes(origin);
+    if (!permitted) return jsonError("Origin is not allowed", 403);
   }
   const headers = new Headers({
-    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, X-KeyWay-App-Id",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Vary": "Origin",
   });
   if (origin) headers.set("Access-Control-Allow-Origin", origin);
   return headers;
+}
+
+function applicationId(request: Request): string | undefined {
+  const value = request.headers.get("x-keyway-app-id")?.trim();
+  return value || undefined;
+}
+
+function requestIp(request: Request): string {
+  return request.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
+    || request.headers.get("x-real-ip")?.trim()
+    || "unknown";
+}
+
+function optionalString(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") throw new Error("Expected a string value");
+  return value;
+}
+
+function optionalNullableString(value: unknown): string | null | undefined {
+  if (value === undefined || value === null) return value;
+  if (typeof value !== "string") throw new Error("Expected a string value");
+  return value;
+}
+
+function optionalBoolean(value: unknown): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") throw new Error("Expected a boolean value");
+  return value;
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number") throw new Error("Expected a number value");
+  return value;
 }
 
 function jsonError(message: string, status: number, headers?: Headers): Response {

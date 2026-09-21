@@ -20,7 +20,7 @@ import {
 } from "@ckb-keyway/react";
 
 export function Providers({ children }: { children: React.ReactNode }) {
-  return <KeyWayProvider appName="Your app">{children}</KeyWayProvider>;
+  return <KeyWayProvider appId="keyway_..." appName="Your app">{children}</KeyWayProvider>;
 }
 
 export function WalletStatus() {
@@ -54,7 +54,7 @@ export function WalletStatus() {
 </CardGroup>
 
 <Info>
-  Version `0.0.1` is a testnet preview. Consumer origins must currently be allowed by the managed KeyWay API before browser requests will succeed.
+  This is a testnet preview. Create a public app ID and register browser origins in the [developer console](https://ckb-keyway.vercel.app/dashboard) before integrating.
 </Info>
 
 ## What the SDK handles

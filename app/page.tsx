@@ -11,7 +11,7 @@ export default function Home() {
     <main className="landing-page">
       <nav className="landing-nav">
         <Brand />
-        <div><a href="#sdk">SDK</a><a href="#security">Security</a><a href="https://ckb-keyway-docs.vercel.app">Docs</a><a href="https://www.npmjs.com/package/@ckb-keyway/react">npm</a><Link className="nav-cta" href="/app">Launch demo</Link></div>
+        <div><a href="#sdk">SDK</a><a href="#security">Security</a><Link href="/dashboard">Dashboard</Link><a href="https://ckb-keyway-docs.vercel.app">Docs</a><a href="https://www.npmjs.com/package/@ckb-keyway/react">npm</a><Link className="nav-cta" href="/app">Launch demo</Link></div>
       </nav>
 
       <section className="landing-hero">

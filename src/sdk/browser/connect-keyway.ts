@@ -16,9 +16,10 @@ export type ConnectedKeyWay = {
 export async function connectKeyWay(options: {
   authToken: string;
   confirmFunding: ConfirmFunding;
+  apiClient?: KeyWayApiClient;
   onLeaseLost?: (error: Error) => void;
 }): Promise<ConnectedKeyWay> {
-  const apiClient = new KeyWayApiClient();
+  const apiClient = options.apiClient ?? new KeyWayApiClient();
   const { wallet, restoreRequired } = await bootstrapKeyWay(options.authToken, apiClient);
   const keyway = createKeyWay({
     identifier: wallet.litPkpId,

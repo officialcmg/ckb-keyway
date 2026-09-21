@@ -52,10 +52,10 @@ const { ready, authenticated, user, status } = useKeyWay();
 
 ## Device behavior
 
-Channel state belongs to the browser profile that opened the channel. KeyWay permits one active Fiber device lease per account and fails closed if another device takes the lease.
+KeyWay permits one active Fiber device lease per account and fails closed if another device holds it. On explicit logout, KeyWay encrypts the wallet's Fiber IndexedDB state in the browser and uploads only ciphertext. The next device restores that state before starting Fiber.
 
 <Warning>
-  Clearing site data removes the browser-local Fiber database. Version `0.0.1` does not include encrypted channel database backup or device migration.
+  Close tabs and browser crashes cannot guarantee a final backup. Use `logout()` before changing devices, and do not clear site data while signed in.
 </Warning>
 
 ## Branding
@@ -63,9 +63,9 @@ Channel state belongs to the browser profile that opened the channel. KeyWay per
 `appName` changes the name shown in KeyWay's modal. `theme` selects the built-in light or dark appearance.
 
 ```tsx
-<KeyWayProvider appName="Acme Pay" theme="dark">
+<KeyWayProvider appId="keyway_..." appName="Acme Pay" theme="dark">
   <App />
 </KeyWayProvider>
 ```
 
-The OTP email sender and template are managed by KeyWay in this preview; `appName` does not currently change the email itself.
+`appName` does not alter the email itself. A developer can select existing Stytch login and signup template IDs for the registered application in the KeyWay developer console.

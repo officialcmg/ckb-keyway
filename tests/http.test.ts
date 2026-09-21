@@ -20,6 +20,21 @@ test("rejects unconfigured browser origins", async () => {
   assert.equal(response.status, 403);
 });
 
+test("allows CORS preflight before validating the app ID on the real request", async () => {
+  process.env.KEYWAY_ALLOWED_ORIGINS = "https://wallet.example";
+  const response = await handleKeyWayRequest(new Request("https://api.example/api/keyway/auth/send-code", {
+    method: "OPTIONS",
+    headers: {
+      Origin: "https://new-app.example",
+      "Access-Control-Request-Headers": "content-type,x-keyway-app-id",
+      "Access-Control-Request-Method": "POST",
+    },
+  }));
+  assert.equal(response.status, 204);
+  assert.equal(response.headers.get("access-control-allow-origin"), "https://new-app.example");
+  assert.match(response.headers.get("access-control-allow-headers") ?? "", /X-KeyWay-App-Id/);
+});
+
 test("rejects malformed OTP requests before calling the provider", async () => {
   process.env.KEYWAY_ALLOWED_ORIGINS = "https://wallet.example";
   const response = await handleKeyWayRequest(new Request("https://api.example/api/keyway/auth/send-code", {

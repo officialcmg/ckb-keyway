@@ -10,6 +10,7 @@ Wrap the part of the React tree that uses KeyWay.
 
 ```tsx
 <KeyWayProvider
+  appId="keyway_..."
   appName="Your app"
   theme="light"
   autoConnect
@@ -18,6 +19,10 @@ Wrap the part of the React tree that uses KeyWay.
   <App />
 </KeyWayProvider>
 ```
+
+<ParamField path="appId" type="string">
+  Public application ID from the KeyWay developer console. SDK requests are accepted only from origins registered to this application.
+</ParamField>
 
 <ParamField path="appName" type="string" default="CKB KeyWay">
   Name displayed in the embedded login UI. Limited to 64 characters.

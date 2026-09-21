@@ -6,7 +6,7 @@ icon: "wrench"
 
 ## Browser requests fail with CORS
 
-Version `0.0.1` uses the managed KeyWay API and an origin allowlist. Register the exact origin, including scheme and port for development. This is KeyWay API configuration, not a Stytch dashboard requirement for SDK consumers.
+Open the [KeyWay developer console](https://ckb-keyway.vercel.app/dashboard) and register the exact origin, including scheme and port. Confirm that the provider uses that application's public `appId`. This is KeyWay API configuration, not a Stytch dashboard requirement.
 
 ## `SharedArrayBuffer` or WASM startup fails
 
@@ -25,7 +25,7 @@ The account's Fiber lease expired or another device took it. Call `connect()` ag
 
 ## `Fiber wallet is bound to another device`
 
-The account already opened channels using another browser device identity. Return to the original browser profile. Cross-device channel database migration is not available in `0.0.1`.
+Another browser still holds the Fiber lease, or the previous browser did not complete an explicit logout and encrypted backup. Log out on the active device before moving the account.
 
 ## A payment has no route
 
@@ -52,4 +52,4 @@ await connection.keyway.activateCkbChannel(amount, (stage) => {
 
 ## Supported scope
 
-The current package supports CKB testnet, CKB-funded Fiber channels, invoices, and routed payments. Mainnet, UDT payments, channel database backup, and self-hosted KeyWay infrastructure are not supported in `0.0.1`.
+The current package supports CKB testnet, CKB-funded Fiber channels, invoices, routed payments, and encrypted state handoff after explicit logout. Mainnet, UDT payments, unexpected-close backup, and self-hosted KeyWay infrastructure are not supported.

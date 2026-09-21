@@ -41,7 +41,7 @@ Every hop must have enough outbound liquidity. A route may exist for `1 CKB` and
 
 ## Browser ownership
 
-Version `0.0.1` uses a browser-local Fiber node. One user therefore has both an account identity and a node identity. Closing the tab stops the running node, while its channel database remains in that browser for the next session.
+KeyWay uses a browser-local Fiber node. One user therefore has both an account identity and a node identity. Closing the tab stops the running node. Explicit logout encrypts and uploads its channel database so the next device can restore it before Fiber starts.
 
 <Warning>
   Do not treat IndexedDB as disposable cache. It contains the off-chain channel state needed to resume the node safely.

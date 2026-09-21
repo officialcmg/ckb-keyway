@@ -169,6 +169,48 @@ button:disabled { opacity: 0.42; cursor: not-allowed; }
 .confirm-actions .quiet { background: #e8e5dc; color: var(--navy); }
 .site-footer { padding-inline: 0.25rem; }
 
+/* Developer console */
+.dashboard-frame { width: min(calc(100% - 2rem), 76rem); min-height: calc(100vh - 2rem); margin: 1rem auto; padding: 1.2rem; border-radius: 2rem 2rem 0.65rem 0.65rem; background: var(--cream); box-shadow: var(--shadow); }
+.dashboard-content { display: grid; gap: 1rem; padding-top: 1rem; border-top: 1px solid var(--line); }
+.dashboard-loading { min-height: 60vh; display: grid; place-items: center; color: var(--navy-soft); }
+.dashboard-hero { display: flex; align-items: end; justify-content: space-between; gap: 2rem; padding: clamp(2rem, 5vw, 4rem) 0.25rem 1.5rem; }
+.dashboard-hero h1, .developer-login h1 { margin: 0.45rem 0 0.8rem; font-size: clamp(2.8rem, 6vw, 5.4rem); line-height: 0.9; letter-spacing: -0.07em; }
+.dashboard-hero p:last-child, .developer-login > div > p:last-child { max-width: 38rem; margin: 0; color: var(--navy-soft); font-size: 1rem; line-height: 1.55; }
+.quiet-button { background: #e8e5dc; color: var(--navy); }
+.danger-button { background: var(--danger); }
+.developer-login { display: grid; grid-template-columns: minmax(0, 1fr) minmax(20rem, 0.7fr); gap: clamp(2rem, 7vw, 6rem); align-items: center; min-height: 38rem; padding: clamp(2rem, 7vw, 5rem); border-top: 1px solid var(--line); background: radial-gradient(circle at 78% 45%, rgba(247,255,137,0.65), transparent 18rem); }
+.developer-login form, .create-application, .application-card, .empty-apps { border-radius: 1.4rem; background: var(--white); }
+.developer-login form { display: grid; gap: 1rem; padding: clamp(1.4rem, 4vw, 2.2rem); box-shadow: 0 18px 60px rgba(17,27,53,0.1); }
+.developer-login h2, .create-application h2, .application-card h2 { margin: 0.35rem 0 0; font-size: clamp(1.5rem, 3vw, 2.2rem); line-height: 1; letter-spacing: -0.045em; }
+.developer-login label, .create-application label, .application-settings label { display: grid; gap: 0.35rem; color: var(--navy-soft); font: 800 0.64rem "SFMono-Regular", Consolas, monospace; text-transform: uppercase; }
+.developer-login input, .create-application input, .application-settings input, .origin-settings input, .origin-settings select { width: 100%; border: 2px solid var(--navy); border-radius: 0.72rem; background: transparent; color: var(--navy); padding: 0.75rem; text-transform: none; }
+.create-application { display: grid; grid-template-columns: minmax(13rem, 0.7fr) minmax(16rem, 1fr) auto; gap: 1rem; align-items: end; padding: 1.35rem; }
+.create-application .error { grid-column: 1 / -1; }
+.application-list { display: grid; gap: 1rem; }
+.application-card { display: grid; gap: 1.25rem; padding: clamp(1.2rem, 3vw, 1.7rem); }
+.application-card.disabled { opacity: 0.72; }
+.application-card > header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.app-id-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 0.9rem 1rem; overflow: hidden; border-radius: 0.9rem; background: var(--navy); color: white; }
+.app-id-row code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.app-id-row .quiet-button { flex: 0 0 auto; padding-block: 0.55rem; }
+.usage-grid { display: grid; grid-template-columns: repeat(3, 1fr); overflow: hidden; border-radius: 1rem; background: var(--blue); color: white; }
+.usage-grid > div { display: grid; gap: 0.15rem; padding: 1rem; }
+.usage-grid > div + div { border-left: 1px solid rgba(255,255,255,0.25); }
+.usage-grid strong { font-size: 1.7rem; }
+.usage-grid span { color: #dfe4ff; font-size: 0.7rem; }
+.application-settings { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.9rem; align-items: end; }
+.application-settings button { width: max-content; }
+.origin-settings { display: grid; gap: 0.8rem; padding-top: 1rem; border-top: 1px solid var(--line); }
+.origin-settings > div:first-child > p:last-child { margin: 0.4rem 0 0; color: var(--navy-soft); font-size: 0.8rem; }
+.origin-list { display: grid; gap: 0.45rem; }
+.origin-list > div { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 0.8rem; align-items: center; padding: 0.7rem 0.8rem; border-radius: 0.75rem; background: var(--cream); }
+.origin-list code { overflow: hidden; text-overflow: ellipsis; }
+.origin-list span { color: var(--navy-soft); font: 700 0.6rem "SFMono-Regular", Consolas, monospace; text-transform: uppercase; }
+.origin-settings > form { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 0.6rem; }
+.empty-origin { margin: 0; color: var(--navy-soft); font-size: 0.8rem; }
+.empty-apps { display: grid; gap: 0.25rem; padding: 2rem; text-align: center; }
+.empty-apps span { color: var(--navy-soft); }
+
 @keyframes pulse { to { opacity: 0.35; transform: scale(0.8); } }
 
 @media (max-width: 800px) {
@@ -183,10 +225,13 @@ button:disabled { opacity: 0.42; cursor: not-allowed; }
   .channel-row { grid-template-columns: minmax(0, 1fr) auto; padding: 0.85rem 0; }
   .channel-liquidity { grid-column: 1 / -1; padding-left: 2.8rem; }
   .payment-grid { grid-template-columns: 1fr; }
+  .developer-login { grid-template-columns: 1fr; }
+  .create-application { grid-template-columns: 1fr; align-items: stretch; }
+  .application-settings { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 560px) {
-  .landing-page, .app-frame { width: 100%; min-height: 100vh; margin: 0; border-radius: 0; }
+  .landing-page, .app-frame, .dashboard-frame { width: 100%; min-height: 100vh; margin: 0; border-radius: 0; }
   .landing-nav > div > a:not(.nav-cta) { display: none; }
   .landing-hero, .sdk-section, .trust-section, .landing-cta { padding-inline: 1.15rem; }
   .hero-copy h1 { font-size: clamp(3.5rem, 19vw, 5rem); }
@@ -204,6 +249,15 @@ button:disabled { opacity: 0.42; cursor: not-allowed; }
   .channel-section { padding: 1rem 0.8rem; }
   .channel-sides strong { font-size: 0.74rem; }
   .diagnostics dl { grid-template-columns: 1fr; }
+  .dashboard-frame { padding: 0.8rem; }
+  .dashboard-hero { align-items: flex-start; flex-direction: column; }
+  .developer-login { min-height: auto; padding: 3rem 0.4rem; background: none; }
+  .usage-grid { grid-template-columns: 1fr; }
+  .usage-grid > div + div { border-top: 1px solid rgba(255,255,255,0.25); border-left: 0; }
+  .app-id-row { align-items: stretch; flex-direction: column; }
+  .app-id-row .quiet-button { width: max-content; }
+  .origin-list > div, .origin-settings > form { grid-template-columns: 1fr; }
+  .origin-list .text-button { width: max-content; padding-left: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {

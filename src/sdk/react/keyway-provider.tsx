@@ -18,6 +18,7 @@ export type KeyWayStatus = "idle" | "authenticating" | "connecting" | "connected
 
 export type KeyWayProviderProps = {
   children: ReactNode;
+  appId?: string;
   appName?: string;
   theme?: "light" | "dark";
   confirmFunding?: ConfirmFunding;
@@ -44,6 +45,7 @@ const KeyWayContext = createContext<KeyWayContextValue | undefined>(undefined);
 
 export function KeyWayProvider({
   children,
+  appId,
   appName = "CKB KeyWay",
   theme = "light",
   confirmFunding,
@@ -51,6 +53,7 @@ export function KeyWayProvider({
   onError,
 }: KeyWayProviderProps) {
   const resolvedAppName = appName.trim().slice(0, 64) || "CKB KeyWay";
+  const api = new KeyWayApiClient({ appId });
   const connectionRef = useRef<ConnectedKeyWay | undefined>(undefined);
   const operationRef = useRef<Promise<void>>(Promise.resolve());
   const runRef = useRef(0);
@@ -86,6 +89,7 @@ export function KeyWayProvider({
       try {
         const next = await connectKeyWay({
           authToken,
+          apiClient: api,
           confirmFunding: (preview) => callbacksRef.current.confirmFunding?.(preview) ??
             new Promise<boolean>((resolve) => setFundingRequest({ preview, resolve })),
           onLeaseLost: (leaseError) => {
@@ -150,7 +154,7 @@ export function KeyWayProvider({
     setError(undefined);
     try {
       if (current) await current.keyway.stopForLogout();
-      if (token) await new KeyWayApiClient().logout(token);
+      if (token) await api.logout(token);
       ++runRef.current;
       connectionRef.current = undefined;
       setConnection(undefined);
@@ -171,12 +175,12 @@ export function KeyWayProvider({
   useEffect(() => {
     let active = true;
     setReady(false);
-    const stored = readStoredSession();
+    const stored = readStoredSession(appId);
     if (!stored) {
       setReady(true);
       return;
     }
-    void new KeyWayApiClient().session(stored.authToken).then(({ user: currentUser }) => {
+    void api.session(stored.authToken).then(({ user: currentUser }) => {
       if (!active) return;
       setAuthToken(stored.authToken);
       setUser(currentUser);
@@ -186,7 +190,7 @@ export function KeyWayProvider({
       if (active) setReady(true);
     });
     return () => { active = false; };
-  }, []);
+  }, [appId]);
 
   useEffect(() => {
     if (!authenticated) {
@@ -222,6 +226,7 @@ export function KeyWayProvider({
       {children}
       {loginOpen && !authenticated ? (
         <KeyWayLoginModal
+          api={api}
           appName={resolvedAppName}
           theme={theme}
           close={() => {
@@ -229,7 +234,7 @@ export function KeyWayProvider({
             setStatus("idle");
           }}
           authenticated={(session) => {
-            storeSession(session);
+            storeSession({ ...session, appId });
             setAuthToken(session.authToken);
             setUser(session.user);
             setLoginOpen(false);
@@ -323,11 +328,13 @@ export function KeyWayConnectButton({
 }
 
 function KeyWayLoginModal({
+  api,
   appName,
   theme,
   close,
   authenticated,
 }: {
+  api: KeyWayApiClient;
   appName: string;
   theme: "light" | "dark";
   close: () => void;
@@ -347,7 +354,6 @@ function KeyWayLoginModal({
     setPending(true);
     setError(undefined);
     setVerificationState("idle");
-    const api = new KeyWayApiClient();
     try {
       if (!methodId) {
         setMethodId((await api.sendCode(email)).methodId);
@@ -371,7 +377,7 @@ function KeyWayLoginModal({
     setCode("");
     setVerificationState("idle");
     try {
-      setMethodId((await new KeyWayApiClient().sendCode(email)).methodId);
+      setMethodId((await api.sendCode(email)).methodId);
       codeInputRef.current?.focus();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not resend the code");
@@ -563,17 +569,18 @@ function KeyWayFundingModal({
   );
 }
 
-type StoredSession = { authToken: string; user: KeyWayUser };
+type StoredSession = { authToken: string; user: KeyWayUser; appId?: string };
 
 const SESSION_STORAGE_KEY = "ckb-keyway.session";
 
-function readStoredSession(): StoredSession | undefined {
+function readStoredSession(expectedAppId?: string): StoredSession | undefined {
   try {
     const value: unknown = JSON.parse(localStorage.getItem(SESSION_STORAGE_KEY) ?? "null");
     if (!value || typeof value !== "object") return;
-    const { authToken, user } = value as Partial<StoredSession>;
+    const { authToken, user, appId } = value as Partial<StoredSession>;
     if (typeof authToken !== "string" || !user || typeof user.id !== "string") return;
-    return { authToken, user };
+    if (appId !== expectedAppId) return;
+    return { authToken, user, appId };
   } catch {
     return;
   }

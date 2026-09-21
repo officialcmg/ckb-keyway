@@ -33,6 +33,25 @@ test("keeps OTP public and protects session requests with the KeyWay token", asy
   assert.equal(new Headers(requests[1].headers).get("authorization"), "Bearer keyway-session");
 });
 
+test("identifies registered applications on every request", async () => {
+  const headers: Headers[] = [];
+  const api = new KeyWayApiClient({
+    appId: "keyway_test",
+    fetch: async (_input, init) => {
+      headers.push(new Headers(init?.headers));
+      return Response.json(headers.length === 1
+        ? { methodId: "email-test" }
+        : { user: { id: "user-test" } });
+    },
+  });
+
+  await api.sendCode("user@example.com");
+  await api.session("keyway-session");
+
+  assert.equal(headers[0].get("x-keyway-app-id"), "keyway_test");
+  assert.equal(headers[1].get("x-keyway-app-id"), "keyway_test");
+});
+
 test("uploads and confirms encrypted node backups through authenticated endpoints", async () => {
   const requests: Array<{ url: string; init?: RequestInit }> = [];
   const api = new KeyWayApiClient({

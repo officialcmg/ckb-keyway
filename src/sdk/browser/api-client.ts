@@ -1,5 +1,6 @@
 export type KeyWayApiClientOptions = {
   fetch?: typeof globalThis.fetch;
+  appId?: string;
 };
 
 export type NodeBackupPayload = {
@@ -17,9 +18,11 @@ const KEYWAY_API_BASE_URL = "https://keyway-api-production.up.railway.app";
 
 export class KeyWayApiClient {
   private readonly fetcher: typeof globalThis.fetch;
+  private readonly appId?: string;
 
   constructor(options: KeyWayApiClientOptions = {}) {
     this.fetcher = options.fetch ?? globalThis.fetch.bind(globalThis);
+    this.appId = options.appId;
   }
 
   async sendCode(email: string): Promise<{ methodId: string }> {
@@ -94,7 +97,7 @@ export class KeyWayApiClient {
   private async publicJson<T>(path: string, body: unknown): Promise<T> {
     const response = await this.fetcher(`${KEYWAY_API_BASE_URL}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: this.headers(),
       body: JSON.stringify(body),
     });
     const result = await response.json();
@@ -112,9 +115,17 @@ export class KeyWayApiClient {
   private request(path: string, authToken: string, body: unknown): Promise<Response> {
     return this.fetcher(`${KEYWAY_API_BASE_URL}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
+      headers: this.headers(authToken),
       body: JSON.stringify(body),
     });
+  }
+
+  private headers(authToken?: string): Record<string, string> {
+    return {
+      "Content-Type": "application/json",
+      ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      ...(this.appId ? { "X-KeyWay-App-Id": this.appId } : {}),
+    };
   }
 }
 

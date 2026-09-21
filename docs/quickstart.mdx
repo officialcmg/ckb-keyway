@@ -20,7 +20,11 @@ yarn add @ckb-keyway/react
 ```
 </CodeGroup>
 
-## 2. Enable cross-origin isolation
+## 2. Register your application
+
+Open the [KeyWay developer console](https://ckb-keyway.vercel.app/dashboard), create an application, and add every exact browser origin that will use it. Add local development origins separately from production origins, then copy the public app ID.
+
+## 3. Enable cross-origin isolation
 
 Fiber runs a multithreaded WASM node in the browser. A Next.js application must send these headers:
 
@@ -46,7 +50,7 @@ export default nextConfig;
 
 After deployment, `window.crossOriginIsolated` must be `true`.
 
-## 3. Add the provider
+## 4. Add the provider
 
 Render `KeyWayProvider` in a client component above every component that uses KeyWay.
 
@@ -57,7 +61,7 @@ import { KeyWayProvider } from "@ckb-keyway/react";
 
 export function Providers({ children }: { children: React.ReactNode }) {
   return (
-    <KeyWayProvider appName="Acme Pay" theme="light">
+    <KeyWayProvider appId="keyway_..." appName="Acme Pay" theme="light">
       {children}
     </KeyWayProvider>
   );
@@ -76,7 +80,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 }
 ```
 
-## 4. Add login and wallet state
+## 5. Add login and wallet state
 
 ```tsx app/wallet.tsx
 "use client";
@@ -101,11 +105,11 @@ export function Wallet() {
 
 `autoConnect` defaults to `true`. After OTP verification, the provider recovers the wallet, starts the Fiber node, connects testnet relays, and then sets `connection`.
 
-<Warning>
-  The managed API currently uses an origin allowlist. A new application will receive a CORS error until its exact production and development origins are registered with KeyWay.
-</Warning>
+<Info>
+  The app ID is public. It identifies the integration and lets KeyWay enforce its registered origins; it is not a secret credential.
+</Info>
 
-## 5. Open the application
+## 6. Open the application
 
 Select **Log in**, enter an email address, and submit the six-digit code. The same email recovers the same CKB account.
 

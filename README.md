@@ -44,13 +44,13 @@ npm run api
 npm run dev
 ```
 
-Configure Stytch email OTP for backend API access. The browser never receives a Stytch token, so no consuming domain is registered in Stytch. Add the frontend origin to `KEYWAY_ALLOWED_ORIGINS`, register the three Actions in `lit-actions/` with Chipotle, and place only server credentials in `.env.local`. Never expose `STYTCH_SECRET`, `LIT_USAGE_API_KEY`, or `LIT_PROVISIONING_API_KEY` to browser code.
+Configure Stytch email OTP for backend API access. The browser never receives a Stytch token, so no consuming domain is registered in Stytch. `KEYWAY_ALLOWED_ORIGINS` permits KeyWay's own frontend; SDK consumers register their origins in the developer console. Set a private `KEYWAY_RATE_LIMIT_SECRET` of at least 32 characters, register the three Actions in `lit-actions/` with Chipotle, and place only server credentials in `.env.local`. Never expose `STYTCH_SECRET`, `LIT_USAGE_API_KEY`, or `LIT_PROVISIONING_API_KEY` to browser code.
 
 ## React SDK
 
 The public package owns email OTP, the login modal, wallet provisioning, and Fiber startup behind one provider. It also retains `connectKeyWay` for lower-level integrations.
 
-> **Testnet prerelease limitation:** installing the package is not enough for an arbitrary application to use the managed KeyWay API yet. The application's exact browser origin must first be added manually to the backend `KEYWAY_ALLOWED_ORIGINS` list; otherwise OTP and wallet requests fail CORS checks. Self-service application registration and origin management are not implemented in `0.0.1`.
+Create an application at [ckb-keyway.vercel.app/dashboard](https://ckb-keyway.vercel.app/dashboard), register its exact development and production origins, and copy its public app ID.
 
 ```sh
 npm install @ckb-keyway/react
@@ -61,7 +61,7 @@ import { KeyWayLoginButton, KeyWayProvider, useKeyWay } from "@ckb-keyway/react"
 
 function Wallet() {
   return (
-    <KeyWayProvider appName="My Fiber App" theme="light">
+    <KeyWayProvider appId="keyway_..." appName="My Fiber App" theme="light">
       <KeyWayLoginButton />
       <Balance />
     </KeyWayProvider>
@@ -87,9 +87,9 @@ function Balance() {
 | `KeyWayConnectButton` | Manually starts or stops Fiber when `autoConnect` is disabled |
 | `useKeyWay()` | Returns auth status, user, wallet connection, errors, and lifecycle methods |
 
-The SDK uses CKB KeyWay's managed backend automatically. `appName` brands the SDK modal, `theme` accepts `"light"` or `"dark"`, `autoConnect` defaults to `true`, and `confirmFunding` can replace the built-in funding modal. `useKeyWay()` returns `ready`, `authenticated`, `user`, `connection`, `status`, `error`, `login`, `logout`, `connect`, and `disconnect`. Fiber operations are available on `connection.keyway`, including channel, invoice, peer, and payment methods. Backend URLs, Stytch credentials, and Stytch configuration are intentionally absent from the public API.
+The SDK uses CKB KeyWay's managed backend automatically. `appId` identifies the registered application and enforces its origin list. `appName` brands the SDK modal, `theme` accepts `"light"` or `"dark"`, `autoConnect` defaults to `true`, and `confirmFunding` can replace the built-in funding modal. `useKeyWay()` returns `ready`, `authenticated`, `user`, `connection`, `status`, `error`, `login`, `logout`, `connect`, and `disconnect`. Fiber operations are available on `connection.keyway`, including channel, invoice, peer, and payment methods. Backend URLs and server credentials are intentionally absent from the public API.
 
-`appName` does not alter the sender or contents of the OTP email. Stytch email templates are configured server-side. Per-application email branding requires a registered KeyWay application whose verified identity maps to an approved template; this would be a future feature.
+`appName` changes the embedded modal. Optional Stytch login and signup template IDs can be saved for each registered application in the developer console; the templates must already exist in KeyWay's Stytch project.
 
 With the default `autoConnect`, successful OTP immediately recovers the wallet, restores any claimed cross-device backup, starts its browser Fiber node, connects testnet relays, and fetches an initial CKB balance. Use `autoConnect={false}` with `connect()` and `disconnect()` when an application wants explicit node lifecycle control.
 
@@ -136,7 +136,7 @@ Closing consumes the channel's on-chain funding cell and settles the final chann
 
 The consuming React application does not need Next.js or backend configuration. The lower-level API is for advanced integrations that already obtained a KeyWay session; normal applications use `KeyWayProvider` and never handle the token.
 
-The current testnet prerelease has no application IDs or developer dashboard. A consuming origin must therefore be added manually to the managed backend's `KEYWAY_ALLOWED_ORIGINS`; no Stytch dashboard access or Stytch domain registration is required. Application IDs and self-service origin registration are post-hackathon onboarding work.
+The developer console also supports disabling an application, removing origins, setting an OTP request limit, and viewing sanitized 24-hour OTP totals. No Stytch dashboard access or Stytch domain registration is required for SDK consumers.
 
 Build the distributable React SDK with:
 
@@ -144,7 +144,7 @@ Build the distributable React SDK with:
 npm run build:package
 ```
 
-The private standalone backend runs with `npm run api` and requires `DATABASE_URL`, `KEYWAY_ALLOWED_ORIGINS`, Stytch server credentials, and the Lit server credentials from `.env.example`. It is deployed by CKB KeyWay and is not exported by the public SDK. The Next.js reference app has no API routes: it imports the published `@ckb-keyway/react@0.0.1` package, and both it and external consumers use the same SDK-managed Railway endpoint.
+The private standalone backend runs with `npm run api` and requires `DATABASE_URL`, `KEYWAY_ALLOWED_ORIGINS`, `KEYWAY_RATE_LIMIT_SECRET`, Stytch server credentials, and the Lit server credentials from `.env.example`. It is deployed by CKB KeyWay and is not exported by the public SDK. The Next.js reference app has no API routes: it imports the published `@ckb-keyway/react` package, and both it and external consumers use the same SDK-managed Railway endpoint.
 
 See [`examples/browser-wallet.ts`](examples/browser-wallet.ts) for a complete minimal lifecycle. The repository package is private. `npm run pack:sdk` stages and packs only `package.sdk.json`, the React/browser build, README, and license. Server-only `postgres` and `stytch` dependencies, Railway code, and Lit Actions are excluded. Publish only with `npm run publish:sdk`.
 
