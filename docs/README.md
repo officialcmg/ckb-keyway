@@ -10,7 +10,7 @@ The source is written in MDX and configured with Mintlify. We use the Mintlify C
 
 ## Tooling
 
-- Mintlify `mint` CLI for local preview, validation, link checks, accessibility checks, and static export
+- Mintlify `mintlify` CLI for local preview, validation, link checks, accessibility checks, and static export
 - MDX for documentation pages
 - `docs.json` for navigation, theme, branding, and external links
 - Vercel CLI for the independent production deployment
@@ -22,7 +22,7 @@ The MDX files and `docs.json` are the source of truth. Exported ZIP files and un
 Install the CLIs once:
 
 ```sh
-npm install -g mint
+npm install -g mintlify
 npm install -g vercel
 ```
 
@@ -30,7 +30,7 @@ Run the docs locally:
 
 ```sh
 cd docs
-mint dev
+mintlify dev
 ```
 
 Mintlify serves the preview at `http://localhost:3000` by default.
@@ -40,7 +40,7 @@ Mintlify serves the preview at `http://localhost:3000` by default.
 1. We authored the public SDK pages and navigation in this directory.
 2. We authenticated the Mintlify CLI with `mint login`.
 3. We validated the build, links, and accessibility locally.
-4. We used `mint export` because the CLI does not directly publish a hosted Mintlify project.
+4. We used `mintlify export` because the CLI does not directly publish a hosted Mintlify project.
 5. We unpacked the static export into a temporary directory.
 6. We linked that directory to a separate Vercel project named `ckb-keyway-docs`.
 7. We deployed it to production and received the stable `ckb-keyway-docs.vercel.app` alias.
@@ -49,9 +49,9 @@ Mintlify serves the preview at `http://localhost:3000` by default.
 First-time Vercel setup:
 
 ```sh
-mint login
+mintlify login
 vercel login
-mint export --output /tmp/ckb-keyway-docs.zip
+mintlify export --output /tmp/ckb-keyway-docs.zip
 mkdir -p /tmp/ckb-keyway-docs-export
 unzip -oq /tmp/ckb-keyway-docs.zip -d /tmp/ckb-keyway-docs-export
 cd /tmp/ckb-keyway-docs-export
@@ -64,10 +64,10 @@ vercel deploy --prod --yes
 Run these commands from this `docs` directory:
 
 ```sh
-mint validate
-mint broken-links
-mint a11y
-mint export --output /tmp/ckb-keyway-docs.zip
+mintlify validate
+mintlify broken-links
+mintlify a11y
+mintlify export --output /tmp/ckb-keyway-docs.zip
 unzip -oq /tmp/ckb-keyway-docs.zip -d /tmp/ckb-keyway-docs-export
 cd /tmp/ckb-keyway-docs-export
 vercel deploy --prod --yes

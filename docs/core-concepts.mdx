@@ -14,7 +14,7 @@ These are separate pieces of state:
 | Fiber node | The networking process that creates invoices, finds routes, and updates channels. | Runs as WASM in the browser. |
 | Channel database | The latest off-chain state for the user's Fiber channels. | IndexedDB in the browser profile. |
 
-Logging in recovers the CKB identity. Starting Fiber also requires the device-bound Fiber identity and local channel database.
+Logging in recovers the CKB and Fiber identities. Starting Fiber also requires the latest channel database, which stays in local IndexedDB during use and can move to the next device through KeyWay's encrypted explicit-logout handoff.
 
 ## Relays are not channels
 
