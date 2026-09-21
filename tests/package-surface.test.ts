@@ -14,6 +14,8 @@ test("publishes only the React SDK entrypoint", async () => {
   assert.equal(packageJson.dependencies.stytch, undefined);
   assert.equal(packageJson.dependencies["@stytch/react"], undefined);
   assert.equal(JSON.stringify(packageJson).includes("dist/server"), false);
+  assert.match(repositoryPackage.scripts["build:sdk"], /--external react(?:\s|$)/);
+  assert.match(repositoryPackage.scripts["build:sdk"], /--external react\/jsx-runtime(?:\s|$)/);
 });
 
 test("exports React and headless KeyWay APIs from one public entrypoint", async () => {

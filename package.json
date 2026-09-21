@@ -1,6 +1,6 @@
 {
   "name": "ckb-keyway",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Email-authenticated CKB wallet and Fiber payment infrastructure",
   "private": true,
   "license": "MIT",
@@ -8,7 +8,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "build:sdk": "tsup src/sdk/react/index.ts --tsconfig tsconfig.sdk.json --format esm --dts --platform browser --out-dir dist/react --clean",
+    "build:sdk": "tsup src/sdk/react/index.ts --tsconfig tsconfig.sdk.json --format esm --dts --platform browser --external react --external react/jsx-runtime --out-dir dist/react --clean",
     "build:api": "tsup server/index.ts --tsconfig tsconfig.sdk.json --format esm --platform node --out-dir dist/api --clean",
     "api": "node dist/api/index.js",
     "dev:api": "node --import tsx server/index.ts",
@@ -22,7 +22,7 @@
   },
   "dependencies": {
     "@ckb-ccc/core": "^1.16.1",
-    "@ckb-keyway/react": "0.0.1",
+    "@ckb-keyway/react": "0.0.2",
     "@fiber-pay/sdk": "^0.2.7",
     "@nervosnetwork/fiber-js": "^0.9.0-rc7",
     "@noble/curves": "^2.0.1",
