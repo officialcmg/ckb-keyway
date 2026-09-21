@@ -136,7 +136,7 @@ Closing consumes the channel's on-chain funding cell and settles the final chann
 
 The consuming React application does not need Next.js or backend configuration. The lower-level API is for advanced integrations that already obtained a KeyWay session; normal applications use `KeyWayProvider` and never handle the token.
 
-The developer console also supports disabling an application, removing origins, setting an OTP request limit, and viewing sanitized 24-hour OTP totals. No Stytch dashboard access or Stytch domain registration is required for SDK consumers.
+The developer console also supports disabling an application, removing origins, setting an OTP request limit, viewing sanitized 24-hour OTP totals, and checking managed API health. No Stytch dashboard access or Stytch domain registration is required for SDK consumers.
 
 Build the distributable React SDK with:
 

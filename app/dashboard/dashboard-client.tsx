@@ -22,10 +22,14 @@ type DeveloperApplication = {
 export function DeveloperDashboard() {
   const [token, setToken] = useState<string>();
   const [ready, setReady] = useState(false);
+  const [apiHealth, setApiHealth] = useState<"checking" | "operational" | "degraded">("checking");
   const [applications, setApplications] = useState<DeveloperApplication[]>([]);
   const [error, setError] = useState<string>();
 
   useEffect(() => {
+    void fetch(`${API_URL}/readyz`)
+      .then((response) => setApiHealth(response.ok ? "operational" : "degraded"))
+      .catch(() => setApiHealth("degraded"));
     const stored = localStorage.getItem(SESSION_KEY) ?? undefined;
     if (!stored) return setReady(true);
     void session(stored).then(() => {
@@ -61,7 +65,10 @@ export function DeveloperDashboard() {
     <section className="dashboard-content">
       <div className="dashboard-hero">
         <div><p className="eyebrow">Developer console</p><h1>Build with KeyWay.</h1><p>Register your application, authorize its browser origins, and monitor email authentication.</p></div>
-        <button type="button" className="quiet-button" onClick={() => void logout()}>Log out</button>
+        <div className="dashboard-actions">
+          <span className={`health-pill ${apiHealth}`}><i /> Managed API {apiHealth}</span>
+          <button type="button" className="quiet-button" onClick={() => void logout()}>Log out</button>
+        </div>
       </div>
       <CreateApplication onCreated={(application) => setApplications((current) => [application, ...current])} token={token} />
       {error ? <p className="error">{error}</p> : null}
