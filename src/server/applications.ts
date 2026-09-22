@@ -217,7 +217,11 @@ export async function recordOtpResult(
     await sql`
       insert into keyway_otp_methods (method_id, app_id, email_hash, ip_hash)
       values (${methodId}, ${context.appId}, ${context.emailHash}, ${context.ipHash})
-      on conflict (method_id) do nothing
+      on conflict (method_id) do update set
+        app_id = excluded.app_id,
+        email_hash = excluded.email_hash,
+        ip_hash = excluded.ip_hash,
+        created_at = now()
     `;
   }
 }
