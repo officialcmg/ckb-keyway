@@ -1,3 +1,5 @@
+import { toKeyWayError } from "./keyway-error";
+
 export function friendlyKeyWayError(value: string): string {
   const normalized = value.toLowerCase();
   if (value.includes("CHANNEL_STATE_DEVICE_BOUND")) {
@@ -24,5 +26,6 @@ export function friendlyKeyWayError(value: string): string {
   if (normalized.includes("lit signature") || normalized.includes("chipotle")) {
     return "Lit could not authorize this operation. Retry once; if it continues, check the KeyWay server configuration.";
   }
-  return value;
+  const typed = toKeyWayError(value);
+  return typed.code === "UNKNOWN" ? value : typed.message;
 }

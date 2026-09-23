@@ -1,7 +1,7 @@
 import type { User } from "stytch";
 import { database, type DatabaseSql } from "./database.ts";
 
-const LEASE_TTL_MS = 45_000;
+const LEASE_TTL_MS = 120_000;
 
 export type StoredDeviceLease = {
   stytchUserId: string;

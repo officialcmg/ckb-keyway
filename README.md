@@ -87,7 +87,7 @@ function Balance() {
 | `KeyWayConnectButton` | Manually starts or stops Fiber when `autoConnect` is disabled |
 | `useKeyWay()` | Returns auth status, user, wallet connection, errors, and lifecycle methods |
 
-The SDK uses CKB KeyWay's managed backend automatically. `appId` identifies the registered application and enforces its origin list. `appName` brands the SDK modal, `theme` accepts `"light"` or `"dark"`, `autoConnect` defaults to `true`, and `confirmFunding` can replace the built-in funding modal. `useKeyWay()` returns `ready`, `authenticated`, `user`, `connection`, `status`, `error`, `login`, `logout`, `connect`, and `disconnect`. Fiber operations are available on `connection.keyway`, including channel, invoice, peer, and payment methods. Backend URLs and server credentials are intentionally absent from the public API.
+The SDK uses CKB KeyWay's managed backend automatically. `appId` identifies the registered application and enforces its origin list. `appName` brands the SDK modal, `theme` accepts `"light"` or `"dark"`, `autoConnect` defaults to `true`, and `confirmFunding` can replace the built-in funding modal. `useKeyWay()` separates `authenticated`, `walletReady`, `fiberStarting`, `fiberReady`, and `fiberError`, while `lifecycleStage` and `lifecycleTimings` expose structured startup progress. The recovered `wallet` is available before the Fiber node finishes starting. Backend URLs and server credentials are intentionally absent from the public API.
 
 `appName` changes the embedded modal. Optional Stytch login and signup template IDs can be saved for each registered application in the developer console; the templates must already exist in KeyWay's Stytch project.
 
@@ -118,6 +118,18 @@ await connected.keyway.waitForPayment(payment.payment_hash);
 
 await connected.keyway.stop();
 ```
+
+Channel activation also accepts configuration while retaining the 1,000 CKB default:
+
+```ts
+await connected.keyway.activateCkbChannel({
+  fundingAmount: 500n * 100_000_000n,
+  peer: optionalPeerPublicKey,
+  public: true,
+});
+```
+
+Use `preflightPayment()` before asking the user to confirm a payment. It performs Fiber's dry run and returns a typed, retryable failure instead of requiring string parsing. `getChannels()` returns normalized lifecycle state plus local, remote, and total balances; `closeChannel()` wraps cooperative or forced shutdown with typed errors. The original raw Fiber methods remain available for advanced use.
 
 `connection.keyway` also exposes direct peer/channel operations and Fiber's route inspection surface: `connectPeer`, `openFundedChannel`, `listChannels`, `graphNodes`, `graphChannels`, `buildRouter`, and `sendPaymentWithRouter`. `sendPayment({ dry_run: true, ... })` checks whether the node can currently build a route for a specific payment without sending it.
 
@@ -184,10 +196,9 @@ The production deployment also sends `Cross-Origin-Opener-Policy: same-origin` a
 
 - Testnet CKB only; UDTs, swaps, merchant checkout, and mainnet are out of scope.
 - Cross-device Fiber state migration currently requires explicit logout. A crash, lost device, force-closed tab, or interrupted browser cannot create a fresh checkpoint, so background snapshots still need an upstream-safe database flush boundary.
-- The migration path is covered by browser archive, cryptography, lifecycle, and Postgres integration tests but has not yet been deployed or verified with two real Fiber testnet browser sessions.
-- Channel balances and raw channel shutdown are available through `connection.keyway`; the reference wallet renders balances and channels but does not yet provide a close-channel screen.
+- Channel balances and managed channel shutdown are available through `connection.keyway`; the reference wallet renders balances and channels but does not yet provide a close-channel screen.
 - The backend is trusted to authorize Lit operations and can observe the decrypted Fiber key.
-- The reference wallet uses fixed activation and maximum-payment-fee limits for a predictable demo.
+- The reference wallet uses fixed activation and maximum-payment-fee limits for a predictable demo; SDK consumers can configure channel funding and preflight payment fees.
 - CKB balance is an indexer-derived sum of live cells, not an account field. The reference wallet polls it every ten seconds, so a newly mined or faucet-created cell can still appear after indexer delay.
 - Lit, Fiber WASM, public peers, Stytch, and the CKB testnet RPC remain external availability dependencies.
 

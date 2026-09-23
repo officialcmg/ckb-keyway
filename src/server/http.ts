@@ -30,6 +30,7 @@ import {
   updateApplication,
   verifyOtpApplication,
 } from "./applications.ts";
+import { managedNodeReady, managedNodeRequest } from "./managed-node.ts";
 
 export async function handleKeyWayRequest(request: Request): Promise<Response> {
   const cors = await corsHeaders(request);
@@ -41,6 +42,10 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
   if (request.method === "GET" && new URL(request.url).pathname === "/readyz") {
     const sql = await database();
     await sql`select 1`;
+    return Response.json({ status: "ready" }, { headers: cors });
+  }
+  if (request.method === "GET" && new URL(request.url).pathname === "/managed-readyz") {
+    await managedNodeReady();
     return Response.json({ status: "ready" }, { headers: cors });
   }
   if (request.method !== "POST") return jsonError("Not found", 404, cors);
@@ -60,6 +65,7 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
       : path === "/api/keyway/node-backup/confirm" ? await confirmNodeBackupRequest(request)
       : path === "/api/keyway/sign-transaction" ? await signTransactionRequest(request)
       : path === "/api/keyway/developer/apps" ? await developerAppsRequest(request)
+      : path === "/api/keyway/managed-node" ? await managedNodeHttpRequest(request)
       : jsonError("Not found", 404);
     for (const [name, value] of cors) response.headers.set(name, value);
     return response;
@@ -70,6 +76,14 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
     console.error("[keyway]", message);
     return jsonError(message, unauthorized ? 401 : rateLimited ? 429 : 400, cors);
   }
+}
+
+async function managedNodeHttpRequest(request: Request): Promise<Response> {
+  const user = await authenticateUser(request.headers.get("authorization"));
+  const body = await objectBody(request, "Invalid managed-node request");
+  return Response.json(await managedNodeRequest(user.user_id, body), {
+    headers: { "Cache-Control": "no-store" },
+  });
 }
 
 async function sendCodeRequest(request: Request): Promise<Response> {

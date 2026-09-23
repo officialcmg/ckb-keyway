@@ -62,6 +62,8 @@ The Stytch-backed identity, PKP, CKB address, and encrypted Fiber key can be rec
 
 Within the primary browser, a Web Lock and `BroadcastChannel` prevent duplicate tabs. A short atomic Postgres lease prevents a second browser process from using the same identity concurrently.
 
+The browser sends a lease heartbeat every 30 seconds and the backend expires an abandoned lease after 120 seconds. SDK lifecycle events separate wallet recovery from Fiber startup, so applications can show the recovered CKB identity while the node restores state and connects.
+
 `KeyWayProvider` starts Fiber automatically after OTP when `autoConnect` is true. Startup recovers the wallet, acquires the browser lock and backend lease, restores a claimed backup when present, decrypts the Fiber key, starts the WASM node, connects testnet relays, and reads the initial CKB balance. `disconnect()`, logout, provider unmount, and page refresh stop the running instance; only explicit logout performs the encrypted handoff. A rejected lease heartbeat stops the node and surfaces an SDK error instead of leaving a stale instance running.
 
 Relay connections provide P2P reachability and gossip; they are not payment channels. The reference activation flow opens a public channel with an official browser-reachable testnet channel provider (`bottle` or `bracer`). Each node builds routes from its gossiped network graph, so two KeyWay users can pay through a shared routing provider without having a direct channel. The exact balance split of remote channels is not globally reliable, so `dry_run` can test a requested amount but cannot promise a stable sender-to-recipient maximum.
@@ -78,3 +80,9 @@ The reference wallet lives at `/app`; `/` is the pitch-oriented project landing 
 - The backend can observe the Fiber key during the current decrypt flow.
 - `fiber-js` owns live channel-state correctness and local persistence.
 - CKB enforces the final funding and settlement scripts.
+
+## Managed-node beta
+
+The backend contains a controlled testnet gateway for one allowlisted account and one dedicated native `fnn` process. The node runs on a persistent Railway volume, exposes RPC only over private networking, and is called with a 15-second RPC timeout. Payment submission requires a successful dry run and a one-use confirmation bound to the exact invoice and fee limit. Mutating requests are serialized to avoid duplicate concurrent operations.
+
+This beta is intentionally not exposed as a `nodeMode` provider option. Browser and native Fiber databases are not interchangeable, so existing browser channels cannot be silently moved into the native node. General managed mode requires explicit enrollment and a defined identity/channel migration rather than pretending the two stores are compatible.

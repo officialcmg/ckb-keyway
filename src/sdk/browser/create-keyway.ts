@@ -6,7 +6,10 @@ import {
   getLockBalanceShannons,
   openChannelWithExternalFundingFlow,
   shouldDiagnoseFundingAbortError,
+  type Channel,
+  type ChannelId,
   type OpenChannelWithExternalFundingParams,
+  type SendPaymentParams,
 } from "@fiber-pay/sdk/browser";
 import { KeyWayCredentialProvider, type FiberKeyLoader } from "./credential-provider";
 import { acquireDeviceLock, type DeviceLock } from "./device-lock";
@@ -19,6 +22,7 @@ import { normalizeFiberPubkey } from "./fiber-pubkey";
 import { KeyWayApiClient } from "./api-client";
 import { createEncryptedNodeBackup, restoreEncryptedNodeBackup } from "./node-backup";
 import { backUpBeforeLogout, restoreBeforeStart } from "./node-migration";
+import { toKeyWayError, type KeyWayError } from "./keyway-error";
 
 export type KeyWayFundingParams = Omit<
   OpenChannelWithExternalFundingParams,
@@ -35,10 +39,35 @@ export type CreateKeyWayOptions = {
   apiClient?: KeyWayApiClient;
   restoreRequired?: boolean;
   onLeaseLost?: (error: Error) => void;
+  onLifecycle?: (stage: KeyWayNodeStage) => void;
 };
 
 export type ActivationStage = "connecting" | "negotiating" | "confirming" | "signing" | "broadcasting" | "waiting";
 export type ActivationProgress = (stage: ActivationStage) => void;
+export type KeyWayNodeStage = "acquiring_lease" | "restoring_database" | "starting_wasm";
+export type OpenKeyWayChannelOptions = {
+  fundingAmount?: bigint;
+  peer?: string;
+  public?: boolean;
+  fundingFeeRate?: bigint;
+  commitmentFeeRate?: bigint;
+};
+export type KeyWayChannelStatus = "pending" | "ready" | "closing" | "closed" | "failed" | "unknown";
+export type KeyWayChannel = {
+  id: ChannelId;
+  peer: string;
+  status: KeyWayChannelStatus;
+  localBalanceShannons: bigint;
+  remoteBalanceShannons: bigint;
+  totalBalanceShannons: bigint;
+  public: boolean;
+  raw: Channel;
+};
+export type PaymentPreflight =
+  | { routable: true; feeShannons: bigint }
+  | { routable: false; error: KeyWayError };
+
+const DEFAULT_CHANNEL_FUNDING = 1_000n * 100_000_000n;
 
 export function createKeyWay(options: CreateKeyWayOptions) {
   let deviceLease: DeviceLease | undefined;
@@ -74,13 +103,21 @@ export function createKeyWay(options: CreateKeyWayOptions) {
 
   async function start() {
     if (node.isRunning) return node.nodeInfo();
+    if (typeof window !== "undefined" && window.crossOriginIsolated !== true) {
+      throw toKeyWayError(new Error("Cross-origin isolated browser context is required"));
+    }
+    options.onLifecycle?.("acquiring_lease");
     deviceLock = await acquireDeviceLock(options.identifier);
     try {
       deviceLease = await acquireDeviceLease(options.authToken, api, (cause) => {
         const error = cause instanceof Error ? cause : new Error("The active KeyWay device lease expired");
         void stop().finally(() => options.onLeaseLost?.(error));
       });
-      if (restoreRequired) await restoreClaimedBackup();
+      if (restoreRequired) {
+        options.onLifecycle?.("restoring_database");
+        await restoreClaimedBackup();
+      }
+      options.onLifecycle?.("starting_wasm");
       return await node.start();
     } catch (error) {
       await releaseGuards();
@@ -171,11 +208,18 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     return preparedPeers;
   }
 
-  async function activateCkbChannel(fundingAmount: bigint, onProgress?: ActivationProgress) {
+  async function activateCkbChannel(
+    input: bigint | OpenKeyWayChannelOptions = DEFAULT_CHANNEL_FUNDING,
+    onProgress?: ActivationProgress,
+  ) {
+    const config = typeof input === "bigint" ? { fundingAmount: input } : input;
+    const fundingAmount = config.fundingAmount ?? DEFAULT_CHANNEL_FUNDING;
     activationProgress = onProgress;
     activationProgress?.("connecting");
     try {
-      const candidates = await prepareCkbChannel(fundingAmount);
+      const candidates = config.peer
+        ? [{ pubkey: normalizeFiberPubkey(config.peer), nodeName: "selected peer" }]
+        : await prepareCkbChannel(fundingAmount);
       let lastAbort: unknown;
       for (const candidate of candidates) {
         try {
@@ -183,7 +227,9 @@ export function createKeyWay(options: CreateKeyWayOptions) {
           const result = await openFundedChannel({
             pubkey: normalizeFiberPubkey(candidate.pubkey),
             funding_amount: `0x${fundingAmount.toString(16)}`,
-            public: true,
+            public: config.public ?? true,
+            funding_fee_rate: config.fundingFeeRate === undefined ? undefined : toHex(config.fundingFeeRate),
+            commitment_fee_rate: config.commitmentFeeRate === undefined ? undefined : toHex(config.commitmentFeeRate),
           });
           activationProgress?.("broadcasting");
           return result;
@@ -206,6 +252,40 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     return getLockBalanceShannons(ckbRpcUrl, cccScriptToFiberScript(address.script));
   }
 
+  async function getChannels(options?: { includeClosed?: boolean }): Promise<KeyWayChannel[]> {
+    const { channels } = await node.listChannels({ include_closed: options?.includeClosed ?? false });
+    return channels.map(normalizeChannel);
+  }
+
+  async function closeChannel(channelId: ChannelId, options?: { force?: boolean; feeRate?: bigint }): Promise<void> {
+    try {
+      await node.shutdownChannel({
+        channel_id: channelId,
+        force: options?.force,
+        fee_rate: options?.feeRate === undefined ? undefined : toHex(options.feeRate),
+      });
+    } catch (error) {
+      throw toKeyWayError(error, "CHANNEL_FAILED");
+    }
+  }
+
+  async function preflightPayment(params: Omit<SendPaymentParams, "dry_run">): Promise<PaymentPreflight> {
+    try {
+      const payment = await node.sendPayment({ ...params, dry_run: true });
+      return { routable: true, feeShannons: BigInt(payment.fee) };
+    } catch (error) {
+      return { routable: false, error: toKeyWayError(error, "PAYMENT_FAILED") };
+    }
+  }
+
+  async function sendPayment(params: SendPaymentParams) {
+    try {
+      return await node.sendPayment(params);
+    } catch (error) {
+      throw toKeyWayError(error, "PAYMENT_FAILED");
+    }
+  }
+
   return {
     start,
     stop,
@@ -214,14 +294,17 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     connectPeer: node.connectPeer.bind(node),
     listPeers: node.listPeers.bind(node),
     listChannels: node.listChannels.bind(node),
+    getChannels,
     shutdownChannel: node.shutdownChannel.bind(node),
+    closeChannel,
     graphNodes: node.graphNodes.bind(node),
     graphChannels: node.graphChannels.bind(node),
     waitForChannelReady: node.waitForChannelReady.bind(node),
     newInvoice: node.newInvoice.bind(node),
     getInvoice: node.getInvoice.bind(node),
     parseInvoice: node.parseInvoice.bind(node),
-    sendPayment: node.sendPayment.bind(node),
+    preflightPayment,
+    sendPayment,
     buildRouter: node.buildRouter.bind(node),
     sendPaymentWithRouter: node.sendPaymentWithRouter.bind(node),
     getPayment: node.getPayment.bind(node),
@@ -235,6 +318,32 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     get state() { return node.state; },
     get isRunning() { return node.isRunning; },
   };
+}
+
+function normalizeChannel(channel: Channel): KeyWayChannel {
+  const localBalanceShannons = BigInt(channel.local_balance);
+  const remoteBalanceShannons = BigInt(channel.remote_balance);
+  const state = String(channel.state.state_name);
+  const status: KeyWayChannelStatus = state === "CHANNEL_READY" ? "ready"
+    : state.includes("SHUTDOWN") || state.includes("CLOSING") ? "closing"
+    : state.includes("CLOSED") ? "closed"
+    : state.includes("FAILED") ? "failed"
+    : state.includes("NEGOTIATING") || state.includes("AWAITING") ? "pending"
+    : "unknown";
+  return {
+    id: channel.channel_id,
+    peer: channel.pubkey,
+    status,
+    localBalanceShannons,
+    remoteBalanceShannons,
+    totalBalanceShannons: localBalanceShannons + remoteBalanceShannons,
+    public: channel.is_public,
+    raw: channel,
+  };
+}
+
+function toHex(value: bigint): `0x${string}` {
+  return `0x${value.toString(16)}`;
 }
 
 export type KeyWay = ReturnType<typeof createKeyWay>;

@@ -113,4 +113,18 @@ export const migrations: Array<{
       `;
     },
   },
+  {
+    version: 4,
+    name: "managed-node-confirmations",
+    up: (sql) => sql`
+      create table if not exists keyway_managed_confirmations (
+        stytch_user_id text not null,
+        purpose text not null check (purpose in ('payment', 'channel_close')),
+        nonce uuid not null,
+        operation_digest text not null,
+        expires_at timestamptz not null,
+        primary key (stytch_user_id, purpose)
+      )
+    `,
+  },
 ];

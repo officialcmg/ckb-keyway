@@ -15,6 +15,7 @@ Wrap the part of the React tree that uses KeyWay.
   theme="light"
   autoConnect
   onError={(error) => console.error(error)}
+  onLifecycle={(event) => console.log(event.stage, event.elapsedMs)}
 >
   <App />
 </KeyWayProvider>
@@ -44,6 +45,10 @@ Wrap the part of the React tree that uses KeyWay.
   Receives connection and device-lease failures.
 </ParamField>
 
+<ParamField path="onLifecycle" type="(event: KeyWayLifecycleEvent) => void">
+  Receives structured wallet recovery, lease, database restore, WASM startup, peer connection, synchronization, and ready events with elapsed milliseconds.
+</ParamField>
+
 ## `useKeyWay()`
 
 ```ts
@@ -52,6 +57,13 @@ const {
   authenticated,
   user,
   connection,
+  wallet,
+  walletReady,
+  fiberStarting,
+  fiberReady,
+  fiberError,
+  lifecycleStage,
+  lifecycleTimings,
   status,
   error,
   login,
@@ -67,6 +79,13 @@ const {
 | `authenticated` | `boolean` | The user has a valid KeyWay session. |
 | `user` | `{ id: string }` | Stable authenticated user identity. |
 | `connection` | `ConnectedKeyWay \| undefined` | Recovered wallet and running Fiber client. |
+| `wallet` | `PublicWallet \| undefined` | Recovered CKB identity, available before Fiber finishes starting. |
+| `walletReady` | `boolean` | Wallet recovery has completed. |
+| `fiberStarting` | `boolean` | Fiber startup is still in progress. |
+| `fiberReady` | `boolean` | Fiber is ready for channels, invoices, and payments. |
+| `fiberError` | `Error \| undefined` | Fiber-specific startup or lease failure. |
+| `lifecycleStage` | `KeyWayLifecycleStage \| undefined` | Current structured startup stage. |
+| `lifecycleTimings` | `Partial<Record<KeyWayLifecycleStage, number>>` | Elapsed milliseconds recorded for reached stages. |
 | `status` | `KeyWayStatus` | `idle`, `authenticating`, `connecting`, `connected`, `disconnecting`, or `error`. |
 | `error` | `Error \| undefined` | Latest provider connection error. |
 | `login()` | `() => void` | Open the email OTP modal. |
@@ -93,12 +112,15 @@ Use `connection.wallet.ckbAddress` for the recovered address and `connection.key
 | Method | Purpose |
 | --- | --- |
 | `getCkbBalance()` | Read indexed on-chain capacity in shannons. |
-| `activateCkbChannel(amount, onProgress?)` | Connect a channel peer and fund a public CKB channel. |
+| `activateCkbChannel(options?, onProgress?)` | Fund a channel with safe defaults or an explicit amount, peer, visibility, and fee rates. |
 | `waitForChannelReady(channelId, options?)` | Wait until a funding transaction becomes a usable channel. |
 | `listChannels(options)` | Read channels, state, local balance, and remote balance. |
+| `getChannels(options?)` | Read normalized lifecycle state and bigint local/remote balances. |
+| `closeChannel(channelId, options?)` | Cooperatively or forcibly close a channel with typed failures. |
 | `newInvoice(params)` | Create a Fiber invoice. |
 | `parseInvoice(params)` | Decode and validate an invoice before payment. |
 | `sendPayment(params)` | Start a routed Fiber payment. |
+| `preflightPayment(params)` | Dry-run a payment and return route/fee readiness or a typed failure. |
 | `waitForPayment(paymentHash, options?)` | Wait for payment success or failure. |
 | `listPeers()` | Inspect connected Fiber peers. |
 | `nodeInfo()` | Read the local Fiber node identity. |

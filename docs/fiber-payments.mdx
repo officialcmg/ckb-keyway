@@ -22,7 +22,7 @@ const SHANNONS_PER_CKB = 100_000_000n;
 const fundingAmount = 1_000n * SHANNONS_PER_CKB;
 
 const result = await connection.keyway.activateCkbChannel(
-  fundingAmount,
+  { fundingAmount, public: true },
   (stage) => console.log(stage),
 );
 
@@ -103,6 +103,20 @@ console.log(created.invoice_address);
 ```
 
 ## Pay an invoice
+
+Preflight the exact invoice and fee limit before showing a confirmation:
+
+```ts
+const preflight = await connection.keyway.preflightPayment({
+  invoice,
+  max_fee_amount: toHex(1n * SHANNONS_PER_CKB),
+});
+
+if (!preflight.routable) {
+  console.log(preflight.error.code, preflight.error.retryable);
+  throw preflight.error;
+}
+```
 
 ```ts
 const payment = await connection.keyway.sendPayment({

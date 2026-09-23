@@ -22,7 +22,7 @@ export async function acquireDeviceLease(
       window.clearInterval(heartbeat);
       onLost?.(error);
     });
-  }, 20_000);
+  }, 30_000);
 
   return {
     leaseId: lease.leaseId,

@@ -11,7 +11,13 @@ import {
   type ReactNode,
 } from "react";
 import { KeyWayApiClient } from "../browser/api-client";
-import { connectKeyWay, type ConnectedKeyWay } from "../browser/connect-keyway";
+import {
+  connectKeyWay,
+  type ConnectedKeyWay,
+  type KeyWayLifecycleEvent,
+  type KeyWayLifecycleStage,
+} from "../browser/connect-keyway";
+import type { PublicWallet } from "../browser/bootstrap";
 import type { ConfirmFunding, FundingPreview } from "../browser/remote-ckb-signer";
 
 export type KeyWayStatus = "idle" | "authenticating" | "connecting" | "connected" | "disconnecting" | "error";
@@ -24,6 +30,7 @@ export type KeyWayProviderProps = {
   confirmFunding?: ConfirmFunding;
   autoConnect?: boolean;
   onError?: (error: Error) => void;
+  onLifecycle?: (event: KeyWayLifecycleEvent) => void;
 };
 
 export type KeyWayUser = { id: string };
@@ -33,8 +40,15 @@ export type KeyWayContextValue = {
   authenticated: boolean;
   user?: KeyWayUser;
   connection?: ConnectedKeyWay;
+  wallet?: PublicWallet;
   status: KeyWayStatus;
   error?: Error;
+  walletReady: boolean;
+  fiberStarting: boolean;
+  fiberReady: boolean;
+  fiberError?: Error;
+  lifecycleStage?: KeyWayLifecycleStage;
+  lifecycleTimings: Partial<Record<KeyWayLifecycleStage, number>>;
   login: () => void;
   logout: () => Promise<void>;
   connect: () => Promise<ConnectedKeyWay>;
@@ -51,17 +65,22 @@ export function KeyWayProvider({
   confirmFunding,
   autoConnect = true,
   onError,
+  onLifecycle,
 }: KeyWayProviderProps) {
   const resolvedAppName = appName.trim().slice(0, 64) || "CKB KeyWay";
   const api = new KeyWayApiClient({ appId });
   const connectionRef = useRef<ConnectedKeyWay | undefined>(undefined);
   const operationRef = useRef<Promise<void>>(Promise.resolve());
   const runRef = useRef(0);
-  const callbacksRef = useRef({ confirmFunding, onError });
-  callbacksRef.current = { confirmFunding, onError };
+  const callbacksRef = useRef({ confirmFunding, onError, onLifecycle });
+  callbacksRef.current = { confirmFunding, onError, onLifecycle };
   const [connection, setConnection] = useState<ConnectedKeyWay>();
+  const [wallet, setWallet] = useState<PublicWallet>();
   const [status, setStatus] = useState<KeyWayStatus>("idle");
   const [error, setError] = useState<Error>();
+  const [fiberError, setFiberError] = useState<Error>();
+  const [lifecycleStage, setLifecycleStage] = useState<KeyWayLifecycleStage>();
+  const [lifecycleTimings, setLifecycleTimings] = useState<Partial<Record<KeyWayLifecycleStage, number>>>({});
   const [authToken, setAuthToken] = useState<string>();
   const [user, setUser] = useState<KeyWayUser>();
   const [ready, setReady] = useState(false);
@@ -77,6 +96,8 @@ export function KeyWayProvider({
     const run = ++runRef.current;
     setStatus("connecting");
     setError(undefined);
+    setFiberError(undefined);
+    setLifecycleTimings({});
     const previousOperation = operationRef.current;
     const operation = (async () => {
       await previousOperation;
@@ -97,8 +118,16 @@ export function KeyWayProvider({
             connectionRef.current = undefined;
             setConnection(undefined);
             setError(leaseError);
+            setFiberError(leaseError);
             setStatus("error");
             callbacksRef.current.onError?.(leaseError);
+          },
+          onWalletReady: setWallet,
+          onLifecycle: (event) => {
+            if (run !== runRef.current) return;
+            setLifecycleStage(event.stage);
+            setLifecycleTimings((current) => ({ ...current, [event.stage]: event.elapsedMs }));
+            callbacksRef.current.onLifecycle?.(event);
           },
         });
         if (run !== runRef.current) {
@@ -113,6 +142,7 @@ export function KeyWayProvider({
         const nextError = cause instanceof Error ? cause : new Error("Could not connect KeyWay");
         if (run === runRef.current) {
           setError(nextError);
+          setFiberError(nextError);
           setStatus("error");
           callbacksRef.current.onError?.(nextError);
         }
@@ -132,6 +162,7 @@ export function KeyWayProvider({
     setConnection(undefined);
     if (!current) {
       setStatus("idle");
+      setLifecycleStage(undefined);
       return;
     }
     setStatus("disconnecting");
@@ -139,6 +170,7 @@ export function KeyWayProvider({
       await current.keyway.stop();
     } finally {
       setStatus("idle");
+      setLifecycleStage(undefined);
     }
   }
 
@@ -158,10 +190,13 @@ export function KeyWayProvider({
       ++runRef.current;
       connectionRef.current = undefined;
       setConnection(undefined);
+      setWallet(undefined);
       clearStoredSession();
       setAuthToken(undefined);
       setUser(undefined);
       setStatus("idle");
+      setFiberError(undefined);
+      setLifecycleStage(undefined);
     } catch (cause) {
       const logoutError = cause instanceof Error ? cause : new Error("Could not safely back up and log out");
       if (current) await connect().catch(() => undefined);
@@ -196,6 +231,9 @@ export function KeyWayProvider({
     if (!authenticated) {
       setConnection(undefined);
       setError(undefined);
+      setWallet(undefined);
+      setFiberError(undefined);
+      setLifecycleStage(undefined);
       if (ready) setStatus(loginOpen ? "authenticating" : "idle");
       return;
     }
@@ -216,8 +254,15 @@ export function KeyWayProvider({
       authenticated,
       user,
       connection,
+      wallet,
       status,
       error,
+      walletReady: Boolean(wallet),
+      fiberStarting: Boolean(wallet && !connection && !fiberError),
+      fiberReady: Boolean(connection),
+      fiberError,
+      lifecycleStage,
+      lifecycleTimings,
       login,
       logout,
       connect,
