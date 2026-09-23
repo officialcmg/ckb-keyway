@@ -103,7 +103,10 @@ function WalletPanel() {
     setActivationStage("connecting");
     setError(undefined);
     try {
-      const result = await current.keyway.activateCkbChannel(parseCkb("1000"), setActivationStage);
+      const result = await current.keyway.activateCkbChannel(
+        { fundingAmount: parseCkb("1000"), public: true },
+        setActivationStage,
+      );
       setFundingResult(result.fundingTxHash);
       setActivationStage("waiting");
       await current.keyway.waitForChannelReady(result.channelId, { timeout: 180_000, interval: 3_000 });
@@ -131,6 +134,12 @@ function WalletPanel() {
     try {
       const { invoice } = await current.keyway.parseInvoice({ invoice: invoiceToPay.trim() });
       if (!invoice.amount) throw new Error("Enter an invoice with a fixed amount");
+      const preflight = await current.keyway.preflightPayment({
+        invoice: invoiceToPay.trim(),
+        timeout: "0x1d4c0",
+        max_fee_amount: toHex(parseCkb("1")),
+      });
+      if (!preflight.routable) throw preflight.error;
       setPaymentPreview({ amountCkb: formatCkb(BigInt(invoice.amount)) });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Invoice could not be read");
