@@ -8,7 +8,7 @@ function getClient() {
   const environment = process.env.STYTCH_ENVIRONMENT ?? "test";
   if (!project_id || !secret) throw new Error("Stytch server configuration is incomplete");
   if (environment !== "test" && environment !== "live") throw new Error("STYTCH_ENVIRONMENT must be test or live");
-  return client ??= new stytch.Client({ project_id, secret, env: stytch.envs[environment] });
+  return client ??= new stytch.Client({ project_id, secret, env: stytch.envs[environment], timeout: 15_000 });
 }
 
 export async function sendEmailCode(

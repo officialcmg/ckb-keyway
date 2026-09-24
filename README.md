@@ -48,7 +48,7 @@ Configure Stytch email OTP for backend API access. The browser never receives a 
 
 ## React SDK
 
-The public package owns email OTP, the login modal, wallet provisioning, and Fiber startup behind one provider. It also retains `connectKeyWay` for lower-level integrations.
+The public package owns email OTP, the login modal, wallet provisioning, and Fiber startup behind one provider. It also retains `connectKeyWay` for lower-level integrations. Browser mode remains the public default. A managed-node adapter is available only for explicitly enrolled testnet beta accounts while KeyWay validates per-user node isolation.
 
 Create an application at [ckb-keyway.vercel.app/dashboard](https://ckb-keyway.vercel.app/dashboard), register its exact development and production origins, and copy its public app ID.
 
@@ -87,7 +87,7 @@ function Balance() {
 | `KeyWayConnectButton` | Manually starts or stops Fiber when `autoConnect` is disabled |
 | `useKeyWay()` | Returns auth status, user, wallet connection, errors, and lifecycle methods |
 
-The SDK uses CKB KeyWay's managed backend automatically. `appId` identifies the registered application and enforces its origin list. `appName` brands the SDK modal, `theme` accepts `"light"` or `"dark"`, `autoConnect` defaults to `true`, and `confirmFunding` can replace the built-in funding modal. `useKeyWay()` separates `authenticated`, `walletReady`, `fiberStarting`, `fiberReady`, and `fiberError`, while `lifecycleStage` and `lifecycleTimings` expose structured startup progress. The recovered `wallet` is available before the Fiber node finishes starting. Backend URLs and server credentials are intentionally absent from the public API.
+The SDK uses CKB KeyWay's managed backend automatically. `appId` identifies the registered application and enforces its origin list. `appName` brands the SDK modal, `theme` accepts `"light"` or `"dark"`, `autoConnect` defaults to `true`, and `confirmFunding` can replace the built-in funding modal. `nodeMode` defaults to `"browser"`; `"managed"` is currently restricted to enrolled testnet beta accounts. `useKeyWay()` separates `authenticated`, `walletReady`, `fiberStarting`, `fiberReady`, and `fiberError`, while `lifecycleStage` and `lifecycleTimings` expose structured startup progress. The recovered `wallet` is available before the Fiber node finishes starting. Backend URLs and server credentials are intentionally absent from the public API.
 
 `appName` changes the embedded modal. Optional Stytch login and signup template IDs can be saved for each registered application in the developer console; the templates must already exist in KeyWay's Stytch project.
 
@@ -118,6 +118,8 @@ await connected.keyway.waitForPayment(payment.payment_hash);
 
 await connected.keyway.stop();
 ```
+
+Enrolled beta accounts can select the API-backed native node with `<KeyWayProvider nodeMode="managed">`. It implements the same high-level channel, invoice, payment preflight, payment, and balance methods without starting WASM in the consuming page. Managed mode uses a distinct persistent native Fiber node; it does not import an existing browser node's IndexedDB channels.
 
 Channel activation also accepts configuration while retaining the 1,000 CKB default:
 
@@ -201,6 +203,7 @@ The production deployment also sends `Cross-Origin-Opener-Policy: same-origin` a
 - The reference wallet uses fixed activation and maximum-payment-fee limits for a predictable demo; SDK consumers can configure channel funding and preflight payment fees.
 - CKB balance is an indexer-derived sum of live cells, not an account field. The reference wallet polls it every ten seconds, so a newly mined or faucet-created cell can still appear after indexer delay.
 - Lit, Fiber WASM, public peers, Stytch, and the CKB testnet RPC remain external availability dependencies.
+- Managed mode is a single-account testnet beta. Multi-user availability remains gated on durable per-user node and channel-state isolation.
 
 ## Upstream foundations
 

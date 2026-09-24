@@ -17,6 +17,10 @@ import {
   type KeyWayLifecycleEvent,
   type KeyWayLifecycleStage,
 } from "../browser/connect-keyway";
+import {
+  connectManagedKeyWay,
+  type ConnectedManagedKeyWay,
+} from "../browser/connect-managed-keyway";
 import type { PublicWallet } from "../browser/bootstrap";
 import type { ConfirmFunding, FundingPreview } from "../browser/remote-ckb-signer";
 
@@ -29,9 +33,13 @@ export type KeyWayProviderProps = {
   theme?: "light" | "dark";
   confirmFunding?: ConfirmFunding;
   autoConnect?: boolean;
+  nodeMode?: KeyWayNodeMode;
   onError?: (error: Error) => void;
   onLifecycle?: (event: KeyWayLifecycleEvent) => void;
 };
+
+export type KeyWayNodeMode = "browser" | "managed";
+export type KeyWayConnection = ConnectedKeyWay | ConnectedManagedKeyWay;
 
 export type KeyWayUser = { id: string };
 
@@ -39,7 +47,7 @@ export type KeyWayContextValue = {
   ready: boolean;
   authenticated: boolean;
   user?: KeyWayUser;
-  connection?: ConnectedKeyWay;
+  connection?: KeyWayConnection;
   wallet?: PublicWallet;
   status: KeyWayStatus;
   error?: Error;
@@ -51,7 +59,7 @@ export type KeyWayContextValue = {
   lifecycleTimings: Partial<Record<KeyWayLifecycleStage, number>>;
   login: () => void;
   logout: () => Promise<void>;
-  connect: () => Promise<ConnectedKeyWay>;
+  connect: () => Promise<KeyWayConnection>;
   disconnect: () => Promise<void>;
 };
 
@@ -64,17 +72,18 @@ export function KeyWayProvider({
   theme = "light",
   confirmFunding,
   autoConnect = true,
+  nodeMode = "browser",
   onError,
   onLifecycle,
 }: KeyWayProviderProps) {
   const resolvedAppName = appName.trim().slice(0, 64) || "CKB KeyWay";
   const api = new KeyWayApiClient({ appId });
-  const connectionRef = useRef<ConnectedKeyWay | undefined>(undefined);
+  const connectionRef = useRef<KeyWayConnection | undefined>(undefined);
   const operationRef = useRef<Promise<void>>(Promise.resolve());
   const runRef = useRef(0);
   const callbacksRef = useRef({ confirmFunding, onError, onLifecycle });
   callbacksRef.current = { confirmFunding, onError, onLifecycle };
-  const [connection, setConnection] = useState<ConnectedKeyWay>();
+  const [connection, setConnection] = useState<KeyWayConnection>();
   const [wallet, setWallet] = useState<PublicWallet>();
   const [status, setStatus] = useState<KeyWayStatus>("idle");
   const [error, setError] = useState<Error>();
@@ -108,12 +117,13 @@ export function KeyWayProvider({
       if (previous) await previous.keyway.stop();
 
       try {
-        const next = await connectKeyWay({
+        const connectNode = nodeMode === "managed" ? connectManagedKeyWay : connectKeyWay;
+        const next = await connectNode({
           authToken,
           apiClient: api,
           confirmFunding: (preview) => callbacksRef.current.confirmFunding?.(preview) ??
             new Promise<boolean>((resolve) => setFundingRequest({ preview, resolve })),
-          onLeaseLost: (leaseError) => {
+          ...(nodeMode === "browser" ? { onLeaseLost: (leaseError: Error) => {
             if (run !== runRef.current) return;
             connectionRef.current = undefined;
             setConnection(undefined);
@@ -121,7 +131,7 @@ export function KeyWayProvider({
             setFiberError(leaseError);
             setStatus("error");
             callbacksRef.current.onError?.(leaseError);
-          },
+          } } : {}),
           onWalletReady: setWallet,
           onLifecycle: (event) => {
             if (run !== runRef.current) return;
@@ -246,7 +256,7 @@ export function KeyWayProvider({
       connectionRef.current = undefined;
       if (current) void current.keyway.stop();
     };
-  }, [authenticated, autoConnect]);
+  }, [authenticated, autoConnect, nodeMode]);
 
   return (
     <KeyWayContext.Provider value={{

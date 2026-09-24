@@ -1,6 +1,7 @@
 import { createHmac, randomBytes } from "node:crypto";
 import type { User } from "stytch";
 import { database, type DatabaseSql } from "./database";
+import { sendSecurityAlert } from "./security-alerts";
 
 const APP_ID = /^keyway_[A-Za-z0-9_-]{24}$/;
 const TEMPLATE_ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -196,7 +197,10 @@ export async function prepareOtpSend(input: {
     await insertOtpEvent(transaction as unknown as DatabaseSql, appId, emailHash, ipHash, "requested");
     return false;
   });
-  if (limited) throw new Error("Too many login codes requested. Try again later");
+  if (limited) {
+    await sendSecurityAlert("otp_rate_limit", { appId });
+    throw new Error("Too many login codes requested. Try again later");
+  }
   return {
     appId,
     emailHash,

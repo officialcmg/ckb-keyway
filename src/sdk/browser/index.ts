@@ -28,6 +28,11 @@ export {
   type KeyWayLifecycleEvent,
   type KeyWayLifecycleStage,
 } from "./connect-keyway";
+export {
+  connectManagedKeyWay,
+  type ConnectedManagedKeyWay,
+} from "./connect-managed-keyway";
+export { createManagedKeyWay, type ManagedKeyWay } from "./create-managed-keyway";
 export { connectTestnetPeers, TESTNET_RELAYS } from "./testnet-peers";
 export { normalizeFiberPubkey } from "./fiber-pubkey";
 export { KeyWayApiClient, type KeyWayApiClientOptions } from "./api-client";

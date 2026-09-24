@@ -127,4 +127,47 @@ export const migrations: Array<{
       )
     `,
   },
+  {
+    version: 5,
+    name: "idempotent-mutations",
+    up: async (sql) => {
+      await sql`
+        create table if not exists keyway_idempotency_keys (
+          stytch_user_id text not null,
+          operation text not null,
+          idempotency_key text not null,
+          request_digest text not null,
+          status text not null check (status in ('running', 'completed', 'failed')),
+          response jsonb,
+          error_message text,
+          expires_at timestamptz not null,
+          created_at timestamptz not null default now(),
+          updated_at timestamptz not null default now(),
+          primary key (stytch_user_id, operation, idempotency_key)
+        )
+      `;
+      await sql`
+        create index if not exists keyway_idempotency_expiry_idx
+        on keyway_idempotency_keys (expires_at)
+      `;
+    },
+  },
+  {
+    version: 6,
+    name: "security-events",
+    up: async (sql) => {
+      await sql`
+        create table if not exists keyway_security_events (
+          id bigint generated always as identity primary key,
+          kind text not null,
+          subject_hash text not null,
+          created_at timestamptz not null default now()
+        )
+      `;
+      await sql`
+        create index if not exists keyway_security_events_window_idx
+        on keyway_security_events (kind, created_at)
+      `;
+    },
+  },
 ];

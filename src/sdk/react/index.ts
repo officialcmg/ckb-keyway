@@ -7,6 +7,8 @@ export {
   type KeyWayConnectButtonProps,
   type KeyWayContextValue,
   type KeyWayLoginButtonProps,
+  type KeyWayConnection,
+  type KeyWayNodeMode,
   type KeyWayProviderProps,
   type KeyWayStatus,
   type KeyWayUser,

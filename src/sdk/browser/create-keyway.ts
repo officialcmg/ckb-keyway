@@ -320,7 +320,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   };
 }
 
-function normalizeChannel(channel: Channel): KeyWayChannel {
+export function normalizeChannel(channel: Channel): KeyWayChannel {
   const localBalanceShannons = BigInt(channel.local_balance);
   const remoteBalanceShannons = BigInt(channel.remote_balance);
   const state = String(channel.state.state_name);

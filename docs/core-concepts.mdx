@@ -11,10 +11,10 @@ These are separate pieces of state:
 | Concept | What it is | Where it lives |
 | --- | --- | --- |
 | CKB account | The on-chain identity and cells controlled through the Lit PKP. | Recoverable from the authenticated email identity. |
-| Fiber node | The networking process that creates invoices, finds routes, and updates channels. | Runs as WASM in the browser. |
-| Channel database | The latest off-chain state for the user's Fiber channels. | IndexedDB in the browser profile. |
+| Fiber node | The networking process that creates invoices, finds routes, and updates channels. | Runs as WASM in browser mode or as a persistent native process in managed mode. |
+| Channel database | The latest off-chain state for the user's Fiber channels. | IndexedDB in browser mode or the managed node's durable volume. |
 
-Logging in recovers the CKB and Fiber identities. Starting Fiber also requires the latest channel database, which stays in local IndexedDB during use and can move to the next device through KeyWay's encrypted explicit-logout handoff.
+Logging in recovers the CKB identity. In browser mode, starting Fiber also requires the latest browser node identity and channel database, which stays in local IndexedDB during use and can move to the next device through KeyWay's encrypted explicit-logout handoff. Managed mode uses a separately enrolled persistent node and does not import browser IndexedDB channels.
 
 ## Relays are not channels
 
@@ -46,3 +46,7 @@ KeyWay uses a browser-local Fiber node. One user therefore has both an account i
 <Warning>
   Do not treat IndexedDB as disposable cache. It contains the off-chain channel state needed to resume the node safely.
 </Warning>
+
+## Managed-node beta
+
+Managed mode keeps a native Fiber process and its channel database online outside the browser lifecycle. The React API remains the same, but KeyWay operates the node and therefore takes on a larger custody and availability boundary. It is currently limited to explicitly enrolled testnet accounts until each user's node identity and channel state can be isolated safely.

@@ -19,17 +19,18 @@ const DEVICE_STORAGE_KEY = "ckb-keyway:device-id";
 export async function bootstrapKeyWay(
   authToken: string,
   api = new KeyWayApiClient(),
+  nodeMode: "browser" | "managed" = "browser",
 ): Promise<{ provisioned: boolean; restoreRequired: boolean; wallet: PublicWallet }> {
   if (!authToken) throw new Error("Authenticated KeyWay session is required");
   return navigator.locks.request("ckb-keyway:bootstrap", async () => {
     const deviceIdHash = await getDeviceIdHash();
-    const existing = await requestBootstrap(api, authToken, { deviceIdHash });
+    const existing = await requestBootstrap(api, authToken, { deviceIdHash, nodeMode });
     if (!existing.needsFiberKey) return existing;
 
     const fiberKey = crypto.getRandomValues(new Uint8Array(32));
     let encodedFiberKey = bytesToBase64(fiberKey);
     try {
-      const provisioned = await requestBootstrap(api, authToken, { deviceIdHash, fiberKey: encodedFiberKey });
+      const provisioned = await requestBootstrap(api, authToken, { deviceIdHash, fiberKey: encodedFiberKey, nodeMode });
       if (provisioned.needsFiberKey) throw new Error("Fiber key provisioning did not complete");
       return provisioned;
     } finally {
@@ -70,7 +71,7 @@ export async function markChannelOpened(authToken: string, api = new KeyWayApiCl
 async function requestBootstrap(
   api: KeyWayApiClient,
   authToken: string,
-  body: { deviceIdHash: string; fiberKey?: string },
+  body: { deviceIdHash: string; fiberKey?: string; nodeMode?: "browser" | "managed" },
 ): Promise<BootstrapResponse> {
   return await api.bootstrap(authToken, body) as BootstrapResponse;
 }

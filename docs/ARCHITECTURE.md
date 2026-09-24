@@ -29,15 +29,13 @@ pinned Lit Chipotle Actions
        +-- sign validated CKB sighash
        +-- encrypt/decrypt Fiber key
 
-Browser
-  Web Lock + backend lease
-       |
-       v
-FiberBrowserNode / fiber-js / IndexedDB
-       |
-       +-- peers and gossip
-       +-- collaborative external funding
-       +-- channels, invoices, routes, and payments
+Browser mode                         Managed beta
+  Web Lock + backend lease            Railway private network
+       |                                      |
+       v                                      v
+FiberBrowserNode / IndexedDB          native fnn / durable volume
+       |                                      |
+       +--------------- Fiber testnet --------+
 ```
 
 The public SDK targets `https://keyway-api-production.up.railway.app` internally. Consumers neither provide an API URL nor import server code; CKB KeyWay operates this backend as part of the service.
@@ -83,6 +81,6 @@ The reference wallet lives at `/app`; `/` is the pitch-oriented project landing 
 
 ## Managed-node beta
 
-The backend contains a controlled testnet gateway for one allowlisted account and one dedicated native `fnn` process. The node runs on a persistent Railway volume, exposes RPC only over private networking, and is called with a 15-second RPC timeout. Payment submission requires a successful dry run and a one-use confirmation bound to the exact invoice and fee limit. Mutating requests are serialized to avoid duplicate concurrent operations.
+The backend contains a controlled testnet gateway for one allowlisted account and one dedicated native `fnn` process. The node runs on a persistent Railway volume, exposes RPC only over private networking, and is called with a 15-second RPC timeout. Payment submission requires a successful dry run and a one-use confirmation bound to the exact invoice and fee limit. Mutating requests are serialized and carry idempotency keys to prevent duplicate operations during retries.
 
-This beta is intentionally not exposed as a `nodeMode` provider option. Browser and native Fiber databases are not interchangeable, so existing browser channels cannot be silently moved into the native node. General managed mode requires explicit enrollment and a defined identity/channel migration rather than pretending the two stores are compatible.
+The SDK exposes `nodeMode="managed"` only as an explicit beta option; browser mode remains the default. Browser and native Fiber databases are not interchangeable, so existing browser channels cannot be silently moved into the native node. General managed mode requires per-user process and storage isolation rather than placing multiple users' channels in one shared node.

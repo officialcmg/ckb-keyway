@@ -31,6 +31,8 @@ import {
   verifyOtpApplication,
 } from "./applications.ts";
 import { managedNodeReady, managedNodeRequest } from "./managed-node.ts";
+import { runIdempotentMutation } from "./idempotency.ts";
+import { recordSigningEvent } from "./security-alerts.ts";
 
 export async function handleKeyWayRequest(request: Request): Promise<Response> {
   const cors = await corsHeaders(request);
@@ -51,7 +53,7 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
   if (request.method !== "POST") return jsonError("Not found", 404, cors);
 
   try {
-    const path = new URL(request.url).pathname;
+    const path = apiPath(new URL(request.url).pathname);
     const response = path === "/api/keyway/auth/send-code" ? await sendCodeRequest(request)
       : path === "/api/keyway/auth/verify-code" ? await verifyCodeRequest(request)
       : path === "/api/keyway/auth/session" ? await sessionRequest(request)
@@ -81,7 +83,17 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
 async function managedNodeHttpRequest(request: Request): Promise<Response> {
   const user = await authenticateUser(request.headers.get("authorization"));
   const body = await objectBody(request, "Invalid managed-node request");
-  return Response.json(await managedNodeRequest(user.user_id, body), {
+  const operation = typeof body.operation === "string" ? body.operation : "unknown";
+  const result = ["new-invoice", "send-payment", "open-channel", "submit-channel-funding", "close-channel"].includes(operation)
+    ? await runIdempotentMutation(
+      user.user_id,
+      `managed:${operation}`,
+      request.headers.get("idempotency-key") ?? "",
+      body,
+      () => managedNodeRequest(user.user_id, body),
+    )
+    : await managedNodeRequest(user.user_id, body);
+  return Response.json(result, {
     headers: { "Cache-Control": "no-store" },
   });
 }
@@ -133,10 +145,13 @@ async function logoutRequest(request: Request): Promise<Response> {
 async function bootstrapRequest(request: Request): Promise<Response> {
   const user = await authenticateUser(request.headers.get("authorization"));
   const body = await objectBody(request, "Invalid bootstrap request");
-  const { deviceIdHash, fiberKey } = body;
+  const { deviceIdHash, fiberKey, nodeMode } = body;
   if (typeof deviceIdHash !== "string") throw new Error("Device ID hash is required");
   if (fiberKey !== undefined && typeof fiberKey !== "string") throw new Error("Fiber key is invalid");
-  return Response.json(await bootstrap(user, deviceIdHash, fiberKey));
+  if (nodeMode !== undefined && nodeMode !== "browser" && nodeMode !== "managed") throw new Error("Node mode is invalid");
+  return Response.json(await versionedMutation(request, user.user_id, "bootstrap", body, () =>
+    bootstrap(user, deviceIdHash, fiberKey, nodeMode),
+  ));
 }
 
 async function fiberKeyRequest(request: Request): Promise<Response> {
@@ -192,7 +207,8 @@ async function deviceLeaseRequest(request: Request): Promise<Response> {
 
 async function saveNodeBackupRequest(request: Request): Promise<Response> {
   const user = await authenticateUser(request.headers.get("authorization"));
-  const { deviceIdHash, leaseId, backup } = await objectBody(request, "Invalid Fiber node backup request");
+  const body = await objectBody(request, "Invalid Fiber node backup request");
+  const { deviceIdHash, leaseId, backup } = body;
   if (typeof deviceIdHash !== "string" || typeof leaseId !== "string") {
     throw new Error("Device ID hash and lease ID are required");
   }
@@ -204,12 +220,15 @@ async function saveNodeBackupRequest(request: Request): Promise<Response> {
   if (parsed.databasePrefix !== `/wasm-${wallet.litPkpId}`) {
     throw new Error("Fiber node backup does not belong to this wallet");
   }
-  return Response.json(await saveNodeBackup(user, deviceIdHash, parsed));
+  return Response.json(await versionedMutation(request, user.user_id, "node-backup:save", body, () =>
+    saveNodeBackup(user, deviceIdHash, parsed),
+  ));
 }
 
 async function loadNodeBackupRequest(request: Request): Promise<Response> {
   const user = await authenticateUser(request.headers.get("authorization"));
-  const { deviceIdHash, leaseId } = await objectBody(request, "Invalid Fiber node backup request");
+  const body = await objectBody(request, "Invalid Fiber node backup request");
+  const { deviceIdHash, leaseId } = body;
   if (typeof deviceIdHash !== "string" || typeof leaseId !== "string") {
     throw new Error("Device ID hash and lease ID are required");
   }
@@ -218,25 +237,32 @@ async function loadNodeBackupRequest(request: Request): Promise<Response> {
     throw new Error("Fiber wallet is bound to another device");
   }
   await requireLease(user, deviceIdHash, leaseId);
-  const backup = await readClaimedNodeBackup(user, deviceIdHash);
+  const backup = await versionedMutation(request, user.user_id, "node-backup:claim", body, () =>
+    readClaimedNodeBackup(user, deviceIdHash),
+  );
   const { sourceDeviceIdHash: _source, status: _status, claimedDeviceIdHash: _claimed, ...publicBackup } = backup;
   return Response.json(publicBackup, { headers: { "Cache-Control": "no-store" } });
 }
 
 async function confirmNodeBackupRequest(request: Request): Promise<Response> {
   const user = await authenticateUser(request.headers.get("authorization"));
-  const { deviceIdHash, leaseId, generation } = await objectBody(request, "Invalid Fiber node backup confirmation");
+  const body = await objectBody(request, "Invalid Fiber node backup confirmation");
+  const { deviceIdHash, leaseId, generation } = body;
   if (typeof deviceIdHash !== "string" || typeof leaseId !== "string" || !Number.isSafeInteger(generation)) {
     throw new Error("Device ID hash, lease ID, and backup generation are required");
   }
   await requireLease(user, deviceIdHash, leaseId);
-  await confirmNodeBackupRestored(user, deviceIdHash, generation as number);
+  await versionedMutation(request, user.user_id, "node-backup:confirm", body, async () => {
+    await confirmNodeBackupRestored(user, deviceIdHash, generation as number);
+    return { confirmed: true };
+  });
   return new Response(null, { status: 204 });
 }
 
 async function signTransactionRequest(request: Request): Promise<Response> {
   const user = await authenticateUser(request.headers.get("authorization"));
-  const { operation, transaction, confirmationNonce } = await objectBody(request, "Invalid signing request");
+  const body = await objectBody(request, "Invalid signing request");
+  const { operation, transaction, confirmationNonce } = body;
   const wallet = await readWallet(user);
   if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
   const validated = await previewFundingTransaction(wallet, transaction);
@@ -250,9 +276,12 @@ async function signTransactionRequest(request: Request): Promise<Response> {
   if (operation !== "sign" || typeof confirmationNonce !== "string") {
     throw new Error("A valid signing operation is required");
   }
-  await consumeConfirmation(user, confirmationNonce, serialized);
-  const signed = await signFundingTransaction(user, wallet, validated);
-  return Response.json({ transaction: serializeTransaction(signed) });
+  return Response.json(await versionedMutation(request, user.user_id, "sign-transaction", body, async () => {
+    await consumeConfirmation(user, confirmationNonce, serialized);
+    await recordSigningEvent(user.user_id);
+    const signed = await signFundingTransaction(user, wallet, validated);
+    return { transaction: serializeTransaction(signed) };
+  }));
 }
 
 async function developerAppsRequest(request: Request): Promise<Response> {
@@ -334,12 +363,33 @@ async function corsHeaders(request: Request): Promise<Headers | Response> {
     if (!permitted) return jsonError("Origin is not allowed", 403);
   }
   const headers = new Headers({
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, X-KeyWay-App-Id",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, X-KeyWay-App-Id",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Vary": "Origin",
   });
   if (origin) headers.set("Access-Control-Allow-Origin", origin);
   return headers;
+}
+
+function apiPath(path: string): string {
+  return path.startsWith("/api/v1/keyway/") ? path.replace("/api/v1/keyway/", "/api/keyway/") : path;
+}
+
+function versionedMutation<T>(
+  request: Request,
+  userId: string,
+  operation: string,
+  body: unknown,
+  mutation: () => Promise<T>,
+): Promise<T> {
+  if (!new URL(request.url).pathname.startsWith("/api/v1/keyway/")) return mutation();
+  return runIdempotentMutation(
+    userId,
+    operation,
+    request.headers.get("idempotency-key") ?? "",
+    body,
+    mutation,
+  );
 }
 
 function applicationId(request: Request): string | undefined {

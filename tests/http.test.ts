@@ -45,3 +45,14 @@ test("rejects malformed OTP requests before calling the provider", async () => {
   assert.equal(response.status, 400);
   assert.deepEqual(await response.json(), { error: "A valid email address is required" });
 });
+
+test("serves versioned API routes while retaining legacy compatibility", async () => {
+  process.env.KEYWAY_ALLOWED_ORIGINS = "https://wallet.example";
+  const response = await handleKeyWayRequest(new Request("https://api.example/api/v1/keyway/auth/send-code", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: "https://wallet.example" },
+    body: JSON.stringify({ email: "not-an-email" }),
+  }));
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: "A valid email address is required" });
+});

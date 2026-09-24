@@ -28,9 +28,10 @@ async function webRequest(incoming: IncomingMessage): Promise<Request> {
     else if (value !== undefined) headers.set(name, value);
   }
   const method = incoming.method ?? "GET";
+  const pathname = incoming.url?.split("?", 1)[0] ?? "/";
   const body = method === "GET" || method === "HEAD" ? undefined : await readBody(
     incoming,
-    incoming.url === "/api/keyway/node-backup/save" ? 16_000_000 : 2_000_000,
+    pathname.endsWith("/keyway/node-backup/save") ? 16_000_000 : 2_000_000,
   );
   return new Request(`${protocol}://${host}${incoming.url ?? "/"}`, { method, headers, body });
 }

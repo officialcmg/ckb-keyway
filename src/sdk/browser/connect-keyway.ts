@@ -6,6 +6,7 @@ import { connectTestnetPeers } from "./testnet-peers";
 import { KeyWayApiClient } from "./api-client";
 
 export type ConnectedKeyWay = {
+  mode: "browser";
   keyway: KeyWay;
   wallet: PublicWallet;
   node: NodeInfoResult;
@@ -18,6 +19,7 @@ export type KeyWayLifecycleStage =
   | "acquiring_lease"
   | "restoring_database"
   | "starting_wasm"
+  | "starting_managed"
   | "connecting_peer"
   | "synchronizing"
   | "ready";
@@ -64,6 +66,7 @@ export async function connectKeyWay(options: {
     const peers = await connectTestnetPeers(keyway);
     stage("synchronizing");
     const connection = {
+      mode: "browser" as const,
       keyway,
       wallet,
       node,

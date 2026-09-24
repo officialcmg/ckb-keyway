@@ -67,6 +67,7 @@ async function executeAction(config: LitRuntimeConfig, js_params: Record<string,
   const action = config.actionCode ? { code: config.actionCode } : { ipfs_id: config.actionCid };
   const response = await fetch(CHIPOTLE_ACTION_URL, {
     method: "POST",
+    signal: AbortSignal.timeout(15_000),
     headers: { "Content-Type": "application/json", "X-Api-Key": config.apiKey },
     body: JSON.stringify({ ...action, js_params }),
   });

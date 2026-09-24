@@ -19,6 +19,8 @@ Cross-Origin-Embedder-Policy: require-corp
 
 Then verify `window.crossOriginIsolated === true`. Browser extensions or third-party resources without compatible cross-origin resource policy headers can also break isolation.
 
+This requirement applies only to `nodeMode="browser"`. Managed mode does not load Fiber WASM in the consuming page, but it currently requires explicit testnet beta enrollment.
+
 ## `An active device lease is required`
 
 The account's Fiber lease expired or another device took it. Call `connect()` again. Avoid running the same account's channels concurrently in multiple browser profiles.

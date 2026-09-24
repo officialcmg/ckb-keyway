@@ -27,19 +27,26 @@ export type BootstrapResult =
       wallet: Omit<ReadyWallet, "encryptedFiberKey">;
     };
 
-export async function bootstrap(user: User, deviceIdHash: string, encodedFiberKey?: string): Promise<BootstrapResult> {
+export async function bootstrap(
+  user: User,
+  deviceIdHash: string,
+  encodedFiberKey?: string,
+  nodeMode: "browser" | "managed" = "browser",
+): Promise<BootstrapResult> {
   if (!DEVICE_ID_HASH.test(deviceIdHash)) throw new Error("Device ID hash must be 32-byte lowercase hex");
-  return withUserLock(user.user_id, (sql) => bootstrapLocked(user, deviceIdHash, encodedFiberKey, sql));
+  return withUserLock(user.user_id, (sql) => bootstrapLocked(user, deviceIdHash, encodedFiberKey, nodeMode, sql));
 }
 
 async function bootstrapLocked(
   user: User,
   deviceIdHash: string,
   encodedFiberKey: string | undefined,
+  nodeMode: "browser" | "managed",
   sql: DatabaseSql,
 ): Promise<BootstrapResult> {
   let wallet = await readWallet(user, sql);
   if (wallet?.status === "ready") {
+    if (nodeMode === "managed") return publicResult(wallet, false, false);
     const activeLeaseDevice = (await readActiveLease(user, sql))?.deviceIdHash;
     const migration = await prepareBackupForDevice(
       user,

@@ -37,6 +37,10 @@ Wrap the part of the React tree that uses KeyWay.
   Recover the wallet and start Fiber automatically after authentication.
 </ParamField>
 
+<ParamField path="nodeMode" type='"browser" | "managed"' default="browser">
+  Select the Fiber runtime. Browser mode runs the WASM node locally. Managed mode uses KeyWay's persistent native testnet node and is currently restricted to explicitly enrolled beta accounts.
+</ParamField>
+
 <ParamField path="confirmFunding" type="ConfirmFunding">
   Optional callback for approving the validated on-chain channel funding transaction. Return `true` to continue to Lit-authorized signing or `false` to abort. When omitted, KeyWay renders its styled built-in confirmation modal.
 </ParamField>
@@ -78,7 +82,7 @@ const {
 | `ready` | `boolean` | Stored session validation has finished. |
 | `authenticated` | `boolean` | The user has a valid KeyWay session. |
 | `user` | `{ id: string }` | Stable authenticated user identity. |
-| `connection` | `ConnectedKeyWay \| undefined` | Recovered wallet and running Fiber client. |
+| `connection` | `ConnectedKeyWay \| ConnectedManagedKeyWay \| undefined` | Recovered wallet and active browser or managed Fiber client. |
 | `wallet` | `PublicWallet \| undefined` | Recovered CKB identity, available before Fiber finishes starting. |
 | `walletReady` | `boolean` | Wallet recovery has completed. |
 | `fiberStarting` | `boolean` | Fiber startup is still in progress. |
@@ -106,6 +110,8 @@ type ConnectedKeyWay = {
 ```
 
 Use `connection.wallet.ckbAddress` for the recovered address and `connection.keyway` for Fiber operations.
+
+Both connection modes implement the recommended methods below. Inspect `connection.mode` when an application needs runtime-specific UI. Browser mode requires cross-origin isolation and explicit-logout database handoff. Managed mode stays online outside the page lifecycle, but currently requires beta enrollment and does not migrate existing browser channels.
 
 ### Recommended client methods
 
