@@ -203,7 +203,7 @@ The production deployment also sends `Cross-Origin-Opener-Policy: same-origin` a
 - The reference wallet uses fixed activation and maximum-payment-fee limits for a predictable demo; SDK consumers can configure channel funding and preflight payment fees.
 - CKB balance is an indexer-derived sum of live cells, not an account field. The reference wallet polls it every ten seconds, so a newly mined or faucet-created cell can still appear after indexer delay.
 - Lit, Fiber WASM, public peers, Stytch, and the CKB testnet RPC remain external availability dependencies.
-- Managed mode is a single-account testnet beta. Multi-user availability remains gated on durable per-user node and channel-state isolation.
+- Managed mode is a controlled testnet beta. Every enrolled account is mapped to a dedicated native node and persistent volume; broader availability remains gated on automatic node provisioning and end-to-end recovery tests.
 
 ## Upstream foundations
 

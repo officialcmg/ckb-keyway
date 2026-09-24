@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { managedNodeRequest } from "../src/server/managed-node.ts";
+import { managedNodeRequest, parseManagedNodeAssignments } from "../src/server/managed-node.ts";
 
 const node = {
   nodeInfo: async () => ({ pubkey: `0x02${"11".repeat(32)}` }),
@@ -78,5 +78,26 @@ test("managed beta exposes only bounded authenticated node operations", async ()
       },
     }, node as never),
     /approved testnet channel peers/,
+  );
+});
+
+test("managed users must be assigned distinct private nodes", () => {
+  const assignments = parseManagedNodeAssignments(JSON.stringify({
+    "user-1": "http://fiber-user-1.railway.internal:8227",
+    "user-2": "https://fiber-user-2.example.com",
+  }));
+  assert.equal(assignments.get("user-1"), "http://fiber-user-1.railway.internal:8227/");
+  assert.equal(assignments.get("user-2"), "https://fiber-user-2.example.com/");
+
+  assert.throws(
+    () => parseManagedNodeAssignments(JSON.stringify({
+      "user-1": "http://fiber.railway.internal:8227",
+      "user-2": "http://fiber.railway.internal:8227",
+    })),
+    /dedicated node/,
+  );
+  assert.throws(
+    () => parseManagedNodeAssignments(JSON.stringify({ "user-1": "http://fiber.example.com" })),
+    /HTTPS or a private Railway address/,
   );
 });

@@ -31,16 +31,15 @@ type ManagedNodeClient = Pick<
   | "shutdownChannel"
 >;
 
-let client: ManagedNodeClient | undefined;
-let mutation = Promise.resolve();
+const clients = new Map<string, ManagedNodeClient>();
+const mutations = new Map<string, Promise<void>>();
 
 export async function managedNodeRequest(
   userId: string,
   body: Record<string, unknown>,
   override?: ManagedNodeClient,
 ): Promise<unknown> {
-  authorize(userId, Boolean(override));
-  const node = override ?? managedNodeClient();
+  const node = override ?? managedNodeClient(userId);
 
   if (body.operation === "status") {
     return {
@@ -55,7 +54,7 @@ export async function managedNodeRequest(
   }
   if (body.operation === "new-invoice") {
     const params = invoiceParams(body);
-    return serializeMutation(() => node.newInvoice(params));
+    return serializeMutation(userId, () => node.newInvoice(params));
   }
   if (body.operation === "get-invoice") {
     return node.getInvoice({ payment_hash: paymentHash(body.paymentHash) });
@@ -81,7 +80,7 @@ export async function managedNodeRequest(
     const params = paymentParams(body);
     if (typeof body.confirmationNonce !== "string") throw new Error("Payment confirmation is required");
     await consumeManagedConfirmation(userId, "payment", body.confirmationNonce, confirmationPayload(params));
-    return serializeMutation(() => node.sendPayment(params));
+    return serializeMutation(userId, () => node.sendPayment(params));
   }
   if (body.operation === "get-payment") {
     return node.getPayment({ payment_hash: paymentHash(body.paymentHash) });
@@ -92,10 +91,10 @@ export async function managedNodeRequest(
   if (body.operation === "open-channel") {
     const params = openChannelParams(body.params);
     await connectManagedPeer(node, params.pubkey);
-    return serializeMutation(() => node.openChannelWithExternalFunding(params));
+    return serializeMutation(userId, () => node.openChannelWithExternalFunding(params));
   }
   if (body.operation === "submit-channel-funding") {
-    return serializeMutation(() => node.submitSignedFundingTx(submitFundingParams(body.params)));
+    return serializeMutation(userId, () => node.submitSignedFundingTx(submitFundingParams(body.params)));
   }
   if (body.operation === "wait-channel-ready") {
     return node.waitForChannelReady(channelId(body.channelId), { timeout: 180_000, interval: 3_000 });
@@ -110,34 +109,64 @@ export async function managedNodeRequest(
     const params = closeParams(body);
     if (typeof body.confirmationNonce !== "string") throw new Error("Channel closure confirmation is required");
     await consumeManagedConfirmation(userId, "channel_close", body.confirmationNonce, closeConfirmationPayload(params));
-    await serializeMutation(() => node.shutdownChannel(params));
+    await serializeMutation(userId, () => node.shutdownChannel(params));
     return { closed: true };
   }
   throw new Error("Unsupported managed-node operation");
 }
 
-export function managedNodeReady(): Promise<unknown> {
-  return managedNodeClient().nodeInfo();
+export async function managedNodeReady(): Promise<unknown> {
+  const assignments = managedNodeAssignments();
+  return Promise.all([...assignments.keys()].map((userId) => managedNodeClient(userId).nodeInfo()));
 }
 
-function managedNodeClient(): ManagedNodeClient {
-  if (client) return client;
-  const url = requiredEnv("KEYWAY_MANAGED_FIBER_RPC_URL");
-  const parsed = new URL(url);
-  if (parsed.protocol !== "https:" && parsed.hostname !== "127.0.0.1" && !parsed.hostname.endsWith(".railway.internal")) {
-    throw new Error("Managed Fiber RPC must use HTTPS or a private Railway address");
-  }
-  client = new FiberRpcClient({
+function managedNodeClient(userId: string): ManagedNodeClient {
+  const existing = clients.get(userId);
+  if (existing) return existing;
+  const url = managedNodeAssignments().get(userId);
+  if (!url) throw new Error("Managed Fiber is not enabled for this account");
+  const client = new FiberRpcClient({
     url,
     timeout: 15_000,
     biscuitToken: process.env.KEYWAY_MANAGED_FIBER_RPC_TOKEN,
   });
+  clients.set(userId, client);
   return client;
 }
 
-function authorize(userId: string, testOverride: boolean): void {
-  const owner = testOverride ? userId : requiredEnv("KEYWAY_MANAGED_BETA_USER_ID");
-  if (userId !== owner) throw new Error("Managed Fiber is not enabled for this account");
+export function parseManagedNodeAssignments(raw: string): Map<string, string> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("Managed Fiber node assignments must be valid JSON");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Managed Fiber node assignments must be an object");
+  }
+  const assignments = new Map<string, string>();
+  const urls = new Set<string>();
+  for (const [userId, value] of Object.entries(parsed)) {
+    if (!userId || typeof value !== "string") throw new Error("Managed Fiber node assignment is invalid");
+    const url = managedRpcUrl(value);
+    if (urls.has(url)) throw new Error("Each managed Fiber user must have a dedicated node");
+    assignments.set(userId, url);
+    urls.add(url);
+  }
+  if (assignments.size === 0) throw new Error("At least one managed Fiber node assignment is required");
+  return assignments;
+}
+
+function managedNodeAssignments(): Map<string, string> {
+  return parseManagedNodeAssignments(requiredEnv("KEYWAY_MANAGED_FIBER_NODES"));
+}
+
+function managedRpcUrl(value: string): string {
+  const url = new URL(value);
+  if (url.protocol !== "https:" && url.hostname !== "127.0.0.1" && !url.hostname.endsWith(".railway.internal")) {
+    throw new Error("Managed Fiber RPC must use HTTPS or a private Railway address");
+  }
+  return url.toString();
 }
 
 function paymentParams(body: Record<string, unknown>): SendPaymentParams {
@@ -301,9 +330,14 @@ function closeConfirmationPayload(params: ReturnType<typeof closeParams>): strin
   return JSON.stringify({ managedChannelClose: params });
 }
 
-function serializeMutation<T>(operation: () => Promise<T>): Promise<T> {
-  const next = mutation.then(operation, operation);
-  mutation = next.then(() => undefined, () => undefined);
+function serializeMutation<T>(userId: string, operation: () => Promise<T>): Promise<T> {
+  const previous = mutations.get(userId) ?? Promise.resolve();
+  const next = previous.then(operation, operation);
+  const settled = next.then(() => undefined, () => undefined);
+  mutations.set(userId, settled);
+  void settled.finally(() => {
+    if (mutations.get(userId) === settled) mutations.delete(userId);
+  });
   return next;
 }
 
