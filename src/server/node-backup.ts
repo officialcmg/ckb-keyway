@@ -37,31 +37,27 @@ export async function saveNodeBackup(
   const ciphertext = Buffer.from(backup.ciphertext, "base64");
   const digest = createHash("sha256").update(ciphertext).digest("hex");
   if (digest !== backup.digest) throw new Error("Encrypted Fiber node backup digest does not match its ciphertext");
-  const rows = await sql<{ generation: string | number; digest: string }[]>`
-    insert into keyway_node_backups (
-      stytch_user_id, generation, format_version, database_prefix, salt, iv,
-      ciphertext, digest, source_device_id_hash, status, claimed_device_id_hash,
-      claim_expires_at, created_at, updated_at
-    ) values (
-      ${user.user_id}, 1, ${backup.formatVersion}, ${backup.databasePrefix}, ${backup.salt}, ${backup.iv},
-      ${ciphertext}, ${digest}, ${deviceIdHash}, 'available', null, null, now(), now()
-    )
-    on conflict (stytch_user_id) do update set
-      generation = keyway_node_backups.generation + 1,
-      format_version = excluded.format_version,
-      database_prefix = excluded.database_prefix,
-      salt = excluded.salt,
-      iv = excluded.iv,
-      ciphertext = excluded.ciphertext,
-      digest = excluded.digest,
-      source_device_id_hash = excluded.source_device_id_hash,
-      status = 'available',
-      claimed_device_id_hash = null,
-      claim_expires_at = null,
-      updated_at = now()
-    returning generation, digest
-  `;
-  return { generation: Number(rows[0].generation), digest: rows[0].digest };
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const rows = await sql<{ generation: string | number; digest: string }[]>`
+      insert into keyway_node_backups (
+        stytch_user_id, generation, format_version, database_prefix, salt, iv,
+        ciphertext, digest, source_device_id_hash, status, claimed_device_id_hash,
+        claim_expires_at, created_at, updated_at
+      )
+      select
+        ${user.user_id}, coalesce(max(generation), 0) + 1,
+        ${backup.formatVersion}, ${backup.databasePrefix}, ${backup.salt}, ${backup.iv},
+        ${ciphertext}, ${digest}, ${deviceIdHash}, 'available', null, null, now(), now()
+      from keyway_node_backups where stytch_user_id = ${user.user_id}
+      on conflict (stytch_user_id, generation) do nothing
+      returning generation, digest
+    `;
+    if (rows[0]) {
+      await pruneNodeBackups(sql, user.user_id);
+      return { generation: Number(rows[0].generation), digest: rows[0].digest };
+    }
+  }
+  throw new Error("Fiber node backup generation could not be assigned");
 }
 
 export async function prepareBackupForDevice(
@@ -87,6 +83,9 @@ export async function prepareBackupForDevice(
       status = 'claimed', claimed_device_id_hash = ${requestedDeviceIdHash},
       claim_expires_at = now() + interval '2 minutes', updated_at = now()
     where stytch_user_id = ${user.user_id}
+      and generation = (
+        select max(generation) from keyway_node_backups where stytch_user_id = ${user.user_id}
+      )
       and (status = 'available' or (status = 'claimed' and claim_expires_at <= now()))
     returning generation
   `;
@@ -119,6 +118,26 @@ async function consumeBackup(user: User, sql: DatabaseSql): Promise<void> {
   await sql`
     update keyway_node_backups set status = 'consumed', claim_expires_at = null, updated_at = now()
     where stytch_user_id = ${user.user_id}
+      and generation = (
+        select max(generation) from keyway_node_backups where stytch_user_id = ${user.user_id}
+      )
+  `;
+}
+
+// ponytail: newest N rows per user, by delete; move to partitioned storage if backups outgrow Postgres.
+async function pruneNodeBackups(sql: DatabaseSql, userId: string): Promise<void> {
+  const keep = Number(process.env.KEYWAY_BACKUP_GENERATIONS ?? 3);
+  if (!Number.isInteger(keep) || keep < 1) return;
+  await sql`
+    delete from keyway_node_backups
+    where stytch_user_id = ${userId}
+      and status <> 'claimed'
+      and generation not in (
+        select generation from keyway_node_backups
+        where stytch_user_id = ${userId}
+        order by generation desc
+        limit ${keep}
+      )
   `;
 }
 
@@ -128,6 +147,8 @@ async function readBackup(user: User, connection?: DatabaseSql): Promise<StoredN
     select generation, format_version, database_prefix, salt, iv, ciphertext, digest,
       source_device_id_hash, status, claimed_device_id_hash
     from keyway_node_backups where stytch_user_id = ${user.user_id}
+    order by generation desc
+    limit 1
   `;
   const row = rows[0];
   if (!row) return undefined;

@@ -70,6 +70,9 @@ export async function restoreEncryptedNodeBackup(
   }
   const ciphertext = base64ToBytes(backup.ciphertext);
   if (await sha256Hex(ciphertext) !== backup.digest) throw new Error("Fiber node backup is corrupted");
+  if ((await existingNodeDatabases(expectedPrefix)).length > 0) {
+    throw new Error("This device already holds local Fiber state; refusing to overwrite it");
+  }
   const salt = base64ToBytes(backup.salt);
   const iv = base64ToBytes(backup.iv);
   const key = await deriveBackupKey(fiberKey, salt);
@@ -102,6 +105,13 @@ export async function exportNodeDatabases(databasePrefix: string): Promise<NodeA
     version: BACKUP_FORMAT_VERSION,
     databases: await Promise.all(databases.map(({ name }) => exportDatabase(name))),
   };
+}
+
+async function existingNodeDatabases(databasePrefix: string): Promise<string[]> {
+  if (!indexedDB.databases) return [];
+  return (await indexedDB.databases())
+    .map(({ name }) => name)
+    .filter((name): name is string => Boolean(name?.startsWith(databasePrefix)));
 }
 
 export async function importNodeDatabases(archive: NodeArchive): Promise<void> {

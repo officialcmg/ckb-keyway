@@ -168,7 +168,7 @@ See [`examples/browser-wallet.ts`](examples/browser-wallet.ts) for a complete mi
 - The backend accepts a complete CKB transaction, enforces testnet funding and fee limits, computes CCC's exact sighash, and invokes only a pinned Lit Action.
 - The stored Fiber identity key is encrypted at rest. The MVP backend can observe it during recovery, and it necessarily exists in browser/WASM memory while Fiber runs.
 - Web Locks, `BroadcastChannel`, and an atomic Postgres lease enforce one active browser node.
-- Fiber state backups are encrypted in the browser and stored as ciphertext. Explicit logout can hand the latest IndexedDB state to one subsequent device while the backend lease prevents concurrent Fiber nodes.
+- Fiber state backups are encrypted in the browser and stored as ciphertext. Explicit logout appends an immutable generation; only the newest can be auto-claimed, older generations stay for rollback, and a restore refuses to overwrite Fiber state that already exists on the device.
 - Email compromise can authorize recovery. This testnet prototype is experimental, unaudited, and not production custody software.
 
 ## Verified testnet result

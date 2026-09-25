@@ -170,4 +170,16 @@ export const migrations: Array<{
       `;
     },
   },
+  {
+    version: 7,
+    name: "node-backup-generations",
+    up: async (sql) => {
+      await sql`alter table keyway_node_backups drop constraint if exists keyway_node_backups_pkey`;
+      await sql`alter table keyway_node_backups add primary key (stytch_user_id, generation)`;
+      await sql`
+        create index if not exists keyway_node_backups_latest_idx
+        on keyway_node_backups (stytch_user_id, generation desc)
+      `;
+    },
+  },
 ];

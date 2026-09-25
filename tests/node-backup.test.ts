@@ -67,6 +67,21 @@ test("exports, encrypts, and restores wallet-scoped IndexedDB state", async () =
   await cleanup();
 });
 
+test("refuses to overwrite Fiber state that already exists on this device", async () => {
+  await cleanup();
+  const database = await openDatabase(`${PREFIX}-fiber`, 1, (target) => target.createObjectStore("records", { keyPath: "id" }));
+  const write = database.transaction("records", "readwrite");
+  write.objectStore("records").put({ id: "local", amount: 5 });
+  await transactionDone(write);
+  database.close();
+  const backup = await createEncryptedNodeBackup(PREFIX, FIBER_KEY);
+  await assert.rejects(restoreEncryptedNodeBackup(backup, PREFIX, FIBER_KEY), /already holds local Fiber state/);
+  const reopened = await request(indexedDB.open(`${PREFIX}-fiber`));
+  assert.deepEqual(await request(reopened.transaction("records").objectStore("records").get("local")), { id: "local", amount: 5 });
+  reopened.close();
+  await cleanup();
+});
+
 test("rejects corrupted ciphertext and the wrong wallet prefix", async () => {
   await cleanup();
   const database = await openDatabase(`${PREFIX}-empty`, 1, (target) => target.createObjectStore("records"));
