@@ -81,6 +81,22 @@ test("managed beta exposes only bounded authenticated node operations", async ()
   );
 });
 
+test("managed beta refuses funding beyond the open-channel capacity", async () => {
+  const full = { ...node, listChannels: async () => ({ channels: Array.from({ length: 5 }, () => ({})) }) };
+  await assert.rejects(
+    managedNodeRequest("user-1", {
+      operation: "open-channel",
+      params: {
+        pubkey: "0x02b6d4e3ab86a2ca2fad6fae0ecb2e1e559e0b911939872a90abdda6d20302be71",
+        funding_amount: "0x5f5e100",
+        shutdown_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" },
+        funding_lock_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" },
+      },
+    }, full as never),
+    /at most 5 open channels/,
+  );
+});
+
 test("managed users must be assigned distinct private nodes", () => {
   const assignments = parseManagedNodeAssignments(JSON.stringify({
     "user-1": "http://fiber-user-1.railway.internal:8227",

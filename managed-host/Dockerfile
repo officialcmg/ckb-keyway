@@ -9,6 +9,7 @@ COPY --from=fiber /usr/local/share/fiber /usr/local/share/fiber
 COPY index.mjs /app/index.mjs
 ENV FIBER_CONFIG_TEMPLATE=/usr/local/share/fiber/config/testnet/config.yml \
     KEYWAY_MANAGED_DATA_DIR=/fiber/users \
+    KEYWAY_MANAGED_BACKUP_DIR=/fiber/backups \
     NODE_ENV=production
 EXPOSE 8080
 ENTRYPOINT ["/usr/bin/tini", "--"]

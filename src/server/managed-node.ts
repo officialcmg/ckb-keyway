@@ -92,6 +92,7 @@ export async function managedNodeRequest(
   if (body.operation === "open-channel") {
     const params = openChannelParams(body.params);
     await connectManagedPeer(node, params.pubkey);
+    await assertChannelCapacity(node);
     return serializeMutation(userId, () => node.openChannelWithExternalFunding(params));
   }
   if (body.operation === "submit-channel-funding") {
@@ -249,6 +250,13 @@ async function connectManagedPeer(node: ManagedNodeClient, peer: Pubkey): Promis
   const address = MANAGED_CHANNEL_PEERS.get(peer.toLowerCase());
   if (!address) throw new Error("Managed beta only supports approved testnet channel peers");
   await node.connectPeer({ address, save: true });
+}
+
+async function assertChannelCapacity(node: ManagedNodeClient): Promise<void> {
+  const limit = Number(process.env.KEYWAY_MANAGED_MAX_CHANNELS ?? 5);
+  if (!Number.isInteger(limit) || limit <= 0) return;
+  const { channels } = await node.listChannels({ include_closed: false });
+  if (channels.length >= limit) throw new Error(`Managed beta allows at most ${limit} open channels`);
 }
 
 const MANAGED_CHANNEL_PEERS = new Map<string, string>([

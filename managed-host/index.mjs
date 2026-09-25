@@ -1,12 +1,13 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdir, readdir, writeFile } from "node:fs/promises";
+import { cp, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const USER_ID = /^[0-9a-f]{64}$/;
+const SNAPSHOT = /^snap-\d+$/;
 const nodes = new Map();
 const starting = new Map();
 let shuttingDown = false;
@@ -45,7 +46,19 @@ async function handleRequest(request, response) {
       return send(response, 401, { error: "Unauthorized" });
     }
     if (request.method === "GET" && request.url === "/readyz") {
-      return send(response, 200, { status: "ready", nodes: nodes.size });
+      return send(response, 200, { status: "ready", nodes: nodes.size, maxNodes: maxNodes() });
+    }
+    const backups = /^\/users\/([0-9a-f]{64})\/backups$/.exec(request.url ?? "");
+    if (backups && request.method === "GET") {
+      return send(response, 200, { snapshots: await listSnapshots({ userId: backups[1] }) });
+    }
+    if (backups && request.method === "POST") {
+      return send(response, 200, await snapshotUser(backups[1]));
+    }
+    const restore = request.method === "POST" && /^\/users\/([0-9a-f]{64})\/restore$/.exec(request.url ?? "");
+    if (restore) {
+      const { name } = await readJsonBody(request);
+      return send(response, 200, await restoreUser(restore[1], name));
     }
     const match = request.method === "POST" && /^\/users\/([0-9a-f]{64})$/.exec(request.url ?? "");
     if (!match) return send(response, 404, { error: "Not found" });
@@ -71,7 +84,7 @@ async function ensureNode(userId) {
   if (running) return running;
   const pending = starting.get(userId);
   if (pending) return pending;
-  if (new Set([...nodes.keys(), ...starting.keys()]).size >= Number(process.env.KEYWAY_MANAGED_MAX_NODES ?? 16)) {
+  if (new Set([...nodes.keys(), ...starting.keys()]).size >= maxNodes()) {
     throw new Error("Managed node capacity is full");
   }
   const promise = startNode(userId).finally(() => starting.delete(userId));
@@ -81,7 +94,7 @@ async function ensureNode(userId) {
 
 async function startNode(userId) {
   const port = await availablePort();
-  const baseDir = join(required("KEYWAY_MANAGED_DATA_DIR", "/fiber/users"), userId);
+  const baseDir = managedDataDir(userId);
   const ckbDir = join(baseDir, "ckb");
   await mkdir(ckbDir, { recursive: true });
   await createCkbKey(join(ckbDir, "key"));
@@ -132,6 +145,181 @@ async function waitForRpc(port, child) {
   }
   child.kill("SIGTERM");
   throw new Error("Fiber node startup timed out");
+}
+
+async function snapshotUser(userId) {
+  const wasRunning = await stopNode(userId);
+  try {
+    return await createSnapshot({ userId });
+  } finally {
+    if (wasRunning) await ensureNode(userId).catch(logError);
+  }
+}
+
+async function restoreUser(userId, name) {
+  const wasRunning = await stopNode(userId);
+  try {
+    return await restoreSnapshot({ userId, name });
+  } finally {
+    if (wasRunning) await ensureNode(userId).catch(logError);
+  }
+}
+
+async function stopNode(userId) {
+  const pending = starting.get(userId);
+  const node = nodes.get(userId) ?? (pending ? await pending.catch(() => undefined) : undefined);
+  if (!node) return false;
+  nodes.delete(userId);
+  await waitForExit(node.child);
+  return true;
+}
+
+function waitForExit(child, timeout = 15_000) {
+  return new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) return resolve();
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve();
+    }, timeout);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    child.kill("SIGTERM");
+  });
+}
+
+export function managedDataDir(userId) {
+  return join(required("KEYWAY_MANAGED_DATA_DIR", "/fiber/users"), userId);
+}
+
+export function managedBackupDir(userId) {
+  return join(required("KEYWAY_MANAGED_BACKUP_DIR", "/fiber/backups"), userId);
+}
+
+export async function listSnapshots({ userId, root = managedBackupDir(userId) }) {
+  let entries;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+  const snapshots = [];
+  for (const entry of entries.filter((candidate) => candidate.isDirectory() && SNAPSHOT.test(candidate.name))) {
+    const path = join(root, entry.name);
+    const record = await readSnapshotRecord(root, entry.name);
+    snapshots.push({
+      name: entry.name,
+      createdAt: record?.createdAt ?? (await stat(path)).mtime.toISOString(),
+      bytes: record?.bytes ?? await directoryBytes(path),
+      digest: record?.digest ?? await snapshotDigest(path),
+    });
+  }
+  return snapshots.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+export async function createSnapshot({
+  userId,
+  dataDir = managedDataDir(userId),
+  root = managedBackupDir(userId),
+  limitBytes = Number(process.env.KEYWAY_MANAGED_MAX_BACKUP_BYTES ?? 512 * 1024 * 1024),
+  keep = Number(process.env.KEYWAY_MANAGED_BACKUP_GENERATIONS ?? 3),
+}) {
+  const bytes = await directoryBytes(dataDir);
+  if (bytes > limitBytes) throw new Error("Managed Fiber data directory exceeds the backup size limit");
+  const expected = await snapshotDigest(dataDir);
+  const name = `snap-${Date.now()}`;
+  await mkdir(root, { recursive: true });
+  const target = join(root, name);
+  await cp(dataDir, target, { recursive: true });
+  if (await snapshotDigest(target) !== expected) {
+    await rm(target, { recursive: true, force: true });
+    throw new Error("Managed Fiber snapshot verification failed");
+  }
+  const createdAt = new Date().toISOString();
+  await writeFile(join(root, `${name}.json`), JSON.stringify({ digest: expected, bytes, createdAt }));
+  for (const stale of (await listSnapshots({ userId, root })).slice(0, -keep)) {
+    await rm(join(root, stale.name), { recursive: true, force: true });
+    await rm(join(root, `${stale.name}.json`), { force: true });
+  }
+  return { name, createdAt, bytes, digest: expected };
+}
+
+export async function restoreSnapshot({
+  userId,
+  dataDir = managedDataDir(userId),
+  root = managedBackupDir(userId),
+  name,
+}) {
+  if (typeof name !== "string" || !SNAPSHOT.test(name)) throw new Error("A valid managed Fiber snapshot name is required");
+  const source = join(root, name);
+  const record = await readSnapshotRecord(root, name);
+  if (!record) throw new Error("Managed Fiber snapshot metadata is missing");
+  const expected = record.digest;
+  const staging = `${dataDir}.restore`;
+  await rm(staging, { recursive: true, force: true });
+  await cp(source, staging, { recursive: true });
+  if (await snapshotDigest(staging) !== expected) {
+    await rm(staging, { recursive: true, force: true });
+    throw new Error("Managed Fiber snapshot is corrupted");
+  }
+  await rm(dataDir, { recursive: true, force: true });
+  await rename(staging, dataDir);
+  return { restored: true, name, digest: expected };
+}
+
+async function readSnapshotRecord(root, name) {
+  try {
+    const record = JSON.parse(await readFile(join(root, `${name}.json`), "utf8"));
+    return /^[0-9a-f]{64}$/.test(record?.digest) && typeof record?.bytes === "number" && typeof record?.createdAt === "string"
+      ? record
+      : undefined;
+  } catch (error) {
+    if (error?.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+export async function snapshotDigest(directory) {
+  const hash = createHash("sha256");
+  for (const relative of await filesIn(directory)) {
+    hash.update(relative);
+    hash.update("\0");
+    hash.update(await readFile(join(directory, relative)));
+  }
+  return hash.digest("hex");
+}
+
+async function directoryBytes(directory) {
+  let bytes = 0;
+  for (const relative of await filesIn(directory)) bytes += (await stat(join(directory, relative))).size;
+  return bytes;
+}
+
+async function filesIn(directory, prefix = "") {
+  const files = [];
+  const entries = await readdir(directory, { withFileTypes: true });
+  for (const entry of [...entries].sort((left, right) => left.name.localeCompare(right.name))) {
+    const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) files.push(...await filesIn(join(directory, entry.name), relative));
+    else if (entry.isFile()) files.push(relative);
+  }
+  return files;
+}
+
+function maxNodes() {
+  return Number(process.env.KEYWAY_MANAGED_MAX_NODES ?? 16);
+}
+
+async function readJsonBody(request, limit = 65_536) {
+  const body = await readBody(request, limit);
+  try {
+    const parsed = JSON.parse(body.toString("utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    throw new Error("Request body must be valid JSON");
+  }
 }
 
 async function existingUsers() {

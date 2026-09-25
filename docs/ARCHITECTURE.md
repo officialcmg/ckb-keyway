@@ -84,3 +84,13 @@ The reference wallet lives at `/app`; `/` is the pitch-oriented project landing 
 The backend contains a controlled testnet gateway that gives each managed account its own native `fnn` process, CKB key, Fiber identity, and data directory. A private managed-host service starts known nodes from one persistent Railway volume and lazily provisions new users. Requests use an opaque hash of the Stytch user ID and a shared bearer token; the host never exposes public RPC. Explicit account-to-node assignments take precedence so an existing node can keep its identity and channels during migration. Duplicate assigned URLs are rejected so two users cannot share a Fiber database. Payment submission requires a successful dry run and a one-use confirmation bound to the exact invoice and fee limit. Mutating requests are serialized per user and carry idempotency keys to prevent duplicate operations during retries.
 
 The SDK exposes `nodeMode="managed"` only as an explicit beta option; browser mode remains the default. Browser and native Fiber databases are not interchangeable, so existing browser channels cannot be silently moved into the native node. General availability still requires production load limits, backup and restore procedures for the managed volume, and full two-account staging tests.
+
+The managed host caps load with `KEYWAY_MANAGED_MAX_NODES` (default 16 concurrent nodes) and `KEYWAY_MANAGED_MAX_CHANNELS` (default 5 open channels per managed account, enforced in the backend before funding). State is protected by an operator-driven snapshot API on the same bearer-token boundary:
+
+| Request | Effect |
+| --- | --- |
+| `GET /users/:id/backups` | List snapshots with size, creation time, and digest |
+| `POST /users/:id/backups` | Stop the user's node, copy its data directory to the backup volume, record the digest, prune older generations, restart the node |
+| `POST /users/:id/restore` | Stop the node, verify the stored digest, stage and swap the data directory, restart the node |
+
+Snapshots live under `KEYWAY_MANAGED_BACKUP_DIR` (default `/fiber/backups`, ideally a separate volume), retain `KEYWAY_MANAGED_BACKUP_GENERATIONS` generations (default 3), and refuse a data directory larger than `KEYWAY_MANAGED_MAX_BACKUP_BYTES` (default 512 MiB). A restore never overwrites live state until the snapshot digest verifies, and it is refused when the metadata is missing or the snapshot was modified. Remaining before general availability: separate staging Stytch and Lit credentials, and the same two-account testnet channel and payment suite run in both browser and managed modes against staging.
