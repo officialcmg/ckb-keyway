@@ -119,7 +119,7 @@ await connected.keyway.waitForPayment(payment.payment_hash);
 await connected.keyway.stop();
 ```
 
-Enrolled beta accounts can select the API-backed native node with `<KeyWayProvider nodeMode="managed">`. It implements the same high-level channel, invoice, payment preflight, payment, and balance methods without starting WASM in the consuming page. Managed mode uses a distinct persistent native Fiber node; it does not import an existing browser node's IndexedDB channels.
+Enrolled beta accounts can select the API-backed native node with `<KeyWayProvider nodeMode="managed">`. It implements the same high-level channel, invoice, payment preflight, payment, and balance methods without starting WASM in the consuming page. Managed mode uses an isolated persistent native Fiber process and data directory for each user; it does not import an existing browser node's IndexedDB channels. Existing beta accounts can remain pinned to their original dedicated node while the managed host provisions new accounts automatically.
 
 Channel activation also accepts configuration while retaining the 1,000 CKB default:
 

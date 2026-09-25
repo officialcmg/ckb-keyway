@@ -10,6 +10,7 @@ import {
   type SendPaymentParams,
   type SubmitSignedFundingTxParams,
 } from "@fiber-pay/sdk/node";
+import { createHash } from "node:crypto";
 import { consumeManagedConfirmation, issueManagedConfirmation } from "./managed-confirmation.ts";
 import { toKeyWayError } from "../sdk/browser/keyway-error.ts";
 
@@ -116,22 +117,42 @@ export async function managedNodeRequest(
 }
 
 export async function managedNodeReady(): Promise<unknown> {
-  const assignments = managedNodeAssignments();
-  return Promise.all([...assignments.keys()].map((userId) => managedNodeClient(userId).nodeInfo()));
+  const ready: unknown[] = [];
+  if (process.env.KEYWAY_MANAGED_FIBER_HOST_URL) {
+    const response = await fetch(new URL("/readyz", managedHostUrl()), {
+      headers: { Authorization: `Bearer ${requiredEnv("KEYWAY_MANAGED_FIBER_HOST_TOKEN")}` },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) throw new Error(`Managed Fiber host is unavailable (${response.status})`);
+    ready.push(await response.json());
+  }
+  const assignments = managedNodeAssignments(false);
+  ready.push(...await Promise.all([...assignments.keys()].map((userId) => managedNodeClient(userId).nodeInfo())));
+  if (ready.length === 0) throw new Error("Managed Fiber is not configured");
+  return ready;
 }
 
 function managedNodeClient(userId: string): ManagedNodeClient {
   const existing = clients.get(userId);
   if (existing) return existing;
-  const url = managedNodeAssignments().get(userId);
+  const assignedUrl = managedNodeAssignments(false).get(userId);
+  const url = assignedUrl ?? (process.env.KEYWAY_MANAGED_FIBER_HOST_URL
+    ? new URL(`/users/${createHash("sha256").update(userId).digest("hex")}`, managedHostUrl()).toString()
+    : undefined);
   if (!url) throw new Error("Managed Fiber is not enabled for this account");
   const client = new FiberRpcClient({
     url,
     timeout: 15_000,
-    biscuitToken: process.env.KEYWAY_MANAGED_FIBER_RPC_TOKEN,
+    biscuitToken: assignedUrl
+      ? process.env.KEYWAY_MANAGED_FIBER_RPC_TOKEN
+      : process.env.KEYWAY_MANAGED_FIBER_HOST_TOKEN,
   });
   clients.set(userId, client);
   return client;
+}
+
+function managedHostUrl(): string {
+  return managedRpcUrl(requiredEnv("KEYWAY_MANAGED_FIBER_HOST_URL"));
 }
 
 export function parseManagedNodeAssignments(raw: string): Map<string, string> {
@@ -157,8 +178,10 @@ export function parseManagedNodeAssignments(raw: string): Map<string, string> {
   return assignments;
 }
 
-function managedNodeAssignments(): Map<string, string> {
-  return parseManagedNodeAssignments(requiredEnv("KEYWAY_MANAGED_FIBER_NODES"));
+function managedNodeAssignments(required = true): Map<string, string> {
+  const raw = process.env.KEYWAY_MANAGED_FIBER_NODES;
+  if (!raw && !required) return new Map();
+  return parseManagedNodeAssignments(raw ?? requiredEnv("KEYWAY_MANAGED_FIBER_NODES"));
 }
 
 function managedRpcUrl(value: string): string {
