@@ -198,7 +198,7 @@ The production deployment also sends `Cross-Origin-Opener-Policy: same-origin` a
 
 - Testnet CKB only; UDTs, swaps, merchant checkout, and mainnet are out of scope.
 - Cross-device Fiber state migration currently requires explicit logout. A crash, lost device, force-closed tab, or interrupted browser cannot create a fresh checkpoint, so background snapshots still need an upstream-safe database flush boundary.
-- Channel balances and managed channel shutdown are available through `connection.keyway`; the reference wallet renders balances and channels but does not yet provide a close-channel screen.
+- Channel balances and channel shutdown are available through `connection.keyway`. The reference wallet renders both sides of each channel and can close one after an explicit confirmation; a cooperative close settles the latest balance back on CKB.
 - The backend is trusted to authorize Lit operations and can observe the decrypted Fiber key.
 - The reference wallet uses fixed activation and maximum-payment-fee limits for a predictable demo; SDK consumers can configure channel funding and preflight payment fees.
 - CKB balance is an indexer-derived sum of live cells, not an account field. The reference wallet polls it every ten seconds, so a newly mined or faucet-created cell can still appear after indexer delay.

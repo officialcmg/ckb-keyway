@@ -44,6 +44,9 @@ function WalletPanel() {
   const [receiveDescription, setReceiveDescription] = useState("CKB KeyWay payment");
   const [createdInvoice, setCreatedInvoice] = useState<string>();
   const [error, setError] = useState<string>();
+  const [notice, setNotice] = useState<string>();
+  const [closingChannel, setClosingChannel] = useState<FiberChannel>();
+  const [closing, setClosing] = useState<string>();
   const [balanceShannons, setBalanceShannons] = useState<bigint>();
   const [channels, setChannels] = useState<FiberChannel[]>([]);
 
@@ -192,6 +195,33 @@ function WalletPanel() {
     }
   }
 
+  async function closeChannel() {
+    const current = connected;
+    const target = closingChannel;
+    if (!current || !target) return;
+    setClosingChannel(undefined);
+    setClosing(target.channel_id);
+    setError(undefined);
+    setNotice(undefined);
+    try {
+      await current.keyway.closeChannel(target.channel_id);
+      const { channels: refreshed } = await current.keyway.listChannels({ include_closed: false });
+      const ready = refreshed.find(({ state }) => state.state_name === "CHANNEL_READY");
+      setChannels(refreshed);
+      setChannelReady(Boolean(ready));
+      setChannelEvidence(ready ? {
+        channelId: ready.channel_id,
+        fundingOutpoint: formatFiberOutpoint(ready.channel_outpoint),
+      } : undefined);
+      setNotice(`Channel ${shorten(target.channel_id)} is closing. Your balance settles back on CKB once the close confirms.`);
+      setBalanceShannons(await current.keyway.getCkbBalance());
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Channel close failed");
+    } finally {
+      setClosing(undefined);
+    }
+  }
+
   if (!ready) return <WalletProgress label="Loading secure email login" />;
   if (!authenticated) {
     return (
@@ -257,7 +287,7 @@ function WalletPanel() {
         </section>
       ) : (
         <>
-          <ChannelList channels={channels} />
+          <ChannelList channels={channels} closing={closing} onClose={setClosingChannel} />
           <div className="payment-grid">
             <section className="payment-card">
               <p className="step-label">Send</p>
@@ -283,6 +313,7 @@ function WalletPanel() {
 
       {createdInvoice && <OutputCard label="Invoice" value={createdInvoice} />}
       {paymentResult && <p className="success">{paymentResult}</p>}
+      {notice && <p className="success">{notice}</p>}
       {error && <p className="error">{friendlyError(error)}</p>}
 
       <details className="diagnostics">
@@ -311,6 +342,25 @@ function WalletPanel() {
             <div className="confirm-actions">
               <button className="quiet" onClick={() => setPaymentPreview(undefined)}>Cancel</button>
               <button onClick={confirmPayment}>Confirm payment</button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {closingChannel && (
+        <div className="modal-backdrop" role="presentation">
+          <section className="confirm-sheet" role="dialog" aria-modal="true" aria-labelledby="close-confirm-title">
+            <p className="step-label">Channel confirmation</p>
+            <h2 id="close-confirm-title">Close this channel?</h2>
+            <dl>
+              <dt>Your balance</dt><dd>{formatCkb(BigInt(closingChannel.local_balance))} CKB</dd>
+              <dt>Peer</dt><dd>{shorten(closingChannel.pubkey)}</dd>
+              <dt>Network</dt><dd>Fiber testnet</dd>
+            </dl>
+            <p className="hint">Closing settles your channel balance back on CKB and stops off-chain payments on this channel.</p>
+            <div className="confirm-actions">
+              <button className="quiet" onClick={() => setClosingChannel(undefined)}>Cancel</button>
+              <button onClick={closeChannel}>Confirm close</button>
             </div>
           </section>
         </div>
@@ -345,7 +395,11 @@ function OutputCard({ label, value }: { label: string; value: string }) {
   return <section className="output-card"><span>{label}</span><code>{value}</code></section>;
 }
 
-function ChannelList({ channels }: { channels: FiberChannel[] }) {
+function ChannelList({ channels, closing, onClose }: {
+  channels: FiberChannel[];
+  closing?: string;
+  onClose: (channel: FiberChannel) => void;
+}) {
   return (
     <section className="channel-section">
       <header><div><p className="step-label">Liquidity</p><h2>Your channels</h2></div><span>{channels.length} open</span></header>
@@ -368,7 +422,16 @@ function ChannelList({ channels }: { channels: FiberChannel[] }) {
                 </div>
                 <small className="channel-capacity">{formatCkb(capacity)} CKB total capacity</small>
               </div>
-              <span className="channel-state">{formatChannelState(channel.state.state_name)}</span>
+              <div className="channel-actions">
+                <span className="channel-state">{formatChannelState(channel.state.state_name)}</span>
+                <button
+                  className="channel-close"
+                  onClick={() => onClose(channel)}
+                  disabled={Boolean(closing) || channel.state.state_name === "SHUTTING_DOWN"}
+                >
+                  {closing === channel.channel_id ? "Closing..." : channel.state.state_name === "SHUTTING_DOWN" ? "Closing" : "Close"}
+                </button>
+              </div>
             </article>
           );
         })}

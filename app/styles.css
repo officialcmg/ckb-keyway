@@ -142,6 +142,10 @@ button:disabled { opacity: 0.42; cursor: not-allowed; }
 .liquidity-track { height: 0.58rem; overflow: hidden; border-radius: 999px; background: var(--coral-soft); }
 .liquidity-track span { display: block; height: 100%; border-radius: inherit 0 0 inherit; background: var(--blue); }
 .channel-capacity { text-align: center; }
+.channel-actions { display: grid; gap: 0.45rem; justify-items: end; }
+.channel-close { border: 1px solid var(--line); border-radius: 999px; background: transparent; color: var(--navy); cursor: pointer; font: 700 0.62rem "SFMono-Regular", Consolas, monospace; letter-spacing: 0.06em; padding: 0.34rem 0.6rem; text-transform: uppercase; }
+.channel-close:hover:not(:disabled) { border-color: var(--navy); }
+.channel-close:disabled { cursor: progress; opacity: 0.5; }
 .channel-state { color: var(--blue); font: 800 0.62rem "SFMono-Regular", Consolas, monospace; text-transform: uppercase; }
 .payment-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem; }
 .payment-card:last-child { background: var(--yellow); }

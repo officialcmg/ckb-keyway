@@ -68,7 +68,7 @@ Relay connections provide P2P reachability and gossip; they are not payment chan
 
 `listChannels` exposes local, remote, offered-TLC, and received-TLC balances for channels known to the browser node. A channel's `channel_outpoint` is the CKB funding cell reference (`tx_hash` plus output `index`) that anchors the off-chain state. Cooperative or forced `shutdownChannel` eventually consumes that funding cell and creates settlement cells from the latest enforceable allocation; forced settlement may remain pending for the negotiated commitment delay.
 
-The reference wallet lives at `/app`; `/` is the pitch-oriented project landing page. The wallet treats ready-channel `local_balance` values as the user's Fiber balance and displays the on-chain CKB cell balance separately. Its transit-map channel list includes every non-closed channel and renders `local_balance` as "You" and `remote_balance` as "Peer", so pending lifecycle states and both sides of each channel remain visible.
+The reference wallet lives at `/app`; `/` is the pitch-oriented project landing page. The wallet treats ready-channel `local_balance` values as the user's Fiber balance and displays the on-chain CKB cell balance separately. Its transit-map channel list includes every non-closed channel and renders `local_balance` as "You" and `remote_balance` as "Peer", so pending lifecycle states and both sides of each channel remain visible. Each row offers a cooperative close behind an explicit confirmation sheet that shows the user's balance, the peer, and the network; a shutting-down channel is shown as closing until settlement returns the balance to CKB.
 
 ## Trust boundaries
 
