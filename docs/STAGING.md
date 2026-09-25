@@ -64,6 +64,6 @@ After the credentials exist, run the same flow used for the original testnet evi
 2. Activate a channel in each profile and wait for `CHANNEL_READY`.
 3. Create a small invoice in profile B and pay it from profile A, confirming the preflight, the routed payment, and the settled payment hash.
 4. Log out in profile A, log in with the same account in a third profile, and confirm the encrypted handoff restores the same channel.
-5. Repeat the payment step with `/app?mode=managed` on both profiles and confirm the same result and the same public lifecycle surface. `/app` exercises browser mode.
+5. Repeat the payment step with `/app?mode=managed` on both profiles and confirm the same result and the same public lifecycle surface. `/app` exercises browser mode. The query switch is enabled only in the staging build.
 
 Record the two payment hashes and the channel IDs under `docs/TESTNET_EVIDENCE.md` when staging is no longer ephemeral.

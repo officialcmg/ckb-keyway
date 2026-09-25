@@ -2,7 +2,9 @@ import Link from "next/link";
 import { AuthPanel } from "../auth-panel";
 
 export default async function WalletApp({ searchParams }: { searchParams: Promise<{ mode?: string }> }) {
-  const nodeMode = (await searchParams).mode === "managed" ? "managed" : "browser";
+  const nodeMode = process.env.KEYWAY_STAGING_FRONTEND === "1" && (await searchParams).mode === "managed"
+    ? "managed"
+    : "browser";
   return (
     <main className="app-frame wallet-app">
       <header className="site-header">
