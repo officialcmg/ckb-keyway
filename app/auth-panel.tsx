@@ -13,9 +13,9 @@ import {
 type Phase = "recovering" | "ready" | "activating" | "paying" | "receiving" | "error";
 type FiberChannel = Awaited<ReturnType<KeyWay["listChannels"]>>["channels"][number];
 
-export function AuthPanel() {
+export function AuthPanel({ nodeMode = "browser" }: { nodeMode?: "browser" | "managed" }) {
   return (
-    <KeyWayProvider>
+    <KeyWayProvider nodeMode={nodeMode}>
       <WalletPanel />
     </KeyWayProvider>
   );

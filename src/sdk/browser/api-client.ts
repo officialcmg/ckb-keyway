@@ -14,7 +14,9 @@ export type NodeBackupPayload = {
 
 export type ClaimedNodeBackup = NodeBackupPayload & { generation: number };
 
-const KEYWAY_API_BASE_URL = "https://keyway-api-production.up.railway.app";
+const KEYWAY_API_BASE_URL = process.env.KEYWAY_API_TARGET === "staging"
+  ? "https://keyway-api-staging-staging.up.railway.app"
+  : "https://keyway-api-production.up.railway.app";
 const KEYWAY_API_PATH = "/api/v1/keyway";
 
 export class KeyWayApiClient {

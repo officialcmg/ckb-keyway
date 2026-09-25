@@ -11,7 +11,7 @@ The Railway project `ckb-keyway` has two environments:
 | production | `keyway-api`, `keyway-managed-host-production`, `keyway-managed-fnn`, `Postgres` |
 | staging | `keyway-api-staging`, `keyway-managed-host`, `keyway-managed-fnn-staging`, `Postgres-oF2n` |
 
-Staging already has its own `DATABASE_URL`, `KEYWAY_*` credentials, managed-host token, and managed Fiber state. It is network-isolated from production wallets because it holds no usable identity provider credentials.
+The separate frontend is deployed at `https://ckb-keyway-staging.vercel.app`. Staging has its own `DATABASE_URL`, `KEYWAY_*` credentials, managed-host token, and managed Fiber state. Its API allows the staging frontend origin and `http://localhost:3000`. It cannot access production identities because it holds no usable identity provider credentials.
 
 Staging is currently missing:
 
@@ -26,6 +26,18 @@ LIT_DECRYPT_ACTION_CID
 ```
 
 Without them, `keyway-api-staging` serves `/healthz` and `/readyz` but cannot send OTP codes or authorize Lit operations, so the two-account Fiber test cannot run there yet.
+
+The npm SDK always targets the production API. For staging only, run `npm run build:staging`. This compiles a separate local SDK bundle with the staging API URL and aliases the demo's `@ckb-keyway/react` import to that bundle. The production `npm run build:sdk` explicitly compiles the production URL; no provider API URL prop is exposed. The separate `ckb-keyway-staging` Vercel project uses `vercel.staging.json` to run that build. The staging API already allows its origin.
+
+The staging Vercel project has no Git connection. Deploy from a clean temporary copy so the checkout's existing `.vercel` link keeps pointing at production:
+
+```sh
+rsync -a --exclude='.git' --exclude='.vercel' --exclude='.next' --exclude='node_modules' --exclude='dist' --exclude='.env*' --exclude='.railway' ./ /tmp/ckb-keyway-staging/
+vercel link --yes --project ckb-keyway-staging --cwd /tmp/ckb-keyway-staging
+vercel deploy --prod --yes -A /tmp/ckb-keyway-staging/vercel.staging.json --cwd /tmp/ckb-keyway-staging
+```
+
+Verify that `https://ckb-keyway-staging.vercel.app/app` loads and that an `OPTIONS` request from this origin to `https://keyway-api-staging-staging.up.railway.app/api/v1/keyway/auth/send-code` receives `Access-Control-Allow-Origin: https://ckb-keyway-staging.vercel.app`.
 
 ## Remaining setup
 
@@ -52,6 +64,6 @@ After the credentials exist, run the same flow used for the original testnet evi
 2. Activate a channel in each profile and wait for `CHANNEL_READY`.
 3. Create a small invoice in profile B and pay it from profile A, confirming the preflight, the routed payment, and the settled payment hash.
 4. Log out in profile A, log in with the same account in a third profile, and confirm the encrypted handoff restores the same channel.
-5. Repeat the payment step with `nodeMode="managed"` on both profiles and confirm the same result and the same public lifecycle surface.
+5. Repeat the payment step with `/app?mode=managed` on both profiles and confirm the same result and the same public lifecycle surface. `/app` exercises browser mode.
 
 Record the two payment hashes and the channel IDs under `docs/TESTNET_EVIDENCE.md` when staging is no longer ephemeral.

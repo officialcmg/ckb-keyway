@@ -1,6 +1,14 @@
 import type { NextConfig } from "next";
+import { resolve } from "node:path";
 
 const nextConfig: NextConfig = {
+  ...(process.env.KEYWAY_STAGING_BUILD === "1" ? {
+    turbopack: { resolveAlias: { "@ckb-keyway/react": "./dist/react-staging/index.js" } },
+    webpack: (config: { resolve: { alias: Record<string, string> } }) => {
+      config.resolve.alias["@ckb-keyway/react"] = resolve("dist/react-staging/index.js");
+      return config;
+    },
+  } : {}),
   async headers() {
     return [
       {

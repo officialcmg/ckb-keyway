@@ -1,7 +1,8 @@
 import Link from "next/link";
 import { AuthPanel } from "../auth-panel";
 
-export default function WalletApp() {
+export default async function WalletApp({ searchParams }: { searchParams: Promise<{ mode?: string }> }) {
+  const nodeMode = (await searchParams).mode === "managed" ? "managed" : "browser";
   return (
     <main className="app-frame wallet-app">
       <header className="site-header">
@@ -12,7 +13,7 @@ export default function WalletApp() {
         <div className="app-links"><a href="https://ckb-keyway-docs.vercel.app">Docs</a><a href="https://www.npmjs.com/package/@ckb-keyway/react">npm</a><div className="network-pill"><span /> CKB testnet</div></div>
       </header>
       <section className="app-intro"><div><p className="eyebrow">Live SDK demo</p><h1>Move CKB through Fiber.</h1></div><p>Email-authenticated wallet recovery, channel liquidity, and routed payments in one reference app.</p></section>
-      <AuthPanel />
+      <AuthPanel nodeMode={nodeMode} />
       <footer className="site-footer"><span>CKB KeyWay</span><Link href="/">Project overview</Link><a href="https://ckb-keyway-docs.vercel.app">Docs</a><a href="https://www.npmjs.com/package/@ckb-keyway/react">npm</a></footer>
     </main>
   );

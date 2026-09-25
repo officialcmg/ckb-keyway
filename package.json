@@ -8,7 +8,9 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "build:sdk": "tsup src/sdk/react/index.ts --tsconfig tsconfig.sdk.json --format esm --dts --platform browser --external react --external react/jsx-runtime --out-dir dist/react --clean",
+    "build:sdk": "tsup src/sdk/react/index.ts --tsconfig tsconfig.sdk.json --format esm --dts --platform browser --external react --external react/jsx-runtime --env.KEYWAY_API_TARGET production --out-dir dist/react --clean",
+    "build:sdk:staging": "tsup src/sdk/react/index.ts --tsconfig tsconfig.sdk.json --format esm --dts --platform browser --external react --external react/jsx-runtime --env.KEYWAY_API_TARGET staging --out-dir dist/react-staging --clean",
+    "build:staging": "npm run build:sdk:staging && KEYWAY_STAGING_BUILD=1 next build",
     "build:api": "tsup server/index.ts --tsconfig tsconfig.sdk.json --format esm --platform node --out-dir dist/api --clean",
     "api": "node dist/api/index.js",
     "dev:api": "node --import tsx server/index.ts",
