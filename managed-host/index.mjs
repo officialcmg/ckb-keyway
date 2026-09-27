@@ -1,15 +1,18 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { spawn } from "node:child_process";
-import { cp, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { cp, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
 import { join } from "node:path";
+import { pipeline } from "node:stream/promises";
 import { pathToFileURL } from "node:url";
 
 const USER_ID = /^[0-9a-f]{64}$/;
 const SNAPSHOT = /^snap-\d+$/;
 const nodes = new Map();
 const starting = new Map();
+const operations = new Map();
 let shuttingDown = false;
 
 export function managedUserId(userId) {
@@ -26,11 +29,12 @@ export function authorizationMatches(header, token) {
 async function main() {
   required("FIBER_SECRET_KEY_PASSWORD");
   required("KEYWAY_MANAGED_HOST_TOKEN");
+  backupKey();
   const server = createServer(handleRequest);
   server.listen(Number(process.env.PORT ?? 8080), "0.0.0.0", () => {
     console.log(`[managed-host] listening on ${process.env.PORT ?? 8080}`);
   });
-  for (const userId of await existingUsers()) void ensureNode(userId).catch(logError);
+  for (const userId of await existingUsers()) void withUserOperation(userId, () => ensureNode(userId)).catch(logError);
   const stop = () => {
     shuttingDown = true;
     server.close();
@@ -50,37 +54,52 @@ async function handleRequest(request, response) {
     }
     const backups = /^\/users\/([0-9a-f]{64})\/backups$/.exec(request.url ?? "");
     if (backups && request.method === "GET") {
-      return send(response, 200, { snapshots: await listSnapshots({ userId: backups[1] }) });
+      return send(response, 200, { snapshots: await withUserOperation(backups[1], () => listSnapshots({ userId: backups[1] })) });
     }
     if (backups && request.method === "POST") {
-      return send(response, 200, await snapshotUser(backups[1]));
+      return send(response, 200, await withUserOperation(backups[1], () => snapshotUser(backups[1])));
     }
     const restore = request.method === "POST" && /^\/users\/([0-9a-f]{64})\/restore$/.exec(request.url ?? "");
     if (restore) {
       const { name } = await readJsonBody(request);
-      return send(response, 200, await restoreUser(restore[1], name));
+      return send(response, 200, await withUserOperation(restore[1], () => restoreUser(restore[1], name)));
     }
     const match = request.method === "POST" && /^\/users\/([0-9a-f]{64})$/.exec(request.url ?? "");
     if (!match) return send(response, 404, { error: "Not found" });
     const body = await readBody(request, 1_048_576);
-    const node = await ensureNode(match[1]);
-    const upstream = await fetch(`http://127.0.0.1:${node.port}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body,
-      signal: AbortSignal.timeout(120_000),
+    await withUserOperation(match[1], async () => {
+      const node = await ensureNode(match[1]);
+      const upstream = await fetch(`http://127.0.0.1:${node.port}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        signal: AbortSignal.timeout(120_000),
+      });
+      response.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json" });
+      response.end(Buffer.from(await upstream.arrayBuffer()));
     });
-    response.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json" });
-    response.end(Buffer.from(await upstream.arrayBuffer()));
   } catch (error) {
     logError(error);
     send(response, 502, { error: error instanceof Error ? error.message : "Managed node failed" });
   }
 }
 
+export async function withUserOperation(userId, operation) {
+  const previous = operations.get(userId) ?? Promise.resolve();
+  const current = previous.catch(() => {}).then(operation);
+  operations.set(userId, current);
+  try {
+    return await current;
+  } finally {
+    if (operations.get(userId) === current) operations.delete(userId);
+  }
+}
+
 async function ensureNode(userId) {
   if (!USER_ID.test(userId)) throw new Error("Managed user ID is invalid");
+  if (shuttingDown) throw new Error("Managed host is shutting down");
   const running = nodes.get(userId);
+  if (running?.stopping) throw new Error("Fiber process is still stopping");
   if (running) return running;
   const pending = starting.get(userId);
   if (pending) return pending;
@@ -113,7 +132,7 @@ async function startNode(userId) {
     const wasRunning = nodes.get(userId)?.child === child;
     if (wasRunning) nodes.delete(userId);
     console.error(`[managed-host] fnn ${userId.slice(0, 8)} exited code=${code} signal=${signal}`);
-    if (wasRunning && !shuttingDown) setTimeout(() => void ensureNode(userId).catch(logError), 1_000);
+    if (wasRunning && !node.stopping && !shuttingDown) setTimeout(() => void withUserOperation(userId, () => ensureNode(userId)).catch(logError), 1_000);
   });
   await waitForRpc(port, child);
   nodes.set(userId, node);
@@ -169,20 +188,23 @@ async function stopNode(userId) {
   const pending = starting.get(userId);
   const node = nodes.get(userId) ?? (pending ? await pending.catch(() => undefined) : undefined);
   if (!node) return false;
-  nodes.delete(userId);
+  node.stopping = true;
   await waitForExit(node.child);
+  if (nodes.get(userId) === node) nodes.delete(userId);
   return true;
 }
 
-function waitForExit(child, timeout = 15_000) {
-  return new Promise((resolve) => {
+export function waitForExit(child, timeout = 15_000) {
+  return new Promise((resolve, reject) => {
     if (child.exitCode !== null || child.signalCode !== null) return resolve();
+    let deadline;
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
-      resolve();
+      deadline = setTimeout(() => reject(new Error("Fiber process did not stop; database operation aborted")), 5_000);
     }, timeout);
     child.once("exit", () => {
       clearTimeout(timer);
+      clearTimeout(deadline);
       resolve();
     });
     child.kill("SIGTERM");
@@ -206,14 +228,15 @@ export async function listSnapshots({ userId, root = managedBackupDir(userId) })
     throw error;
   }
   const snapshots = [];
-  for (const entry of entries.filter((candidate) => candidate.isDirectory() && SNAPSHOT.test(candidate.name))) {
-    const path = join(root, entry.name);
-    const record = await readSnapshotRecord(root, entry.name);
+  for (const entry of entries.filter((candidate) => candidate.isFile() && /^snap-\d+\.json$/.test(candidate.name))) {
+    const name = entry.name.slice(0, -5);
+    const record = await readSnapshotRecord(root, name);
+    if (!record) continue;
     snapshots.push({
-      name: entry.name,
-      createdAt: record?.createdAt ?? (await stat(path)).mtime.toISOString(),
-      bytes: record?.bytes ?? await directoryBytes(path),
-      digest: record?.digest ?? await snapshotDigest(path),
+      name,
+      createdAt: record.createdAt,
+      bytes: record.bytes,
+      digest: record.digest,
     });
   }
   return snapshots.sort((left, right) => left.name.localeCompare(right.name));
@@ -225,22 +248,30 @@ export async function createSnapshot({
   root = managedBackupDir(userId),
   limitBytes = Number(process.env.KEYWAY_MANAGED_MAX_BACKUP_BYTES ?? 512 * 1024 * 1024),
   keep = Number(process.env.KEYWAY_MANAGED_BACKUP_GENERATIONS ?? 3),
+  encryptionKey,
 }) {
+  const key = backupKey(encryptionKey);
   const bytes = await directoryBytes(dataDir);
   if (bytes > limitBytes) throw new Error("Managed Fiber data directory exceeds the backup size limit");
   const expected = await snapshotDigest(dataDir);
   const name = `snap-${Date.now()}`;
   await mkdir(root, { recursive: true });
-  const target = join(root, name);
-  await cp(dataDir, target, { recursive: true });
-  if (await snapshotDigest(target) !== expected) {
-    await rm(target, { recursive: true, force: true });
-    throw new Error("Managed Fiber snapshot verification failed");
+  const target = join(root, `${name}.enc`);
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const tar = spawn("tar", ["-C", dataDir, "-cf", "-", "."], { stdio: ["ignore", "pipe", "pipe"] });
+  try {
+    await Promise.all([pipeline(tar.stdout, cipher, createWriteStream(target, { mode: 0o600 })), tarResult(tar)]);
+  } catch (error) {
+    tar.kill();
+    await rm(target, { force: true });
+    throw error;
   }
   const createdAt = new Date().toISOString();
-  await writeFile(join(root, `${name}.json`), JSON.stringify({ digest: expected, bytes, createdAt }));
+  await writeFile(join(root, `${name}.json`), JSON.stringify({ digest: expected, bytes, createdAt, format: 2, iv: iv.toString("hex"), tag: cipher.getAuthTag().toString("hex") }), { mode: 0o600 });
   for (const stale of (await listSnapshots({ userId, root })).slice(0, -keep)) {
     await rm(join(root, stale.name), { recursive: true, force: true });
+    await rm(join(root, `${stale.name}.enc`), { force: true });
     await rm(join(root, `${stale.name}.json`), { force: true });
   }
   return { name, createdAt, bytes, digest: expected };
@@ -251,18 +282,36 @@ export async function restoreSnapshot({
   dataDir = managedDataDir(userId),
   root = managedBackupDir(userId),
   name,
+  encryptionKey,
 }) {
   if (typeof name !== "string" || !SNAPSHOT.test(name)) throw new Error("A valid managed Fiber snapshot name is required");
-  const source = join(root, name);
   const record = await readSnapshotRecord(root, name);
   if (!record) throw new Error("Managed Fiber snapshot metadata is missing");
   const expected = record.digest;
   const staging = `${dataDir}.restore`;
   await rm(staging, { recursive: true, force: true });
-  await cp(source, staging, { recursive: true });
-  if (await snapshotDigest(staging) !== expected) {
+  await mkdir(staging, { recursive: true });
+  try {
+    if (record.format === 2) {
+      const decipher = createDecipheriv("aes-256-gcm", backupKey(encryptionKey), Buffer.from(record.iv, "hex"));
+      decipher.setAuthTag(Buffer.from(record.tag, "hex"));
+      const scratch = await mkdtemp(`${dataDir}.archive-`);
+      try {
+        const archive = join(scratch, "snapshot.tar");
+        // GCM authenticates at EOF; never feed unauthenticated plaintext to tar.
+        await pipeline(createReadStream(join(root, `${name}.enc`)), decipher, createWriteStream(archive, { flags: "wx", mode: 0o600 }));
+        const tar = spawn("tar", ["-C", staging, "-xf", archive], { stdio: ["ignore", "ignore", "pipe"] });
+        await tarResult(tar);
+      } finally {
+        await rm(scratch, { recursive: true, force: true });
+      }
+    } else {
+      await cp(join(root, name), staging, { recursive: true });
+    }
+    if (await snapshotDigest(staging) !== expected) throw new Error("Managed Fiber snapshot is corrupted");
+  } catch (error) {
     await rm(staging, { recursive: true, force: true });
-    throw new Error("Managed Fiber snapshot is corrupted");
+    throw error;
   }
   await rm(dataDir, { recursive: true, force: true });
   await rename(staging, dataDir);
@@ -272,13 +321,30 @@ export async function restoreSnapshot({
 async function readSnapshotRecord(root, name) {
   try {
     const record = JSON.parse(await readFile(join(root, `${name}.json`), "utf8"));
-    return /^[0-9a-f]{64}$/.test(record?.digest) && typeof record?.bytes === "number" && typeof record?.createdAt === "string"
+    return /^[0-9a-f]{64}$/.test(record?.digest) && typeof record?.bytes === "number" && typeof record?.createdAt === "string" && (record.format === undefined || record.format === 2 && /^[0-9a-f]{24}$/.test(record.iv) && /^[0-9a-f]{32}$/.test(record.tag))
       ? record
       : undefined;
   } catch (error) {
     if (error?.code === "ENOENT") return undefined;
     throw error;
   }
+}
+
+function backupKey(override) {
+  const configured = override ? undefined : required("KEYWAY_MANAGED_BACKUP_KEY");
+  if (configured && !/^[0-9a-fA-F]{64}$/.test(configured)) throw new Error("KEYWAY_MANAGED_BACKUP_KEY must be 32 bytes (64 hex characters)");
+  const key = override ?? Buffer.from(configured, "hex");
+  if (!Buffer.isBuffer(key) || key.length !== 32) throw new Error("KEYWAY_MANAGED_BACKUP_KEY must be 32 bytes (64 hex characters)");
+  return key;
+}
+
+function tarResult(child) {
+  return new Promise((resolve, reject) => {
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    child.once("error", reject);
+    child.once("close", (code) => code === 0 ? resolve() : reject(new Error(`tar failed: ${stderr.trim()}`)));
+  });
 }
 
 export async function snapshotDigest(directory) {
