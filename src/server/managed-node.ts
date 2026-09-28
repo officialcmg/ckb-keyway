@@ -1,7 +1,6 @@
 import {
   FiberRpcClient,
   type ChannelId,
-  type CkbTransaction,
   type Hash256,
   type NewInvoiceParams,
   type OpenChannelWithExternalFundingParams,
@@ -14,6 +13,8 @@ import { createHash } from "node:crypto";
 import { consumeManagedConfirmation, issueManagedConfirmation } from "./managed-confirmation.ts";
 import { toKeyWayError } from "../sdk/browser/keyway-error.ts";
 import { connectCandidates, TESTNET_CHANNEL_PEERS } from "../sdk/browser/channel-peers.ts";
+import { normalizeCkbTransactionForCcc } from "@fiber-pay/sdk/browser";
+import { serializeCccTransactionForRpc } from "../sdk/browser/ccc-transaction.ts";
 
 type ManagedNodeClient = Pick<
   FiberRpcClient,
@@ -243,14 +244,23 @@ function submitFundingParams(value: unknown): SubmitSignedFundingTxParams {
   const transaction = object(params.signed_funding_tx, "Signed funding transaction is required");
   return {
     channel_id: channelId(params.channel_id),
-    signed_funding_tx: transaction as CkbTransaction,
+    signed_funding_tx: serializeCccTransactionForRpc(normalizeCkbTransactionForCcc(transaction)),
   };
 }
 
 async function connectManagedPeer(node: ManagedNodeClient, peer: Pubkey): Promise<void> {
   const candidate = TESTNET_CHANNEL_PEERS.find(({ pubkey }) => pubkey === peer.toLowerCase());
   if (!candidate) throw new Error("Managed beta only supports approved testnet channel peers");
-  if ((await connectCandidates(node, [candidate], 10_000, 250)).length === 0) {
+  // Native nodes resolve current TCP addresses from gossip, not browser WSS seeds.
+  let addresses: string[] = [];
+  try {
+    await node.connectPeer({ pubkey: peer, addr_type: "tcp", save: true });
+  } catch {
+    // Bootstrap hints may go stale; the handshake still must match the approved key.
+    addresses = candidate.nativeAddresses ?? [];
+  }
+  const nativeCandidate = { ...candidate, addresses };
+  if ((await connectCandidates(node, [nativeCandidate], 10_000, 250)).length === 0) {
     throw new Error("Could not connect to the selected Fiber channel peer");
   }
 }

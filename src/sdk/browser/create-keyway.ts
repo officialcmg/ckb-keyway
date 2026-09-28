@@ -14,7 +14,7 @@ import {
 import { KeyWayCredentialProvider, type FiberKeyLoader } from "./credential-provider";
 import { acquireDeviceLock, type DeviceLock } from "./device-lock";
 import { acquireDeviceLease, type DeviceLease } from "./device-lease";
-import { serializeCccTransaction } from "./ccc-transaction";
+import { serializeCccTransactionForRpc } from "./ccc-transaction";
 import { RemoteCkbSigner, type ConfirmFunding } from "./remote-ckb-signer";
 import { getDeviceIdHash, markChannelOpened } from "./bootstrap";
 import { connectChannelPeers, type ChannelPeer } from "./channel-peers";
@@ -95,7 +95,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     knownScripts: [ccc.KnownScript.Secp256k1Blake160],
     ckbRpcUrl: "https://testnet.ckb.dev/",
     // fiber-pay normalizes field names, but CCC must first serialize bigint fields to CKB RPC hex.
-    signFundingTxOptions: { toRpcTransaction: serializeCccTransaction },
+    signFundingTxOptions: { toRpcTransaction: serializeCccTransactionForRpc },
   });
   const ckbRpcUrl = "https://testnet.ckbapp.dev/";
   const databasePrefix = `/wasm-${options.identifier}`;

@@ -37,7 +37,7 @@ import {
 } from "./create-keyway";
 import { normalizeFiberPubkey } from "./fiber-pubkey";
 import { RemoteCkbSigner, type ConfirmFunding } from "./remote-ckb-signer";
-import { serializeCccTransaction } from "./ccc-transaction";
+import { serializeCccTransactionForRpc } from "./ccc-transaction";
 import { toKeyWayError } from "./keyway-error";
 
 type ManagedStatus = {
@@ -71,7 +71,7 @@ export function createManagedKeyWay(options: {
     signer: fundingSigner,
     knownScripts: [ccc.KnownScript.Secp256k1Blake160],
     ckbRpcUrl: "https://testnet.ckb.dev/",
-    signFundingTxOptions: { toRpcTransaction: serializeCccTransaction },
+    signFundingTxOptions: { toRpcTransaction: serializeCccTransactionForRpc },
   });
   let running = false;
   let status: ManagedStatus | undefined;
