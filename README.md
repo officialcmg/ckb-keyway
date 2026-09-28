@@ -160,7 +160,9 @@ npm run build:package
 
 The private standalone backend runs with `npm run api` and requires `DATABASE_URL`, `KEYWAY_ALLOWED_ORIGINS`, `KEYWAY_RATE_LIMIT_SECRET`, Stytch server credentials, and the Lit server credentials from `.env.example`. It is deployed by CKB KeyWay and is not exported by the public SDK. The Next.js reference app has no API routes: it imports the published `@ckb-keyway/react` package, and both it and external consumers use the same SDK-managed Railway endpoint.
 
-See [`examples/browser-wallet.ts`](examples/browser-wallet.ts) for a complete minimal lifecycle. The repository package is private. `npm run pack:sdk` stages and packs only `package.sdk.json`, the React/browser build, README, and license. Server-only `postgres` and `stytch` dependencies, Railway code, and Lit Actions are excluded. Publish only with `npm run publish:sdk`.
+See [`examples/browser-wallet.ts`](examples/browser-wallet.ts) for a complete minimal lifecycle. The repository package is private. `npm run pack:sdk` stages and packs only `package.sdk.json`, the React/browser build, README, and license. Server-only `postgres` and `stytch` dependencies, Railway code, and Lit Actions are excluded. Releases use npm Trusted Publishing: an explicit `v<package-version>` tag triggers `.github/workflows/publish.yml`, which runs the full suite with disposable Postgres, checks types, builds the public package, and publishes through OIDC. Ordinary commits do not publish an npm version.
+
+The public package pins its tested Fiber WASM version. Node upgrades require explicit compatibility and recovery verification; they must not happen silently during dependency resolution.
 
 ## Security model
 

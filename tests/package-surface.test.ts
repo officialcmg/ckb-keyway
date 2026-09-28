@@ -13,6 +13,8 @@ test("publishes only the React SDK entrypoint", async () => {
   assert.equal(packageJson.dependencies.postgres, undefined);
   assert.equal(packageJson.dependencies.stytch, undefined);
   assert.equal(packageJson.dependencies["@stytch/react"], undefined);
+  assert.match(packageJson.dependencies["@nervosnetwork/fiber-js"], /^\d+\.\d+\.\d+(?:-[\w.-]+)?$/);
+  assert.equal(repositoryPackage.dependencies["@nervosnetwork/fiber-js"], packageJson.dependencies["@nervosnetwork/fiber-js"]);
   assert.equal(JSON.stringify(packageJson).includes("dist/server"), false);
   assert.match(repositoryPackage.scripts["build:sdk"], /--external react(?:\s|$)/);
   assert.match(repositoryPackage.scripts["build:sdk"], /--external react\/jsx-runtime(?:\s|$)/);
