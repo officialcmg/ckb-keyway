@@ -13,6 +13,7 @@ import {
 import { createHash } from "node:crypto";
 import { consumeManagedConfirmation, issueManagedConfirmation } from "./managed-confirmation.ts";
 import { toKeyWayError } from "../sdk/browser/keyway-error.ts";
+import { connectCandidates, TESTNET_CHANNEL_PEERS } from "../sdk/browser/channel-peers.ts";
 
 type ManagedNodeClient = Pick<
   FiberRpcClient,
@@ -247,9 +248,11 @@ function submitFundingParams(value: unknown): SubmitSignedFundingTxParams {
 }
 
 async function connectManagedPeer(node: ManagedNodeClient, peer: Pubkey): Promise<void> {
-  const address = MANAGED_CHANNEL_PEERS.get(peer.toLowerCase());
-  if (!address) throw new Error("Managed beta only supports approved testnet channel peers");
-  await node.connectPeer({ address, save: true });
+  const candidate = TESTNET_CHANNEL_PEERS.find(({ pubkey }) => pubkey === peer.toLowerCase());
+  if (!candidate) throw new Error("Managed beta only supports approved testnet channel peers");
+  if ((await connectCandidates(node, [candidate], 10_000, 250)).length === 0) {
+    throw new Error("Could not connect to the selected Fiber channel peer");
+  }
 }
 
 async function assertChannelCapacity(node: ManagedNodeClient): Promise<void> {
@@ -258,17 +261,6 @@ async function assertChannelCapacity(node: ManagedNodeClient): Promise<void> {
   const { channels } = await node.listChannels({ include_closed: false });
   if (channels.length >= limit) throw new Error(`Managed beta allows at most ${limit} open channels`);
 }
-
-const MANAGED_CHANNEL_PEERS = new Map<string, string>([
-  [
-    "0x02b6d4e3ab86a2ca2fad6fae0ecb2e1e559e0b911939872a90abdda6d20302be71",
-    "/dns4/bottle.fiber.channel/tcp/443/wss/p2p/QmXen3eUHhywmutEzydCsW4hXBoeVmdET2FJvMX69XJ1Eo",
-  ],
-  [
-    "0x0291a6576bd5a94bd74b27080a48340875338fff9f6d6361fe6b8db8d0d1912fcc",
-    "/dns4/bracer.fiber.channel/tcp/443/wss/p2p/QmbKyzq9qUmymW2Gi8Zq7kKVpPiNA1XUJ6uMvsUC4F3p89",
-  ],
-]);
 
 function pubkey(value: unknown): Pubkey {
   if (typeof value !== "string" || !/^0x0[23][0-9a-f]{64}$/i.test(value)) {

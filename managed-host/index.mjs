@@ -114,6 +114,7 @@ async function ensureNode(userId) {
 async function startNode(userId) {
   const port = await availablePort();
   const baseDir = managedDataDir(userId);
+  await requireCleanRestore(baseDir);
   const ckbDir = join(baseDir, "ckb");
   await mkdir(ckbDir, { recursive: true });
   await createCkbKey(join(ckbDir, "key"));
@@ -285,6 +286,7 @@ export async function restoreSnapshot({
   encryptionKey,
 }) {
   if (typeof name !== "string" || !SNAPSHOT.test(name)) throw new Error("A valid managed Fiber snapshot name is required");
+  await requireCleanRestore(dataDir);
   const record = await readSnapshotRecord(root, name);
   if (!record) throw new Error("Managed Fiber snapshot metadata is missing");
   const expected = record.digest;
@@ -313,9 +315,33 @@ export async function restoreSnapshot({
     await rm(staging, { recursive: true, force: true });
     throw error;
   }
-  await rm(dataDir, { recursive: true, force: true });
-  await rename(staging, dataDir);
+  const previous = `${dataDir}.previous`;
+  let hadPrevious = false;
+  try {
+    await rename(dataDir, previous);
+    hadPrevious = true;
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  try {
+    await rename(staging, dataDir);
+  } catch (error) {
+    if (hadPrevious) await rename(previous, dataDir);
+    throw error;
+  }
+  if (hadPrevious) await rm(previous, { recursive: true });
   return { restored: true, name, digest: expected };
+}
+
+export async function requireCleanRestore(dataDir) {
+  try {
+    await stat(`${dataDir}.previous`);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  // Do not start with stale channel state or create a new key after an interrupted swap.
+  throw new Error("Managed Fiber restore was interrupted; operator recovery is required before startup");
 }
 
 async function readSnapshotRecord(root, name) {

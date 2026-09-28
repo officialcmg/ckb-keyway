@@ -5,7 +5,7 @@ import { managedNodeRequest, parseManagedNodeAssignments } from "../src/server/m
 const node = {
   nodeInfo: async () => ({ pubkey: `0x02${"11".repeat(32)}` }),
   connectPeer: async () => undefined,
-  listPeers: async () => ({ peers: [] }),
+  listPeers: async () => ({ peers: [{ pubkey: "02b6d4e3ab86a2ca2fad6fae0ecb2e1e559e0b911939872a90abdda6d20302be71" }] }),
   listChannels: async () => ({ channels: [] }),
   openChannelWithExternalFunding: async () => ({
     channel_id: `0x${"33".repeat(32)}`,
@@ -116,4 +116,25 @@ test("managed users must be assigned distinct private nodes", () => {
     () => parseManagedNodeAssignments(JSON.stringify({ "user-1": "http://fiber.example.com" })),
     /HTTPS or a private Railway address/,
   );
+});
+
+test("managed funding waits until the requested peer handshake is visible", async () => {
+  let polls = 0;
+  const delayed = {
+    ...node,
+    listPeers: async () => ++polls === 1 ? { peers: [] } : node.listPeers(),
+    openChannelWithExternalFunding: async () => {
+      assert.ok(polls >= 2, "channel negotiation must wait for peer readiness");
+      return node.openChannelWithExternalFunding();
+    },
+  };
+  await managedNodeRequest("handshake-test", {
+    operation: "open-channel",
+    params: {
+      pubkey: "0x02b6d4e3ab86a2ca2fad6fae0ecb2e1e559e0b911939872a90abdda6d20302be71",
+      funding_amount: "0x5f5e100",
+      shutdown_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" },
+      funding_lock_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" },
+    },
+  }, delayed as never);
 });

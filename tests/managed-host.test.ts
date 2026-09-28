@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -13,6 +13,7 @@ import {
   listSnapshots,
   managedUserId,
   restoreSnapshot,
+  requireCleanRestore,
   snapshotDigest,
   waitForExit,
   withUserOperation,
@@ -121,6 +122,20 @@ test("managed host rejects a tampered snapshot before overwriting live state", a
     restoreSnapshot({ userId: USER, dataDir, root, name: "../escape", encryptionKey: ENCRYPTION_KEY }),
     /valid managed Fiber snapshot name/,
   );
+});
+
+test("an interrupted restore preserves old state and blocks startup or another restore", async (context) => {
+  const { dataDir, root } = await fixture(context);
+  await writeFile(join(dataDir, "fiber.db"), "current-state");
+  const snapshot = await createSnapshot({ userId: USER, dataDir, root, encryptionKey: ENCRYPTION_KEY });
+  await rename(dataDir, `${dataDir}.previous`);
+  await assert.rejects(requireCleanRestore(dataDir), /operator recovery/);
+  await assert.rejects(
+    restoreSnapshot({ userId: USER, dataDir, root, name: snapshot.name, encryptionKey: ENCRYPTION_KEY }),
+    /operator recovery/,
+  );
+  assert.equal(await readFile(join(`${dataDir}.previous`, "fiber.db"), "utf8"), "current-state");
+  await assert.rejects(stat(dataDir), { code: "ENOENT" });
 });
 
 test("managed host can restore a pre-encryption snapshot", async (context) => {

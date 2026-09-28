@@ -71,7 +71,7 @@ export async function connectChannelPeers(
   return reachable;
 }
 
-async function connectCandidates(
+export async function connectCandidates(
   client: Pick<ChannelPeerClient, "connectPeer" | "listPeers">,
   candidates: readonly ChannelPeer[],
   timeoutMs: number,
