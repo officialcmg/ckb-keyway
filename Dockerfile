@@ -11,4 +11,5 @@ ENV NODE_ENV=production
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist/api ./dist/api
+COPY --from=build /app/lit-actions ./lit-actions
 CMD ["node", "dist/api/index.js"]

@@ -51,3 +51,14 @@ npm run build
 ```
 
 Automated coverage includes PKP recovery, signature formatting, Lit Action boundaries, encrypted Fiber-key round trips, device leases, collaborative funding policy, CCC-to-RPC transaction serialization, peer selection, and actionable error mapping.
+
+## September 28 Verification
+
+The current testnet release uses the existing deployment and newly created disposable accounts. Separate staging identity-provider credentials are deferred until mainnet preparation; existing users' wallet metadata, keys, and channel databases must remain untouched.
+
+- Full local suite against disposable Postgres: 76 passed, 0 failed, 0 skipped. The temporary Postgres server was stopped afterward.
+- API build, SDK build, typecheck, and Next.js production build passed.
+- Production demo deployment `dpl_3bZABTfBFWntzTueGtoD2HWqGGAz` is ready. `/app` remains browser mode; `/app?mode=managed` is explicit opt-in.
+- A new disposable mailbox received a real OTP from the existing API. Verification and session validation returned 200, logout returned 204, and the revoked session was rejected with 401. No mailbox credentials or session tokens are recorded here.
+- The browser wallet recovery check exposed a missing `/app/lit-actions/decrypt-fiber-key.js` file in the API runtime image. The Dockerfile now copies all three Lit Actions into the runtime image, with a regression test. This API fix is not deployed yet because Railway access has expired.
+- Funding, routed payments, funded-channel restore, and cross-browser migration remain unverified for this release. Earlier July payment evidence and the unfunded staging restore do not substitute for these checks. Managed mode must remain opt-in.
