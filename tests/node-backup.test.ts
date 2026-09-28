@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   createEncryptedNodeBackup,
   exportNodeDatabases,
+  importNodeDatabases,
   restoreEncryptedNodeBackup,
 } from "../src/sdk/browser/node-backup.ts";
 
@@ -87,9 +88,44 @@ test("rejects corrupted ciphertext and the wrong wallet prefix", async () => {
   const database = await openDatabase(`${PREFIX}-empty`, 1, (target) => target.createObjectStore("records"));
   database.close();
   const backup = await createEncryptedNodeBackup(PREFIX, FIBER_KEY);
+  await deleteDatabase(`${PREFIX}-empty`);
   const corrupted = { ...backup, ciphertext: `${backup.ciphertext.slice(0, -4)}AAAA` };
   await assert.rejects(restoreEncryptedNodeBackup(corrupted, PREFIX, FIBER_KEY), /corrupted/);
+  for (const field of ["salt", "iv", "digest"] as const) {
+    const modified = { ...backup, [field]: `${backup[field][0] === "A" ? "B" : "A"}${backup[field].slice(1)}` };
+    await assert.rejects(restoreEncryptedNodeBackup(modified, PREFIX, FIBER_KEY));
+    assert.equal((await indexedDB.databases()).filter(({ name }) => name?.startsWith(PREFIX)).length, 0);
+  }
   await assert.rejects(restoreEncryptedNodeBackup(backup, "/wasm-other", FIBER_KEY), /does not belong/);
+  await cleanup();
+});
+
+test("validates all schemas before import and removes only a failed import's new databases", async () => {
+  await cleanup();
+  const database = await openDatabase(`${PREFIX}-source`, 1, (target) => {
+    const store = target.createObjectStore("records", { keyPath: "id" });
+    store.createIndex("unique-kind", "kind", { unique: true });
+  });
+  const write = database.transaction("records", "readwrite");
+  write.objectStore("records").put({ id: 1, kind: "channel" });
+  await transactionDone(write);
+  database.close();
+  const archive = await exportNodeDatabases(PREFIX);
+  await deleteDatabase(`${PREFIX}-source`);
+  archive.databases.push({ ...structuredClone(archive.databases[0]), name: `${PREFIX}-second` });
+  archive.databases[1].version = 0;
+  await assert.rejects(importNodeDatabases(archive), /schema is invalid/);
+  assert.equal((await indexedDB.databases()).filter(({ name }) => name?.startsWith(PREFIX)).length, 0);
+
+  archive.databases[1].version = 1;
+  archive.databases[1].stores[0].records.push({ key: 2, value: { id: 2, kind: "channel" } });
+  await assert.rejects(importNodeDatabases(archive));
+  assert.equal((await indexedDB.databases()).filter(({ name }) => name?.startsWith(PREFIX)).length, 0);
+
+  archive.databases[1].stores[0].records.pop();
+  await importNodeDatabases(archive);
+  await assert.rejects(importNodeDatabases(archive), /refusing to overwrite/);
+  assert.equal((await indexedDB.databases()).filter(({ name }) => name?.startsWith(PREFIX)).length, 2);
   await cleanup();
 });
 

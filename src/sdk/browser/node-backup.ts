@@ -115,40 +115,57 @@ async function existingNodeDatabases(databasePrefix: string): Promise<string[]> 
 }
 
 export async function importNodeDatabases(archive: NodeArchive): Promise<void> {
-  for (const database of archive.databases) {
-    await deleteDatabase(database.name);
-    const opened = indexedDB.open(database.name, database.version);
-    opened.onupgradeneeded = () => {
-      const target = opened.result;
-      for (const store of database.stores) {
-        const created = target.createObjectStore(store.name, {
-          keyPath: store.keyPath ?? undefined,
-          autoIncrement: store.autoIncrement,
-        });
-        for (const index of store.indexes) {
-          created.createIndex(index.name, index.keyPath ?? "", {
-            unique: index.unique,
-            multiEntry: index.multiEntry,
+  validateArchive(archive, "");
+  const existing = new Set((await indexedDB.databases()).map(({ name }) => name));
+  if (archive.databases.some(({ name }) => existing.has(name))) {
+    throw new Error("This device already holds local Fiber state; refusing to overwrite it");
+  }
+  const created: string[] = [];
+  try {
+    for (const database of archive.databases) {
+      const opened = indexedDB.open(database.name, database.version);
+      opened.onupgradeneeded = (event) => {
+        if (event.oldVersion !== 0) {
+          opened.transaction?.abort();
+          return;
+        }
+        created.push(database.name);
+        const target = opened.result;
+        for (const store of database.stores) {
+          const destination = target.createObjectStore(store.name, {
+            keyPath: store.keyPath ?? undefined,
+            autoIncrement: store.autoIncrement,
           });
+          for (const index of store.indexes) {
+            destination.createIndex(index.name, index.keyPath ?? "", {
+              unique: index.unique,
+              multiEntry: index.multiEntry,
+            });
+          }
         }
-      }
-    };
-    const target = await request(opened);
-    try {
-      for (const store of database.stores) {
-        if (!store.records.length) continue;
-        const transaction = target.transaction(store.name, "readwrite");
-        const completed = transactionDone(transaction);
-        const destination = transaction.objectStore(store.name);
-        for (const record of store.records) {
-          if (store.keyPath === null) destination.put(record.value, record.key);
-          else destination.put(record.value);
+      };
+      const target = await request(opened);
+      try {
+        if (!created.includes(database.name)) throw new Error("Fiber database appeared during restoration");
+        for (const store of database.stores) {
+          if (!store.records.length) continue;
+          const transaction = target.transaction(store.name, "readwrite");
+          const completed = transactionDone(transaction);
+          const destination = transaction.objectStore(store.name);
+          for (const record of store.records) {
+            if (store.keyPath === null) destination.put(record.value, record.key);
+            else destination.put(record.value);
+          }
+          await completed;
         }
-        await completed;
+      } finally {
+        target.close();
       }
-    } finally {
-      target.close();
     }
+  } catch (error) {
+    // Only remove this attempt's new databases, never pre-existing wallet state.
+    await Promise.all(created.map(deleteDatabase));
+    throw error;
   }
 }
 
@@ -202,8 +219,41 @@ function validateArchive(archive: NodeArchive, expectedPrefix: string): void {
   if (archive?.version !== BACKUP_FORMAT_VERSION || !Array.isArray(archive.databases)) {
     throw new Error("Fiber node backup format is invalid");
   }
-  if (archive.databases.some((database) => !database.name.startsWith(expectedPrefix))) {
-    throw new Error("Fiber node backup contains another wallet's database");
+  const uniqueNames = (items: Array<{ name: string }>) => {
+    if (items.some((item) => !item || typeof item.name !== "string") ||
+      new Set(items.map(({ name }) => name)).size !== items.length) {
+      throw new Error("Fiber node backup contains invalid or duplicate names");
+    }
+  };
+  const keyPathValid = (value: unknown) => value === null || typeof value === "string" ||
+    (Array.isArray(value) && value.length > 0 && value.every((part) => typeof part === "string"));
+  uniqueNames(archive.databases);
+  for (const database of archive.databases) {
+    if (!database.name.startsWith(expectedPrefix)) {
+      throw new Error("Fiber node backup contains another wallet's database");
+    }
+    if (!database.name || !Number.isSafeInteger(database.version) || database.version < 1 ||
+      !Array.isArray(database.stores)) throw new Error("Fiber node backup database schema is invalid");
+    uniqueNames(database.stores);
+    for (const store of database.stores) {
+      if (!keyPathValid(store.keyPath) || typeof store.autoIncrement !== "boolean" ||
+        !Array.isArray(store.indexes) || !Array.isArray(store.records) ||
+        (store.autoIncrement && (store.keyPath === "" || Array.isArray(store.keyPath)))) {
+        throw new Error("Fiber node backup store schema is invalid");
+      }
+      uniqueNames(store.indexes);
+      for (const index of store.indexes) {
+        if (index.keyPath === null || !keyPathValid(index.keyPath) ||
+          typeof index.unique !== "boolean" || typeof index.multiEntry !== "boolean" ||
+          (index.multiEntry && Array.isArray(index.keyPath))) {
+          throw new Error("Fiber node backup index schema is invalid");
+        }
+      }
+      for (const record of store.records) {
+        if (!record || !Object.hasOwn(record, "value")) throw new Error("Fiber node backup record is invalid");
+        indexedDB.cmp(record.key, record.key);
+      }
+    }
   }
 }
 

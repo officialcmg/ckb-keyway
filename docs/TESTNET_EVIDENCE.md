@@ -56,7 +56,7 @@ Automated coverage includes PKP recovery, signature formatting, Lit Action bound
 
 The current testnet release uses the existing deployment and newly created disposable accounts. Separate staging identity-provider credentials are deferred until mainnet preparation; existing users' wallet metadata, keys, and channel databases must remain untouched.
 
-- Full local suite against disposable Postgres: 81 passed, 0 failed, 0 skipped. The temporary Postgres server was stopped afterward. Coverage includes native TCP bootstrap and strict funding serialization, in addition to the managed-host restore safeguards.
+- Full local suite against disposable Postgres: 82 passed, 0 failed, 0 skipped. The temporary Postgres server was stopped afterward. Coverage includes native TCP bootstrap, strict funding serialization, and failed IndexedDB import cleanup, in addition to the managed-host restore safeguards.
 - API build, SDK build, typecheck, and Next.js production build passed.
 - Production demo deployment `dpl_3bZABTfBFWntzTueGtoD2HWqGGAz` is ready. `/app` remains browser mode; `/app?mode=managed` is explicit opt-in.
 - A new disposable mailbox received a real OTP from the existing API. Verification and session validation returned 200, logout returned 204, and the revoked session was rejected with 401. No mailbox credentials or session tokens are recorded here.
@@ -70,3 +70,11 @@ The current testnet release uses the existing deployment and newly created dispo
 - Both disposable channels reached `CHANNEL_READY`, each initially exposing 901 CKB local and 151 CKB remote liquidity. A 1 CKB payment settled successfully with hash `0xe41104e39d7a0830c628f1e49d392e4bf7fa93517494254970f797fad547cf7a`; the receiver independently reported `Paid` and its local balance increased to 902 CKB. A reverse 1 CKB payment using installed `@ckb-keyway/react@0.0.5` also settled successfully, with hash `0x5221ce6a0e119344de041f93c589a1cf21444af1f2a517383542cf2fb447108c`. Each route charged 0.001 CKB. The tests used the real SDK and API, with curl as the transport because Node connection establishment was intermittently timing out; they do not substitute for browser UI verification.
 - Native logs show an initial broadcast rejection of the partial transaction before peer witnesses arrived. Both exact transaction hashes later committed and both channels became ready. The observed error alone was not proof of final channel failure; no duplicate funding was submitted.
 - Funded-channel restore and cross-browser migration still require verification for this release. The unfunded staging restore does not substitute for funded recovery. Managed mode must remain opt-in.
+
+### Browser verification in progress
+
+- A new disposable account completed real Chrome OTP login, Lit wallet recovery, browser WASM startup, faucet funding, and channel funding confirmation through the production demo using SDK 0.0.5.
+- Funding transaction: `0xfd2877fdeabf110cd7e092515d31ed61c5e0b0ce65930eb01789a0047526949c`; channel: `0x00fe8b37564d93c95a7292ef63ca178ea2f408b716ca0768c15f191c235ddef9`. The UI reached Ready with 901 CKB local and 151 CKB remote liquidity. Fiber identity: `0347f7a3b00f36082204dbbf942d170224ec7bf4bd863c20d290691e018f425fe7`.
+- A 1 CKB browser-to-managed payment preflight reported no available route; no payment was submitted. This flow still requires successful settlement verification.
+- Recovery hardening now validates all archive schemas before writing, refuses pre-existing databases, and cleans up only databases created by a failed import. Tests also reject modified salt, IV, ciphertext, and digest before creating local state.
+- The in-app browser blocks the Railway API with `ERR_BLOCKED_BY_CLIENT`; Chrome was used instead. An independent incognito handoff remains in progress. Neither this browser funding check nor local archive tests prove funded cross-device recovery.
