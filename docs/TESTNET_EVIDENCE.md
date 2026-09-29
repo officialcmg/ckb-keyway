@@ -96,3 +96,11 @@ The current testnet release uses the existing deployment and newly created dispo
 - This patch includes failed-import cleanup and archive schema validation. It pins the tested Fiber WASM runtime to `0.9.0-rc7`; no funded node database is upgraded by this release.
 - The reference app now imports npm SDK 0.0.6. Local typecheck, backup/package regression tests, and its production build pass. Browser mode remains the default, with managed mode explicitly opt-in.
 - Dependency inspection reports one unpatched low-severity [elliptic advisory](https://github.com/advisories/GHSA-848j-6mx2-7j84), propagated into five npm findings through CCC/JoyID dependencies. KeyWay has no direct elliptic/JoyID call sites; this does not establish that every transitive execution path is unaffected. No forced dependency replacement was applied.
+
+### September 29 Production Smoke Checks
+
+- Production deployment `dpl_2cE815o9iGhYFRdtDLwxN831QTcy` is ready at the canonical demo URL and uses npm SDK 0.0.6. Browser mode remains the default.
+- A new disposable account completed dashboard OTP login, application creation, and origin registration. App-aware OTP returned 200 for the registered origin. Disabling the application and removing its origin each produced an independently verified 403. The test application was left disabled with no registered origins, and dashboard logout succeeded.
+- An isolated headless browser completed real OTP login, wallet recovery, WASM startup, encrypted backup upload, lease release, and session revocation using SDK 0.0.6. This account was unfunded; it does not substitute for the earlier funded-channel tests.
+- The initial second-profile attempt reached the intended five-OTP-per-email, ten-minute limit and returned 429 before authentication. Verification respects the cooldown rather than weakening abuse controls.
+- After the cooldown, two fresh isolated headless profiles completed real OTP login and restored the same CKB and Fiber identities. Each backup load returned 200 and restore confirmation returned 204 before WASM readiness. Each explicit logout then saved the encrypted backup (200), released the lease (204), and revoked the session (204). Both browser contexts were closed afterward; their private temporary profiles were retained outside Git.
