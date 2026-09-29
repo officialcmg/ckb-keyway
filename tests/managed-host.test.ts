@@ -8,6 +8,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   authorizationMatches,
+  completeDatabaseOperation,
   createCkbKey,
   createSnapshot,
   listSnapshots,
@@ -21,6 +22,26 @@ import {
 
 const USER = "a".repeat(64);
 const ENCRYPTION_KEY = randomBytes(32);
+
+test("managed database operations report success only after the node resumes", async () => {
+  const events: string[] = [];
+  const result = await completeDatabaseOperation(
+    async () => { events.push("database"); return { restored: true }; },
+    async () => { events.push("resume"); },
+  );
+  assert.deepEqual(result, { restored: true });
+  assert.deepEqual(events, ["database", "resume"]);
+  await assert.rejects(completeDatabaseOperation(
+    async () => ({ restored: true }),
+    async () => { throw new Error("node startup failed"); },
+  ), /node startup failed/);
+  let resumed = false;
+  await assert.rejects(completeDatabaseOperation(
+    async () => { throw new Error("snapshot failed"); },
+    async () => { resumed = true; },
+  ), /snapshot failed/);
+  assert.equal(resumed, true);
+});
 
 test("managed database operations serialize per user without blocking other users", async () => {
   const events: string[] = [];

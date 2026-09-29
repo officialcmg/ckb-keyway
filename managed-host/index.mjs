@@ -169,19 +169,25 @@ async function waitForRpc(port, child) {
 
 async function snapshotUser(userId) {
   const wasRunning = await stopNode(userId);
-  try {
-    return await createSnapshot({ userId });
-  } finally {
-    if (wasRunning) await ensureNode(userId).catch(logError);
-  }
+  return completeDatabaseOperation(
+    () => createSnapshot({ userId }),
+    async () => { if (wasRunning) await ensureNode(userId); },
+  );
 }
 
 async function restoreUser(userId, name) {
   const wasRunning = await stopNode(userId);
+  return completeDatabaseOperation(
+    () => restoreSnapshot({ userId, name }),
+    async () => { if (wasRunning) await ensureNode(userId); },
+  );
+}
+
+export async function completeDatabaseOperation(operation, resume) {
   try {
-    return await restoreSnapshot({ userId, name });
+    return await operation();
   } finally {
-    if (wasRunning) await ensureNode(userId).catch(logError);
+    await resume();
   }
 }
 
