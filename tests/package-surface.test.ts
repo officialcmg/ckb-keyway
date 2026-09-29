@@ -39,3 +39,12 @@ test("the reference app imports the SDK package", async () => {
   assert.match(referenceApp, /from "@ckb-keyway\/react"/);
   assert.doesNotMatch(referenceApp, /src\/sdk\/react/);
 });
+
+test("defaults to managed testnet while retaining an explicit browser-wallet route", async () => {
+  const provider = await readFile(new URL("../src/sdk/react/keyway-provider.tsx", import.meta.url), "utf8");
+  const page = await readFile(new URL("../app/app/page.tsx", import.meta.url), "utf8");
+  assert.match(provider, /nodeMode = "managed"/);
+  assert.match(page, /mode === "browser"/);
+  assert.match(page, /\/app\?mode=browser/);
+  assert.match(page, /switching modes does not migrate channels/);
+});

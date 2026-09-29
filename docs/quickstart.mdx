@@ -24,33 +24,7 @@ yarn add @ckb-keyway/react
 
 Open the [KeyWay developer console](https://ckb-keyway.vercel.app/dashboard), create an application, and add every exact browser origin that will use it. Add local development origins separately from production origins, then copy the public app ID.
 
-## 3. Enable cross-origin isolation
-
-Fiber runs a multithreaded WASM node in the browser. A Next.js application must send these headers:
-
-```ts next.config.ts
-import type { NextConfig } from "next";
-
-const nextConfig: NextConfig = {
-  async headers() {
-    return [
-      {
-        source: "/(.*)",
-        headers: [
-          { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
-          { key: "Cross-Origin-Embedder-Policy", value: "require-corp" },
-        ],
-      },
-    ];
-  },
-};
-
-export default nextConfig;
-```
-
-After deployment, `window.crossOriginIsolated` must be `true`.
-
-## 4. Add the provider
+## 3. Add the provider
 
 Render `KeyWayProvider` in a client component above every component that uses KeyWay.
 
@@ -80,7 +54,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 }
 ```
 
-## 5. Add login and wallet state
+## 4. Add login and wallet state
 
 ```tsx app/wallet.tsx
 "use client";
@@ -103,15 +77,35 @@ export function Wallet() {
 }
 ```
 
-`autoConnect` defaults to `true`. After OTP verification, the provider recovers the wallet, starts the Fiber node, connects testnet relays, and then sets `connection`.
+`autoConnect` defaults to `true`. After OTP verification, the provider recovers the wallet, connects its persistent managed Fiber node, and then sets `connection`. Managed mode is the default from SDK 0.0.7 and requires no WASM isolation headers.
 
 <Info>
   The app ID is public. It identifies the integration and lets KeyWay enforce its registered origins; it is not a secret credential.
 </Info>
 
-## 6. Open the application
+## 5. Open the application
 
 Select **Log in**, enter an email address, and submit the six-digit code. The same email recovers the same CKB account.
+
+## Optional browser mode
+
+Set `nodeMode="browser"` on the provider to run Fiber WASM locally. This requires cross-origin isolation. For Next.js, add these response headers in `next.config.ts`:
+
+```ts
+export default {
+  async headers() {
+    return [{
+      source: "/(.*)",
+      headers: [
+        { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
+        { key: "Cross-Origin-Embedder-Policy", value: "require-corp" },
+      ],
+    }];
+  },
+};
+```
+
+For Vite, configure the same headers under `server.headers` for local development and on your production host. Verify `window.crossOriginIsolated === true` before startup. Browser state moves between devices only after a successful explicit logout backup. Switching between browser and managed mode does not migrate channels.
 
 <Card title="Next: activate Fiber payments" icon="arrow-right" href="/fiber-payments">
   Open a channel and make the account ready to send and receive.

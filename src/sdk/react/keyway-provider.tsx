@@ -72,7 +72,7 @@ export function KeyWayProvider({
   theme = "light",
   confirmFunding,
   autoConnect = true,
-  nodeMode = "browser",
+  nodeMode = "managed",
   onError,
   onLifecycle,
 }: KeyWayProviderProps) {

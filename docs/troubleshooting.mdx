@@ -19,15 +19,15 @@ Cross-Origin-Embedder-Policy: require-corp
 
 Then verify `window.crossOriginIsolated === true`. Browser extensions or third-party resources without compatible cross-origin resource policy headers can also break isolation.
 
-This requirement applies only to `nodeMode="browser"`. Managed mode does not load Fiber WASM in the consuming page, but it currently requires explicit testnet beta enrollment.
+This requirement applies only to `nodeMode="browser"`. Managed mode, the default from SDK 0.0.7, does not load Fiber WASM in the consuming page.
 
 ## `An active device lease is required`
 
-The account's Fiber lease expired or another device took it. Call `connect()` again. Avoid running the same account's channels concurrently in multiple browser profiles.
+In browser mode, the account's Fiber lease expired or another device took it. Call `connect()` again. Avoid running the same account's channels concurrently in multiple browser profiles.
 
 ## `Fiber wallet is bound to another device`
 
-Another browser still holds the Fiber lease, or the previous browser did not complete an explicit logout and encrypted backup. Log out on the active device before moving the account.
+In browser mode, another browser still holds the Fiber lease, or the previous browser did not complete an explicit logout and encrypted backup. Log out on the active device before moving the account.
 
 ## A payment has no route
 
@@ -36,7 +36,7 @@ The public graph did not contain a route with enough outbound liquidity for the 
 - Try a smaller payment.
 - Confirm both sender and receiver have ready public channels.
 - Allow a newly opened channel time to propagate through gossip.
-- Keep both browser nodes online while testing the payment.
+- Keep browser-mode nodes online while testing; managed nodes persist after logout.
 
 ## CKB balance updates slowly
 

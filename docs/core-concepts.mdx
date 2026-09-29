@@ -14,7 +14,7 @@ These are separate pieces of state:
 | Fiber node | The networking process that creates invoices, finds routes, and updates channels. | Runs as WASM in browser mode or as a persistent native process in managed mode. |
 | Channel database | The latest off-chain state for the user's Fiber channels. | IndexedDB in browser mode or the managed node's durable volume. |
 
-Logging in recovers the CKB identity. In browser mode, starting Fiber also requires the latest browser node identity and channel database, which stays in local IndexedDB during use and can move to the next device through KeyWay's encrypted explicit-logout handoff. Managed mode uses a separately enrolled persistent node and does not import browser IndexedDB channels.
+Logging in recovers the CKB identity and connects the persistent managed node by default. Optional browser mode requires its own node identity and channel database, which stays in local IndexedDB during use and can move to the next device through KeyWay's encrypted explicit-logout handoff. The two modes do not share channel state.
 
 ## Relays are not channels
 
@@ -41,12 +41,12 @@ Every hop must have enough outbound liquidity. A route may exist for `1 CKB` and
 
 ## Browser ownership
 
-KeyWay uses a browser-local Fiber node. One user therefore has both an account identity and a node identity. Closing the tab stops the running node. Explicit logout encrypts and uploads its channel database so the next device can restore it before Fiber starts.
+In optional browser mode, one user has both an account identity and a local node identity. Closing the tab stops that node. Explicit logout encrypts and uploads its channel database so the next device can restore it before Fiber starts.
 
 <Warning>
   Do not treat IndexedDB as disposable cache. It contains the off-chain channel state needed to resume the node safely.
 </Warning>
 
-## Managed-node beta
+## Managed mode
 
-Managed mode keeps a native Fiber process and its channel database online outside the browser lifecycle. The React API remains the same, but KeyWay operates the node and therefore takes on a larger custody and availability boundary. It is currently limited to explicitly enrolled testnet accounts until each user's node identity and channel state can be isolated safely.
+Managed mode is the testnet default from SDK 0.0.7. It keeps a dedicated native Fiber process and channel database online outside the browser lifecycle. The React API remains the same, but KeyWay operates the node and therefore takes on a larger custody and availability boundary. Host node and channel capacity limits apply. Existing browser channels are not moved into managed mode.

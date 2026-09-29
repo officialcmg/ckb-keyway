@@ -37,8 +37,8 @@ Wrap the part of the React tree that uses KeyWay.
   Recover the wallet and start Fiber automatically after authentication.
 </ParamField>
 
-<ParamField path="nodeMode" type='"browser" | "managed"' default="browser">
-  Select the Fiber runtime. Browser mode runs the WASM node locally. Managed mode uses KeyWay's persistent native testnet node and is currently restricted to explicitly enrolled beta accounts.
+<ParamField path="nodeMode" type='"browser" | "managed"' default="managed">
+  Select the Fiber runtime. From SDK 0.0.7, managed mode uses KeyWay's persistent native testnet node by default, subject to host capacity limits. Browser mode runs WASM locally. Switching modes does not migrate channels.
 </ParamField>
 
 <ParamField path="confirmFunding" type="ConfirmFunding">
@@ -93,9 +93,9 @@ const {
 | `status` | `KeyWayStatus` | `idle`, `authenticating`, `connecting`, `connected`, `disconnecting`, or `error`. |
 | `error` | `Error \| undefined` | Latest provider connection error. |
 | `login()` | `() => void` | Open the email OTP modal. |
-| `logout()` | `() => Promise<void>` | Stop Fiber, clear the session, and log out. |
-| `connect()` | `() => Promise<ConnectedKeyWay>` | Recover and start KeyWay manually. |
-| `disconnect()` | `() => Promise<void>` | Stop Fiber without logging out. |
+| `logout()` | `() => Promise<void>` | Clear the session; browser mode first backs up and stops Fiber. |
+| `connect()` | `() => Promise<KeyWayConnection>` | Recover and connect the selected runtime manually. |
+| `disconnect()` | `() => Promise<void>` | Disconnect the client; stop Fiber only in browser mode. |
 
 ## `connection`
 
@@ -111,7 +111,7 @@ type ConnectedKeyWay = {
 
 Use `connection.wallet.ckbAddress` for the recovered address and `connection.keyway` for Fiber operations.
 
-Both connection modes implement the recommended methods below. Inspect `connection.mode` when an application needs runtime-specific UI. Browser mode requires cross-origin isolation and explicit-logout database handoff. Managed mode stays online outside the page lifecycle, but currently requires beta enrollment and does not migrate existing browser channels.
+Both connection modes implement the recommended methods below. Inspect `connection.mode` when an application needs runtime-specific UI. Browser mode requires cross-origin isolation and explicit-logout database handoff. Managed mode stays online outside the page lifecycle and does not migrate existing browser channels. The managed host holds operational node keys and state; it is a different trust model from a local browser node.
 
 ### Recommended client methods
 
@@ -130,7 +130,7 @@ Both connection modes implement the recommended methods below. Inspect `connecti
 | `waitForPayment(paymentHash, options?)` | Wait for payment success or failure. |
 | `listPeers()` | Inspect connected Fiber peers. |
 | `nodeInfo()` | Read the local Fiber node identity. |
-| `stop()` | Stop the node and release browser/device guards. Prefer provider `disconnect()`. |
+| `stop()` | Disconnect the client; browser mode also stops the node and releases device guards. Prefer provider `disconnect()`. |
 
 ## Buttons
 

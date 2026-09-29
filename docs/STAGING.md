@@ -4,7 +4,9 @@ Staging exists to prove a change before production and to host the two-account F
 
 ## Current state
 
-Product decision (2026-09-28): KeyWay remains testnet-only. Keep this staging infrastructure, but separate Stytch/Lit credentials and full staging isolation are deferred to mainnet preparation and are not release gates. Verify the current testnet deployment with newly created disposable accounts only; never overwrite existing users' metadata, keys, or channel databases. Managed mode remains explicit opt-in (`/app?mode=managed`); `/app` remains browser mode until both modes pass end-to-end funding, payment, and recovery tests.
+Product decision (2026-09-28): KeyWay remains testnet-only. Keep this staging infrastructure, but separate Stytch/Lit credentials and full staging isolation are deferred to mainnet preparation and are not release gates. Verify with disposable accounts only; never overwrite existing users' metadata, keys, or channel databases.
+
+Update (2026-09-29): funded payment and recovery verification has passed in both modes (see `TESTNET_EVIDENCE.md`). SDK 0.0.7 and its reference app select managed mode by default; browser mode remains at `/app?mode=browser`. Switching modes does not migrate existing channels. The older staging checklist below is retained for future isolated verification, not as a testnet release requirement.
 
 The Railway project `ckb-keyway` has two environments:
 

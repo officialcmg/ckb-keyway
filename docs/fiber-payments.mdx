@@ -141,9 +141,9 @@ The sender does not need a direct channel to the receiver. Fiber uses its public
   A newly opened public channel may need time to propagate through Fiber gossip before other nodes can route through it.
 </Info>
 
-## Stop the browser node
+## Disconnect the client
 
-Call `disconnect()` from `useKeyWay` when your application intentionally wants to stop Fiber. This stops the browser node; it does not close or settle channels on-chain.
+Call `disconnect()` from `useKeyWay` to disconnect the SDK client. In browser mode it also stops the local node. The managed native node stays online. Neither operation closes or settles channels on-chain; use `closeChannel()` for that.
 
 ```ts
 const { disconnect } = useKeyWay();

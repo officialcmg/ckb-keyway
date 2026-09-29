@@ -1,6 +1,6 @@
 # CKB KeyWay
 
-CKB KeyWay is reusable email-authenticated wallet infrastructure for Fiber Network. It combines Stytch email OTP, a Lit Chipotle PKP, CCC transaction construction, and a browser Fiber node so an application can recover a stable CKB identity and externally fund Fiber channels without exporting the PKP private key.
+CKB KeyWay is reusable email-authenticated wallet infrastructure for Fiber Network. It combines Stytch email OTP, a Lit Chipotle PKP, CCC transaction construction, and a managed or browser Fiber node so an application can recover a stable CKB identity and externally fund Fiber channels without exporting the PKP private key.
 
 The repository contains two independent deliverables:
 
@@ -21,13 +21,13 @@ Standalone API: [keyway-api-production.up.railway.app](https://keyway-api-produc
 
 1. The SDK sends email OTP requests to the managed KeyWay API; Stytch remains private backend infrastructure and supplies a stable user ID.
 2. The backend provisions or recovers one Lit PKP and its CKB testnet address.
-3. A separately generated Fiber identity key is recovered after authentication and loaded into the browser WASM node.
-4. The browser connects to Fiber testnet relays and a channel peer.
+3. Managed mode connects to the user's persistent native Fiber node. Optional browser mode recovers its separate Fiber identity and loads a WASM node.
+4. The selected node connects to Fiber testnet peers.
 5. Fiber and the peer collaboratively construct an unsigned funding transaction.
 6. The backend validates the complete transaction and computes only the KeyWay lock group's CKB sighash.
 7. A pinned Lit Action signs that digest. KeyWay verifies the recovered public key and inserts only its witness.
 8. Fiber submits the signed transaction, waits for `ChannelReady`, and can send or receive invoices.
-9. Explicit logout stops Fiber, encrypts its wallet-scoped IndexedDB state in the browser, and uploads only ciphertext for restoration before the next device starts Fiber.
+9. Managed logout clears the SDK session while the native node stays online. Browser logout stops Fiber and uploads an encrypted wallet-scoped IndexedDB backup before releasing device ownership.
 
 KeyWay connects each browser node to the official testnet relays for network reachability and gossip. Its convenience activation flow then prefers the browser-reachable Bottle or Bracer channel providers, falling back to eligible nodes discovered from the Fiber graph. The 400 CKB value in `channel-peers.ts` is the minimum request KeyWay will send to those providers, not their contribution. In the verified 1,250 CKB testnet channel below, KeyWay requested 1,000 CKB and the accepting peer contributed the remaining 250 CKB; applications should read the negotiated `local_balance` and `remote_balance` rather than assume that split for every channel.
 
@@ -48,7 +48,7 @@ Configure Stytch email OTP for backend API access. The browser never receives a 
 
 ## React SDK
 
-The public package owns email OTP, the login modal, wallet provisioning, and Fiber startup behind one provider. It also retains `connectKeyWay` for lower-level integrations. Browser mode remains the public default. A managed-node adapter is available only for explicitly enrolled testnet beta accounts while KeyWay validates per-user node isolation.
+The public package owns email OTP, the login modal, wallet provisioning, and Fiber startup behind one provider. Managed mode is the default from version 0.0.7; browser mode remains an explicit option. The package exports `connectManagedKeyWay` and `connectKeyWay` for lower-level integrations.
 
 Create an application at [ckb-keyway.vercel.app/dashboard](https://ckb-keyway.vercel.app/dashboard), register its exact development and production origins, and copy its public app ID.
 
@@ -76,7 +76,7 @@ function Balance() {
 }
 ```
 
-`KeyWayLoginButton` opens the built-in email OTP modal. After verification, KeyWay recovers or provisions the same CKB identity and starts the browser Fiber node automatically. Channel activation uses a built-in transaction confirmation unless the application supplies `confirmFunding`. Applications can call `login()` and `logout()` from `useKeyWay()` when they want custom buttons.
+`KeyWayLoginButton` opens the built-in email OTP modal. After verification, KeyWay recovers or provisions the same CKB identity and connects the selected Fiber runtime automatically. Channel activation uses a built-in transaction confirmation unless the application supplies `confirmFunding`. Applications can call `login()` and `logout()` from `useKeyWay()` when they want custom buttons.
 
 ### React API
 
@@ -87,20 +87,20 @@ function Balance() {
 | `KeyWayConnectButton` | Manually starts or stops Fiber when `autoConnect` is disabled |
 | `useKeyWay()` | Returns auth status, user, wallet connection, errors, and lifecycle methods |
 
-The SDK uses CKB KeyWay's managed backend automatically. `appId` identifies the registered application and enforces its origin list. `appName` brands the SDK modal, `theme` accepts `"light"` or `"dark"`, `autoConnect` defaults to `true`, and `confirmFunding` can replace the built-in funding modal. `nodeMode` defaults to `"browser"`; `"managed"` is currently restricted to enrolled testnet beta accounts. `useKeyWay()` separates `authenticated`, `walletReady`, `fiberStarting`, `fiberReady`, and `fiberError`, while `lifecycleStage` and `lifecycleTimings` expose structured startup progress. The recovered `wallet` is available before the Fiber node finishes starting. Backend URLs and server credentials are intentionally absent from the public API.
+The SDK uses CKB KeyWay's managed backend automatically. `appId` identifies the registered application and enforces its origin list. `appName` brands the SDK modal, `theme` accepts `"light"` or `"dark"`, `autoConnect` defaults to `true`, and `confirmFunding` can replace the built-in funding modal. `nodeMode` defaults to `"managed"`; set `"browser"` to run WASM locally. `useKeyWay()` separates `authenticated`, `walletReady`, `fiberStarting`, `fiberReady`, and `fiberError`, while `lifecycleStage` and `lifecycleTimings` expose structured startup progress. The recovered `wallet` is available before the Fiber node finishes starting. Backend URLs and server credentials are intentionally absent from the public API.
 
 `appName` changes the embedded modal. Optional Stytch login and signup template IDs can be saved for each registered application in the developer console; the templates must already exist in KeyWay's Stytch project.
 
-With the default `autoConnect`, successful OTP immediately recovers the wallet, restores any claimed cross-device backup, starts its browser Fiber node, connects testnet relays, and fetches an initial CKB balance. Use `autoConnect={false}` with `connect()` and `disconnect()` when an application wants explicit node lifecycle control.
+With the default `autoConnect`, successful OTP recovers the wallet, connects its managed native node, and fetches an initial CKB balance. Browser mode instead restores any claimed backup before starting WASM and connecting testnet relays. Use `autoConnect={false}` with `connect()` and `disconnect()` for explicit client lifecycle control.
 
-Explicit `logout()` is transactional after a Fiber connection exists: KeyWay stops the node while retaining its device lease, snapshots only that wallet's IndexedDB databases, derives an AES-256-GCM backup key from the Lit-recovered Fiber key with HKDF-SHA256, and uploads ciphertext to the managed backend. Authentication and ownership are cleared only after the backend independently verifies and stores the ciphertext. A new device claims and restores that one-use backup before Fiber starts. If backup or restoration fails, KeyWay does not release or consume the only recoverable state.
+In browser mode, explicit `logout()` is transactional after a Fiber connection exists: KeyWay stops the node while retaining its device lease, snapshots only that wallet's IndexedDB databases, derives an AES-256-GCM backup key from the Lit-recovered Fiber key with HKDF-SHA256, and uploads ciphertext to the managed backend. Authentication and ownership are cleared only after the backend independently verifies and stores the ciphertext. A new device claims and restores that one-use backup before Fiber starts. If backup or restoration fails, KeyWay does not release or consume the only recoverable state. Managed logout does not stop the persistent node.
 
 The same package exports the headless connection API:
 
 ```ts
-import { connectKeyWay } from "@ckb-keyway/react";
+import { connectManagedKeyWay } from "@ckb-keyway/react";
 
-const connected = await connectKeyWay({
+const connected = await connectManagedKeyWay({
   authToken: keyWaySessionToken,
   confirmFunding: ({ amountCkb, feeCkb }) =>
     showConfirmation(`Lock ${amountCkb} CKB with a ${feeCkb} CKB fee?`),
@@ -119,7 +119,7 @@ await connected.keyway.waitForPayment(payment.payment_hash);
 await connected.keyway.stop();
 ```
 
-Enrolled beta accounts can select the API-backed native node with `<KeyWayProvider nodeMode="managed">`. It implements the same high-level channel, invoice, payment preflight, payment, and balance methods without starting WASM in the consuming page. Managed mode uses an isolated persistent native Fiber process and data directory for each user; it does not import an existing browser node's IndexedDB channels. Existing beta accounts can remain pinned to their original dedicated node while the managed host provisions new accounts automatically.
+Managed mode implements the same high-level channel, invoice, payment preflight, payment, and balance methods without starting WASM in the consuming page. It uses an isolated persistent native Fiber process and data directory for each user, subject to host capacity limits. Select `<KeyWayProvider nodeMode="browser">` for local WASM; the demo retains it at `/app?mode=browser`. Switching modes does not migrate channels: native and browser nodes have separate identities and state. Existing dedicated-node assignments are preserved.
 
 Channel activation also accepts configuration while retaining the 1,000 CKB default:
 
@@ -133,7 +133,7 @@ await connected.keyway.activateCkbChannel({
 
 Use `preflightPayment()` before asking the user to confirm a payment. It performs Fiber's dry run and returns a typed, retryable failure instead of requiring string parsing. `getChannels()` returns normalized lifecycle state plus local, remote, and total balances; `closeChannel()` wraps cooperative or forced shutdown with typed errors. The original raw Fiber methods remain available for advanced use.
 
-`connection.keyway` also exposes direct peer/channel operations and Fiber's route inspection surface: `connectPeer`, `openFundedChannel`, `listChannels`, `graphNodes`, `graphChannels`, `buildRouter`, and `sendPaymentWithRouter`. `sendPayment({ dry_run: true, ... })` checks whether the node can currently build a route for a specific payment without sending it.
+Browser mode additionally exposes direct peer/channel operations and Fiber's route inspection surface: `connectPeer`, `openFundedChannel`, `graphNodes`, `graphChannels`, `buildRouter`, and `sendPaymentWithRouter`. Use the shared `preflightPayment()` method to check current route readiness without sending.
 
 `listChannels({ include_closed: false })` exposes each channel's current `local_balance`, `remote_balance`, and in-flight TLC balances in shannons. These are off-chain allocations inside the channel, not the wallet's on-chain CKB balance. The reference app presents the sum of ready-channel local balances as the primary Fiber balance, keeps loose on-chain CKB separate, and lists every non-closed channel with explicit user-side and peer-side balances.
 
@@ -168,7 +168,7 @@ The public package pins its tested Fiber WASM version. Node upgrades require exp
 
 - The Lit PKP private key is not returned to the browser or KeyWay backend.
 - The backend accepts a complete CKB transaction, enforces testnet funding and fee limits, computes CCC's exact sighash, and invokes only a pinned Lit Action.
-- The stored Fiber identity key is encrypted at rest. The MVP backend can observe it during recovery, and it necessarily exists in browser/WASM memory while Fiber runs.
+- The stored Fiber identity key is encrypted at rest. The backend can observe it during recovery. Browser mode loads it into WASM memory; managed mode trusts the host with the native node's operational keys and channel state.
 - Web Locks, `BroadcastChannel`, and an atomic Postgres lease enforce one active browser node.
 - Fiber state backups are encrypted in the browser and stored as ciphertext. Explicit logout appends an immutable generation; only the newest can be auto-claimed, older generations stay for rollback, and a restore refuses to overwrite Fiber state that already exists on the device.
 - Email compromise can authorize recovery. This testnet prototype is experimental, unaudited, and not production custody software.
@@ -205,7 +205,7 @@ The production deployment also sends `Cross-Origin-Opener-Policy: same-origin` a
 - The reference wallet uses fixed activation and maximum-payment-fee limits for a predictable demo; SDK consumers can configure channel funding and preflight payment fees.
 - CKB balance is an indexer-derived sum of live cells, not an account field. The reference wallet polls it every ten seconds, so a newly mined or faucet-created cell can still appear after indexer delay.
 - Lit, Fiber WASM, public peers, Stytch, and the CKB testnet RPC remain external availability dependencies.
-- Managed mode is a controlled testnet beta. Every account is mapped to a dedicated native node on a persistent volume, and the managed host enforces `KEYWAY_MANAGED_MAX_NODES` and `KEYWAY_MANAGED_MAX_CHANNELS`. Operators can snapshot and restore a user's node state through the managed host's bearer-token backup API (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)). Broader availability remains gated on separate staging Stytch and Lit credentials and a two-account testnet run in both modes.
+- Managed mode remains experimental testnet infrastructure. Every account is mapped to a dedicated native node on a persistent volume, with node/channel capacity limits. Authenticated operators can snapshot and restore state; current backups share the host volume and are not off-volume disaster recovery. Separate staging credentials are deferred to mainnet preparation. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and the funded recovery evidence.
 
 ## Upstream foundations
 

@@ -31,7 +31,7 @@ function SignIn() {
     The user ID maps to the same Lit PKP and CKB address on future logins.
   </Step>
   <Step title="Start Fiber">
-    With `autoConnect` enabled, the SDK recovers the device's Fiber identity and starts the browser node.
+    With `autoConnect` enabled, the SDK connects the persistent managed node by default. Optional browser mode restores its device state and starts WASM.
   </Step>
 </Steps>
 
@@ -52,10 +52,10 @@ const { ready, authenticated, user, status } = useKeyWay();
 
 ## Device behavior
 
-KeyWay permits one active Fiber device lease per account and fails closed if another device holds it. On explicit logout, KeyWay encrypts the wallet's Fiber IndexedDB state in the browser and uploads only ciphertext. The next device restores that state before starting Fiber.
+Managed mode keeps the node online after logout, so another browser can reconnect to the same managed identity. In optional browser mode, KeyWay permits one active device lease per account and fails closed if another device holds it. On explicit logout, it encrypts the wallet's Fiber IndexedDB state and uploads only ciphertext. The next device restores that state before starting Fiber.
 
 <Warning>
-  Close tabs and browser crashes cannot guarantee a final backup. Use `logout()` before changing devices, and do not clear site data while signed in.
+  In browser mode, closing a tab or crashing cannot guarantee a final backup. Use `logout()` before changing devices, and do not clear site data while signed in.
 </Warning>
 
 ## Branding
