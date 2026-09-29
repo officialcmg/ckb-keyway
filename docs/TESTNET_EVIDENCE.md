@@ -89,3 +89,10 @@ The current testnet release uses the existing deployment and newly created dispo
 - Managed to restored browser: 1 CKB settled with payment hash `0x701e83a2d5c8214fd4cdfc3bb7e06162003117bec88036186f7a48373d2f87d7`. The browser receiver independently reported `Paid`; the fee was 0.001 CKB.
 - Both accounts then completed explicit logout. The private browser profile is retained outside Git, and its latest encrypted database backup was saved by the SDK. No test credentials, payment preimages, or full invoices are recorded here.
 - This verifies real send and receive after explicit-logout recovery using published SDK 0.0.5. Funded managed snapshot/restore and unexpected-close recovery remain separate, unproven gates.
+
+### SDK 0.0.6 Release
+
+- [Trusted Publishing run 36445023342](https://github.com/officialcmg/ckb-keyway/actions/runs/36445023342) passed all 82 tests with zero skips against disposable Postgres, typechecked, built the public package, and published `@ckb-keyway/react@0.0.6` through OIDC.
+- This patch includes failed-import cleanup and archive schema validation. It pins the tested Fiber WASM runtime to `0.9.0-rc7`; no funded node database is upgraded by this release.
+- The reference app now imports npm SDK 0.0.6. Local typecheck, backup/package regression tests, and its production build pass. Browser mode remains the default, with managed mode explicitly opt-in.
+- Dependency inspection reports one unpatched low-severity [elliptic advisory](https://github.com/advisories/GHSA-848j-6mx2-7j84), propagated into five npm findings through CCC/JoyID dependencies. KeyWay has no direct elliptic/JoyID call sites; this does not establish that every transitive execution path is unaffected. No forced dependency replacement was applied.
