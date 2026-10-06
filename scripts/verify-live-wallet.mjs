@@ -39,6 +39,7 @@ async function login(mailbox) {
 }
 const domain = (await json("https://api.mail.tm/domains"))["hydra:member"][0].domain;
 const browser = await chromium.launch({ headless: true, channel: "chrome" });
+const activePages = [];
 const evidenceDirectory = process.env.REUSE_ACCOUNTS_DIRECTORY ?? await mkdtemp("/private/tmp/keyway-010-live-");
 console.log(`Private disposable-account evidence: ${evidenceDirectory}`);
 try {
@@ -71,10 +72,55 @@ try {
       assert.equal(typeof node, "string");
       assert.ok(node.length > 60);
       if (expectedNode) assert.equal(node, expectedNode); else expectedNode = node;
+      if (process.env.VERIFY_PAYMENTS === "1" && device === 1) {
+        activePages.push({ page, context });
+        console.log(`PASS disposable account ${index + 1}: retained only for funded test`);
+        continue;
+      }
       await page.evaluate(() => window.probe.auth.logout());
       assert.equal(await page.evaluate(() => window.probe.auth.authenticated), false);
       await context.close();
       console.log(`PASS disposable account ${index + 1}, device ${device + 1}: real OTP, wallet-only login, balance, explicit managed connection, logout`);
     }
   }
-} finally { await browser.close(); }
+  if (process.env.VERIFY_PAYMENTS === "1") {
+    for (const { page } of activePages) {
+      const address = await page.evaluate(() => window.probe.account.address);
+      const balance = await page.evaluate(() => window.probe.account.balance.toString());
+      if (BigInt(balance) < 100_000_000_000n) {
+        await json("https://faucet-api.nervos.org/claim_events", { claim_event: { address_hash: address, amount: "10000" } });
+        for (let attempt = 0; attempt < 30; attempt++) {
+          const amount = await page.evaluate(async () => (await window.probe.account.refreshBalance()).toString());
+          if (BigInt(amount) >= 100_000_000_000n) break;
+          await new Promise(resolve => setTimeout(resolve, 3000));
+        }
+      }
+      const channels = await page.evaluate(() => window.probe.fiber.refreshChannels());
+      if (!channels.some(channel => channel.status === "ready")) {
+        await page.evaluate(() => { window.opening = window.probe.fiber.openChannel({ fundingAmount: 100_000_000_000n, public: true }); });
+        await page.getByRole("button", { name: "Confirm activation", exact: true }).click({ timeout: 120_000 });
+        await page.evaluate(() => window.opening);
+      }
+      console.log("PASS disposable channel funded and ready");
+    }
+    for (const [sender, receiver] of [[activePages[0].page, activePages[1].page], [activePages[1].page, activePages[0].page]]) {
+      const invoice = await receiver.evaluate(async () => (await window.probe.fiber.createInvoice({ amount: "0x5f5e100", currency: "Fibt", description: "KeyWay 0.1.0 disposable verification", expiry: "0x36ee80" })).invoice_address);
+      let routable = false;
+      for (let attempt = 0; attempt < 20; attempt++) {
+        routable = await sender.evaluate(async invoice => (await window.probe.fiber.preflightPayment({ invoice, max_fee_amount: "0x5f5e100" })).routable, invoice);
+        if (routable) break;
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
+      assert.equal(routable, true, "No route for disposable 1 CKB payment");
+      const payment = await sender.evaluate(invoice => window.probe.fiber.payInvoice(invoice, { max_fee_amount: "0x5f5e100" }), invoice);
+      assert.equal(payment.status, "Success");
+      const received = await receiver.evaluate(hash => window.probe.fiber.getInvoice({ payment_hash: hash }), payment.payment_hash);
+      assert.equal(received.status, "Paid");
+      console.log(`PASS real routed 1 CKB payment: ${payment.payment_hash}`);
+    }
+    for (const { page } of activePages) await page.evaluate(() => window.probe.auth.logout());
+  }
+} finally {
+  for (const { page } of activePages) await page.evaluate(() => window.probe.auth.logout()).catch(() => undefined);
+  await browser.close();
+}
