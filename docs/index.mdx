@@ -4,7 +4,7 @@ description: "Email-native CKB accounts and Fiber payments for React application
 icon: "route"
 ---
 
-CKB KeyWay gives a React application email OTP login, a recoverable CKB testnet account, and a browser-based Fiber node through one SDK.
+CKB KeyWay gives a React application email OTP login, a recoverable CKB testnet account, and optional managed or browser Fiber connectivity. Login does not start Fiber.
 
 ```bash
 npm install @ckb-keyway/react
@@ -17,6 +17,7 @@ import {
   KeyWayLoginButton,
   KeyWayProvider,
   useKeyWay,
+  useCkbWallet,
 } from "@ckb-keyway/react";
 
 export function Providers({ children }: { children: React.ReactNode }) {
@@ -24,15 +25,16 @@ export function Providers({ children }: { children: React.ReactNode }) {
 }
 
 export function WalletStatus() {
-  const { ready, authenticated, connection } = useKeyWay();
+  const { ready, authenticated } = useKeyWay();
+  const { address } = useCkbWallet();
 
   if (!ready) return <p>Loading...</p>;
 
   return (
     <div>
       <KeyWayLoginButton />
-      {authenticated && !connection ? <p>Recovering wallet...</p> : null}
-      {connection ? <p>{connection.wallet.ckbAddress}</p> : null}
+      {authenticated && !address ? <p>Recovering wallet...</p> : null}
+      {address ? <p>{address}</p> : null}
     </div>
   );
 }
@@ -48,13 +50,13 @@ export function WalletStatus() {
   <Card title="React SDK" icon="brackets-curly" href="/react-sdk">
     Provider, hook, components, and client methods.
   </Card>
-  <Card title="Live demo" icon="arrow-up-right-from-square" href="https://ckb-keyway.vercel.app/app">
+  <Card title="Live demo" icon="arrow-up-right-from-square" href="https://ckbkeyway.dev/app">
     Test the complete flow on CKB testnet.
   </Card>
 </CardGroup>
 
 <Info>
-  This is a testnet preview. Create a public app ID and register browser origins in the [developer console](https://ckb-keyway.vercel.app/dashboard) before integrating.
+  This is a testnet preview. Create a public app ID and register browser origins in the [developer console](https://ckbkeyway.dev/dashboard) before integrating.
 </Info>
 
 ## What the SDK handles
@@ -68,8 +70,8 @@ export function WalletStatus() {
 ## Requirements
 
 - React 18.2 or newer
-- A browser with WebAssembly, Web Locks, IndexedDB, and Web Crypto
-- Cross-origin isolation headers for Fiber's multithreaded WASM runtime
+- A modern browser with Web Locks and Web Crypto
+- Browser mode additionally requires WebAssembly, IndexedDB, and cross-origin isolation
 - CKB testnet funds when opening a channel
 
 <Card title="View on npm" icon="box" href="https://www.npmjs.com/package/@ckb-keyway/react">

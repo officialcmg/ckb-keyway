@@ -27,6 +27,9 @@ test("exports React and headless KeyWay APIs from one public entrypoint", async 
   assert.equal(typeof sdk.KeyWayLoginButton, "function");
   assert.equal(typeof sdk.KeyWayConnectButton, "function");
   assert.equal(typeof sdk.useKeyWay, "function");
+  assert.equal(typeof sdk.useCkbWallet, "function");
+  assert.equal(typeof sdk.useFiber, "function");
+  assert.equal(typeof sdk.getCkbAccountBalance, "function");
   assert.equal(typeof sdk.connectKeyWay, "function");
 });
 

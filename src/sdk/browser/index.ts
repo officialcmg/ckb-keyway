@@ -39,3 +39,4 @@ export { KeyWayApiClient, type KeyWayApiClientOptions } from "./api-client";
 export { friendlyKeyWayError } from "./friendly-error";
 export { KeyWayError, toKeyWayError, type KeyWayErrorCode } from "./keyway-error";
 export { formatFiberOutpoint } from "./channel-evidence";
+export { getCkbAccountBalance } from "./ckb-balance";

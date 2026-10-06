@@ -1,142 +1,70 @@
 ---
 title: "React SDK"
-description: "Reference for the provider, hook, components, and connected KeyWay client."
+description: "Authentication, CKB accounts, and optional Fiber connections."
 icon: "code"
 ---
 
-## `KeyWayProvider`
-
-Wrap the part of the React tree that uses KeyWay.
+## Provider
 
 ```tsx
-<KeyWayProvider
-  appId="keyway_..."
-  appName="Your app"
-  theme="light"
-  autoConnect
-  onError={(error) => console.error(error)}
-  onLifecycle={(event) => console.log(event.stage, event.elapsedMs)}
->
+<KeyWayProvider appId="keyway_..." appName="Your app" theme="light" nodeMode="managed">
   <App />
 </KeyWayProvider>
 ```
 
-<ParamField path="appId" type="string">
-  Public application ID from the KeyWay developer console. SDK requests are accepted only from origins registered to this application.
-</ParamField>
+| Prop | Default | Purpose |
+| --- | --- | --- |
+| `appId` | none | Public application ID. Requests require a registered origin. |
+| `appName` | `CKB KeyWay` | Modal branding, not the email sender or subject. |
+| `theme` | `light` | Light or dark login/funding modals. |
+| `nodeMode` | `managed` | Managed native hosting or optional browser WASM. |
+| `autoConnect` | `false` | Opt into Fiber connection after login. Account recovery is always automatic. |
+| `confirmFunding` | built-in modal | Optional approval callback for validated channel funding. |
+| `onError` | none | Recovery, connection, and lease errors. |
+| `onLifecycle` | none | Structured connection stages and elapsed timings. |
 
-<ParamField path="appName" type="string" default="CKB KeyWay">
-  Name displayed in the embedded login UI. Limited to 64 characters.
-</ParamField>
+## Authentication: `useKeyWay()`
 
-<ParamField path="theme" type='"light" | "dark"' default="light">
-  Appearance of KeyWay's login and funding confirmation modals.
-</ParamField>
+```ts
+const { ready, authenticated, user, login, logout } = useKeyWay();
+```
 
-<ParamField path="autoConnect" type="boolean" default="true">
-  Recover the wallet and start Fiber automatically after authentication.
-</ParamField>
+`ready` means session validation finished, not that the account or Fiber is ready. `user` contains the stable user ID. `login()` opens the OTP modal. `logout()` revokes the session; connected browser mode first performs its safe database backup. Managed nodes remain online.
 
-<ParamField path="nodeMode" type='"browser" | "managed"' default="managed">
-  Select the Fiber runtime. From SDK 0.0.7, managed mode uses KeyWay's persistent native testnet node by default, subject to host capacity limits. Browser mode runs WASM locally. Switching modes does not migrate channels.
-</ParamField>
+## Account: `useCkbWallet()`
 
-<ParamField path="confirmFunding" type="ConfirmFunding">
-  Optional callback for approving the validated on-chain channel funding transaction. Return `true` to continue to Lit-authorized signing or `false` to abort. When omitted, KeyWay renders its styled built-in confirmation modal.
-</ParamField>
+```ts
+const { status, wallet, address, balance, refreshing, refreshBalance, error } = useCkbWallet();
+```
 
-<ParamField path="onError" type="(error: Error) => void">
-  Receives connection and device-lease failures.
-</ParamField>
+`status` is `disconnected`, `recovering`, `ready`, or `error`. `wallet` contains public identity metadata. `balance` is a bigint in shannons, undefined until the independent on-chain read completes. `refreshBalance()` updates it without Fiber. A balance error does not invalidate the recovered account.
 
-<ParamField path="onLifecycle" type="(event: KeyWayLifecycleEvent) => void">
-  Receives structured wallet recovery, lease, database restore, WASM startup, peer connection, synchronization, and ready events with elapsed milliseconds.
-</ParamField>
+Arbitrary CKB signing is not exposed by this hook. The remote signer currently authorizes channel funding under backend policy.
 
-## `useKeyWay()`
+## Fiber: `useFiber()`
 
 ```ts
 const {
-  ready,
-  authenticated,
-  user,
-  connection,
-  wallet,
-  walletReady,
-  fiberStarting,
-  fiberReady,
-  fiberError,
-  lifecycleStage,
-  lifecycleTimings,
-  status,
-  error,
-  login,
-  logout,
-  connect,
-  disconnect,
-} = useKeyWay();
+  status, nodeMode, connect, disconnect, channels, refreshChannels,
+  openChannel, closeChannel, createInvoice, getInvoice, parseInvoice,
+  preflightPayment, payInvoice, error, connection,
+} = useFiber();
 ```
 
-| Field | Type | Purpose |
-| --- | --- | --- |
-| `ready` | `boolean` | Stored session validation has finished. |
-| `authenticated` | `boolean` | The user has a valid KeyWay session. |
-| `user` | `{ id: string }` | Stable authenticated user identity. |
-| `connection` | `ConnectedKeyWay \| ConnectedManagedKeyWay \| undefined` | Recovered wallet and active browser or managed Fiber client. |
-| `wallet` | `PublicWallet \| undefined` | Recovered CKB identity, available before Fiber finishes starting. |
-| `walletReady` | `boolean` | Wallet recovery has completed. |
-| `fiberStarting` | `boolean` | Fiber startup is still in progress. |
-| `fiberReady` | `boolean` | Fiber is ready for channels, invoices, and payments. |
-| `fiberError` | `Error \| undefined` | Fiber-specific startup or lease failure. |
-| `lifecycleStage` | `KeyWayLifecycleStage \| undefined` | Current structured startup stage. |
-| `lifecycleTimings` | `Partial<Record<KeyWayLifecycleStage, number>>` | Elapsed milliseconds recorded for reached stages. |
-| `status` | `KeyWayStatus` | `idle`, `authenticating`, `connecting`, `connected`, `disconnecting`, or `error`. |
-| `error` | `Error \| undefined` | Latest provider connection error. |
-| `login()` | `() => void` | Open the email OTP modal. |
-| `logout()` | `() => Promise<void>` | Clear the session; browser mode first backs up and stops Fiber. |
-| `connect()` | `() => Promise<KeyWayConnection>` | Recover and connect the selected runtime manually. |
-| `disconnect()` | `() => Promise<void>` | Disconnect the client; stop Fiber only in browser mode. |
-
-## `connection`
-
-```ts
-type ConnectedKeyWay = {
-  keyway: KeyWay;
-  wallet: PublicWallet;
-  node: NodeInfoResult;
-  peers: ListPeersResult["peers"];
-  balanceShannons: bigint;
-};
-```
-
-Use `connection.wallet.ckbAddress` for the recovered address and `connection.keyway` for Fiber operations.
-
-Both connection modes implement the recommended methods below. Inspect `connection.mode` when an application needs runtime-specific UI. Browser mode requires cross-origin isolation and explicit-logout database handoff. Managed mode stays online outside the page lifecycle and does not migrate existing browser channels. The managed host holds operational node keys and state; it is a different trust model from a local browser node.
-
-### Recommended client methods
-
-| Method | Purpose |
+| Member | Behavior |
 | --- | --- |
-| `getCkbBalance()` | Read indexed on-chain capacity in shannons. |
-| `activateCkbChannel(options?, onProgress?)` | Fund a channel with safe defaults or an explicit amount, peer, visibility, and fee rates. |
-| `waitForChannelReady(channelId, options?)` | Wait until a funding transaction becomes a usable channel. |
-| `listChannels(options)` | Read channels, state, local balance, and remote balance. |
-| `getChannels(options?)` | Read normalized lifecycle state and bigint local/remote balances. |
-| `closeChannel(channelId, options?)` | Cooperatively or forcibly close a channel with typed failures. |
-| `newInvoice(params)` | Create a Fiber invoice. |
-| `parseInvoice(params)` | Decode and validate an invoice before payment. |
-| `sendPayment(params)` | Start a routed Fiber payment. |
-| `preflightPayment(params)` | Dry-run a payment and return route/fee readiness or a typed failure. |
-| `waitForPayment(paymentHash, options?)` | Wait for payment success or failure. |
-| `listPeers()` | Inspect connected Fiber peers. |
-| `nodeInfo()` | Read the local Fiber node identity. |
-| `stop()` | Disconnect the client; browser mode also stops the node and releases device guards. Prefer provider `disconnect()`. |
+| `status` | disconnected, connecting, connected, or error. Connected does not imply a funded channel. |
+| `connect()` | Start browser Fiber or attach to/provision managed Fiber. Does not fund a channel. |
+| `disconnect()` | Disconnect the client; only browser mode stops the node. Does not settle channels. |
+| `channels` | Normalized channels refreshed every ten seconds while connected. |
+| `refreshChannels()` | Read channels and update React state. |
+| `openChannel(options, onProgress?)` | Confirm/fund, wait for readiness, and refresh channels. |
+| `closeChannel(id, options?)` | Request closure and refresh. On-chain settlement is asynchronous. |
+| `createInvoice(params)` | Create a Fiber testnet invoice. |
+| `getInvoice(params)` / `parseInvoice(params)` | Read invoice status or decode contents. |
+| `preflightPayment(params)` | Test routing for an invoice/fee limit at that moment. |
+| `payInvoice(invoice, options?)` | Submit, wait for successful settlement, and refresh. Show confirmation before calling. |
+| `error` | Connection or channel-listing error. Mutation promises also reject and must be caught. |
+| `connection` | Low-level escape hatch. Browser and managed method surfaces differ. |
 
-## Buttons
-
-`KeyWayLoginButton` toggles login/logout. `KeyWayConnectButton` starts or stops Fiber and opens login first when needed. Both accept normal button attributes and label overrides.
-
-```tsx
-<KeyWayLoginButton loginLabel="Continue with email" />
-<KeyWayConnectButton connectLabel="Start payments" />
-```
+`KeyWayLoginButton` provides login/logout; `KeyWayConnectButton` provides explicit Fiber connection. Headless connection factories and their types remain exported. No backend implementation or credentials are shipped.

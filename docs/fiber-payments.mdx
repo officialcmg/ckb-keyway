@@ -4,13 +4,11 @@ description: "Activate a channel, inspect balances, create invoices, and settle 
 icon: "bolt"
 ---
 
-All Fiber operations are available through `connection.keyway`. Wait for `connection` before calling them.
+Use `useFiber()` for channel and payment operations. Connect explicitly before using them.
 
 ```ts
-const { connection } = useKeyWay();
-if (!connection) return;
-
-const keyway = connection.keyway;
+const fiber = useFiber();
+await fiber.connect();
 ```
 
 ## Activate a channel
@@ -21,15 +19,12 @@ A Fiber channel locks CKB on-chain and makes that capacity available for off-cha
 const SHANNONS_PER_CKB = 100_000_000n;
 const fundingAmount = 1_000n * SHANNONS_PER_CKB;
 
-const result = await connection.keyway.activateCkbChannel(
+const result = await fiber.openChannel(
   { fundingAmount, public: true },
   (stage) => console.log(stage),
 );
 
-await connection.keyway.waitForChannelReady(result.channelId, {
-  timeout: 180_000,
-  interval: 3_000,
-});
+// Resolves after the channel becomes ready.
 ```
 
 ### Confirm the funding transaction
@@ -68,22 +63,21 @@ Supply `confirmFunding` only when the application needs to render its own confir
 ## Read channels and balances
 
 ```ts
-const onchainShannons = await connection.keyway.getCkbBalance();
-const { channels } = await connection.keyway.listChannels({
-  include_closed: false,
-});
+const account = useCkbWallet();
+const onchainShannons = account.balance;
+const channels = fiber.channels;
 
 const readyChannels = channels.filter(
-  (channel) => channel.state.state_name === "CHANNEL_READY",
+  (channel) => channel.status === "ready",
 );
 
 const fiberShannons = readyChannels.reduce(
-  (total, channel) => total + BigInt(channel.local_balance),
+  (total, channel) => total + channel.localBalanceShannons,
   0n,
 );
 ```
 
-`local_balance` is the spendable capacity on the user's side. `remote_balance` is capacity on the peer's side. Their sum is the channel's total capacity.
+`localBalanceShannons` and `remoteBalanceShannons` report the user's and peer's sides. Reserves, pending transfers, and route liquidity can limit the amount currently payable.
 
 ## Create an invoice
 
@@ -92,7 +86,7 @@ function toHex(value: bigint) {
   return `0x${value.toString(16)}`;
 }
 
-const created = await connection.keyway.newInvoice({
+const created = await fiber.createInvoice({
   amount: toHex(1n * SHANNONS_PER_CKB),
   currency: "Fibt",
   description: "Order 42",
@@ -107,7 +101,7 @@ console.log(created.invoice_address);
 Preflight the exact invoice and fee limit before showing a confirmation:
 
 ```ts
-const preflight = await connection.keyway.preflightPayment({
+const preflight = await fiber.preflightPayment({
   invoice,
   max_fee_amount: toHex(1n * SHANNONS_PER_CKB),
 });
@@ -119,20 +113,12 @@ if (!preflight.routable) {
 ```
 
 ```ts
-const payment = await connection.keyway.sendPayment({
-  invoice,
+const settled = await fiber.payInvoice(invoice, {
   timeout: "0x1d4c0",
   max_fee_amount: toHex(1n * SHANNONS_PER_CKB),
 });
 
-const settled = await connection.keyway.waitForPayment(
-  payment.payment_hash,
-  { timeout: 120_000 },
-);
-
-if (settled.status !== "Success") {
-  throw new Error(settled.failed_error ?? "Fiber payment failed");
-}
+// Resolves only after successful settlement; rejects on failure.
 ```
 
 The sender does not need a direct channel to the receiver. Fiber uses its public channel graph to find a multi-hop route whose channels have enough outbound liquidity.
@@ -143,9 +129,9 @@ The sender does not need a direct channel to the receiver. Fiber uses its public
 
 ## Disconnect the client
 
-Call `disconnect()` from `useKeyWay` to disconnect the SDK client. In browser mode it also stops the local node. The managed native node stays online. Neither operation closes or settles channels on-chain; use `closeChannel()` for that.
+Call `disconnect()` from `useFiber()` to disconnect the SDK client. In browser mode it also stops the local node. The managed native node stays online. Neither closes or settles channels; use `closeChannel()` for that.
 
 ```ts
-const { disconnect } = useKeyWay();
+const { disconnect } = useFiber();
 await disconnect();
 ```

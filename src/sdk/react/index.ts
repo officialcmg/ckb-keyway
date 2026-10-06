@@ -1,11 +1,11 @@
 export * from "../browser/index";
+export { useCkbWallet, useFiber } from "./wallet-hooks";
 export {
   KeyWayConnectButton,
   KeyWayLoginButton,
   KeyWayProvider,
   useKeyWay,
   type KeyWayConnectButtonProps,
-  type KeyWayContextValue,
   type KeyWayLoginButtonProps,
   type KeyWayConnection,
   type KeyWayNodeMode,

@@ -4,8 +4,8 @@ This directory contains the standalone developer documentation for `@ckb-keyway/
 
 The source is written in MDX and configured with Mintlify. We use the Mintlify CLI to preview, validate, and export the site, then deploy the generated static bundle as a separate Vercel project.
 
-- Documentation: <https://ckb-keyway-docs.vercel.app>
-- Demo application: <https://ckb-keyway.vercel.app>
+- Documentation: <https://docs.ckbkeyway.dev>
+- Demo application: <https://ckbkeyway.dev>
 - npm package: <https://www.npmjs.com/package/@ckb-keyway/react>
 
 ## Tooling

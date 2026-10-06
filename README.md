@@ -7,11 +7,11 @@ The repository contains two independent deliverables:
 - The public React SDK under `src/sdk`, including its framework-independent browser client.
 - A standalone Node/Postgres backend and a Next.js reference wallet demonstrating login, recovery, channel activation, invoices, and payments.
 
-Project overview: [ckb-keyway.vercel.app](https://ckb-keyway.vercel.app)
+Project overview: [ckb-keyway.vercel.app](https://ckbkeyway.dev)
 
-Live testnet wallet: [ckb-keyway.vercel.app/app](https://ckb-keyway.vercel.app/app)
+Live testnet wallet: [ckb-keyway.vercel.app/app](https://ckbkeyway.dev/app)
 
-React SDK documentation: [ckb-keyway-docs.vercel.app](https://ckb-keyway-docs.vercel.app)
+React SDK documentation: [ckb-keyway-docs.vercel.app](https://docs.ckbkeyway.dev)
 
 npm package: [@ckb-keyway/react](https://www.npmjs.com/package/@ckb-keyway/react)
 
@@ -50,14 +50,14 @@ Configure Stytch email OTP for backend API access. The browser never receives a 
 
 The public package owns email OTP, the login modal, wallet provisioning, and Fiber startup behind one provider. Managed mode is the default from version 0.0.7; browser mode remains an explicit option. The package exports `connectManagedKeyWay` and `connectKeyWay` for lower-level integrations.
 
-Create an application at [ckb-keyway.vercel.app/dashboard](https://ckb-keyway.vercel.app/dashboard), register its exact development and production origins, and copy its public app ID.
+Create an application at [ckb-keyway.vercel.app/dashboard](https://ckbkeyway.dev/dashboard), register its exact development and production origins, and copy its public app ID.
 
 ```sh
 npm install @ckb-keyway/react
 ```
 
 ```tsx
-import { KeyWayLoginButton, KeyWayProvider, useKeyWay } from "@ckb-keyway/react";
+import { KeyWayLoginButton, KeyWayProvider, useKeyWay, useCkbWallet } from "@ckb-keyway/react";
 
 function Wallet() {
   return (
@@ -69,14 +69,15 @@ function Wallet() {
 }
 
 function Balance() {
-  const { ready, authenticated, connection } = useKeyWay();
+  const { ready, authenticated } = useKeyWay();
+  const { balance } = useCkbWallet();
   if (!ready) return <p>Loading KeyWay...</p>;
   if (!authenticated) return null;
-  return connection ? <p>{connection.balanceShannons.toString()} shannons</p> : null;
+  return balance === undefined ? <p>Loading balance...</p> : <p>{balance.toString()} shannons</p>;
 }
 ```
 
-`KeyWayLoginButton` opens the built-in email OTP modal. After verification, KeyWay recovers or provisions the same CKB identity and connects the selected Fiber runtime automatically. Channel activation uses a built-in transaction confirmation unless the application supplies `confirmFunding`. Applications can call `login()` and `logout()` from `useKeyWay()` when they want custom buttons.
+`KeyWayLoginButton` opens the built-in email OTP modal. Login recovers the CKB identity without starting Fiber. Use `connect()` from `useFiber()` or `KeyWayConnectButton` when needed. Channel activation uses a built-in funding confirmation. Use `login()` and `logout()` from `useKeyWay()` for custom buttons.
 
 ### React API
 
@@ -85,13 +86,15 @@ function Balance() {
 | `KeyWayProvider` | Owns email OTP, wallet recovery, Fiber startup, and funding confirmation |
 | `KeyWayLoginButton` | Opens the email OTP modal and logs out an authenticated user |
 | `KeyWayConnectButton` | Manually starts or stops Fiber when `autoConnect` is disabled |
-| `useKeyWay()` | Returns auth status, user, wallet connection, errors, and lifecycle methods |
+| `useKeyWay()` | Authentication readiness, user, login, and logout |
+| `useCkbWallet()` | Account, address, independent balance, refresh, and errors |
+| `useFiber()` | Explicit connection, channels, invoices, preflight, and settled payments |
 
-The SDK uses CKB KeyWay's managed backend automatically. `appId` identifies the registered application and enforces its origin list. `appName` brands the SDK modal, `theme` accepts `"light"` or `"dark"`, `autoConnect` defaults to `true`, and `confirmFunding` can replace the built-in funding modal. `nodeMode` defaults to `"managed"`; set `"browser"` to run WASM locally. `useKeyWay()` separates `authenticated`, `walletReady`, `fiberStarting`, `fiberReady`, and `fiberError`, while `lifecycleStage` and `lifecycleTimings` expose structured startup progress. The recovered `wallet` is available before the Fiber node finishes starting. Backend URLs and server credentials are intentionally absent from the public API.
+The SDK uses KeyWay's managed backend. `appId` identifies the registered application and enforces origins. `appName` brands the modal; `theme` accepts light or dark; `confirmFunding` can replace funding confirmation. From 0.1.0, `autoConnect` defaults to false. `nodeMode` defaults to managed; use browser for local WASM. Authentication, account recovery, and Fiber readiness have separate hooks. Backend URLs and credentials are absent from provider configuration.
 
 `appName` changes the embedded modal. Optional Stytch login and signup template IDs can be saved for each registered application in the developer console; the templates must already exist in KeyWay's Stytch project.
 
-With the default `autoConnect`, successful OTP recovers the wallet, connects its managed native node, and fetches an initial CKB balance. Browser mode instead restores any claimed backup before starting WASM and connecting testnet relays. Use `autoConnect={false}` with `connect()` and `disconnect()` for explicit client lifecycle control.
+Successful OTP recovers the CKB account without a node. `useCkbWallet()` reads its balance independently. `useFiber().connect()` starts or attaches to Fiber. Browser mode restores any claimed backup before WASM startup. Opt into automatic connection with `autoConnect`. Disconnecting a managed client does not stop the persistent server node.
 
 In browser mode, explicit `logout()` is transactional after a Fiber connection exists: KeyWay stops the node while retaining its device lease, snapshots only that wallet's IndexedDB databases, derives an AES-256-GCM backup key from the Lit-recovered Fiber key with HKDF-SHA256, and uploads ciphertext to the managed backend. Authentication and ownership are cleared only after the backend independently verifies and stores the ciphertext. A new device claims and restores that one-use backup before Fiber starts. If backup or restoration fails, KeyWay does not release or consume the only recoverable state. Managed logout does not stop the persistent node.
 

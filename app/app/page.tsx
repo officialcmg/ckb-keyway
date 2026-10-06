@@ -12,11 +12,11 @@ export default async function WalletApp({ searchParams }: { searchParams: Promis
           <span className="brand-mark" aria-hidden="true">K</span>
           <div><strong>CKB KeyWay</strong><span>Live Fiber wallet</span></div>
         </Link>
-        <div className="app-links"><Link href={nodeMode === "managed" ? "/app?mode=browser" : "/app"}>{nodeMode === "managed" ? "Browser wallet" : "Managed wallet"}</Link><a href="https://ckb-keyway-docs.vercel.app">Docs</a><a href="https://www.npmjs.com/package/@ckb-keyway/react">npm</a><div className="network-pill"><span /> CKB testnet</div></div>
+        <div className="app-links"><Link href={nodeMode === "managed" ? "/app?mode=browser" : "/app"}>{nodeMode === "managed" ? "Browser wallet" : "Managed wallet"}</Link><a href="https://docs.ckbkeyway.dev">Docs</a><a href="https://www.npmjs.com/package/@ckb-keyway/react">npm</a><div className="network-pill"><span /> CKB testnet</div></div>
       </header>
       <section className="app-intro"><div><p className="eyebrow">{nodeMode === "managed" ? "Managed node demo" : "Browser node demo"}</p><h1>Move CKB through Fiber.</h1></div><p>{nodeMode === "managed" ? "KeyWay keeps your testnet node online. Existing browser channels stay in the browser wallet; switching modes does not migrate channels." : "Your Fiber node runs in this browser. Log out explicitly to back up its state before changing devices."}</p></section>
       <AuthPanel nodeMode={nodeMode} />
-      <footer className="site-footer"><span>CKB KeyWay</span><Link href="/">Project overview</Link><a href="https://ckb-keyway-docs.vercel.app">Docs</a><a href="https://www.npmjs.com/package/@ckb-keyway/react">npm</a></footer>
+      <footer className="site-footer"><span>CKB KeyWay</span><Link href="/">Project overview</Link><a href="https://docs.ckbkeyway.dev">Docs</a><a href="https://www.npmjs.com/package/@ckb-keyway/react">npm</a></footer>
     </main>
   );
 }

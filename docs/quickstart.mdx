@@ -22,7 +22,7 @@ yarn add @ckb-keyway/react
 
 ## 2. Register your application
 
-Open the [KeyWay developer console](https://ckb-keyway.vercel.app/dashboard), create an application, and add every exact browser origin that will use it. Add local development origins separately from production origins, then copy the public app ID.
+Open the [KeyWay developer console](https://ckbkeyway.dev/dashboard), create an application, and add every exact browser origin that will use it. Add local development origins separately from production origins, then copy the public app ID.
 
 ## 3. Add the provider
 
@@ -59,25 +59,32 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 ```tsx app/wallet.tsx
 "use client";
 
-import { KeyWayLoginButton, useKeyWay } from "@ckb-keyway/react";
+import { KeyWayLoginButton, useKeyWay, useCkbWallet, useFiber } from "@ckb-keyway/react";
 
 export function Wallet() {
-  const { ready, authenticated, connection, status, error } = useKeyWay();
+  const { ready, authenticated } = useKeyWay();
+  const account = useCkbWallet();
+  const fiber = useFiber();
 
   if (!ready) return <p>Loading login...</p>;
 
   return (
     <section>
       <KeyWayLoginButton />
-      {authenticated && status === "connecting" ? <p>Recovering wallet...</p> : null}
-      {connection ? <p>CKB address: {connection.wallet.ckbAddress}</p> : null}
-      {error ? <p role="alert">{error.message}</p> : null}
+      {authenticated && !account.wallet ? <p>Recovering wallet...</p> : null}
+      {account.address ? <p>CKB address: {account.address}</p> : null}
+      {account.wallet && fiber.status !== "connected" ? (
+        <button disabled={fiber.status === "connecting"} onClick={() => void fiber.connect().catch(() => undefined)}>
+          {fiber.status === "connecting" ? "Starting Fiber..." : "Connect Fiber"}
+        </button>
+      ) : null}
+      {account.error || fiber.error ? <p role="alert">{(account.error ?? fiber.error)?.message}</p> : null}
     </section>
   );
 }
 ```
 
-`autoConnect` defaults to `true`. After OTP verification, the provider recovers the wallet, connects its persistent managed Fiber node, and then sets `connection`. Managed mode is the default from SDK 0.0.7 and requires no WASM isolation headers.
+From SDK 0.1.0, login recovers the CKB account without starting Fiber. Calling `connect()` from `useFiber()` starts or attaches to Fiber; it does not fund a channel. Set `autoConnect` to opt into automatic Fiber connection. Managed mode requires no WASM isolation headers.
 
 <Info>
   The app ID is public. It identifies the integration and lets KeyWay enforce its registered origins; it is not a secret credential.

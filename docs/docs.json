@@ -25,7 +25,7 @@
     "primary": {
       "type": "button",
       "label": "Open demo",
-      "href": "https://ckb-keyway.vercel.app/app"
+      "href": "https://ckbkeyway.dev/app"
     }
   },
   "navigation": {
@@ -36,7 +36,7 @@
       },
       {
         "group": "Build",
-        "pages": ["authentication", "fiber-payments", "core-concepts"]
+        "pages": ["authentication", "fiber-payments", "email-branding", "core-concepts"]
       },
       {
         "group": "Reference",
@@ -51,7 +51,7 @@
         "items": [
           {
             "label": "Live demo",
-            "href": "https://ckb-keyway.vercel.app/app"
+            "href": "https://ckbkeyway.dev/app"
           },
           {
             "label": "npm package",

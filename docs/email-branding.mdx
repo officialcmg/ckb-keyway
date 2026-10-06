@@ -1,0 +1,24 @@
+---
+title: "Email branding"
+description: "Configure application-specific OTP emails and a verified sender domain."
+icon: "envelope"
+---
+
+KeyWay uses Stytch to generate, deliver, and verify email codes. The provider's `appName` changes the modal only; it does not override the email sender or subject.
+
+## Templates
+
+The KeyWay developer console stores approved Stytch login and signup template IDs for each registered application. Both templates must exist in KeyWay's Stytch project. The backend resolves them from the registered app ID, not from arbitrary browser HTML.
+
+The repository's `src/server/email-template.ts` generates a neutral white-card layout with a 40px selectable code and a plaintext alternative. Give the generator the registered application name and the exact OTP variable supplied by Stytch's template editor. Preview login and signup templates, then verify delivery before enabling them for an application. The generator does not create or verify codes.
+
+## Sender domain (operator setup)
+
+1. In the Stytch Dashboard, open Emails and configure a custom sender domain, for example `auth.ckbkeyway.dev`.
+2. Add the exact DNS records Stytch generates at the domain's DNS provider. Do not replace unrelated website or email records.
+3. Wait for Stytch to confirm verification.
+4. Configure `login@auth.ckbkeyway.dev` and an appropriate sender name on the templates.
+5. Create the OTP login and signup templates with their HTML, plaintext, and subject, then save their IDs for the registered KeyWay application.
+6. Test delivery and code verification using a disposable account. Inspect sender authentication in the received message and check desktop/mobile rendering.
+
+Custom sender domains require Stytch's branding add-on. Check its current pricing before enabling a paid subscription. No DNS or billing changes are made by generating the templates.

@@ -21,7 +21,7 @@ import {
   connectManagedKeyWay,
   type ConnectedManagedKeyWay,
 } from "../browser/connect-managed-keyway";
-import type { PublicWallet } from "../browser/bootstrap";
+import { bootstrapKeyWay, type PublicWallet } from "../browser/bootstrap";
 import type { ConfirmFunding, FundingPreview } from "../browser/remote-ckb-signer";
 
 export type KeyWayStatus = "idle" | "authenticating" | "connecting" | "connected" | "disconnecting" | "error";
@@ -47,6 +47,7 @@ export type KeyWayContextValue = {
   ready: boolean;
   authenticated: boolean;
   user?: KeyWayUser;
+  nodeMode: KeyWayNodeMode;
   connection?: KeyWayConnection;
   wallet?: PublicWallet;
   status: KeyWayStatus;
@@ -71,7 +72,7 @@ export function KeyWayProvider({
   appName = "CKB KeyWay",
   theme = "light",
   confirmFunding,
-  autoConnect = true,
+  autoConnect = false,
   nodeMode = "managed",
   onError,
   onLifecycle,
@@ -121,8 +122,11 @@ export function KeyWayProvider({
         const next = await connectNode({
           authToken,
           apiClient: api,
-          confirmFunding: (preview) => callbacksRef.current.confirmFunding?.(preview) ??
-            new Promise<boolean>((resolve) => setFundingRequest({ preview, resolve })),
+          confirmFunding: (preview) => {
+            if (run !== runRef.current) return false;
+            return callbacksRef.current.confirmFunding?.(preview) ??
+              new Promise<boolean>((resolve) => setFundingRequest({ preview, resolve }));
+          },
           ...(nodeMode === "browser" ? { onLeaseLost: (leaseError: Error) => {
             if (run !== runRef.current) return;
             connectionRef.current = undefined;
@@ -132,7 +136,9 @@ export function KeyWayProvider({
             setStatus("error");
             callbacksRef.current.onError?.(leaseError);
           } } : {}),
-          onWalletReady: setWallet,
+          onWalletReady: (nextWallet) => {
+            if (run === runRef.current) setWallet(nextWallet);
+          },
           onLifecycle: (event) => {
             if (run !== runRef.current) return;
             setLifecycleStage(event.stage);
@@ -191,9 +197,13 @@ export function KeyWayProvider({
 
   async function logout() {
     const token = authToken;
-    const current = connectionRef.current;
+    ++runRef.current;
+    fundingRequest?.resolve(false);
+    setFundingRequest(undefined);
     setStatus("disconnecting");
     setError(undefined);
+    await operationRef.current;
+    const current = connectionRef.current;
     try {
       if (current) await current.keyway.stopForLogout();
       if (token) await api.logout(token);
@@ -220,6 +230,8 @@ export function KeyWayProvider({
   useEffect(() => {
     let active = true;
     setReady(false);
+    setAuthToken(undefined);
+    setUser(undefined);
     const stored = readStoredSession(appId);
     if (!stored) {
       setReady(true);
@@ -230,7 +242,7 @@ export function KeyWayProvider({
       setAuthToken(stored.authToken);
       setUser(currentUser);
     }).catch(() => {
-      clearStoredSession();
+      if (active) clearStoredSession();
     }).finally(() => {
       if (active) setReady(true);
     });
@@ -248,27 +260,44 @@ export function KeyWayProvider({
       return;
     }
     setLoginOpen(false);
-    if (!autoConnect) return;
-    void connect().catch(() => undefined);
+    let active = true;
+    if (autoConnect) {
+      void connect().catch(() => undefined);
+    } else {
+      setError(undefined);
+      // Managed bootstrap recovers identity without claiming browser state or starting a node.
+      void bootstrapKeyWay(authToken!, api, "managed").then(({ wallet: nextWallet }) => {
+        if (!active) return;
+        setWallet(nextWallet);
+        setStatus((current) => current === "authenticating" ? "idle" : current);
+      }).catch((cause) => {
+        if (!active) return;
+        const recoveryError = cause instanceof Error ? cause : new Error("Could not recover CKB account");
+        setError(recoveryError);
+        callbacksRef.current.onError?.(recoveryError);
+      });
+    }
     return () => {
+      active = false;
       ++runRef.current;
       const current = connectionRef.current;
       connectionRef.current = undefined;
       if (current) void current.keyway.stop();
     };
-  }, [authenticated, autoConnect, nodeMode]);
+  }, [authenticated, authToken, appId, autoConnect, nodeMode]);
 
   return (
     <KeyWayContext.Provider value={{
       ready,
       authenticated,
       user,
+      nodeMode,
       connection,
       wallet,
       status,
       error,
       walletReady: Boolean(wallet),
-      fiberStarting: Boolean(wallet && !connection && !fiberError),
+      fiberStarting: status === "connecting",
       fiberReady: Boolean(connection),
       fiberError,
       lifecycleStage,
@@ -310,10 +339,15 @@ export function KeyWayProvider({
   );
 }
 
-export function useKeyWay(): KeyWayContextValue {
+export function useKeyWayContext(): KeyWayContextValue {
   const value = useContext(KeyWayContext);
   if (!value) throw new Error("useKeyWay must be used inside KeyWayProvider");
   return value;
+}
+
+export function useKeyWay() {
+  const { ready, authenticated, user, login, logout } = useKeyWayContext();
+  return { ready, authenticated, user, login, logout };
 }
 
 export type KeyWayLoginButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
@@ -330,7 +364,7 @@ export function KeyWayLoginButton({
   onClick,
   ...props
 }: KeyWayLoginButtonProps) {
-  const { ready, authenticated, status, login, logout } = useKeyWay();
+  const { ready, authenticated, status, login, logout } = useKeyWayContext();
   const pending = !ready || status === "authenticating" || status === "disconnecting";
   return (
     <button
@@ -363,7 +397,7 @@ export function KeyWayConnectButton({
   onClick,
   ...props
 }: KeyWayConnectButtonProps) {
-  const { authenticated, connection, status, login, connect, disconnect } = useKeyWay();
+  const { authenticated, connection, status, login, connect, disconnect } = useKeyWayContext();
   const pending = status === "connecting" || status === "disconnecting";
   return (
     <button

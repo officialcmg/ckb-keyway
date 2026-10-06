@@ -8,6 +8,8 @@ import {
   type ActivationStage,
   type KeyWay,
   useKeyWay,
+  useCkbWallet,
+  useFiber,
 } from "@ckb-keyway/react";
 
 type Phase = "recovering" | "ready" | "activating" | "paying" | "receiving" | "error";
@@ -25,13 +27,15 @@ function WalletPanel() {
   const {
     ready,
     authenticated,
-    connection: connected,
-    status,
-    error: connectionError,
     login,
     logout,
-    connect,
   } = useKeyWay();
+  const account = useCkbWallet();
+  const fiber = useFiber();
+  const connected = fiber.connection;
+  const connectionError = fiber.error ?? account.error;
+  const status = fiber.status;
+  const connect = fiber.connect;
   const [phase, setPhase] = useState<Phase>("recovering");
   const [channelReady, setChannelReady] = useState(false);
   const [channelEvidence, setChannelEvidence] = useState<{ channelId: string; fundingOutpoint: string }>();
@@ -106,13 +110,12 @@ function WalletPanel() {
     setActivationStage("connecting");
     setError(undefined);
     try {
-      const result = await current.keyway.activateCkbChannel(
+      const result = await fiber.openChannel(
         { fundingAmount: parseCkb("1000"), public: true },
         setActivationStage,
       );
       setFundingResult(result.fundingTxHash);
       setActivationStage("waiting");
-      await current.keyway.waitForChannelReady(result.channelId, { timeout: 180_000, interval: 3_000 });
       const { channels } = await current.keyway.listChannels({ include_closed: false });
       const readyChannel = channels.find(({ channel_id }) => channel_id === result.channelId);
       setChannels(channels);
@@ -135,9 +138,9 @@ function WalletPanel() {
     if (!current || !invoiceToPay.trim()) return;
     setError(undefined);
     try {
-      const { invoice } = await current.keyway.parseInvoice({ invoice: invoiceToPay.trim() });
+      const { invoice } = await fiber.parseInvoice({ invoice: invoiceToPay.trim() });
       if (!invoice.amount) throw new Error("Enter an invoice with a fixed amount");
-      const preflight = await current.keyway.preflightPayment({
+      const preflight = await fiber.preflightPayment({
         invoice: invoiceToPay.trim(),
         timeout: "0x1d4c0",
         max_fee_amount: toHex(parseCkb("1")),
@@ -157,12 +160,10 @@ function WalletPanel() {
     setError(undefined);
     setPaymentResult(undefined);
     try {
-      const payment = await current.keyway.sendPayment({
-        invoice: invoiceToPay.trim(),
+      const settled = await fiber.payInvoice(invoiceToPay.trim(), {
         timeout: "0x1d4c0",
         max_fee_amount: toHex(parseCkb("1")),
       });
-      const settled = await current.keyway.waitForPayment(payment.payment_hash, { timeout: 120_000 });
       if (settled.status !== "Success") throw new Error(settled.failed_error ?? "Fiber payment failed");
       const refreshed = await current.keyway.listChannels({ include_closed: false });
       setChannels(refreshed.channels);
@@ -181,7 +182,7 @@ function WalletPanel() {
     setPhase("receiving");
     setError(undefined);
     try {
-      const result = await current.keyway.newInvoice({
+      const result = await fiber.createInvoice({
         amount: toHex(parseCkb(receiveCkb)),
         currency: "Fibt",
         description: receiveDescription.trim() || undefined,
@@ -204,7 +205,7 @@ function WalletPanel() {
     setError(undefined);
     setNotice(undefined);
     try {
-      await current.keyway.closeChannel(target.channel_id);
+      await fiber.closeChannel(target.channel_id);
       const { channels: refreshed } = await current.keyway.listChannels({ include_closed: false });
       const ready = refreshed.find(({ state }) => state.state_name === "CHANNEL_READY");
       setChannels(refreshed);
@@ -236,9 +237,18 @@ function WalletPanel() {
   if (!connected) {
     return (
       <section className="wallet-shell">
-        <WalletProgress label={status === "error" ? "Wallet needs attention" : "Recovering your wallet"} />
+        {!account.wallet ? <WalletProgress label={account.error ? "Wallet needs attention" : "Recovering your CKB account"} /> : (
+          <section className="activation-card">
+            <p className="step-label">CKB account ready</p>
+            <h2>Your account. Fiber when you need it.</h2>
+            <p>{account.address}</p>
+            <p>On-chain balance: {account.balance === undefined ? "Loading..." : `${formatCkb(account.balance)} CKB`}</p>
+            <button disabled={status === "connecting"} onClick={() => void connect().catch(() => undefined)}>
+              {status === "connecting" ? "Connecting Fiber..." : "Connect Fiber"}
+            </button>
+          </section>
+        )}
         {(connectionError || error) && <p className="error">{friendlyError(connectionError?.message ?? error ?? "Wallet recovery failed")}</p>}
-        {status === "error" && <button onClick={() => void connect()}>Try again</button>}
         <button className="text-button" onClick={() => void logout()}>Use another email</button>
       </section>
     );

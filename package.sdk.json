@@ -8,7 +8,7 @@
     "react",
     "wallet"
   ],
-  "homepage": "https://ckb-keyway.vercel.app",
+  "homepage": "https://ckbkeyway.dev",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/officialcmg/ckb-keyway.git"

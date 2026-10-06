@@ -31,7 +31,7 @@ function SignIn() {
     The user ID maps to the same Lit PKP and CKB address on future logins.
   </Step>
   <Step title="Start Fiber">
-    With `autoConnect` enabled, the SDK connects the persistent managed node by default. Optional browser mode restores its device state and starts WASM.
+    Login only recovers the CKB identity. Call `connect()` from `useFiber()` to start or attach to Fiber, or enable `autoConnect`. Optional browser mode restores device state and starts WASM.
   </Step>
 </Steps>
 
@@ -40,7 +40,7 @@ function SignIn() {
 The SDK stores the KeyWay session in browser `localStorage` and validates it when the provider mounts. Use `ready` before reading authentication state.
 
 ```tsx
-const { ready, authenticated, user, status } = useKeyWay();
+const { ready, authenticated, user } = useKeyWay();
 ```
 
 | Value | Meaning |
