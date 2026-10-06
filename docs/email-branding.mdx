@@ -12,6 +12,14 @@ The KeyWay developer console stores approved Stytch login and signup template ID
 
 The repository's `src/server/email-template.ts` generates a neutral white-card layout with a 40px selectable code and a plaintext alternative. Give the generator the registered application name and the exact OTP variable supplied by Stytch's template editor. Preview login and signup templates, then verify delivery before enabling them for an application. The generator does not create or verify codes.
 
+From the repository root, export the template files:
+
+```sh
+node --import tsx scripts/export-otp-email.mjs "Your registered app name" "EXACT_STYTCH_OTP_VARIABLE" /tmp/keyway-email
+```
+
+Replace the example variable with the exact variable from the Stytch editor. Upload `otp.html`, `otp.txt`, and the subject to the corresponding template fields. These files contain no generated login code.
+
 ## Sender domain (operator setup)
 
 1. In the Stytch Dashboard, open Emails and configure a custom sender domain, for example `auth.ckbkeyway.dev`.

@@ -43,7 +43,7 @@ const activePages = [];
 const evidenceDirectory = process.env.REUSE_ACCOUNTS_DIRECTORY ?? await mkdtemp("/private/tmp/keyway-010-live-");
 console.log(`Private disposable-account evidence: ${evidenceDirectory}`);
 try {
-  for (let index = 0; index < 2; index++) {
+  for (let index = 0; index < (process.env.PRODUCTION_UI === "1" ? 1 : 2); index++) {
     const saved = await readFile(`${evidenceDirectory}/account-${index + 1}.json`, "utf8").then(JSON.parse).catch(() => undefined);
     const email = saved?.email ?? `keyway-sdk-${randomBytes(8).toString("hex")}@${domain}`;
     const password = saved?.password ?? randomBytes(24).toString("base64url");
@@ -51,13 +51,25 @@ try {
     const mailbox = { email, token: (await json("https://api.mail.tm/token", { address: email, password })).token, seen: new Set() };
     await writeFile(`${evidenceDirectory}/account-${index + 1}.json`, JSON.stringify({ email, password }), { mode: 0o600 });
     let expectedAddress, expectedNode;
-    for (let device = 0; device < 2; device++) {
+    for (let device = 0; device < (process.env.PRODUCTION_UI === "1" ? 1 : 2); device++) {
       const session = await login(mailbox);
       const context = await browser.newContext();
       await context.addInitScript(session => localStorage.setItem("ckb-keyway.session", JSON.stringify({ authToken: session.sessionToken, user: session.user })), session);
       const page = await context.newPage();
       const calls = [];
       page.on("request", request => { if (request.url().endsWith("/managed-node")) calls.push(request.postDataJSON()); });
+      if (process.env.PRODUCTION_UI === "1") {
+        await page.goto(`${origin}/app`, { waitUntil: "domcontentloaded", timeout: 60_000 });
+        await page.getByRole("heading", { name: "Your account. Fiber when you need it." }).waitFor({ timeout: 120_000 });
+        assert.equal(calls.length, 0, "Production login must not start Fiber");
+        await page.getByRole("button", { name: "Connect Fiber", exact: true }).click();
+        await page.getByRole("heading", { name: "Your channels", exact: true }).waitFor({ timeout: 120_000 });
+        await page.getByRole("button", { name: "Log out", exact: true }).click();
+        await page.getByRole("button", { name: "Log in with email", exact: true }).waitFor({ timeout: 30_000 });
+        await context.close();
+        console.log("PASS production UI: account-only login, explicit connection, funded channel display, logout");
+        continue;
+      }
       await page.route(`${origin}/__sdk-verification`, route => route.fulfill({ contentType: "text/html", body: '<div id="root"></div><script src="/__sdk-fixture.js"></script>' }));
       await page.route(`${origin}/__sdk-fixture.js`, route => route.fulfill({ contentType: "text/javascript", body: Buffer.from(bundle.outputFiles[0].contents) }));
       await page.goto(`${origin}/__sdk-verification`, { waitUntil: "domcontentloaded", timeout: 120_000 });
