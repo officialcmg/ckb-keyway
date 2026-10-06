@@ -44,12 +44,13 @@ const evidenceDirectory = process.env.REUSE_ACCOUNTS_DIRECTORY ?? await mkdtemp(
 console.log(`Private disposable-account evidence: ${evidenceDirectory}`);
 try {
   for (let index = 0; index < (process.env.PRODUCTION_UI === "1" ? 1 : 2); index++) {
-    const saved = await readFile(`${evidenceDirectory}/account-${index + 1}.json`, "utf8").then(JSON.parse).catch(() => undefined);
+    const accountNumber = index + 1 + Number(process.env.ACCOUNT_OFFSET ?? 0);
+    const saved = await readFile(`${evidenceDirectory}/account-${accountNumber}.json`, "utf8").then(JSON.parse).catch(() => undefined);
     const email = saved?.email ?? `keyway-sdk-${randomBytes(8).toString("hex")}@${domain}`;
     const password = saved?.password ?? randomBytes(24).toString("base64url");
     if (!saved) await json("https://api.mail.tm/accounts", { address: email, password });
     const mailbox = { email, token: (await json("https://api.mail.tm/token", { address: email, password })).token, seen: new Set() };
-    await writeFile(`${evidenceDirectory}/account-${index + 1}.json`, JSON.stringify({ email, password }), { mode: 0o600 });
+    await writeFile(`${evidenceDirectory}/account-${accountNumber}.json`, JSON.stringify({ email, password }), { mode: 0o600 });
     let expectedAddress, expectedNode;
     for (let device = 0; device < (process.env.PRODUCTION_UI === "1" ? 1 : 2); device++) {
       const session = await login(mailbox);
@@ -59,7 +60,12 @@ try {
       const calls = [];
       page.on("request", request => { if (request.url().endsWith("/managed-node")) calls.push(request.postDataJSON()); });
       if (process.env.PRODUCTION_UI === "1") {
+        page.on("response", response => {
+          if (response.url().includes("/api/v1/keyway/")) console.log(`Production API ${new URL(response.url()).pathname}: ${response.status()}`);
+        });
         await page.goto(`${origin}/app`, { waitUntil: "domcontentloaded", timeout: 60_000 });
+        await page.waitForTimeout(8000);
+        console.log(JSON.stringify({ headings: await page.getByRole("heading").allTextContents(), buttons: await page.getByRole("button").allTextContents() }));
         await page.getByRole("heading", { name: "Your account. Fiber when you need it." }).waitFor({ timeout: 120_000 });
         assert.equal(calls.length, 0, "Production login must not start Fiber");
         await page.getByRole("button", { name: "Connect Fiber", exact: true }).click();
