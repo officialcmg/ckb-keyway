@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { User } from "stytch";
+import type { User } from "../src/server/auth-user.ts";
 import {
   addApplicationOrigin,
   applicationAllowsOrigin,
@@ -10,15 +10,14 @@ import {
   recordOtpResult,
   removeApplicationOrigin,
   updateApplication,
-  verifyOtpApplication,
 } from "../src/server/applications.ts";
 import { database } from "../src/server/database.ts";
 
 process.env.KEYWAY_RATE_LIMIT_SECRET ??= "test-rate-limit-secret-that-is-long-enough";
 
 test("keeps application settings scoped to their owner", { skip: !process.env.DATABASE_URL }, async () => {
-  const owner = { user_id: `app-owner-${crypto.randomUUID()}` } as User;
-  const stranger = { user_id: `app-stranger-${crypto.randomUUID()}` } as User;
+  const owner = { id: crypto.randomUUID() } as User;
+  const stranger = { id: crypto.randomUUID() } as User;
   const created = await createApplication(owner, { name: "Example Pay" });
   assert.match(created.appId, /^keyway_/);
   assert.equal((await listApplications(stranger)).length, 0);
@@ -41,7 +40,7 @@ test("keeps application settings scoped to their owner", { skip: !process.env.DA
 });
 
 test("records OTP usage and enforces each application's request limit", { skip: !process.env.DATABASE_URL }, async () => {
-  const owner = { user_id: `rate-owner-${crypto.randomUUID()}` } as User;
+  const owner = { id: crypto.randomUUID() } as User;
   const application = await createApplication(owner, { name: "Rate Limited", otpLimitPerMinute: 1 });
   const request = {
     appId: application.appId,
@@ -49,7 +48,7 @@ test("records OTP usage and enforces each application's request limit", { skip: 
     ipAddress: `test-${crypto.randomUUID()}`,
   };
   const context = await prepareOtpSend(request);
-  await recordOtpResult(context, "sent", `method-${crypto.randomUUID()}`);
+  await recordOtpResult(context, "sent");
   await assert.rejects(prepareOtpSend(request), /too many/i);
 
   const [updated] = await listApplications(owner);
@@ -57,30 +56,11 @@ test("records OTP usage and enforces each application's request limit", { skip: 
   assert.equal(updated.usage.rateLimited24h, 1);
 });
 
-test("refreshes a reused Stytch email method for the latest OTP send", { skip: !process.env.DATABASE_URL }, async () => {
-  const owner = { user_id: `otp-owner-${crypto.randomUUID()}` } as User;
-  const first = await createApplication(owner, { name: "First App" });
-  const second = await createApplication(owner, { name: "Second App" });
-  const methodId = `method-${crypto.randomUUID()}`;
-  const firstContext = await prepareOtpSend({
-    appId: first.appId,
-    email: `${crypto.randomUUID()}@example.com`,
-    ipAddress: `test-${crypto.randomUUID()}`,
-  });
-  await recordOtpResult(firstContext, "sent", methodId);
-  const sql = await database();
-  await sql`update keyway_otp_methods set created_at = now() - interval '1 hour' where method_id = ${methodId}`;
-
-  const secondContext = await prepareOtpSend({
-    appId: second.appId,
-    email: `${crypto.randomUUID()}@example.com`,
-    ipAddress: `test-${crypto.randomUUID()}`,
-  });
-  await recordOtpResult(secondContext, "sent", methodId);
-
-  assert.deepEqual(await verifyOtpApplication(methodId, second.appId), {
-    appId: second.appId,
-    emailHash: secondContext.emailHash,
-    ipHash: secondContext.ipHash,
-  });
+test("application quotas are atomic across distinct email and IP subjects", { skip: !process.env.DATABASE_URL }, async () => {
+  const owner = { id: crypto.randomUUID() } as User;
+  const app = await createApplication(owner, { name: "Concurrent App", otpLimitPerMinute: 2 });
+  const results = await Promise.allSettled(Array.from({ length: 8 }, () => prepareOtpSend({
+    appId: app.appId, email: `${crypto.randomUUID()}@example.com`, ipAddress: crypto.randomUUID(),
+  })));
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 2);
 });

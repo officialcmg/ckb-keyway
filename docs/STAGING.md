@@ -1,5 +1,7 @@
 # Staging Runbook
 
+Historical Stytch notes below describe the previous release. The local Better Auth/Resend replacement and cutover gates are in `AUTH_REPLACEMENT.md`; do not create another Stytch project for the replacement.
+
 Staging exists to prove a change before production and to host the two-account Fiber test without touching production wallets. This file is repository-only; it is not part of the published Mintlify site.
 
 ## Current state

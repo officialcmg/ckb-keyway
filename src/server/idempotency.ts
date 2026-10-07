@@ -20,18 +20,18 @@ export async function runIdempotentMutation<T>(
 
   const sql = await database();
   const [claimed] = await sql<Array<{ id: number }>>`
-    insert into keyway_idempotency_keys (
-      stytch_user_id, operation, idempotency_key, request_digest, status, expires_at
+    insert into keyway_v2_idempotency_keys (
+      user_id, operation, idempotency_key, request_digest, status, expires_at
     ) values (${userId}, ${operation}, ${key}, ${digest}, 'running', now() + interval '24 hours')
-    on conflict (stytch_user_id, operation, idempotency_key) do nothing
+    on conflict (user_id, operation, idempotency_key) do nothing
     returning 1 as id
   `;
 
   if (!claimed) {
     const rows = await sql<StoredResult[]>`
       select request_digest, status, response, error_message
-      from keyway_idempotency_keys
-      where stytch_user_id = ${userId} and operation = ${operation} and idempotency_key = ${key}
+      from keyway_v2_idempotency_keys
+      where user_id = ${userId} and operation = ${operation} and idempotency_key = ${key}
         and expires_at > now()
       limit 1
     `;
@@ -46,17 +46,17 @@ export async function runIdempotentMutation<T>(
   try {
     const result = await mutation();
     await sql`
-      update keyway_idempotency_keys
+      update keyway_v2_idempotency_keys
       set status = 'completed', response = ${sql.json(result as never)}, updated_at = now()
-      where stytch_user_id = ${userId} and operation = ${operation} and idempotency_key = ${key}
+      where user_id = ${userId} and operation = ${operation} and idempotency_key = ${key}
     `;
     return result;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Managed operation failed";
     await sql`
-      update keyway_idempotency_keys
+      update keyway_v2_idempotency_keys
       set status = 'failed', error_message = ${message}, updated_at = now()
-      where stytch_user_id = ${userId} and operation = ${operation} and idempotency_key = ${key}
+      where user_id = ${userId} and operation = ${operation} and idempotency_key = ${key}
     `;
     throw error;
   }

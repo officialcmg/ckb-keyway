@@ -26,6 +26,7 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgres://postgres:keyway-ci@localhost:5432/postgres
+      KEYWAY_AUTH_TEST_DATABASE_URL: postgres://postgres:keyway-ci@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6

@@ -18,10 +18,21 @@ import {
   snapshotDigest,
   waitForExit,
   withUserOperation,
+  requireClosedChannels,
 } from "../managed-host/index.mjs";
 
 const USER = "a".repeat(64);
 const ENCRYPTION_KEY = randomBytes(32);
+
+test("node retirement rejects active, settling, or unknown channel states", () => {
+  requireClosedChannels([]);
+  requireClosedChannels([{ state: { state_name: "Closed", state_flags: "COOPERATIVE" } }]);
+  assert.throws(() => requireClosedChannels([{ state: { state_name: "Closed", state_flags: "FORCE" } }]), /preserve/);
+  for (const state_name of ["ChannelReady", "ShuttingDown", "AwaitingTxSignatures", "Unknown"]) {
+    assert.throws(() => requireClosedChannels([{ state: { state_name } }]), /preserve/);
+  }
+  assert.throws(() => requireClosedChannels(undefined), /preserve/);
+});
 
 test("managed database operations report success only after the node resumes", async () => {
   const events: string[] = [];

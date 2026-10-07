@@ -10,7 +10,7 @@ export async function database() {
   const url = process.env.DATABASE_URL;
   if (!url) throw new Error("DATABASE_URL is required");
   client ??= postgres(url, { max: 10, idle_timeout: 20 });
-  migration ??= migrate(client);
+  migration ??= process.env.NODE_ENV === "production" ? verifySchema(client) : migrateDatabase(client);
   await migration;
   return client;
 }
@@ -30,7 +30,7 @@ export async function withUserLock<T>(userId: string, task: (sql: DatabaseSql) =
   }
 }
 
-async function migrate(sql: ReturnType<typeof postgres>): Promise<void> {
+export async function migrateDatabase(sql: ReturnType<typeof postgres>): Promise<void> {
   await sql.begin(async (transaction) => {
     await transaction`select pg_advisory_xact_lock(hashtext('ckb-keyway-schema'))`;
     await transaction`
@@ -51,4 +51,9 @@ async function migrate(sql: ReturnType<typeof postgres>): Promise<void> {
       `;
     }
   });
+}
+
+async function verifySchema(sql: DatabaseSql): Promise<void> {
+  const [row] = await sql<Array<{ version: number }>>`select max(version) as version from keyway_schema_migrations`;
+  if (row?.version !== migrations.at(-1)?.version) throw new Error("Run the KeyWay database migrations before starting the API");
 }

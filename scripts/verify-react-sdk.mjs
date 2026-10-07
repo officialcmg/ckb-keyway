@@ -14,7 +14,7 @@ const wallet = { version: 1, status: "ready", litPkpId: "disposable", litPublicK
 try {
   for (const scenario of ["default", "browser", "auto", "recovery-failure", "balance-failure", "logout-race", "payment-refresh-failure"]) {
     const context = await browser.newContext();
-    await context.addInitScript(() => localStorage.setItem("ckb-keyway.session", JSON.stringify({ authToken: "mock-disposable-token", user: { id: "test" } })));
+    await context.addInitScript(() => localStorage.setItem("ckb-keyway.session.v2:unregistered", JSON.stringify({ authToken: "mock-disposable-token", user: { id: "test" }, expiresAt: new Date(Date.now() + 86_400_000).toISOString() })));
     const page = await context.newPage();
     const calls = [], errors = [];
     page.on("pageerror", error => errors.push(error.message));
@@ -26,7 +26,7 @@ try {
         const body = route.request().postDataJSON();
         calls.push({ url, body });
         let result = {}, status = 200;
-        if (url.endsWith("/auth/session")) result = { user: { id: "test" } };
+        if (url.endsWith("/auth/session")) result = { user: { id: "test" }, expiresAt: new Date(Date.now() + 86_400_000).toISOString() };
         else if (url.endsWith("/bootstrap")) {
           if (scenario === "logout-race") await barrier;
           if (scenario === "recovery-failure") { status = 400; result = { error: "Recovery rejected" }; }

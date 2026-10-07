@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage } from "node:http";
+import { isIP } from "node:net";
 import { handleKeyWayRequest } from "../src/server/http.ts";
 
 const port = Number(process.env.PORT ?? 3001);
@@ -27,11 +28,17 @@ async function webRequest(incoming: IncomingMessage): Promise<Request> {
     if (Array.isArray(value)) value.forEach((item) => headers.append(name, item));
     else if (value !== undefined) headers.set(name, value);
   }
+  headers.delete("x-keyway-client-ip");
+  const socketIp = incoming.socket.remoteAddress ?? "unknown";
+  // Enable only behind Railway's edge; use its appended (rightmost) address,
+  // never a browser-supplied leftmost X-Forwarded-For value.
+  const forwarded = headers.get("x-forwarded-for")?.split(",").at(-1)?.trim();
+  headers.set("x-keyway-client-ip", process.env.KEYWAY_TRUST_PROXY === "railway" && forwarded && isIP(forwarded) ? forwarded : socketIp);
   const method = incoming.method ?? "GET";
   const pathname = incoming.url?.split("?", 1)[0] ?? "/";
   const body = method === "GET" || method === "HEAD" ? undefined : await readBody(
     incoming,
-    pathname.endsWith("/keyway/node-backup/save") ? 16_000_000 : 2_000_000,
+    pathname.endsWith("/keyway/node-backup/save") ? 16_000_000 : pathname.includes("/keyway/auth/") ? 8_192 : 2_000_000,
   );
   return new Request(`${protocol}://${host}${incoming.url ?? "/"}`, { method, headers, body });
 }

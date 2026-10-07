@@ -1,5 +1,5 @@
 import { sha256 } from "@noble/hashes/sha2.js";
-import type { User } from "stytch";
+import type { User } from "./auth-user.ts";
 import { database } from "./database.ts";
 
 const TTL_MS = 5 * 60_000;
@@ -8,9 +8,9 @@ export async function issueConfirmation(user: User, serializedTransaction: strin
   const sql = await database();
   const nonce = crypto.randomUUID();
   await sql`
-    insert into keyway_signing_confirmations (stytch_user_id, nonce, transaction_digest, expires_at)
-    values (${user.user_id}, ${nonce}, ${digest(serializedTransaction)}, ${new Date(Date.now() + TTL_MS)})
-    on conflict (stytch_user_id) do update set
+    insert into keyway_v2_signing_confirmations (user_id, nonce, transaction_digest, expires_at)
+    values (${user.id}, ${nonce}, ${digest(serializedTransaction)}, ${new Date(Date.now() + TTL_MS)})
+    on conflict (user_id) do update set
       nonce = excluded.nonce,
       transaction_digest = excluded.transaction_digest,
       expires_at = excluded.expires_at
@@ -21,8 +21,8 @@ export async function issueConfirmation(user: User, serializedTransaction: strin
 export async function consumeConfirmation(user: User, nonce: string, serializedTransaction: string): Promise<void> {
   const sql = await database();
   const rows = await sql`
-    delete from keyway_signing_confirmations
-    where stytch_user_id = ${user.user_id}
+    delete from keyway_v2_signing_confirmations
+    where user_id = ${user.id}
       and nonce = ${nonce}
       and transaction_digest = ${digest(serializedTransaction)}
       and expires_at > now()

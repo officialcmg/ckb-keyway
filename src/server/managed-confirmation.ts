@@ -13,10 +13,10 @@ export async function issueManagedConfirmation(
   const sql = await database();
   const nonce = crypto.randomUUID();
   await sql`
-    insert into keyway_managed_confirmations
-      (stytch_user_id, purpose, nonce, operation_digest, expires_at)
+    insert into keyway_v2_managed_confirmations
+      (user_id, purpose, nonce, operation_digest, expires_at)
     values (${userId}, ${purpose}, ${nonce}, ${digest(payload)}, ${new Date(Date.now() + TTL_MS)})
-    on conflict (stytch_user_id, purpose) do update set
+    on conflict (user_id, purpose) do update set
       nonce = excluded.nonce,
       operation_digest = excluded.operation_digest,
       expires_at = excluded.expires_at
@@ -32,8 +32,8 @@ export async function consumeManagedConfirmation(
 ): Promise<void> {
   const sql = await database();
   const rows = await sql`
-    delete from keyway_managed_confirmations
-    where stytch_user_id = ${userId}
+    delete from keyway_v2_managed_confirmations
+    where user_id = ${userId}
       and purpose = ${purpose}
       and nonce = ${nonce}
       and operation_digest = ${digest(payload)}

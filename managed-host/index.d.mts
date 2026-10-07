@@ -1,4 +1,5 @@
 export function managedUserId(userId: string): string;
+export function requireClosedChannels(channels: unknown): void;
 export function authorizationMatches(header: string | undefined, token: string): boolean;
 export function createCkbKey(path: string): Promise<void>;
 export function requireCleanRestore(dataDir: string): Promise<void>;

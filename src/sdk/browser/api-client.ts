@@ -3,6 +3,10 @@ export type KeyWayApiClientOptions = {
   appId?: string;
 };
 
+export class KeyWayApiError extends Error {
+  constructor(message: string, readonly status: number) { super(message); }
+}
+
 export type NodeBackupPayload = {
   formatVersion: 1;
   databasePrefix: string;
@@ -28,15 +32,19 @@ export class KeyWayApiClient {
     this.appId = options.appId;
   }
 
-  async sendCode(email: string): Promise<{ methodId: string }> {
+  async sendCode(email: string): Promise<{ challengeId: string }> {
     return this.publicJson(`${KEYWAY_API_PATH}/auth/send-code`, { email });
   }
 
-  async verifyCode(methodId: string, code: string): Promise<{ sessionToken: string; user: { id: string } }> {
-    return this.publicJson(`${KEYWAY_API_PATH}/auth/verify-code`, { methodId, code });
+  legacyCleanup(): Promise<{ epoch: string; prefixes: string[] }> {
+    return this.publicJson(`${KEYWAY_API_PATH}/auth/legacy-cleanup`, {});
   }
 
-  async session(authToken: string): Promise<{ user: { id: string } }> {
+  async verifyCode(challengeId: string, code: string): Promise<{ sessionToken: string; user: { id: string }; expiresAt: string }> {
+    return this.publicJson(`${KEYWAY_API_PATH}/auth/verify-code`, { challengeId, code });
+  }
+
+  async session(authToken: string): Promise<{ user: { id: string }; expiresAt: string; sessionToken?: string }> {
     return this.json(`${KEYWAY_API_PATH}/auth/session`, authToken, {});
   }
 
@@ -125,7 +133,7 @@ export class KeyWayApiClient {
       body: JSON.stringify(body),
     });
     const result = await response.json();
-    if (!response.ok) throw new Error(result.error ?? "KeyWay request failed");
+    if (!response.ok) throw new KeyWayApiError(result.error ?? "KeyWay request failed", response.status);
     return result;
   }
 
@@ -137,7 +145,7 @@ export class KeyWayApiClient {
   ): Promise<T> {
     const response = await this.request(path, authToken, body, extraHeaders);
     const result = await response.json();
-    if (!response.ok) throw new Error(result.error ?? "KeyWay request failed");
+    if (!response.ok) throw new KeyWayApiError(result.error ?? "KeyWay request failed", response.status);
     return result;
   }
 

@@ -4,29 +4,30 @@ description: "Configure application-specific OTP emails and a verified sender do
 icon: "envelope"
 ---
 
-KeyWay uses Stytch to generate, deliver, and verify email codes. The provider's `appName` changes the modal only; it does not override the email sender or subject.
+Better Auth generates and verifies login codes. Resend delivers them. The backend resolves the email's application name from the registered `appId`; browser-provided `appName` changes the modal only.
 
 ## Templates
 
-The KeyWay developer console stores approved Stytch login and signup template IDs for each registered application. Both templates must exist in KeyWay's Stytch project. The backend resolves them from the registered app ID, not from arbitrary browser HTML.
+Applications do not upload email HTML or configure provider template IDs. The backend uses the registered application name, not arbitrary browser HTML.
 
-The repository's `src/server/email-template.ts` generates a neutral white-card layout with a 40px selectable code and a plaintext alternative. Give the generator the registered application name and the exact OTP variable supplied by Stytch's template editor. Preview login and signup templates, then verify delivery before enabling them for an application. The generator does not create or verify codes.
+The existing `src/server/email-template.ts` uses a neutral white card, a prominent selectable code, a ten-minute expiry notice, an ignore-if-not-requested message, and a plaintext alternative. Better Auth supplies the code; the template does not generate or verify it.
 
 From the repository root, export the template files:
 
 ```sh
-node --import tsx scripts/export-otp-email.mjs "Your registered app name" "EXACT_STYTCH_OTP_VARIABLE" /tmp/keyway-email
+node --import tsx scripts/export-otp-email.mjs "Your registered app name" "123456" /tmp/keyway-email
 ```
 
-Replace the example variable with the exact variable from the Stytch editor. Upload `otp.html`, `otp.txt`, and the subject to the corresponding template fields. These files contain no generated login code.
+This exports a preview only. Live delivery uses Better Auth's generated OTP. Sending or resending in App B does not replace App A's code for the same email.
 
 ## Sender domain (operator setup)
 
-1. In the Stytch Dashboard, open Emails and configure a custom sender domain, for example `auth.ckbkeyway.dev`.
-2. Add the exact DNS records Stytch generates at the domain's DNS provider. Do not replace unrelated website or email records.
-3. Wait for Stytch to confirm verification.
-4. Configure `login@auth.ckbkeyway.dev` and an appropriate sender name on the templates.
-5. Create the OTP login and signup templates with their HTML, plaintext, and subject, then save their IDs for the registered KeyWay application.
-6. Test delivery and code verification using a disposable account. Inspect sender authentication in the received message and check desktop/mobile rendering.
+1. Add `auth.ckbkeyway.dev` to Resend and enable sending. Receiving email is not required.
+2. Review and approve the exact generated DKIM and SPF/return-path records (TXT, MX, or CNAME). Do not invent values or replace website/docs DNS. CNAME records must not be proxied.
+3. Wait for Resend to verify the domain.
+4. Create a sending-only key restricted to this domain; configure server-only `RESEND_API_KEY`.
+5. Set `KEYWAY_AUTH_EMAIL_FROM` to `CKB KeyWay <login@auth.ckbkeyway.dev>` and disable open/click tracking.
+6. Add an approved DMARC TXT record at `_dmarc.auth.ckbkeyway.dev`, initially `v=DMARC1; p=none;`. Add reporting only with a working reporting address.
+7. Test a disposable account; inspect received-message SPF, DKIM, DMARC and desktop/mobile rendering.
 
-Custom sender domains require Stytch's branding add-on. Check its current pricing before enabling a paid subscription. No DNS or billing changes are made by generating the templates.
+No subscription or DNS modification is automatic. Provider acceptance does not guarantee inbox delivery. Provider errors fail the request rather than reporting a false delivery success. See [Resend domain setup](https://resend.com/docs/add-a-domain).

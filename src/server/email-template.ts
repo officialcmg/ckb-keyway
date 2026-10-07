@@ -2,10 +2,10 @@ function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]!);
 }
 
-/** Supply Stytch's OTP variable from its template editor; never generate an OTP here. */
+/** The authentication provider generates the code; this module only renders it. */
 export function createOtpEmailTemplate(appName: string, codeVariable: string) {
   const name = appName.trim().slice(0, 64);
-  if (!name || !codeVariable.trim()) throw new Error("Application name and Stytch OTP variable are required");
+  if (!name || !codeVariable.trim()) throw new Error("Application name and login code are required");
   const safeName = escapeHtml(name);
   const code = escapeHtml(codeVariable);
   return {

@@ -3,15 +3,13 @@
 import { useEffect, useState, type FormEvent } from "react";
 
 const API_URL = "https://keyway-api-production.up.railway.app";
-const SESSION_KEY = "ckb-keyway.developer-session";
+const SESSION_KEY = "ckb-keyway.developer-session.v2";
 
 type ApplicationOrigin = { origin: string; environment: "development" | "production" };
 type DeveloperApplication = {
   appId: string;
   name: string;
   disabled: boolean;
-  otpLoginTemplateId?: string;
-  otpSignupTemplateId?: string;
   otpLimitPerMinute: number;
   origins: ApplicationOrigin[];
   usage: { sent24h: number; failed24h: number; rateLimited24h: number };
@@ -30,6 +28,7 @@ export function DeveloperDashboard() {
     void fetch(`${API_URL}/readyz`)
       .then((response) => setApiHealth(response.ok ? "operational" : "degraded"))
       .catch(() => setApiHealth("degraded"));
+    localStorage.removeItem("ckb-keyway.developer-session");
     const stored = localStorage.getItem(SESSION_KEY) ?? undefined;
     if (!stored) return setReady(true);
     void session(stored).then(() => {
@@ -37,6 +36,20 @@ export function DeveloperDashboard() {
       return loadApplications(stored);
     }).catch(() => localStorage.removeItem(SESSION_KEY)).finally(() => setReady(true));
   }, []);
+
+  useEffect(() => {
+    if (!token) return;
+    const check = () => void session(token).catch((cause) => {
+      if (cause instanceof DashboardApiError && cause.status === 401) {
+        localStorage.removeItem(SESSION_KEY);
+        setToken(undefined);
+        setApplications([]);
+      }
+    });
+    const interval = setInterval(check, 15 * 60_000);
+    window.addEventListener("focus", check);
+    return () => { clearInterval(interval); window.removeEventListener("focus", check); };
+  }, [token]);
 
   async function loadApplications(authToken = token) {
     if (!authToken) return;
@@ -52,7 +65,7 @@ export function DeveloperDashboard() {
   }
 
   async function logout() {
-    if (token) await apiRequest("/api/keyway/auth/logout", {}, token).catch(() => undefined);
+    if (token) await apiRequest("/api/keyway/auth/logout", {}, token);
     localStorage.removeItem(SESSION_KEY);
     setToken(undefined);
     setApplications([]);
@@ -67,7 +80,7 @@ export function DeveloperDashboard() {
         <div><p className="eyebrow">Developer console</p><h1>Build with KeyWay.</h1><p>Register your application, authorize its browser origins, and monitor email authentication.</p></div>
         <div className="dashboard-actions">
           <span className={`health-pill ${apiHealth}`}><i /> Managed API {apiHealth}</span>
-          <button type="button" className="quiet-button" onClick={() => void logout()}>Log out</button>
+          <button type="button" className="quiet-button" onClick={() => void logout().catch(() => setError("Could not revoke the session. Please retry logout."))}>Log out</button>
         </div>
       </div>
       <CreateApplication onCreated={(application) => setApplications((current) => [application, ...current])} token={token} />
@@ -90,7 +103,7 @@ export function DeveloperDashboard() {
 
 function DeveloperLogin({ onAuthenticated }: { onAuthenticated: (token: string) => Promise<void> }) {
   const [email, setEmail] = useState("");
-  const [methodId, setMethodId] = useState<string>();
+  const [challengeId, setChallengeId] = useState<string>();
   const [code, setCode] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string>();
@@ -100,11 +113,11 @@ function DeveloperLogin({ onAuthenticated }: { onAuthenticated: (token: string) 
     setPending(true);
     setError(undefined);
     try {
-      if (!methodId) {
-        const result = await apiRequest<{ methodId: string }>("/api/keyway/auth/send-code", { email });
-        setMethodId(result.methodId);
+      if (!challengeId) {
+        const result = await apiRequest<{ challengeId: string }>("/api/keyway/auth/send-code", { email });
+        setChallengeId(result.challengeId);
       } else {
-        const result = await apiRequest<{ sessionToken: string }>("/api/keyway/auth/verify-code", { methodId, code });
+        const result = await apiRequest<{ sessionToken: string }>("/api/keyway/auth/verify-code", { challengeId, code });
         await onAuthenticated(result.sessionToken);
       }
     } catch (cause) {
@@ -118,16 +131,16 @@ function DeveloperLogin({ onAuthenticated }: { onAuthenticated: (token: string) 
     <section className="developer-login">
       <div><p className="eyebrow">Developer console</p><h1>Ship a Fiber wallet.</h1><p>Create an application and connect it to the managed KeyWay API without handling server credentials.</p></div>
       <form onSubmit={submit}>
-        <p className="step-label">{methodId ? "Check your inbox" : "Email login"}</p>
-        <h2>{methodId ? "Enter your code" : "Continue with email"}</h2>
-        {!methodId ? (
+        <p className="step-label">{challengeId ? "Check your inbox" : "Email login"}</p>
+        <h2>{challengeId ? "Enter your code" : "Continue with email"}</h2>
+        {!challengeId ? (
           <label>Email address<input required autoFocus type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="developer@example.com" /></label>
         ) : (
           <label>Six-digit code<input required autoFocus inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="000000" /></label>
         )}
         {error ? <p className="error">{error}</p> : null}
-        <button disabled={pending || (methodId ? code.length !== 6 : !email)}>{pending ? "Please wait..." : methodId ? "Verify code" : "Send code"}</button>
-        {methodId ? <button type="button" className="text-button" onClick={() => { setMethodId(undefined); setCode(""); setError(undefined); }}>Use another email</button> : null}
+        <button disabled={pending || (challengeId ? code.length !== 6 : !email)}>{pending ? "Please wait..." : challengeId ? "Verify code" : "Send code"}</button>
+        {challengeId ? <button type="button" className="text-button" onClick={() => { setChallengeId(undefined); setCode(""); setError(undefined); }}>Use another email</button> : null}
       </form>
     </section>
   );
@@ -173,8 +186,6 @@ function ApplicationCard({ application, token, onChange, onError }: {
   onError: (message?: string) => void;
 }) {
   const [name, setName] = useState(application.name);
-  const [loginTemplate, setLoginTemplate] = useState(application.otpLoginTemplateId ?? "");
-  const [signupTemplate, setSignupTemplate] = useState(application.otpSignupTemplateId ?? "");
   const [otpLimit, setOtpLimit] = useState(String(application.otpLimitPerMinute));
   const [origin, setOrigin] = useState("");
   const [environment, setEnvironment] = useState<ApplicationOrigin["environment"]>("development");
@@ -199,8 +210,6 @@ function ApplicationCard({ application, token, onChange, onError }: {
     await act({
       operation: "update",
       name,
-      otpLoginTemplateId: loginTemplate || null,
-      otpSignupTemplateId: signupTemplate || null,
       otpLimitPerMinute: Number(otpLimit),
     });
   }
@@ -226,8 +235,6 @@ function ApplicationCard({ application, token, onChange, onError }: {
       <form className="application-settings" onSubmit={save}>
         <label>Display name<input required maxLength={80} value={name} onChange={(event) => setName(event.target.value)} /></label>
         <label>OTP requests per minute<input required type="number" min={1} max={120} value={otpLimit} onChange={(event) => setOtpLimit(event.target.value)} /></label>
-        <label>Stytch login template ID<input value={loginTemplate} onChange={(event) => setLoginTemplate(event.target.value)} placeholder="Optional" /></label>
-        <label>Stytch signup template ID<input value={signupTemplate} onChange={(event) => setSignupTemplate(event.target.value)} placeholder="Optional" /></label>
         <button disabled={pending}>Save settings</button>
       </form>
       <section className="origin-settings">
@@ -259,10 +266,14 @@ function developerRequest<T>(token: string, body: Record<string, unknown>): Prom
 async function apiRequest<T>(path: string, body: unknown, token?: string): Promise<T> {
   const response = await fetch(`${API_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    headers: { "Content-Type": "application/json", "X-KeyWay-Auth-Scope": "dashboard", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
     body: JSON.stringify(body),
   });
   const result = response.status === 204 ? undefined : await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(result?.error ?? "KeyWay request failed");
+  if (!response.ok) throw new DashboardApiError(result?.error ?? "KeyWay request failed", response.status);
   return result as T;
+}
+
+class DashboardApiError extends Error {
+  constructor(message: string, readonly status: number) { super(message); }
 }

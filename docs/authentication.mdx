@@ -25,7 +25,7 @@ function SignIn() {
     The SDK requests an OTP from the managed KeyWay API. Backend email credentials never enter the browser.
   </Step>
   <Step title="Create a KeyWay session">
-    A valid code returns a KeyWay session tied to a stable backend user ID.
+    A valid application-specific code returns a database-backed bearer session bound to that application and its permanent KeyWay user ID.
   </Step>
   <Step title="Recover the account">
     The user ID maps to the same Lit PKP and CKB address on future logins.
@@ -37,7 +37,7 @@ function SignIn() {
 
 ## Session state
 
-The SDK stores the KeyWay session in browser `localStorage` and validates it when the provider mounts. Use `ready` before reading authentication state.
+The SDK stores its session in application-specific browser `localStorage` and validates it on mount and focus. Sessions expire after seven days and renew through Better Auth after 24 hours of age while the SDK is active. Expired or revoked sessions require login again. Use `ready` before reading authentication state. Application A's session cannot authorize Application B or the developer dashboard.
 
 ```tsx
 const { ready, authenticated, user } = useKeyWay();
@@ -47,7 +47,7 @@ const { ready, authenticated, user } = useKeyWay();
 | --- | --- |
 | `ready` | Stored session validation has completed. |
 | `authenticated` | A valid KeyWay session exists. |
-| `user.id` | Stable backend identity for the email account. |
+| `user.id` | Permanent account ID within the registered application. The same email in another application has a different account and wallet. |
 | `status` | Current authentication or connection lifecycle state. |
 
 ## Device behavior
@@ -68,4 +68,10 @@ Managed mode keeps the node online after logout, so another browser can reconnec
 </KeyWayProvider>
 ```
 
-`appName` does not alter the email itself. A developer can select existing Stytch login and signup template IDs for the registered application in the KeyWay developer console.
+`appName` does not alter the email itself. The backend uses the registered application's name with KeyWay's template and verified Resend sender. No provider template IDs are needed.
+
+## Recovery and logout
+
+Better Auth verifies email ownership; KeyWay maps its permanent application account ID to the Lit PKP. Email is not converted into a private key. Login does not automatically start Fiber.
+
+Logout revokes the backend session. Browser mode must first successfully back up its channel state; failed backup keeps the user authenticated so recovery can be retried. Legacy test accounts are not migrated into replacement accounts.

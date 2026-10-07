@@ -1,0 +1,10 @@
+// Generated from Better Auth 1.7.7 authSchemaOptions; reviewed for PostgreSQL.
+export const authSchemaSql = `
+create table if not exists "keyway_auth_users" ("id" uuid default pg_catalog.gen_random_uuid() not null primary key, "name" text not null, "email" text not null unique, "emailVerified" boolean not null, "image" text, "createdAt" timestamptz default CURRENT_TIMESTAMP not null, "updatedAt" timestamptz default CURRENT_TIMESTAMP not null);
+create table if not exists "keyway_auth_sessions" ("id" uuid default pg_catalog.gen_random_uuid() not null primary key, "expiresAt" timestamptz not null, "token" text not null unique, "createdAt" timestamptz default CURRENT_TIMESTAMP not null, "updatedAt" timestamptz not null, "ipAddress" text, "userAgent" text, "userId" uuid not null references "keyway_auth_users" ("id") on delete cascade, "scopeId" text not null);
+create table if not exists "keyway_auth_accounts" ("id" uuid default pg_catalog.gen_random_uuid() not null primary key, "accountId" text not null, "providerId" text not null, "userId" uuid not null references "keyway_auth_users" ("id") on delete cascade, "accessToken" text, "refreshToken" text, "idToken" text, "accessTokenExpiresAt" timestamptz, "refreshTokenExpiresAt" timestamptz, "scope" text, "password" text, "createdAt" timestamptz default CURRENT_TIMESTAMP not null, "updatedAt" timestamptz not null);
+create table if not exists "keyway_auth_verifications" ("id" uuid default pg_catalog.gen_random_uuid() not null primary key, "identifier" text not null, "value" text not null, "expiresAt" timestamptz not null, "createdAt" timestamptz default CURRENT_TIMESTAMP not null, "updatedAt" timestamptz default CURRENT_TIMESTAMP not null);
+create index if not exists "keyway_auth_sessions_userId_idx" on "keyway_auth_sessions" ("userId");
+create index if not exists "keyway_auth_accounts_userId_idx" on "keyway_auth_accounts" ("userId");
+create index if not exists "keyway_auth_verifications_identifier_idx" on "keyway_auth_verifications" ("identifier");
+`;

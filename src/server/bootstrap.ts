@@ -1,4 +1,4 @@
-import type { User } from "stytch";
+import type { User } from "./auth-user.ts";
 import { addPkpToGroup, createPkp, findGroupId } from "./chipotle";
 import { loadLitAction } from "./lit-actions";
 import { encryptFiberKey } from "./lit";
@@ -34,7 +34,7 @@ export async function bootstrap(
   nodeMode: "browser" | "managed" = "browser",
 ): Promise<BootstrapResult> {
   if (!DEVICE_ID_HASH.test(deviceIdHash)) throw new Error("Device ID hash must be 32-byte lowercase hex");
-  return withUserLock(user.user_id, (sql) => bootstrapLocked(user, deviceIdHash, encodedFiberKey, nodeMode, sql));
+  return withUserLock(user.id, (sql) => bootstrapLocked(user, deviceIdHash, encodedFiberKey, nodeMode, sql));
 }
 
 async function bootstrapLocked(

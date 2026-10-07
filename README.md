@@ -1,6 +1,8 @@
 # CKB KeyWay
 
-CKB KeyWay is reusable email-authenticated wallet infrastructure for Fiber Network. It combines Stytch email OTP, a Lit Chipotle PKP, CCC transaction construction, and a managed or browser Fiber node so an application can recover a stable CKB identity and externally fund Fiber channels without exporting the PKP private key.
+> The Better Auth/Resend replacement is implemented locally but not deployed or published yet. Existing live services use the previous release. Sender setup and channel-safe legacy reset are release gates; see [operator status](docs/AUTH_REPLACEMENT.md).
+
+CKB KeyWay is reusable email-authenticated wallet infrastructure for Fiber Network. It combines Better Auth email OTP and Resend delivery, a Lit Chipotle PKP, CCC transaction construction, and a managed or browser Fiber node so an application can recover a stable CKB identity and externally fund Fiber channels without exporting the PKP private key.
 
 The repository contains two independent deliverables:
 
@@ -19,7 +21,7 @@ Standalone API: [keyway-api-production.up.railway.app](https://keyway-api-produc
 
 ## Working flow
 
-1. The SDK sends email OTP requests to the managed KeyWay API; Stytch remains private backend infrastructure and supplies a stable user ID.
+1. The SDK sends email OTP requests to the managed KeyWay API; Better Auth verifies app-specific codes and creates application-bound sessions; KeyWay supplies permanent application account IDs.
 2. The backend provisions or recovers one Lit PKP and its CKB testnet address.
 3. Managed mode connects to the user's persistent native Fiber node. Optional browser mode recovers its separate Fiber identity and loads a WASM node.
 4. The selected node connects to Fiber testnet peers.
@@ -33,7 +35,7 @@ KeyWay connects each browser node to the official testnet relays for network rea
 
 ## Run locally
 
-Requirements: Node.js 20 or newer, a Stytch Consumer test project, a configured Lit Chipotle account, and Postgres.
+Requirements: Node.js 20 or newer, a verified Resend sender, a configured Lit Chipotle account, and Postgres.
 
 ```sh
 npm install
@@ -44,7 +46,7 @@ npm run api
 npm run dev
 ```
 
-Configure Stytch email OTP for backend API access. The browser never receives a Stytch token, so no consuming domain is registered in Stytch. `KEYWAY_ALLOWED_ORIGINS` permits KeyWay's own frontend; SDK consumers register their origins in the developer console. Set a private `KEYWAY_RATE_LIMIT_SECRET` of at least 32 characters, register the three Actions in `lit-actions/` with Chipotle, and place only server credentials in `.env.local`. Never expose `STYTCH_SECRET`, `LIT_USAGE_API_KEY`, or `LIT_PROVISIONING_API_KEY` to browser code.
+Configure Better Auth, Postgres and a verified Resend sender using `.env.example`. Run `npm run migrate` explicitly before production startup. Consumers register exact origins in the developer console; the demo uses `NEXT_PUBLIC_KEYWAY_APP_ID`. Keep database, Better Auth, Resend and Lit credentials server-only.
 
 ## React SDK
 
@@ -92,7 +94,7 @@ function Balance() {
 
 The SDK uses KeyWay's managed backend. `appId` identifies the registered application and enforces origins. `appName` brands the modal; `theme` accepts light or dark; `confirmFunding` can replace funding confirmation. From 0.1.0, `autoConnect` defaults to false. `nodeMode` defaults to managed; use browser for local WASM. Authentication, account recovery, and Fiber readiness have separate hooks. Backend URLs and credentials are absent from provider configuration.
 
-`appName` changes the embedded modal. Optional Stytch login and signup template IDs can be saved for each registered application in the developer console; the templates must already exist in KeyWay's Stytch project.
+`appName` changes the modal. Emails use the registered application's name and the existing neutral template through Resend. OTP records and sessions are isolated by application; the same email in another application gets a different permanent KeyWay account and wallet. The server binds session scope using Better Auth's `databaseHooks.session.create.before` hook.
 
 Successful OTP recovers the CKB account without a node. `useCkbWallet()` reads its balance independently. `useFiber().connect()` starts or attaches to Fiber. Browser mode restores any claimed backup before WASM startup. Opt into automatic connection with `autoConnect`. Disconnecting a managed client does not stop the persistent server node.
 
@@ -153,7 +155,7 @@ Closing consumes the channel's on-chain funding cell and settles the final chann
 
 The consuming React application does not need Next.js or backend configuration. The lower-level API is for advanced integrations that already obtained a KeyWay session; normal applications use `KeyWayProvider` and never handle the token.
 
-The developer console also supports disabling an application, removing origins, setting an OTP request limit, viewing sanitized 24-hour OTP totals, and checking managed API health. No Stytch dashboard access or Stytch domain registration is required for SDK consumers.
+The developer console supports disabling applications, removing origins, setting OTP limits, viewing sanitized usage and checking API health. Its session scope is separate from SDK application sessions. Consumers need no authentication-provider credentials.
 
 Build the distributable React SDK with:
 
@@ -161,9 +163,9 @@ Build the distributable React SDK with:
 npm run build:package
 ```
 
-The private standalone backend runs with `npm run api` and requires `DATABASE_URL`, `KEYWAY_ALLOWED_ORIGINS`, `KEYWAY_RATE_LIMIT_SECRET`, Stytch server credentials, and the Lit server credentials from `.env.example`. It is deployed by CKB KeyWay and is not exported by the public SDK. The Next.js reference app has no API routes: it imports the published `@ckb-keyway/react` package, and both it and external consumers use the same SDK-managed Railway endpoint.
+The private standalone backend runs with `npm run api` and requires `DATABASE_URL`, `KEYWAY_ALLOWED_ORIGINS`, `KEYWAY_RATE_LIMIT_SECRET`, Better Auth/Resend server credentials, and the Lit server credentials from `.env.example`. It is deployed by CKB KeyWay and is not exported by the public SDK. The Next.js reference app has no API routes: it imports the published `@ckb-keyway/react` package, and both it and external consumers use the same SDK-managed Railway endpoint.
 
-See [`examples/browser-wallet.ts`](examples/browser-wallet.ts) for a complete minimal lifecycle. The repository package is private. `npm run pack:sdk` stages and packs only `package.sdk.json`, the React/browser build, README, and license. Server-only `postgres` and `stytch` dependencies, Railway code, and Lit Actions are excluded. Releases use npm Trusted Publishing: an explicit `v<package-version>` tag triggers `.github/workflows/publish.yml`, which runs the full suite with disposable Postgres, checks types, builds the public package, and publishes through OIDC. Ordinary commits do not publish an npm version.
+See [`examples/browser-wallet.ts`](examples/browser-wallet.ts) for a complete minimal lifecycle. The repository package is private. `npm run pack:sdk` stages and packs only `package.sdk.json`, the React/browser build, README, and license. Server-only `postgres`, `pg`, `better-auth`, and `resend` dependencies, Railway code, and Lit Actions are excluded. Releases use npm Trusted Publishing: an explicit `v<package-version>` tag triggers `.github/workflows/publish.yml`, which runs the full suite with disposable Postgres, checks types, builds the public package, and publishes through OIDC. Ordinary commits do not publish an npm version.
 
 The public package pins its tested Fiber WASM version. Node upgrades require explicit compatibility and recovery verification; they must not happen silently during dependency resolution.
 
@@ -207,7 +209,7 @@ The production deployment also sends `Cross-Origin-Opener-Policy: same-origin` a
 - The backend is trusted to authorize Lit operations and can observe the decrypted Fiber key.
 - The reference wallet uses fixed activation and maximum-payment-fee limits for a predictable demo; SDK consumers can configure channel funding and preflight payment fees.
 - CKB balance is an indexer-derived sum of live cells, not an account field. The reference wallet polls it every ten seconds, so a newly mined or faucet-created cell can still appear after indexer delay.
-- Lit, Fiber WASM, public peers, Stytch, and the CKB testnet RPC remain external availability dependencies.
+- Lit, Fiber WASM, public peers, Resend, and the CKB testnet RPC remain external availability dependencies.
 - Managed mode remains experimental testnet infrastructure. Every account is mapped to a dedicated native node on a persistent volume, with node/channel capacity limits. Authenticated operators can snapshot and restore state; current backups share the host volume and are not off-volume disaster recovery. Separate staging credentials are deferred to mainnet preparation. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and the funded recovery evidence.
 
 ## Upstream foundations
@@ -215,7 +217,7 @@ The production deployment also sends `Cross-Origin-Opener-Policy: same-origin` a
 - `@nervosnetwork/fiber-js` `0.9.0-rc7`
 - `@fiber-pay/sdk` `0.2.7`
 - `@ckb-ccc/core` `1.16.1`
-- `stytch` server SDK `14.2.0` (private backend only)
+- Better Auth `1.7.7` and Resend `6.32.1` (private backend only)
 - Lit Chipotle Actions pinned by immutable IPFS CID
 
 CKB KeyWay is independent experimental infrastructure and is not affiliated with or endorsed by these projects.

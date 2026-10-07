@@ -1,5 +1,7 @@
 # Architecture
 
+The Better Auth/Resend replacement is local and pending cutover; see `AUTH_REPLACEMENT.md`. Legacy test identities are not migrated. Permanent KeyWay accounts, wallet mappings and bearer sessions are isolated by registered application.
+
 ## Key separation
 
 CKB KeyWay deliberately uses two unrelated secp256k1 identities.
@@ -17,7 +19,7 @@ The Fiber key is never derived from the PKP, an OTP, or an ECDSA signature.
 KeyWay React OTP modal
        |
        v
-managed KeyWay backend -- server-side Stytch OTP/session
+managed KeyWay backend -- server-side Better Auth OTP/session and Resend delivery
        |
        +------------------------ Railway Postgres wallet metadata
        |                                  |
@@ -56,7 +58,7 @@ Peer-owned inputs and peer change are expected because Fiber funding is collabor
 
 ## Recovery and concurrency
 
-The Stytch-backed identity, PKP, CKB address, and encrypted Fiber key can be recovered after login. The browser never receives Stytch credentials or configures a domain with Stytch; it calls KeyWay's `send-code`, `verify-code`, `session`, and `logout` API routes. Explicit logout stops Fiber while retaining the device lease, encrypts the wallet-scoped IndexedDB databases in the browser, uploads only ciphertext, and releases ownership after the backend acknowledges the backup. Each upload appends an immutable generation; only the newest generation can be auto-claimed, older generations stay for rollback, and `KEYWAY_BACKUP_GENERATIONS` bounds retention without pruning a claimed generation. A new device claims and restores that backup before starting Fiber, and the restore refuses to overwrite Fiber state that already exists locally. Crashes and forced tab closure cannot create this final checkpoint, so users must log out before changing devices.
+The application-scoped KeyWay identity, PKP, CKB address, and encrypted Fiber key can be recovered after login. The browser never receives backend provider credentials; it calls KeyWay's `send-code`, `verify-code`, `session`, and `logout` API routes. Explicit logout stops Fiber while retaining the device lease, encrypts the wallet-scoped IndexedDB databases in the browser, uploads only ciphertext, and releases ownership after the backend acknowledges the backup. Each upload appends an immutable generation; only the newest generation can be auto-claimed, older generations stay for rollback, and `KEYWAY_BACKUP_GENERATIONS` bounds retention without pruning a claimed generation. A new device claims and restores that backup before starting Fiber, and the restore refuses to overwrite Fiber state that already exists locally. Crashes and forced tab closure cannot create this final checkpoint, so users must log out before changing devices.
 
 Within the primary browser, a Web Lock and `BroadcastChannel` prevent duplicate tabs. A short atomic Postgres lease prevents a second browser process from using the same identity concurrently.
 
@@ -72,7 +74,7 @@ The reference wallet lives at `/app`; `/` is the pitch-oriented project landing 
 
 ## Trust boundaries
 
-- Stytch proves control of the configured email account behind the managed backend.
+- Better Auth verifies application-isolated email OTPs and binds database sessions to validated application scope. Resend delivers email.
 - The KeyWay backend is trusted to map users to PKPs, enforce transaction policy, hold provider credentials, and authorize Lit calls.
 - Lit protects PKP key material and executes only configured Actions for the permitted account resources.
 - The backend can observe the Fiber key during the current decrypt flow.
@@ -81,7 +83,7 @@ The reference wallet lives at `/app`; `/` is the pitch-oriented project landing 
 
 ## Managed-node beta
 
-The backend contains a controlled testnet gateway that gives each managed account its own native `fnn` process, CKB key, Fiber identity, and data directory. A managed-host service starts known nodes from one persistent Railway volume and lazily provisions new users. Native RPC ports bind to loopback; the HTTPS operator gateway requires a shared bearer token and an opaque hash of the Stytch user ID. No unauthenticated RPC is exposed. Explicit account-to-node assignments take precedence so an existing node can keep its identity and channels during migration. Duplicate assigned URLs are rejected so two users cannot share a Fiber database. Payment submission requires a successful dry run and a one-use confirmation bound to the exact invoice and fee limit. Mutating requests are serialized per user and carry idempotency keys to prevent duplicate operations during retries.
+The backend contains a controlled testnet gateway that gives each managed account its own native `fnn` process, CKB key, Fiber identity, and data directory. A managed-host service starts known nodes from one persistent Railway volume and lazily provisions new users. Native RPC ports bind to loopback; the HTTPS operator gateway requires a shared bearer token and an opaque hash of the permanent application-scoped KeyWay account ID. No unauthenticated RPC is exposed. Explicit account-to-node assignments take precedence so an existing node can keep its identity and channels during migration. Duplicate assigned URLs are rejected so two users cannot share a Fiber database. Payment submission requires a successful dry run and a one-use confirmation bound to the exact invoice and fee limit. Mutating requests are serialized per user and carry idempotency keys to prevent duplicate operations during retries.
 
 From SDK 0.0.7, `nodeMode="managed"` is the default; `nodeMode="browser"` remains available explicitly. Browser and native Fiber databases are not interchangeable, so existing browser channels cannot be silently moved into the native node. Funded payment and recovery checks in both modes, plus production headless managed login without isolation headers, are recorded in `TESTNET_EVIDENCE.md`. These checks used disposable testnet accounts on the existing deployment; isolated staging identity-provider credentials are deferred to mainnet preparation. Managed hosting trusts KeyWay's host with operational Fiber keys and channel state.
 

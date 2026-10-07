@@ -1,4 +1,4 @@
-import type { User } from "stytch";
+import type { User } from "./auth-user.ts";
 import { database, withUserLock, type DatabaseSql } from "./database.ts";
 
 export type ProvisioningWallet = {
@@ -36,23 +36,17 @@ export function parseWallet(value: unknown): KeyWayWallet | undefined {
 export async function readWallet(user: User, connection?: DatabaseSql): Promise<KeyWayWallet | undefined> {
   const sql = connection ?? await database();
   const [row] = await sql<{ wallet: unknown }[]>`
-    select wallet from keyway_wallets where stytch_user_id = ${user.user_id}
+    select wallet from keyway_v2_wallets where user_id = ${user.id}
   `;
-  const stored = parseWallet(row?.wallet);
-  if (stored) return stored;
-
-  // Import wallets created before Postgres became the authoritative store.
-  const legacy = parseWallet(user.trusted_metadata?.keyway);
-  if (legacy) await saveWallet(user, legacy, sql);
-  return legacy;
+  return parseWallet(row?.wallet);
 }
 
 export async function saveWallet(user: User, wallet: KeyWayWallet, connection?: DatabaseSql): Promise<void> {
   const sql = connection ?? await database();
   await sql`
-    insert into keyway_wallets (stytch_user_id, wallet)
-    values (${user.user_id}, ${sql.json(wallet)})
-    on conflict (stytch_user_id) do update
+    insert into keyway_v2_wallets (user_id, wallet)
+    values (${user.id}, ${sql.json(wallet)})
+    on conflict (user_id) do update
       set wallet = excluded.wallet, updated_at = now()
   `;
 }
@@ -85,7 +79,7 @@ export function rebindProvisioningWallet(
 }
 
 export async function markChannelOpened(user: User, deviceIdHash: string): Promise<ReadyWallet> {
-  return withUserLock(user.user_id, async (sql) => {
+  return withUserLock(user.id, async (sql) => {
     const wallet = await readWallet(user, sql);
     if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
     if (wallet.primaryDeviceIdHash !== deviceIdHash) throw new Error("Fiber wallet is bound to another device");

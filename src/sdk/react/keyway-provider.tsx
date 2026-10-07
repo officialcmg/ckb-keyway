@@ -10,7 +10,8 @@ import {
   type CSSProperties,
   type ReactNode,
 } from "react";
-import { KeyWayApiClient } from "../browser/api-client";
+import { KeyWayApiClient, KeyWayApiError } from "../browser/api-client";
+import { cleanupLegacyDatabases } from "../browser/legacy-cleanup";
 import {
   connectKeyWay,
   type ConnectedKeyWay,
@@ -92,6 +93,7 @@ export function KeyWayProvider({
   const [lifecycleStage, setLifecycleStage] = useState<KeyWayLifecycleStage>();
   const [lifecycleTimings, setLifecycleTimings] = useState<Partial<Record<KeyWayLifecycleStage, number>>>({});
   const [authToken, setAuthToken] = useState<string>();
+  const [expiresAt, setExpiresAt] = useState<string>();
   const [user, setUser] = useState<KeyWayUser>();
   const [ready, setReady] = useState(false);
   const [loginOpen, setLoginOpen] = useState(false);
@@ -211,8 +213,9 @@ export function KeyWayProvider({
       connectionRef.current = undefined;
       setConnection(undefined);
       setWallet(undefined);
-      clearStoredSession();
+      clearStoredSession(appId);
       setAuthToken(undefined);
+      setExpiresAt(undefined);
       setUser(undefined);
       setStatus("idle");
       setFiberError(undefined);
@@ -229,6 +232,9 @@ export function KeyWayProvider({
 
   useEffect(() => {
     let active = true;
+    void api.legacyCleanup().then((manifest) => {
+      if (manifest.epoch && manifest.prefixes.length) return cleanupLegacyDatabases(manifest);
+    }).catch(() => { /* Retry on the next visit; never delete unapproved state. */ });
     setReady(false);
     setAuthToken(undefined);
     setUser(undefined);
@@ -237,17 +243,60 @@ export function KeyWayProvider({
       setReady(true);
       return;
     }
-    void api.session(stored.authToken).then(({ user: currentUser }) => {
+    void api.session(stored.authToken).then(({ user: currentUser, expiresAt, sessionToken }) => {
       if (!active) return;
-      setAuthToken(stored.authToken);
+      const token = sessionToken ?? stored.authToken;
+      storeSession({ authToken: token, user: currentUser, appId, expiresAt });
+      setAuthToken(token);
+      setExpiresAt(expiresAt);
       setUser(currentUser);
     }).catch(() => {
-      if (active) clearStoredSession();
+      if (active) clearStoredSession(appId);
     }).finally(() => {
       if (active) setReady(true);
     });
     return () => { active = false; };
   }, [appId]);
+
+  useEffect(() => {
+    if (!authToken || !expiresAt) return;
+    let active = true;
+    const invalidate = () => {
+      ++runRef.current;
+      const current = connectionRef.current;
+      connectionRef.current = undefined;
+      if (current) void current.keyway.stop().catch(() => undefined);
+      clearStoredSession(appId);
+      setAuthToken(undefined);
+      setUser(undefined);
+      setExpiresAt(undefined);
+    };
+    const validate = async () => {
+      try {
+        const session = await api.session(authToken);
+        if (!active) return;
+        const token = session.sessionToken ?? authToken;
+        storeSession({ authToken: token, user: session.user, appId, expiresAt: session.expiresAt });
+        setAuthToken(token);
+        setExpiresAt(session.expiresAt);
+      } catch (cause) {
+        // A network failure is not proof of revocation; expiry remains enforced.
+        if (active && ((cause instanceof KeyWayApiError && cause.status === 401) || Date.now() >= Date.parse(expiresAt))) invalidate();
+      }
+    };
+    const expiry = window.setTimeout(invalidate, Math.min(2_147_483_647, Math.max(0, Date.parse(expiresAt) - Date.now())));
+    const renewal = window.setInterval(() => void validate(), 15 * 60_000);
+    const focus = () => { if (document.visibilityState === "visible") void validate(); };
+    window.addEventListener("focus", focus);
+    document.addEventListener("visibilitychange", focus);
+    return () => {
+      active = false;
+      clearTimeout(expiry);
+      clearInterval(renewal);
+      window.removeEventListener("focus", focus);
+      document.removeEventListener("visibilitychange", focus);
+    };
+  }, [authToken, expiresAt, appId]);
 
   useEffect(() => {
     if (!authenticated) {
@@ -320,6 +369,7 @@ export function KeyWayProvider({
           authenticated={(session) => {
             storeSession({ ...session, appId });
             setAuthToken(session.authToken);
+            setExpiresAt(session.expiresAt);
             setUser(session.user);
             setLoginOpen(false);
           }}
@@ -431,7 +481,7 @@ function KeyWayLoginModal({
 }) {
   const [email, setEmail] = useState("");
   const [code, setCode] = useState("");
-  const [methodId, setMethodId] = useState<string>();
+  const [challengeId, setChallengeId] = useState<string>();
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string>();
   const [verificationState, setVerificationState] = useState<"idle" | "success" | "error">("idle");
@@ -444,17 +494,17 @@ function KeyWayLoginModal({
     setError(undefined);
     setVerificationState("idle");
     try {
-      if (!methodId) {
-        setMethodId((await api.sendCode(email)).methodId);
+      if (!challengeId) {
+        setChallengeId((await api.sendCode(email)).challengeId);
         return;
       }
-      const result = await api.verifyCode(methodId, code);
+      const result = await api.verifyCode(challengeId, code);
       setVerificationState("success");
       await new Promise((resolve) => setTimeout(resolve, 900));
-      authenticated({ authToken: result.sessionToken, user: result.user });
+      authenticated({ authToken: result.sessionToken, user: result.user, expiresAt: result.expiresAt });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not complete email login");
-      if (methodId) setVerificationState("error");
+      if (challengeId) setVerificationState("error");
     } finally {
       setPending(false);
     }
@@ -466,7 +516,7 @@ function KeyWayLoginModal({
     setCode("");
     setVerificationState("idle");
     try {
-      setMethodId((await api.sendCode(email)).methodId);
+      setChallengeId((await api.sendCode(email)).challengeId);
       codeInputRef.current?.focus();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not resend the code");
@@ -484,17 +534,17 @@ function KeyWayLoginModal({
   }, [close]);
 
   useEffect(() => {
-    if (methodId && code.length === 6 && !pending && verificationState === "idle") void submit();
-  }, [code, methodId, pending, verificationState]);
+    if (challengeId && code.length === 6 && !pending && verificationState === "idle") void submit();
+  }, [code, challengeId, pending, verificationState]);
 
   useEffect(() => {
-    if (!methodId) {
+    if (!challengeId) {
       setCodeFocused(false);
       return;
     }
     codeInputRef.current?.focus();
     setCodeFocused(document.activeElement === codeInputRef.current);
-  }, [methodId]);
+  }, [challengeId]);
 
   const codeColor = verificationState === "success" ? palette.success
     : verificationState === "error" ? palette.error
@@ -513,11 +563,11 @@ function KeyWayLoginModal({
     >
       <section role="dialog" aria-modal="true" aria-labelledby="keyway-login-title" style={{ ...modalPanel, background: palette.panel, borderColor: palette.border, color: palette.text }}>
         <style>{`@keyframes ckb-keyway-caret { 0%, 45% { opacity: 1; } 46%, 100% { opacity: 0; } }`}</style>
-        {!methodId ? (
+        {!challengeId ? (
           <button type="button" aria-label="Close login" onClick={close} style={{ ...modalClose, color: palette.muted }}>&times;</button>
         ) : (
           <button type="button" aria-label="Back" disabled={pending} style={{ ...modalBack, background: palette.surface, color: palette.muted }} onClick={() => {
-            setMethodId(undefined);
+            setChallengeId(undefined);
             setCode("");
             setError(undefined);
             setVerificationState("idle");
@@ -525,15 +575,15 @@ function KeyWayLoginModal({
         )}
         <div style={{ ...modalIcon, background: palette.surface, color: palette.muted }}><MailIcon /></div>
         <p style={{ ...modalEyebrow, color: palette.muted }}>{appName}</p>
-        <h2 id="keyway-login-title" style={modalTitle}>{methodId ? "Enter confirmation code" : "Log in or sign up"}</h2>
-        <p style={{ ...modalCopy, color: palette.muted }}>{methodId
+        <h2 id="keyway-login-title" style={modalTitle}>{challengeId ? "Enter confirmation code" : "Log in or sign up"}</h2>
+        <p style={{ ...modalCopy, color: palette.muted }}>{challengeId
           ? <>Check <strong style={{ color: palette.text }}>{email}</strong> for a six-digit code.</>
           : `Use your email to continue to ${appName}.`}</p>
         <form onSubmit={(event) => {
           event.preventDefault();
-          if (!methodId || code.length === 6) void submit();
+          if (!challengeId || code.length === 6) void submit();
         }}>
-          {!methodId ? (
+          {!challengeId ? (
             <label style={{ ...modalLabel, color: palette.muted }}>
               Email address
               <input
@@ -587,9 +637,9 @@ function KeyWayLoginModal({
             </label>
           )}
           {verificationState === "success" ? <p role="status" style={{ ...modalStatus, color: palette.success }}>Code verified</p> : null}
-          {methodId && pending && verificationState === "idle" ? <p role="status" style={{ ...modalStatus, color: palette.muted }}>Checking code...</p> : null}
+          {challengeId && pending && verificationState === "idle" ? <p role="status" style={{ ...modalStatus, color: palette.muted }}>Checking code...</p> : null}
           {error ? <p role="alert" style={{ ...modalStatus, color: palette.error }}>{friendlyOtpError(error)}</p> : null}
-          {!methodId ? (
+          {!challengeId ? (
             <button type="submit" disabled={pending} style={{ ...modalButton, ...modalPrimaryButton, background: palette.primary, color: palette.primaryText }}>
               {pending ? "Sending code..." : "Continue"}
             </button>
@@ -658,29 +708,33 @@ function KeyWayFundingModal({
   );
 }
 
-type StoredSession = { authToken: string; user: KeyWayUser; appId?: string };
+type StoredSession = { authToken: string; user: KeyWayUser; appId?: string; expiresAt: string };
 
-const SESSION_STORAGE_KEY = "ckb-keyway.session";
+const SESSION_STORAGE_KEY = "ckb-keyway.session.v2";
+
+function sessionStorageKey(appId?: string): string { return `${SESSION_STORAGE_KEY}:${appId ?? "unregistered"}`; }
 
 function readStoredSession(expectedAppId?: string): StoredSession | undefined {
   try {
-    const value: unknown = JSON.parse(localStorage.getItem(SESSION_STORAGE_KEY) ?? "null");
+    localStorage.removeItem("ckb-keyway.session");
+    const value: unknown = JSON.parse(localStorage.getItem(sessionStorageKey(expectedAppId)) ?? "null");
     if (!value || typeof value !== "object") return;
-    const { authToken, user, appId } = value as Partial<StoredSession>;
+    const { authToken, user, appId, expiresAt } = value as Partial<StoredSession>;
     if (typeof authToken !== "string" || !user || typeof user.id !== "string") return;
     if (appId !== expectedAppId) return;
-    return { authToken, user, appId };
+    if (typeof expiresAt !== "string" || !Number.isFinite(Date.parse(expiresAt)) || Date.parse(expiresAt) <= Date.now()) return;
+    return { authToken, user, appId, expiresAt };
   } catch {
     return;
   }
 }
 
 function storeSession(session: StoredSession): void {
-  localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
+  localStorage.setItem(sessionStorageKey(session.appId), JSON.stringify(session));
 }
 
-function clearStoredSession(): void {
-  localStorage.removeItem(SESSION_STORAGE_KEY);
+function clearStoredSession(appId?: string): void {
+  localStorage.removeItem(sessionStorageKey(appId));
 }
 
 const modalBackdrop: CSSProperties = {

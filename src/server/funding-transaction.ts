@@ -1,5 +1,5 @@
 import * as ccc from "@ckb-ccc/core";
-import type { User } from "stytch";
+import type { User } from "./auth-user.ts";
 import { loadLitAction } from "./lit-actions.ts";
 import { signCkbDigest } from "./lit.ts";
 import { recoverPkpPublicKey } from "./pkp-identity.ts";

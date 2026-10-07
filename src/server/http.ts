@@ -6,7 +6,9 @@ import {
   revokeSession,
   sendEmailCode,
   verifyEmailCode,
-} from "./stytch.ts";
+  sessionForRequest,
+  resolveAuthScope,
+} from "./auth.ts";
 import { acquireLease, heartbeatLease, releaseLease, requireLease } from "./device-lease.ts";
 import { loadLitAction } from "./lit-actions.ts";
 import { decryptFiberKey } from "./lit.ts";
@@ -23,12 +25,8 @@ import {
   applicationAllowsOrigin,
   createApplication,
   listApplications,
-  prepareOtpSend,
-  recordOtpResult,
-  recordOtpVerification,
   removeApplicationOrigin,
   updateApplication,
-  verifyOtpApplication,
 } from "./applications.ts";
 import { managedNodeReady, managedNodeRequest } from "./managed-node.ts";
 import { runIdempotentMutation } from "./idempotency.ts";
@@ -54,7 +52,12 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
 
   try {
     const path = apiPath(new URL(request.url).pathname);
+    const scope = await resolveAuthScope(request);
+    if (scope.id === "dashboard" && !path.startsWith("/api/keyway/auth/") && path !== "/api/keyway/developer/apps") {
+      return jsonError("Dashboard credentials cannot authorize wallet operations", 403, cors);
+    }
     const response = path === "/api/keyway/auth/send-code" ? await sendCodeRequest(request)
+      : path === "/api/keyway/auth/legacy-cleanup" ? await legacyCleanupRequest(request)
       : path === "/api/keyway/auth/verify-code" ? await verifyCodeRequest(request)
       : path === "/api/keyway/auth/session" ? await sessionRequest(request)
       : path === "/api/keyway/auth/logout" ? await logoutRequest(request)
@@ -75,24 +78,24 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
     const message = error instanceof Error ? error.message : "KeyWay request failed";
     const unauthorized = /session|bearer/i.test(message);
     const rateLimited = /too many/i.test(message);
-    console.error("[keyway]", message);
+    console.error("[keyway] request failed", { status: unauthorized ? 401 : rateLimited ? 429 : 400 });
     return jsonError(message, unauthorized ? 401 : rateLimited ? 429 : 400, cors);
   }
 }
 
 async function managedNodeHttpRequest(request: Request): Promise<Response> {
-  const user = await authenticateUser(request.headers.get("authorization"));
+  const user = await authenticateUser(request);
   const body = await objectBody(request, "Invalid managed-node request");
   const operation = typeof body.operation === "string" ? body.operation : "unknown";
   const result = ["new-invoice", "send-payment", "open-channel", "submit-channel-funding", "close-channel"].includes(operation)
     ? await runIdempotentMutation(
-      user.user_id,
+      user.id,
       `managed:${operation}`,
       request.headers.get("idempotency-key") ?? "",
       body,
-      () => managedNodeRequest(user.user_id, body),
+      () => managedNodeRequest(user.id, body),
     )
-    : await managedNodeRequest(user.user_id, body);
+    : await managedNodeRequest(user.id, body);
   return Response.json(result, {
     headers: { "Cache-Control": "no-store" },
   });
@@ -103,59 +106,47 @@ async function sendCodeRequest(request: Request): Promise<Response> {
   if (typeof email !== "string" || !/^\S+@\S+\.\S+$/.test(email) || email.length > 254) {
     throw new Error("A valid email address is required");
   }
-  const context = await prepareOtpSend({
-    appId: applicationId(request),
-    email,
-    ipAddress: requestIp(request),
-  });
-  try {
-    const methodId = await sendEmailCode(email, context);
-    await recordOtpResult(context, "sent", methodId);
-    return Response.json({ methodId });
-  } catch (error) {
-    await recordOtpResult(context, "send_failed");
-    throw error;
-  }
+  return Response.json(await sendEmailCode(request, email));
+}
+
+async function legacyCleanupRequest(request: Request): Promise<Response> {
+  await resolveAuthScope(request);
+  const sql = await database();
+  const rows = await sql<Array<{ database_prefix: string; epoch: string }>>`select database_prefix, epoch from keyway_legacy_cleanup where origin = ${request.headers.get("origin")!} order by database_prefix`;
+  return Response.json({ epoch: rows.map((row) => row.epoch).join(":"), prefixes: rows.map((row) => row.database_prefix) }, { headers: { "Cache-Control": "no-store" } });
 }
 
 async function verifyCodeRequest(request: Request): Promise<Response> {
-  const { methodId, code } = await objectBody(request, "Invalid email OTP verification");
-  if (typeof methodId !== "string" || !methodId) throw new Error("OTP method is required");
+  const { challengeId, code } = await objectBody(request, "Invalid email OTP verification");
+  if (typeof challengeId !== "string" || !challengeId) throw new Error("OTP challenge is required");
   if (typeof code !== "string" || !/^\d{6}$/.test(code)) throw new Error("Enter the six-digit code");
-  const context = await verifyOtpApplication(methodId, applicationId(request));
-  try {
-    const result = await verifyEmailCode(methodId, code);
-    await recordOtpVerification(context, "verified");
-    return Response.json(result);
-  } catch (error) {
-    await recordOtpVerification(context, "verify_failed");
-    throw error;
-  }
+  return Response.json(await verifyEmailCode(request, challengeId, code));
 }
 
 async function sessionRequest(request: Request): Promise<Response> {
-  return Response.json({ user: publicUser(await authenticateUser(request.headers.get("authorization"))) });
+  const session = await sessionForRequest(request);
+  return Response.json({ ...session, user: publicUser(session.user) }, { headers: { "Cache-Control": "no-store" } });
 }
 
 async function logoutRequest(request: Request): Promise<Response> {
-  await revokeSession(request.headers.get("authorization"));
+  await revokeSession(request);
   return new Response(null, { status: 204 });
 }
 
 async function bootstrapRequest(request: Request): Promise<Response> {
-  const user = await authenticateUser(request.headers.get("authorization"));
+  const user = await authenticateUser(request);
   const body = await objectBody(request, "Invalid bootstrap request");
   const { deviceIdHash, fiberKey, nodeMode } = body;
   if (typeof deviceIdHash !== "string") throw new Error("Device ID hash is required");
   if (fiberKey !== undefined && typeof fiberKey !== "string") throw new Error("Fiber key is invalid");
   if (nodeMode !== undefined && nodeMode !== "browser" && nodeMode !== "managed") throw new Error("Node mode is invalid");
-  return Response.json(await versionedMutation(request, user.user_id, "bootstrap", body, () =>
+  return Response.json(await versionedMutation(request, user.id, "bootstrap", body, () =>
     bootstrap(user, deviceIdHash, fiberKey, nodeMode),
   ));
 }
 
 async function fiberKeyRequest(request: Request): Promise<Response> {
-  const user = await authenticateUser(request.headers.get("authorization"));
+  const user = await authenticateUser(request);
   const { deviceIdHash, leaseId } = await objectBody(request, "Invalid Fiber key request");
   if (typeof deviceIdHash !== "string") throw new Error("Device ID hash is required");
   if (typeof leaseId !== "string") throw new Error("Device lease is required");
@@ -179,7 +170,7 @@ async function fiberKeyRequest(request: Request): Promise<Response> {
 }
 
 async function channelStateRequest(request: Request): Promise<Response> {
-  const user = await authenticateUser(request.headers.get("authorization"));
+  const user = await authenticateUser(request);
   const { deviceIdHash } = await objectBody(request, "Invalid channel-state request");
   if (typeof deviceIdHash !== "string") throw new Error("Device ID hash is required");
   await markChannelOpened(user, deviceIdHash);
@@ -187,7 +178,7 @@ async function channelStateRequest(request: Request): Promise<Response> {
 }
 
 async function deviceLeaseRequest(request: Request): Promise<Response> {
-  const user = await authenticateUser(request.headers.get("authorization"));
+  const user = await authenticateUser(request);
   const { operation, deviceIdHash, leaseId } = await objectBody(request, "Invalid lease request");
   if (typeof operation !== "string" || typeof deviceIdHash !== "string") {
     throw new Error("Lease operation and device ID hash are required");
@@ -206,7 +197,7 @@ async function deviceLeaseRequest(request: Request): Promise<Response> {
 }
 
 async function saveNodeBackupRequest(request: Request): Promise<Response> {
-  const user = await authenticateUser(request.headers.get("authorization"));
+  const user = await authenticateUser(request);
   const body = await objectBody(request, "Invalid Fiber node backup request");
   const { deviceIdHash, leaseId, backup } = body;
   if (typeof deviceIdHash !== "string" || typeof leaseId !== "string") {
@@ -220,13 +211,13 @@ async function saveNodeBackupRequest(request: Request): Promise<Response> {
   if (parsed.databasePrefix !== `/wasm-${wallet.litPkpId}`) {
     throw new Error("Fiber node backup does not belong to this wallet");
   }
-  return Response.json(await versionedMutation(request, user.user_id, "node-backup:save", body, () =>
+  return Response.json(await versionedMutation(request, user.id, "node-backup:save", body, () =>
     saveNodeBackup(user, deviceIdHash, parsed),
   ));
 }
 
 async function loadNodeBackupRequest(request: Request): Promise<Response> {
-  const user = await authenticateUser(request.headers.get("authorization"));
+  const user = await authenticateUser(request);
   const body = await objectBody(request, "Invalid Fiber node backup request");
   const { deviceIdHash, leaseId } = body;
   if (typeof deviceIdHash !== "string" || typeof leaseId !== "string") {
@@ -237,7 +228,7 @@ async function loadNodeBackupRequest(request: Request): Promise<Response> {
     throw new Error("Fiber wallet is bound to another device");
   }
   await requireLease(user, deviceIdHash, leaseId);
-  const backup = await versionedMutation(request, user.user_id, "node-backup:claim", body, () =>
+  const backup = await versionedMutation(request, user.id, "node-backup:claim", body, () =>
     readClaimedNodeBackup(user, deviceIdHash),
   );
   const { sourceDeviceIdHash: _source, status: _status, claimedDeviceIdHash: _claimed, ...publicBackup } = backup;
@@ -245,14 +236,14 @@ async function loadNodeBackupRequest(request: Request): Promise<Response> {
 }
 
 async function confirmNodeBackupRequest(request: Request): Promise<Response> {
-  const user = await authenticateUser(request.headers.get("authorization"));
+  const user = await authenticateUser(request);
   const body = await objectBody(request, "Invalid Fiber node backup confirmation");
   const { deviceIdHash, leaseId, generation } = body;
   if (typeof deviceIdHash !== "string" || typeof leaseId !== "string" || !Number.isSafeInteger(generation)) {
     throw new Error("Device ID hash, lease ID, and backup generation are required");
   }
   await requireLease(user, deviceIdHash, leaseId);
-  await versionedMutation(request, user.user_id, "node-backup:confirm", body, async () => {
+  await versionedMutation(request, user.id, "node-backup:confirm", body, async () => {
     await confirmNodeBackupRestored(user, deviceIdHash, generation as number);
     return { confirmed: true };
   });
@@ -260,7 +251,7 @@ async function confirmNodeBackupRequest(request: Request): Promise<Response> {
 }
 
 async function signTransactionRequest(request: Request): Promise<Response> {
-  const user = await authenticateUser(request.headers.get("authorization"));
+  const user = await authenticateUser(request);
   const body = await objectBody(request, "Invalid signing request");
   const { operation, transaction, confirmationNonce } = body;
   const wallet = await readWallet(user);
@@ -276,16 +267,17 @@ async function signTransactionRequest(request: Request): Promise<Response> {
   if (operation !== "sign" || typeof confirmationNonce !== "string") {
     throw new Error("A valid signing operation is required");
   }
-  return Response.json(await versionedMutation(request, user.user_id, "sign-transaction", body, async () => {
+  return Response.json(await versionedMutation(request, user.id, "sign-transaction", body, async () => {
     await consumeConfirmation(user, confirmationNonce, serialized);
-    await recordSigningEvent(user.user_id);
+    await recordSigningEvent(user.id);
     const signed = await signFundingTransaction(user, wallet, validated);
     return { transaction: serializeTransaction(signed) };
   }));
 }
 
 async function developerAppsRequest(request: Request): Promise<Response> {
-  const user = await authenticateUser(request.headers.get("authorization"));
+  const user = await authenticateUser(request);
+  if (user.scopeId !== "dashboard") throw new Error("Dashboard session is required");
   const body = await objectBody(request, "Invalid developer application request");
   const operation = body.operation;
   if (operation === "list") return Response.json({ applications: await listApplications(user) });
@@ -302,8 +294,6 @@ async function developerAppsRequest(request: Request): Promise<Response> {
       appId: body.appId,
       name: optionalString(body.name),
       disabled: optionalBoolean(body.disabled),
-      otpLoginTemplateId: optionalNullableString(body.otpLoginTemplateId),
-      otpSignupTemplateId: optionalNullableString(body.otpSignupTemplateId),
       otpLimitPerMinute: optionalNumber(body.otpLimitPerMinute),
     }));
   }
@@ -357,13 +347,15 @@ function parseNodeBackup(value: unknown) {
 async function corsHeaders(request: Request): Promise<Headers | Response> {
   const origin = request.headers.get("origin");
   const allowed = (process.env.KEYWAY_ALLOWED_ORIGINS ?? "").split(",").map((value) => value.trim()).filter(Boolean);
-  if (origin && request.method !== "OPTIONS" && origin !== new URL(request.url).origin) {
-    const appId = applicationId(request);
-    const permitted = appId ? await applicationAllowsOrigin(appId, origin) : allowed.includes(origin);
-    if (!permitted) return jsonError("Origin is not allowed", 403);
+  if (new URL(request.url).pathname.includes("/keyway/")) {
+    if (request.method !== "OPTIONS") {
+      try { await resolveAuthScope(request); } catch { return jsonError("Application origin is not allowed", 403); }
+    } else if (!origin) return jsonError("Origin is required", 403);
+  } else if (origin && !allowed.includes(origin) && origin !== new URL(request.url).origin) {
+    return jsonError("Origin is not allowed", 403);
   }
   const headers = new Headers({
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, X-KeyWay-App-Id",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, X-KeyWay-App-Id, X-KeyWay-Auth-Scope",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Vary": "Origin",
   });

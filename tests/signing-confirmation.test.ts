@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { User } from "stytch";
+import type { User } from "../src/server/auth-user.ts";
 import {
   consumeConfirmation,
   issueConfirmation,
 } from "../src/server/signing-confirmation.ts";
 
 test("binds a signing confirmation to the exact prepared transaction", { skip: !process.env.DATABASE_URL }, async () => {
-  const user = { user_id: `confirmation-test-${crypto.randomUUID()}` } as User;
+  const user = { id: `confirmation-test-${crypto.randomUUID()}` } as User;
   const transaction = '{"version":"0x0","witnesses":["0x"]}';
   const nonce = await issueConfirmation(user, transaction);
   await assert.rejects(

@@ -17,7 +17,7 @@ type FiberChannel = Awaited<ReturnType<KeyWay["listChannels"]>>["channels"][numb
 
 export function AuthPanel({ nodeMode = "managed" }: { nodeMode?: "browser" | "managed" }) {
   return (
-    <KeyWayProvider nodeMode={nodeMode}>
+    <KeyWayProvider appId={process.env.NEXT_PUBLIC_KEYWAY_APP_ID} nodeMode={nodeMode}>
       <WalletPanel />
     </KeyWayProvider>
   );

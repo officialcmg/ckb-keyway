@@ -52,6 +52,13 @@ async function handleRequest(request, response) {
     if (request.method === "GET" && request.url === "/readyz") {
       return send(response, 200, { status: "ready", nodes: nodes.size, maxNodes: maxNodes() });
     }
+    if (request.method === "GET" && request.url === "/inventory") {
+      return send(response, 200, { users: await existingUsers(), running: [...nodes.keys()] });
+    }
+    const retirement = request.method === "POST" && /^\/users\/([0-9a-f]{64})\/retire$/.exec(request.url ?? "");
+    if (retirement) {
+      return send(response, 200, await withUserOperation(retirement[1], () => retireUser(retirement[1])));
+    }
     const backups = /^\/users\/([0-9a-f]{64})\/backups$/.exec(request.url ?? "");
     if (backups && request.method === "GET") {
       return send(response, 200, { snapshots: await withUserOperation(backups[1], () => listSnapshots({ userId: backups[1] })) });
@@ -98,6 +105,7 @@ export async function withUserOperation(userId, operation) {
 async function ensureNode(userId) {
   if (!USER_ID.test(userId)) throw new Error("Managed user ID is invalid");
   if (shuttingDown) throw new Error("Managed host is shutting down");
+  if (await isRetired(userId)) throw new Error("Legacy Fiber node has been retired");
   const running = nodes.get(userId);
   if (running?.stopping) throw new Error("Fiber process is still stopping");
   if (running) return running;
@@ -224,6 +232,40 @@ export function managedDataDir(userId) {
 
 export function managedBackupDir(userId) {
   return join(required("KEYWAY_MANAGED_BACKUP_DIR", "/fiber/backups"), userId);
+}
+
+function retiredPath(userId) {
+  if (!USER_ID.test(userId)) throw new Error("Managed user ID is invalid");
+  return join(required("KEYWAY_MANAGED_RETIRED_DIR", "/fiber/retired"), userId);
+}
+
+async function isRetired(userId) {
+  try { await stat(retiredPath(userId)); return true; }
+  catch (error) { if (error?.code === "ENOENT") return false; throw error; }
+}
+
+export function requireClosedChannels(channels) {
+  if (!Array.isArray(channels) || channels.some((channel) => String(channel?.state?.state_name).replaceAll("_", "").toLowerCase() !== "closed" || channel?.state?.state_flags !== "COOPERATIVE")) {
+    throw new Error("Channel closure is incomplete; preserve the node database");
+  }
+}
+
+async function retireUser(userId) {
+  if (await isRetired(userId)) return { retired: true, databasePreserved: true };
+  await stat(managedDataDir(userId)); // Never provision a new identity for cleanup.
+  const node = await ensureNode(userId);
+  const response = await fetch(`http://127.0.0.1:${node.port}`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "list_channels", params: [{ include_closed: true }] }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  const result = await response.json();
+  if (!response.ok || result.error) throw new Error("Could not verify channel closure");
+  requireClosedChannels(result.result?.channels);
+  await mkdir(required("KEYWAY_MANAGED_RETIRED_DIR", "/fiber/retired"), { recursive: true });
+  await writeFile(retiredPath(userId), JSON.stringify({ retiredAt: new Date().toISOString() }), { flag: "wx", mode: 0o600 });
+  await stopNode(userId);
+  return { retired: true, databasePreserved: true };
 }
 
 export async function listSnapshots({ userId, root = managedBackupDir(userId) }) {
@@ -422,9 +464,11 @@ async function readJsonBody(request, limit = 65_536) {
 
 async function existingUsers() {
   try {
-    return (await readdir(required("KEYWAY_MANAGED_DATA_DIR", "/fiber/users"), { withFileTypes: true }))
+    const users = (await readdir(required("KEYWAY_MANAGED_DATA_DIR", "/fiber/users"), { withFileTypes: true }))
       .filter((entry) => entry.isDirectory() && USER_ID.test(entry.name))
       .map((entry) => entry.name);
+    const retired = await Promise.all(users.map((userId) => isRetired(userId)));
+    return users.filter((_, index) => !retired[index]);
   } catch (error) {
     if (error?.code === "ENOENT") return [];
     throw error;

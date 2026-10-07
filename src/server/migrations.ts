@@ -1,4 +1,5 @@
 import type { DatabaseSql } from "./database";
+import { authSchemaSql } from "./auth-schema.ts";
 
 export const migrations: Array<{
   version: number;
@@ -181,5 +182,37 @@ export const migrations: Array<{
         on keyway_node_backups (stytch_user_id, generation desc)
       `;
     },
+  },
+  {
+    version: 8,
+    name: "application-scoped-authentication",
+    up: async (sql) => {
+      await sql`create table keyway_users (
+        id uuid primary key, auth_user_id uuid not null, scope_id text not null,
+        created_at timestamptz not null default now(), unique (auth_user_id, scope_id)
+      )`;
+      await sql`alter table keyway_applications alter column owner_stytch_user_id drop not null`;
+      await sql`alter table keyway_applications add column owner_user_id uuid`;
+      for (const suffix of ["wallets", "device_leases", "signing_confirmations", "node_backups", "managed_confirmations", "idempotency_keys"]) {
+        await sql.unsafe(`create table keyway_v2_${suffix} (like keyway_${suffix} including all)`);
+        await sql.unsafe(`alter table keyway_v2_${suffix} rename column stytch_user_id to user_id`);
+      }
+      await sql`create table keyway_auth_challenges (
+        id uuid primary key, scope_id text not null, email text not null,
+        expires_at timestamptz not null, created_at timestamptz not null default now(),
+        status text not null check (status in ('pending', 'sent', 'failed', 'consumed', 'superseded'))
+      )`;
+      await sql`create index keyway_auth_challenge_subject on keyway_auth_challenges (scope_id, email, created_at desc)`;
+      await sql`create table keyway_auth_rate_limits (key text primary key, count integer not null, starts_at timestamptz not null)`;
+    },
+  },
+  { version: 9, name: "better-auth-1.7.7-schema", up: (sql) => sql.unsafe(authSchemaSql) },
+  {
+    version: 10, name: "settlement-approved-browser-cleanup",
+    up: (sql) => sql`create table keyway_legacy_cleanup (
+      origin text not null, database_prefix text not null, epoch text not null,
+      settlement_evidence jsonb not null, approved_at timestamptz not null default now(),
+      primary key (origin, database_prefix)
+    )`,
   },
 ];

@@ -1,11 +1,10 @@
 import { createHmac, randomBytes } from "node:crypto";
-import type { User } from "stytch";
+import type { User } from "./auth-user.ts";
 import { database, type DatabaseSql } from "./database";
 import { sendSecurityAlert } from "./security-alerts";
 
 const APP_ID = /^keyway_[A-Za-z0-9_-]{24}$/;
-const TEMPLATE_ID = /^[A-Za-z0-9_-]{1,128}$/;
-const LEGACY_APP_ID = "legacy";
+const LEGACY_APP_ID = "dashboard";
 
 export type ApplicationOrigin = {
   origin: string;
@@ -16,8 +15,6 @@ export type DeveloperApplication = {
   appId: string;
   name: string;
   disabled: boolean;
-  otpLoginTemplateId?: string;
-  otpSignupTemplateId?: string;
   otpLimitPerMinute: number;
   origins: ApplicationOrigin[];
   usage: { sent24h: number; failed24h: number; rateLimited24h: number };
@@ -46,8 +43,8 @@ export async function createApplication(
   const appId = `keyway_${randomBytes(18).toString("base64url")}`;
   await sql`
     insert into keyway_applications (
-      app_id, owner_stytch_user_id, name, otp_limit_per_minute
-    ) values (${appId}, ${user.user_id}, ${name}, ${otpLimit})
+      app_id, owner_user_id, name, otp_limit_per_minute
+    ) values (${appId}, ${user.id}, ${name}, ${otpLimit})
   `;
   return (await listApplications(user)).find((app) => app.appId === appId)!;
 }
@@ -58,7 +55,7 @@ export async function listApplications(user: User): Promise<DeveloperApplication
     select app_id, name, disabled, otp_login_template_id, otp_signup_template_id,
       otp_limit_per_minute, created_at, updated_at
     from keyway_applications
-    where owner_stytch_user_id = ${user.user_id}
+    where owner_user_id = ${user.id}
     order by created_at desc
   `;
   if (!apps.length) return [];
@@ -92,8 +89,6 @@ export async function updateApplication(
     appId: string;
     name?: string;
     disabled?: boolean;
-    otpLoginTemplateId?: string | null;
-    otpSignupTemplateId?: string | null;
     otpLimitPerMinute?: number;
   },
 ): Promise<DeveloperApplication> {
@@ -101,20 +96,13 @@ export async function updateApplication(
   const existing = await ownedApplication(user, input.appId, sql);
   const name = input.name === undefined ? existing.name : applicationName(input.name);
   const disabled = input.disabled ?? existing.disabled;
-  const loginTemplate = input.otpLoginTemplateId === undefined
-    ? existing.otp_login_template_id
-    : templateId(input.otpLoginTemplateId);
-  const signupTemplate = input.otpSignupTemplateId === undefined
-    ? existing.otp_signup_template_id
-    : templateId(input.otpSignupTemplateId);
   const otpLimit = input.otpLimitPerMinute === undefined
     ? existing.otp_limit_per_minute
     : otpLimitPerMinute(input.otpLimitPerMinute);
   await sql`
     update keyway_applications
-    set name = ${name}, disabled = ${disabled}, otp_login_template_id = ${loginTemplate},
-      otp_signup_template_id = ${signupTemplate}, otp_limit_per_minute = ${otpLimit}, updated_at = now()
-    where app_id = ${input.appId} and owner_stytch_user_id = ${user.user_id}
+    set name = ${name}, disabled = ${disabled}, otp_limit_per_minute = ${otpLimit}, updated_at = now()
+    where app_id = ${input.appId} and owner_user_id = ${user.id}
   `;
   return (await listApplications(user)).find((app) => app.appId === input.appId)!;
 }
@@ -171,8 +159,6 @@ export async function prepareOtpSend(input: {
   appId: string;
   emailHash: string;
   ipHash: string;
-  loginTemplateId?: string;
-  signupTemplateId?: string;
 }> {
   const sql = await database();
   const app = input.appId ? await activeApplication(input.appId, sql) : undefined;
@@ -181,7 +167,9 @@ export async function prepareOtpSend(input: {
   const ipHash = privateHash("ip", input.ipAddress);
   const appLimit = app?.otp_limit_per_minute ?? 30;
   const limited = await sql.begin(async (transaction) => {
-    await transaction`select pg_advisory_xact_lock(hashtextextended(${`otp:${appId}:${emailHash}:${ipHash}`}, 0))`;
+    for (const key of [`otp:app:${appId}`, `otp:email:${emailHash}`, `otp:ip:${ipHash}`].sort()) {
+      await transaction`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`;
+    }
     const [limits] = await transaction<Array<{ app_count: number; email_count: number; ip_count: number }>>`
       select
         count(*) filter (where app_id = ${appId} and created_at >= now() - interval '1 minute')::int as app_count,
@@ -205,49 +193,15 @@ export async function prepareOtpSend(input: {
     appId,
     emailHash,
     ipHash,
-    loginTemplateId: app?.otp_login_template_id ?? undefined,
-    signupTemplateId: app?.otp_signup_template_id ?? undefined,
   };
 }
 
 export async function recordOtpResult(
   context: { appId: string; emailHash: string; ipHash: string },
   outcome: "sent" | "send_failed",
-  methodId?: string,
 ): Promise<void> {
   const sql = await database();
   await insertOtpEvent(sql, context.appId, context.emailHash, context.ipHash, outcome);
-  if (methodId) {
-    await sql`
-      insert into keyway_otp_methods (method_id, app_id, email_hash, ip_hash)
-      values (${methodId}, ${context.appId}, ${context.emailHash}, ${context.ipHash})
-      on conflict (method_id) do update set
-        app_id = excluded.app_id,
-        email_hash = excluded.email_hash,
-        ip_hash = excluded.ip_hash,
-        created_at = now()
-    `;
-  }
-}
-
-export async function verifyOtpApplication(methodId: string, requestedAppId?: string): Promise<{
-  appId: string;
-  emailHash: string;
-  ipHash: string;
-}> {
-  const sql = await database();
-  const rows = await sql<Array<{ app_id: string; email_hash: string; ip_hash: string }>>`
-    select app_id, email_hash, ip_hash
-    from keyway_otp_methods
-    where method_id = ${methodId} and created_at >= now() - interval '15 minutes'
-    limit 1
-  `;
-  const context = rows[0];
-  if (!context) throw new Error("OTP session is invalid or expired");
-  const expectedAppId = requestedAppId ?? LEGACY_APP_ID;
-  if (context.app_id !== expectedAppId) throw new Error("OTP session does not belong to this application");
-  if (requestedAppId) await activeApplication(requestedAppId, sql);
-  return { appId: context.app_id, emailHash: context.email_hash, ipHash: context.ip_hash };
 }
 
 export async function recordOtpVerification(
@@ -266,8 +220,6 @@ function publicApplication(
     appId: app.app_id,
     name: app.name,
     disabled: app.disabled,
-    otpLoginTemplateId: app.otp_login_template_id ?? undefined,
-    otpSignupTemplateId: app.otp_signup_template_id ?? undefined,
     otpLimitPerMinute: app.otp_limit_per_minute,
     origins: origins.map(({ origin, environment }) => ({ origin, environment })),
     usage: {
@@ -286,7 +238,7 @@ async function ownedApplication(user: User, appId: string, sql: DatabaseSql): Pr
     select app_id, name, disabled, otp_login_template_id, otp_signup_template_id,
       otp_limit_per_minute, created_at, updated_at
     from keyway_applications
-    where app_id = ${appId} and owner_stytch_user_id = ${user.user_id}
+    where app_id = ${appId} and owner_user_id = ${user.id}
     limit 1
   `;
   if (!rows[0]) throw new Error("Application not found");
@@ -308,13 +260,6 @@ function applicationName(value: string): string {
   const name = value.trim();
   if (!name || name.length > 80) throw new Error("Application name must be between 1 and 80 characters");
   return name;
-}
-
-function templateId(value: string | null): string | null {
-  if (value === null || value.trim() === "") return null;
-  const normalized = value.trim();
-  if (!TEMPLATE_ID.test(normalized)) throw new Error("OTP template ID is invalid");
-  return normalized;
 }
 
 function otpLimitPerMinute(value: number): number {

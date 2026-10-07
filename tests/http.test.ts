@@ -37,9 +37,10 @@ test("allows CORS preflight before validating the app ID on the real request", a
 
 test("rejects malformed OTP requests before calling the provider", async () => {
   process.env.KEYWAY_ALLOWED_ORIGINS = "https://wallet.example";
+  process.env.KEYWAY_DASHBOARD_ORIGINS = "https://wallet.example";
   const response = await handleKeyWayRequest(new Request("https://api.example/api/keyway/auth/send-code", {
     method: "POST",
-    headers: { "Content-Type": "application/json", Origin: "https://wallet.example" },
+    headers: { "Content-Type": "application/json", Origin: "https://wallet.example", "X-KeyWay-Auth-Scope": "dashboard" },
     body: JSON.stringify({ email: "not-an-email" }),
   }));
   assert.equal(response.status, 400);
@@ -48,9 +49,10 @@ test("rejects malformed OTP requests before calling the provider", async () => {
 
 test("serves versioned API routes while retaining legacy compatibility", async () => {
   process.env.KEYWAY_ALLOWED_ORIGINS = "https://wallet.example";
+  process.env.KEYWAY_DASHBOARD_ORIGINS = "https://wallet.example";
   const response = await handleKeyWayRequest(new Request("https://api.example/api/v1/keyway/auth/send-code", {
     method: "POST",
-    headers: { "Content-Type": "application/json", Origin: "https://wallet.example" },
+    headers: { "Content-Type": "application/json", Origin: "https://wallet.example", "X-KeyWay-Auth-Scope": "dashboard" },
     body: JSON.stringify({ email: "not-an-email" }),
   }));
   assert.equal(response.status, 400);
