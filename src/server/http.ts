@@ -22,7 +22,6 @@ import { database } from "./database.ts";
 import { confirmNodeBackupRestored, readClaimedNodeBackup, saveNodeBackup } from "./node-backup.ts";
 import {
   addApplicationOrigin,
-  applicationAllowsOrigin,
   createApplication,
   listApplications,
   removeApplicationOrigin,
@@ -384,25 +383,8 @@ function versionedMutation<T>(
   );
 }
 
-function applicationId(request: Request): string | undefined {
-  const value = request.headers.get("x-keyway-app-id")?.trim();
-  return value || undefined;
-}
-
-function requestIp(request: Request): string {
-  return request.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
-    || request.headers.get("x-real-ip")?.trim()
-    || "unknown";
-}
-
 function optionalString(value: unknown): string | undefined {
   if (value === undefined) return undefined;
-  if (typeof value !== "string") throw new Error("Expected a string value");
-  return value;
-}
-
-function optionalNullableString(value: unknown): string | null | undefined {
-  if (value === undefined || value === null) return value;
   if (typeof value !== "string") throw new Error("Expected a string value");
   return value;
 }
