@@ -10,7 +10,7 @@ The source is written in MDX and configured with Mintlify. We use the Mintlify C
 
 ## Tooling
 
-- Mintlify `mintlify` CLI for local preview, validation, link checks, accessibility checks, and static export
+- Mintlify `mint` CLI for local preview, validation, link checks, accessibility checks, and static export
 - MDX for documentation pages
 - `docs.json` for navigation, theme, branding, and external links
 - Vercel CLI for the independent production deployment
@@ -22,7 +22,7 @@ The MDX files and `docs.json` are the source of truth. Exported ZIP files and un
 Install the CLIs once:
 
 ```sh
-npm install -g mintlify
+npm install -g mint
 npm install -g vercel
 ```
 
@@ -30,7 +30,7 @@ Run the docs locally:
 
 ```sh
 cd docs
-mintlify dev
+mint dev
 ```
 
 Mintlify serves the preview at `http://localhost:3000` by default.
@@ -49,9 +49,9 @@ Mintlify serves the preview at `http://localhost:3000` by default.
 First-time Vercel setup:
 
 ```sh
-mintlify login
+mint login
 vercel login
-mintlify export --output /tmp/ckb-keyway-docs.zip
+mint export --output /tmp/ckb-keyway-docs.zip
 mkdir -p /tmp/ckb-keyway-docs-export
 unzip -oq /tmp/ckb-keyway-docs.zip -d /tmp/ckb-keyway-docs-export
 cd /tmp/ckb-keyway-docs-export
@@ -64,10 +64,10 @@ vercel deploy --prod --yes
 Run these commands from this `docs` directory:
 
 ```sh
-mintlify validate
-mintlify broken-links
-mintlify a11y
-mintlify export --output /tmp/ckb-keyway-docs.zip
+mint validate
+mint broken-links
+mint a11y
+mint export --output /tmp/ckb-keyway-docs.zip
 unzip -oq /tmp/ckb-keyway-docs.zip -d /tmp/ckb-keyway-docs-export
 cd /tmp/ckb-keyway-docs-export
 vercel deploy --prod --yes
