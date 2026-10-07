@@ -19,10 +19,33 @@ import {
   waitForExit,
   withUserOperation,
   requireClosedChannels,
+  purgeRetiredUser,
 } from "../managed-host/index.mjs";
 
 const USER = "a".repeat(64);
 const ENCRYPTION_KEY = randomBytes(32);
+
+test("retired node purge is exact, preserves other users and keeps the tombstone", async () => {
+  const root = await mkdtemp(join(tmpdir(), "keyway-purge-test-"));
+  const roots = { dataRoot: join(root, "users"), backupRoot: join(root, "backups"), retiredRoot: join(root, "retired") };
+  const other = "b".repeat(64);
+  try {
+    for (const path of Object.values(roots)) await mkdir(path, { recursive: true });
+    for (const id of [USER, other]) {
+      await mkdir(join(roots.dataRoot, id));
+      await mkdir(join(roots.backupRoot, id));
+    }
+    await assert.rejects(purgeRetiredUser(USER, roots), /Only a retired/);
+    await assert.rejects(purgeRetiredUser("../users", roots), /invalid/);
+    await writeFile(join(roots.retiredRoot, USER), "retired");
+    await purgeRetiredUser(USER, roots);
+    await assert.rejects(stat(join(roots.dataRoot, USER)));
+    await assert.rejects(stat(join(roots.backupRoot, USER)));
+    await stat(join(roots.dataRoot, other));
+    await stat(join(roots.backupRoot, other));
+    await stat(join(roots.retiredRoot, USER));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 test("node retirement rejects active, settling, or unknown channel states", () => {
   requireClosedChannels([]);

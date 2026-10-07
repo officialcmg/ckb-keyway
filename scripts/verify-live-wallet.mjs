@@ -78,7 +78,7 @@ try {
         console.log("PASS production UI: account-only login, explicit connection, funded channel display, logout");
         continue;
       }
-      await page.route(`${origin}/__sdk-verification`, route => route.fulfill({ contentType: "text/html", body: '<div id="root"></div><script src="/__sdk-fixture.js"></script>' }));
+      await page.route(`${origin}/__sdk-verification*`, route => route.fulfill({ contentType: "text/html", body: '<div id="root"></div><script src="/__sdk-fixture.js"></script>' }));
       await page.route(`${origin}/__sdk-fixture.js`, route => route.fulfill({ contentType: "text/javascript", body: Buffer.from(bundle.outputFiles[0].contents) }));
       await page.goto(`${origin}/__sdk-verification?app=${encodeURIComponent(appId)}`, { waitUntil: "domcontentloaded", timeout: 120_000 });
       await page.waitForFunction(() => ["ready", "error"].includes(window.probe?.account.status), undefined, { timeout: 180_000 });

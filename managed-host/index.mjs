@@ -59,6 +59,12 @@ async function handleRequest(request, response) {
     if (retirement) {
       return send(response, 200, await withUserOperation(retirement[1], () => retireUser(retirement[1])));
     }
+    const purge = request.method === "POST" && /^\/users\/([0-9a-f]{64})\/purge-retired$/.exec(request.url ?? "");
+    if (purge) {
+      const { confirmUserId } = await readJsonBody(request);
+      if (confirmUserId !== purge[1]) throw new Error("Explicit retired-user confirmation is required");
+      return send(response, 200, await withUserOperation(purge[1], () => purgeRetiredUser(purge[1])));
+    }
     const backups = /^\/users\/([0-9a-f]{64})\/backups$/.exec(request.url ?? "");
     if (backups && request.method === "GET") {
       return send(response, 200, { snapshots: await withUserOperation(backups[1], () => listSnapshots({ userId: backups[1] })) });
@@ -266,6 +272,17 @@ async function retireUser(userId) {
   await writeFile(retiredPath(userId), JSON.stringify({ retiredAt: new Date().toISOString() }), { flag: "wx", mode: 0o600 });
   await stopNode(userId);
   return { retired: true, databasePreserved: true };
+}
+
+export async function purgeRetiredUser(userId, roots = {}) {
+  if (!USER_ID.test(userId)) throw new Error("Managed user ID is invalid");
+  const marker = join(roots.retiredRoot ?? required("KEYWAY_MANAGED_RETIRED_DIR", "/fiber/retired"), userId);
+  await stat(marker).catch(() => { throw new Error("Only a retired node may be purged"); });
+  if (nodes.has(userId) || starting.has(userId)) throw new Error("Node is still running");
+  await rm(roots.dataRoot ? join(roots.dataRoot, userId) : managedDataDir(userId), { recursive: true, force: true });
+  await rm(roots.backupRoot ? join(roots.backupRoot, userId) : managedBackupDir(userId), { recursive: true, force: true });
+  // Keep the tombstone so stale callers cannot recreate the obsolete identity.
+  return { purged: true, userId };
 }
 
 export async function listSnapshots({ userId, root = managedBackupDir(userId) }) {

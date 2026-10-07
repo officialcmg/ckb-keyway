@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import postgres from "postgres";
 
 type Account = { userId: string; managedRetired: boolean; browserInspected: boolean; channels: Array<{ fundingHash: string; fundingIndex: string; closingTransaction: string; cooperative: boolean }> };
-type ResetReport = { projectId: string; accounts: Account[]; preservedAppIds: string[] };
+type ResetReport = { projectId: string; accounts: Account[]; preservedAppIds: string[]; ownerConfirmedNoOpenBrowserChannelsAt?: string };
 const reportPath = process.argv[process.argv.indexOf("--report") + 1];
 if (!process.argv.includes("--report") || !reportPath) throw new Error("Provide a complete private --report file; no deletion without channel inspection");
 const report: ResetReport = JSON.parse(await readFile(reportPath, "utf8"));
@@ -38,8 +38,9 @@ try {
   if (JSON.stringify(appIds) !== JSON.stringify([...report.preservedAppIds].sort())) throw new Error("Application preservation inventory changed");
   const tip = BigInt(await rpc("get_tip_block_number", []));
   for (const account of report.accounts) {
-    if (!account.managedRetired || !account.browserInspected || !Array.isArray(account.channels)) throw new Error("Uninspected or active node state blocks the entire reset");
-    if (wallets.find((row) => row.stytch_user_id === account.userId)?.wallet.hasOpenedChannel && !account.channels.length) throw new Error("A previously funded wallet requires settlement evidence");
+    const ownerConfirmed = typeof report.ownerConfirmedNoOpenBrowserChannelsAt === "string" && Number.isFinite(Date.parse(report.ownerConfirmedNoOpenBrowserChannelsAt));
+    if (!account.managedRetired || (!account.browserInspected && !ownerConfirmed) || !Array.isArray(account.channels)) throw new Error("Active node state or missing browser inspection/owner confirmation blocks the reset");
+    if (wallets.find((row) => row.stytch_user_id === account.userId)?.wallet.hasOpenedChannel && !account.channels.length && !ownerConfirmed) throw new Error("A previously funded wallet requires settlement evidence or explicit owner confirmation that no browser channels remain open");
     for (const channel of account.channels) {
       if (!channel.cooperative) throw new Error("Force-close settlement requires separate approval and verification");
       const closing = await rpc("get_transaction", [channel.closingTransaction]);
