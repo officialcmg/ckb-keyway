@@ -75,7 +75,13 @@ test("real Better Auth endpoints: independent OTPs, application sessions, replay
   const dashboardRequest = (token?: string) => new Request("http://localhost:3001/api/v1/keyway/auth/session", { headers: { Origin: "https://dashboard.example", "x-keyway-auth-scope": "dashboard", "x-keyway-client-ip": dashboardIp, ...(token ? { Authorization: `Bearer ${token}` } : {}) } });
   const dashboardEmail = `developer-${crypto.randomUUID()}@example.com`;
   const dashboardChallenge = await sendEmailCode(dashboardRequest(), dashboardEmail);
-  const dashboardLogin = await verifyEmailCode(dashboardRequest(), dashboardChallenge.challengeId, emails.get(`dashboard:${dashboardEmail}`)!);
+  const dashboardVerify = await handleKeyWayRequest(new Request("http://localhost:3001/api/v1/keyway/auth/verify-code", {
+    method: "POST",
+    headers: { ...Object.fromEntries(dashboardRequest().headers), "Content-Type": "application/json" },
+    body: JSON.stringify({ challengeId: dashboardChallenge.challengeId, code: emails.get(`dashboard:${dashboardEmail}`)! }),
+  }));
+  const dashboardLogin = await dashboardVerify.json();
+  assert.equal(dashboardVerify.status, 200, JSON.stringify(dashboardLogin));
   assert.equal((await sessionForRequest(dashboardRequest(dashboardLogin.sessionToken))).user.scopeId, "dashboard");
   await assert.rejects(sessionForRequest(request(appA, dashboardLogin.sessionToken)), /Session/);
   const listHeaders = new Headers(dashboard.headers);

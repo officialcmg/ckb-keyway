@@ -6,11 +6,13 @@ import { build } from "esbuild";
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE ?? "playwright");
 const api = "https://keyway-api-production.up.railway.app/api/v1/keyway";
 const origin = "https://ckbkeyway.dev";
+const appId = process.env.KEYWAY_TEST_APP_ID;
+if (!appId) throw new Error("KEYWAY_TEST_APP_ID must identify a registered disposable-test application");
 const bundle = await build({ entryPoints: ["tests/fixtures/react-sdk.tsx"], bundle: true, write: false, platform: "browser", format: "iife", jsx: "automatic", define: { "process.env.KEYWAY_API_TARGET": '"production"', "process.env.NODE_ENV": '"development"' } });
 async function json(url, body, token, headers = {}) {
   let response;
   for (let attempt = 0; attempt < 4; attempt++) {
-    response = await fetch(url, { method: body ? "POST" : "GET", headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers }, ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(30_000) });
+    response = await fetch(url, { method: body ? "POST" : "GET", headers: { "Content-Type": "application/json", ...(url.startsWith(api) ? { Origin: origin, "X-KeyWay-App-Id": appId } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers }, ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(30_000) });
     if (response.status !== 429 || attempt === 3) break;
     await new Promise(resolve => setTimeout(resolve, 20_000));
   }
@@ -21,7 +23,7 @@ async function json(url, body, token, headers = {}) {
 async function login(mailbox) {
   const existing = await json("https://api.mail.tm/messages", undefined, mailbox.token);
   for (const message of existing["hydra:member"]) mailbox.seen.add(message.id);
-  const { methodId } = await json(`${api}/auth/send-code`, { email: mailbox.email }, undefined, { Origin: origin });
+  const { challengeId } = await json(`${api}/auth/send-code`, { email: mailbox.email });
   for (let attempt = 0; attempt < 30; attempt++) {
     const messages = await json("https://api.mail.tm/messages", undefined, mailbox.token);
     for (const message of messages["hydra:member"]) {
@@ -30,7 +32,7 @@ async function login(mailbox) {
       const match = `${full.text ?? ""} ${full.html?.join(" ") ?? ""}`.match(/\b\d{6}\b/);
       if (match) {
         mailbox.seen.add(message.id);
-        return json(`${api}/auth/verify-code`, { methodId, code: match[0] }, undefined, { Origin: origin });
+        return json(`${api}/auth/verify-code`, { challengeId, code: match[0] });
       }
     }
     await new Promise(resolve => setTimeout(resolve, 2000));
@@ -55,7 +57,7 @@ try {
     for (let device = 0; device < (process.env.PRODUCTION_UI === "1" ? 1 : 2); device++) {
       const session = await login(mailbox);
       const context = await browser.newContext();
-      await context.addInitScript(session => localStorage.setItem("ckb-keyway.session", JSON.stringify({ authToken: session.sessionToken, user: session.user })), session);
+      await context.addInitScript(({ session, appId }) => localStorage.setItem(`ckb-keyway.session.v2:${appId}`, JSON.stringify({ authToken: session.sessionToken, user: session.user, expiresAt: session.expiresAt, appId })), { session, appId });
       const page = await context.newPage();
       const calls = [];
       page.on("request", request => { if (request.url().endsWith("/managed-node")) calls.push(request.postDataJSON()); });
@@ -78,7 +80,7 @@ try {
       }
       await page.route(`${origin}/__sdk-verification`, route => route.fulfill({ contentType: "text/html", body: '<div id="root"></div><script src="/__sdk-fixture.js"></script>' }));
       await page.route(`${origin}/__sdk-fixture.js`, route => route.fulfill({ contentType: "text/javascript", body: Buffer.from(bundle.outputFiles[0].contents) }));
-      await page.goto(`${origin}/__sdk-verification`, { waitUntil: "domcontentloaded", timeout: 120_000 });
+      await page.goto(`${origin}/__sdk-verification?app=${encodeURIComponent(appId)}`, { waitUntil: "domcontentloaded", timeout: 120_000 });
       await page.waitForFunction(() => ["ready", "error"].includes(window.probe?.account.status), undefined, { timeout: 180_000 });
       assert.equal(await page.evaluate(() => window.probe.account.status), "ready", "Real account recovery failed");
       assert.equal(calls.length, 0, "Login must not start managed Fiber");
@@ -122,7 +124,7 @@ try {
       console.log("PASS disposable channel funded and ready");
     }
     for (const [sender, receiver] of [[activePages[0].page, activePages[1].page], [activePages[1].page, activePages[0].page]]) {
-      const invoice = await receiver.evaluate(async () => (await window.probe.fiber.createInvoice({ amount: "0x5f5e100", currency: "Fibt", description: "KeyWay 0.1.0 disposable verification", expiry: "0x36ee80" })).invoice_address);
+      const invoice = await receiver.evaluate(async () => (await window.probe.fiber.createInvoice({ amount: "0x5f5e100", currency: "Fibt", description: "KeyWay disposable verification", expiry: "0x36ee80" })).invoice_address);
       let routable = false;
       for (let attempt = 0; attempt < 20; attempt++) {
         routable = await sender.evaluate(async invoice => (await window.probe.fiber.preflightPayment({ invoice, max_fee_amount: "0x5f5e100" })).routable, invoice);

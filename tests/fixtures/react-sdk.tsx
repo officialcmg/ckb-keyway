@@ -11,4 +11,4 @@ function Probe() {
 const params = new URLSearchParams(location.search);
 const root = createRoot(document.getElementById("root")!);
 Object.assign(window, { unmount: () => root.unmount() });
-root.render(<KeyWayProvider nodeMode={params.has("browser") ? "browser" : "managed"} autoConnect={params.has("auto")}><Probe /></KeyWayProvider>);
+root.render(<KeyWayProvider appId={params.get("app") ?? undefined} nodeMode={params.has("browser") ? "browser" : "managed"} autoConnect={params.has("auto")}><Probe /></KeyWayProvider>);

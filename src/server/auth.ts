@@ -170,7 +170,10 @@ export async function verifyEmailCode(request: Request, challengeId: string, cod
     if (!sessionToken) throw new Error("Authentication session was not issued");
     await connection`update keyway_auth_challenges set status = 'consumed' where id = ${challengeId}`;
     const user = await keywayUser(result.user.id, scope.id);
-    const sessionResponse = await callAuthEndpoint(new Request(request, { headers: new Headers({ ...Object.fromEntries(request.headers), authorization: `Bearer ${sessionToken}` }) }), scope, "/get-session");
+    const sessionRequest = new Request(request.url, {
+      headers: new Headers({ ...Object.fromEntries(request.headers), authorization: `Bearer ${sessionToken}` }),
+    });
+    const sessionResponse = await callAuthEndpoint(sessionRequest, scope, "/get-session");
     const session = await sessionResponse.json();
     if (!sessionResponse.ok || session?.session?.scopeId !== scope.id) throw new Error("Session scope mismatch");
     await recordOtpVerification(context, "verified");
