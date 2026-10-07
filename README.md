@@ -1,6 +1,6 @@
 # CKB KeyWay
 
-> The Better Auth/Resend replacement is implemented locally but not deployed or published yet. Existing live services use the previous release. Sender setup and channel-safe legacy reset are release gates; see [operator status](docs/AUTH_REPLACEMENT.md).
+> The Better Auth/Resend backend and updated demo are deployed. SDK 0.2.0 is not published yet; the demo temporarily builds the repository SDK. Published 0.1.0 authentication is incompatible with the replacement backend. Live funded acceptance is in progress, and legacy test-data deletion is blocked by the execution safety reviewer; see [operator status](docs/AUTH_REPLACEMENT.md).
 
 CKB KeyWay is reusable email-authenticated wallet infrastructure for Fiber Network. It combines Better Auth email OTP and Resend delivery, a Lit Chipotle PKP, CCC transaction construction, and a managed or browser Fiber node so an application can recover a stable CKB identity and externally fund Fiber channels without exporting the PKP private key.
 

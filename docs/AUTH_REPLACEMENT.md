@@ -1,6 +1,6 @@
 # Authentication replacement: operator release checklist
 
-## Current status (2026-10-07)
+## Current status (2026-10-08)
 
 Better Auth 1.7.7 and Resend 6.32.1 are deployed on the production API. SDK 0.2.0 is staged but not published; the production demo currently builds the local SDK using an explicit deployment build override. Railway authentication configuration and production additive migrations are complete. Real Resend delivery from `login@auth.ckbkeyway.dev`, public OTP verification, database-backed session validation and logout revocation passed against the deployed API with a disposable inbox. Funded wallet acceptance remains in progress. No legacy account, channel database or backup has been deleted. Eight obsolete managed nodes remain retired, and the empty dedicated-node deployment remains stopped.
 
