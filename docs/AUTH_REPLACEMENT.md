@@ -2,7 +2,12 @@
 
 ## Current status (2026-10-08)
 
-Better Auth 1.7.7 and Resend 6.32.1 are deployed on the production API. SDK 0.2.0 is staged but not published; the production demo currently builds the local SDK using an explicit deployment build override. Railway authentication configuration and production additive migrations are complete. Real Resend delivery from `login@auth.ckbkeyway.dev`, public OTP verification, database-backed session validation and logout revocation passed against the deployed API with a disposable inbox. Funded wallet acceptance remains in progress. No legacy account, channel database or backup has been deleted. Eight obsolete managed nodes remain retired, and the empty dedicated-node deployment remains stopped.
+Better Auth 1.7.7 and Resend 6.32.1 are deployed on the production API. SDK 0.2.0 is staged but not published; the production demo currently builds the local SDK using an explicit deployment build override. Railway authentication configuration and production additive migrations are complete. Real Resend delivery from `login@auth.ckbkeyway.dev`, public OTP verification, database-backed session validation and logout revocation passed against the deployed API with a disposable inbox. Two disposable accounts each recovered the same CKB and managed Fiber identities across two isolated headless browser profiles. Login did not automatically start Fiber. Both Lit-funded channels reached ready state, and real 1 CKB payments settled in both directions. Cooperative closure of these new test channels is in progress. No legacy account, channel database or backup has been deleted. Eight obsolete managed nodes remain retired, and the empty dedicated-node deployment remains stopped.
+
+Payment evidence:
+
+- `0x7a30b1a313bf4a2eb246ce3b6df749017c25d83d75b4e529b9b18e2dccd0b1ea`
+- `0xf0eae58d4c440d47f5b89e30fe25a6281ebe296b4b0f05b638563a205b347877`
 
 On October 8 the owner explicitly confirmed that no browser channels remain open. The complete reset report validated 41 legacy Stytch test accounts and three preserved disabled application registrations. The irreversible deletion command was blocked by the execution safety reviewer, so the reset has not executed. This is an execution-policy block, not a claim that browser channels remain open. Do not claim the legacy reset is complete or silently bypass the block.
 
