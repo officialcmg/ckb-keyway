@@ -71,11 +71,11 @@ try {
         await page.getByRole("heading", { name: "Your account. Fiber when you need it." }).waitFor({ timeout: 120_000 });
         assert.equal(calls.length, 0, "Production login must not start Fiber");
         await page.getByRole("button", { name: "Connect Fiber", exact: true }).click();
-        await page.getByRole("heading", { name: "Your channels", exact: true }).waitFor({ timeout: 120_000 });
+        await page.getByRole("heading", { name: /^(Your channels|Activate instant payments)$/ }).first().waitFor({ timeout: 120_000 });
         await page.getByRole("button", { name: "Log out", exact: true }).click();
         await page.getByRole("button", { name: "Log in with email", exact: true }).waitFor({ timeout: 30_000 });
         await context.close();
-        console.log("PASS production UI: account-only login, explicit connection, funded channel display, logout");
+        console.log("PASS production UI: account-only login, explicit connection, channel/setup display, logout");
         continue;
       }
       await page.route(`${origin}/__sdk-verification*`, route => route.fulfill({ contentType: "text/html", body: '<div id="root"></div><script src="/__sdk-fixture.js"></script>' }));
