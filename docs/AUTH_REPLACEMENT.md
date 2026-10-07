@@ -2,9 +2,11 @@
 
 ## Current status (2026-10-07)
 
-Local authentication implementation: Better Auth 1.7.7 and Resend 6.32.1, staged for SDK 0.2.0 (not published). Production authentication has not been switched. Resend credentials are absent in Railway. No legacy account, channel database or backup has been deleted. Only the managed host retirement guard has been deployed; the obsolete dedicated-node deployment was stopped, preserving its service configuration and volume.
+Local authentication implementation: Better Auth 1.7.7 and Resend 6.32.1, staged for SDK 0.2.0 (not published). Production authentication has not been switched. Railway authentication configuration is present and production additive schema migrations have completed. Real Resend delivery from `login@auth.ckbkeyway.dev`, public OTP verification, database-backed session validation and logout revocation passed using a fresh disposable inbox and the local replacement HTTP handler against production Postgres. This is not a deployed-API or funded-wallet acceptance test. No legacy account, channel database or backup has been deleted. Only the managed host retirement guard has been deployed; the obsolete dedicated-node deployment was stopped, preserving its service configuration and volume.
 
 Real PostgreSQL HTTP endpoint tests verify independent application OTPs, resend isolation, atomic one-use consumption across two auth instances, app-bound sessions, dashboard access, renewal, revocation, expiry, attempts, delivery failures, and durable concurrent limits. The full suite passed 89 tests without skips; seven headless React scenarios passed. Light/dark email and OTP modals match the Git baseline at 360px and 1280px (less than 0.1% pixel variance). SDK, API and demo builds and typecheck passed.
+
+The real delivery test exposed a consumed-request-body bug after OTP verification. Session validation now constructs a fresh bodyless request. A regression exercises the public verification handler with a JSON POST body, rather than only calling the internal auth function.
 
 ## Release order
 

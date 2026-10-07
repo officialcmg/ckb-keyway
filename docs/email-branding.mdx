@@ -12,13 +12,7 @@ Applications do not upload email HTML or configure provider template IDs. The ba
 
 The existing `src/server/email-template.ts` uses a neutral white card, a prominent selectable code, a ten-minute expiry notice, an ignore-if-not-requested message, and a plaintext alternative. Better Auth supplies the code; the template does not generate or verify it.
 
-From the repository root, export the template files:
-
-```sh
-node --import tsx scripts/export-otp-email.mjs "Your registered app name" "123456" /tmp/keyway-email
-```
-
-This exports a preview only. Live delivery uses Better Auth's generated OTP. Sending or resending in App B does not replace App A's code for the same email.
+Sending or resending in App B does not replace App A's code for the same email. SDK developers do not need to run a template export command or configure Resend.
 
 ## Sender domain (operator setup)
 
@@ -27,7 +21,7 @@ This exports a preview only. Live delivery uses Better Auth's generated OTP. Sen
 3. Wait for Resend to verify the domain.
 4. Create a sending-only key restricted to this domain; configure server-only `RESEND_API_KEY`.
 5. Set `KEYWAY_AUTH_EMAIL_FROM` to `CKB KeyWay <login@auth.ckbkeyway.dev>` and disable open/click tracking.
-6. Add an approved DMARC TXT record at `_dmarc.auth.ckbkeyway.dev`, initially `v=DMARC1; p=none;`. Add reporting only with a working reporting address.
+6. Optionally add an approved DMARC TXT record at `_dmarc.auth.ckbkeyway.dev`, initially `v=DMARC1; p=none;`. This is recommended but does not block Resend setup. Add reporting only with a working reporting address.
 7. Test a disposable account; inspect received-message SPF, DKIM, DMARC and desktop/mobile rendering.
 
 No subscription or DNS modification is automatic. Provider acceptance does not guarantee inbox delivery. Provider errors fail the request rather than reporting a false delivery success. See [Resend domain setup](https://resend.com/docs/add-a-domain).
