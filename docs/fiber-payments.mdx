@@ -99,6 +99,8 @@ const created = await fiber.createInvoice({
 console.log(created.invoice_address);
 ```
 
+`expiry` is a hex string of seconds, as Fiber's `new_invoice` RPC expects. If you omit it, the invoice expires after 24 hours (`0x15180`) in both managed and browser mode. Managed mode accepts 60 seconds to 24 hours and rejects anything else with "Invoice expiry must be between 60 seconds and 24 hours". Managed invoices always use the `Fibt` testnet currency.
+
 ## Pay an invoice
 
 Preflight the exact invoice and fee limit before showing a confirmation:

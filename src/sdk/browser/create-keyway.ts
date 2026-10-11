@@ -8,6 +8,7 @@ import {
   shouldDiagnoseFundingAbortError,
   type Channel,
   type ChannelId,
+  type NewInvoiceParams,
   type OpenChannelWithExternalFundingParams,
   type SendPaymentParams,
 } from "@fiber-pay/sdk/browser";
@@ -23,6 +24,7 @@ import { KeyWayApiClient } from "./api-client";
 import { createEncryptedNodeBackup, restoreEncryptedNodeBackup } from "./node-backup";
 import { backUpBeforeLogout, restoreBeforeStart } from "./node-migration";
 import { toKeyWayError, type KeyWayError } from "./keyway-error";
+import { withDefaultInvoiceExpiry } from "./invoice-expiry";
 
 export type KeyWayFundingParams = Omit<
   OpenChannelWithExternalFundingParams,
@@ -300,7 +302,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     graphNodes: node.graphNodes.bind(node),
     graphChannels: node.graphChannels.bind(node),
     waitForChannelReady: node.waitForChannelReady.bind(node),
-    newInvoice: node.newInvoice.bind(node),
+    newInvoice: (params: NewInvoiceParams) => node.newInvoice(withDefaultInvoiceExpiry(params)),
     getInvoice: node.getInvoice.bind(node),
     parseInvoice: node.parseInvoice.bind(node),
     preflightPayment,

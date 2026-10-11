@@ -32,3 +32,24 @@ test("managed payments reuse the exact preflight confirmation once", async () =>
   assert.equal(requests[1].body.confirmationNonce, "confirmation-1");
   assert.match(requests[1].key ?? "", /^[0-9a-f-]{36}$/);
 });
+
+test("managed invoices forward the caller expiry", async () => {
+  const bodies: Array<Record<string, unknown>> = [];
+  const keyway = createManagedKeyWay({
+    authToken: "session",
+    ckbPublicKey: `0x02${"11".repeat(32)}`,
+    confirmFunding: () => true,
+    apiClient: {
+      managedNode: async (_token: string, body: Record<string, unknown>) => {
+        bodies.push(body);
+        return { invoice_address: "fibt-test" };
+      },
+    } as never,
+  });
+
+  await keyway.newInvoice({ amount: "0x64", currency: "Fibt", description: "tea", expiry: "0xe10" });
+  await keyway.newInvoice({ amount: "0x64", currency: "Fibt" });
+
+  assert.deepEqual(bodies[0], { operation: "new-invoice", amount: "0x64", description: "tea", expiry: "0xe10" });
+  assert.equal(bodies[1].expiry, undefined);
+});

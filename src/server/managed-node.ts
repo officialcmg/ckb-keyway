@@ -15,6 +15,7 @@ import { toKeyWayError } from "../sdk/browser/keyway-error.ts";
 import { connectCandidates, TESTNET_CHANNEL_PEERS } from "../sdk/browser/channel-peers.ts";
 import { normalizeCkbTransactionForCcc } from "@fiber-pay/sdk/browser";
 import { serializeCccTransactionForRpc } from "../sdk/browser/ccc-transaction.ts";
+import { DEFAULT_INVOICE_EXPIRY } from "../sdk/browser/invoice-expiry.ts";
 
 type ManagedNodeClient = Pick<
   FiberRpcClient,
@@ -344,8 +345,16 @@ function invoiceParams(body: Record<string, unknown>): NewInvoiceParams {
     amount: body.amount as `0x${string}`,
     currency: "Fibt",
     description: body.description as string | undefined,
-    expiry: "0x15180",
+    expiry: invoiceExpiry(body.expiry),
   };
+}
+
+function invoiceExpiry(value: unknown): `0x${string}` {
+  if (value === undefined) return DEFAULT_INVOICE_EXPIRY;
+  if (typeof value !== "string" || !/^0x[0-9a-f]+$/i.test(value) || BigInt(value) < 60n || BigInt(value) > 86_400n) {
+    throw new Error("Invoice expiry must be between 60 seconds and 24 hours");
+  }
+  return value as `0x${string}`;
 }
 
 function confirmationPayload(params: SendPaymentParams): string {

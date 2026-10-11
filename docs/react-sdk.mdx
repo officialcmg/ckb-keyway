@@ -60,7 +60,7 @@ const {
 | `refreshChannels()` | Read channels and update React state. |
 | `openChannel(options, onProgress?)` | Confirm/fund, wait for readiness, and refresh channels. |
 | `closeChannel(id, options?)` | Request closure and refresh. On-chain settlement is asynchronous. |
-| `createInvoice(params)` | Create a Fiber testnet invoice. |
+| `createInvoice(params)` | Create a Fiber testnet invoice. `expiry` is hex seconds; it defaults to 24 hours (`0x15180`), and managed mode accepts 60 seconds to 24 hours. |
 | `getInvoice(params)` / `parseInvoice(params)` | Read invoice status or decode contents. |
 | `preflightPayment(params)` | Test routing for an invoice/fee limit at that moment. |
 | `payInvoice(invoice, options?)` | Submit, wait for successful settlement, and refresh. Show confirmation before calling. |

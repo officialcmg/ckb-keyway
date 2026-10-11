@@ -124,7 +124,7 @@ try {
       console.log("PASS disposable channel funded and ready");
     }
     for (const [sender, receiver] of [[activePages[0].page, activePages[1].page], [activePages[1].page, activePages[0].page]]) {
-      const invoice = await receiver.evaluate(async () => (await window.probe.fiber.createInvoice({ amount: "0x5f5e100", currency: "Fibt", description: "KeyWay disposable verification", expiry: "0x36ee80" })).invoice_address);
+      const invoice = await receiver.evaluate(async () => (await window.probe.fiber.createInvoice({ amount: "0x5f5e100", currency: "Fibt", description: "KeyWay disposable verification", expiry: "0xe10" })).invoice_address);
       let routable = false;
       for (let attempt = 0; attempt < 20; attempt++) {
         routable = await sender.evaluate(async invoice => (await window.probe.fiber.preflightPayment({ invoice, max_fee_amount: "0x5f5e100" })).routable, invoice);

@@ -30,6 +30,28 @@ const node = {
   shutdownChannel: async () => undefined,
 };
 
+test("managed invoices honor a bounded caller expiry and default to 24 hours", async () => {
+  const request = (expiry?: unknown) => managedNodeRequest("user-1", {
+    operation: "new-invoice",
+    amount: "0x5f5e100",
+    ...(expiry === undefined ? {} : { expiry }),
+  }, node as never);
+
+  await request("0xe10");
+  assert.equal(lastInvoiceParams?.expiry, "0xe10");
+  assert.equal(lastInvoiceParams?.currency, "Fibt");
+  await request("0x3c");
+  assert.equal(lastInvoiceParams?.expiry, "0x3c");
+  await request("0x15180");
+  assert.equal(lastInvoiceParams?.expiry, "0x15180");
+  await request();
+  assert.equal(lastInvoiceParams?.expiry, "0x15180");
+
+  for (const expiry of ["0x3b", "0x15181", "3600", "0xzz", 3600]) {
+    await assert.rejects(request(expiry), /Invoice expiry must be between 60 seconds and 24 hours/);
+  }
+});
+
 test("managed beta exposes only bounded authenticated node operations", async () => {
   const status = await managedNodeRequest("user-1", { operation: "status" }, node as never) as {
     network: string;

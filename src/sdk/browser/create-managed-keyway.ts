@@ -183,6 +183,7 @@ export function createManagedKeyWay(options: {
       operation: "new-invoice",
       amount: params.amount,
       description: params.description,
+      expiry: params.expiry,
     }, crypto.randomUUID());
   }
 
