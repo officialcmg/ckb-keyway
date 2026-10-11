@@ -86,11 +86,14 @@ function toHex(value: bigint) {
   return `0x${value.toString(16)}`;
 }
 
+// Fiber invoice expiry is in seconds.
+const INVOICE_EXPIRY_SECONDS = 60n * 60n;
+
 const created = await fiber.createInvoice({
   amount: toHex(1n * SHANNONS_PER_CKB),
   currency: "Fibt",
   description: "Order 42",
-  expiry: "0x36ee80",
+  expiry: toHex(INVOICE_EXPIRY_SECONDS),
 });
 
 console.log(created.invoice_address);

@@ -43,6 +43,16 @@ test("the reference app imports the SDK package", async () => {
   assert.doesNotMatch(referenceApp, /src\/sdk\/react/);
 });
 
+test("reference invoices expire after one hour in Fiber's seconds unit", async () => {
+  const referenceApp = await readFile(new URL("../app/auth-panel.tsx", import.meta.url), "utf8");
+  const docs = await readFile(new URL("../docs/fiber-payments.mdx", import.meta.url), "utf8");
+  for (const source of [referenceApp, docs]) {
+    assert.match(source, /const INVOICE_EXPIRY_SECONDS = 60n \* 60n;/);
+    assert.match(source, /expiry: toHex\(INVOICE_EXPIRY_SECONDS\)/);
+    assert.doesNotMatch(source, /0x36ee80/i);
+  }
+});
+
 test("defaults to managed testnet while retaining an explicit browser-wallet route", async () => {
   const provider = await readFile(new URL("../src/sdk/react/keyway-provider.tsx", import.meta.url), "utf8");
   const page = await readFile(new URL("../app/app/page.tsx", import.meta.url), "utf8");

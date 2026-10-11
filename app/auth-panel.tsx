@@ -15,6 +15,9 @@ import {
 type Phase = "recovering" | "ready" | "activating" | "paying" | "receiving" | "error";
 type FiberChannel = Awaited<ReturnType<KeyWay["listChannels"]>>["channels"][number];
 
+// Fiber's new_invoice `expiry` is in seconds.
+const INVOICE_EXPIRY_SECONDS = 60n * 60n;
+
 export function AuthPanel({ nodeMode = "managed" }: { nodeMode?: "browser" | "managed" }) {
   return (
     <KeyWayProvider appId={process.env.NEXT_PUBLIC_KEYWAY_APP_ID} nodeMode={nodeMode}>
@@ -186,7 +189,7 @@ function WalletPanel() {
         amount: toHex(parseCkb(receiveCkb)),
         currency: "Fibt",
         description: receiveDescription.trim() || undefined,
-        expiry: "0x36ee80",
+        expiry: toHex(INVOICE_EXPIRY_SECONDS),
       });
       setCreatedInvoice(result.invoice_address);
       setPhase("ready");

@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { managedNodeRequest, parseManagedNodeAssignments } from "../src/server/managed-node.ts";
 
+let lastInvoiceParams: Record<string, unknown> | undefined;
+
 const node = {
   nodeInfo: async () => ({ pubkey: `0x02${"11".repeat(32)}` }),
   connectPeer: async () => undefined,
@@ -16,7 +18,10 @@ const node = {
     funding_tx_hash: `0x${"44".repeat(32)}`,
   }),
   waitForChannelReady: async () => ({ channel_id: `0x${"33".repeat(32)}` }),
-  newInvoice: async ({ amount }: { amount: string }) => ({ invoice_address: `fibt-${amount}` }),
+  newInvoice: async (params: { amount: string }) => {
+    lastInvoiceParams = params;
+    return { invoice_address: `fibt-${params.amount}` };
+  },
   getInvoice: async () => ({ status: "Open" }),
   parseInvoice: async ({ invoice }: { invoice: string }) => ({ invoice: { currency: invoice.slice(0, 4) } }),
   sendPayment: async () => ({ payment_hash: `0x${"22".repeat(32)}`, fee: "0x1" }),
@@ -39,6 +44,8 @@ test("managed beta exposes only bounded authenticated node operations", async ()
     description: "test",
   }, node as never) as { invoice_address: string };
   assert.equal(invoice.invoice_address, "fibt-0x5f5e100");
+  // Fiber invoice expiry is in seconds: 0x15180 = 86,400 s = 24 hours.
+  assert.equal(lastInvoiceParams?.expiry, "0x15180");
 
   const parsed = await managedNodeRequest("user-1", {
     operation: "parse-invoice",
