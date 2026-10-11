@@ -1,22 +1,23 @@
-import Link from "next/link";
 import { AuthPanel } from "../auth-panel";
+import { SiteFooter } from "../_components/site-footer";
+import { SiteHeader } from "../_components/site-header";
+import "./demo.css";
 
-export default async function WalletApp({ searchParams }: { searchParams: Promise<{ mode?: string }> }) {
-  const nodeMode = (await searchParams).mode === "browser"
-    ? "browser"
-    : "managed";
+export const metadata = { title: "Live demo · CKB KeyWay" };
+
+export default async function DemoPage({ searchParams }: { searchParams: Promise<{ mode?: string; screen?: string }> }) {
+  const params = await searchParams;
+  const nodeMode = params.mode === "browser" ? "browser" : "managed";
+  const devScreen = process.env.NODE_ENV !== "production" ? params.screen : undefined;
   return (
-    <main className="app-frame wallet-app">
-      <header className="site-header">
-        <Link className="brand-lockup brand-link" href="/">
-          <span className="brand-mark" aria-hidden="true">K</span>
-          <div><strong>CKB KeyWay</strong><span>Live Fiber wallet</span></div>
-        </Link>
-        <div className="app-links"><Link href={nodeMode === "managed" ? "/app?mode=browser" : "/app"}>{nodeMode === "managed" ? "Browser wallet" : "Managed wallet"}</Link><a href="https://docs.ckbkeyway.dev">Docs</a><a href="https://www.npmjs.com/package/@ckb-keyway/react">npm</a><div className="network-pill"><span /> CKB testnet</div></div>
-      </header>
-      <section className="app-intro"><div><p className="eyebrow">{nodeMode === "managed" ? "Managed node demo" : "Browser node demo"}</p><h1>Move CKB through Fiber.</h1></div><p>{nodeMode === "managed" ? "KeyWay keeps your testnet node online. Existing browser channels stay in the browser wallet; switching modes does not migrate channels." : "Your Fiber node runs in this browser. Log out explicitly to back up its state before changing devices."}</p></section>
-      <AuthPanel nodeMode={nodeMode} />
-      <footer className="site-footer"><span>CKB KeyWay</span><Link href="/">Project overview</Link><a href="https://docs.ckbkeyway.dev">Docs</a><a href="https://www.npmjs.com/package/@ckb-keyway/react">npm</a></footer>
-    </main>
+    <div className="demo-page">
+      <SiteHeader bordered />
+      <main className="demo-main">
+        <div className="demo-wrap">
+          <AuthPanel nodeMode={nodeMode} devScreen={devScreen} />
+        </div>
+      </main>
+      <SiteFooter />
+    </div>
   );
 }

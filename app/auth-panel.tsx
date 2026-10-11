@@ -1,485 +1,248 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import dynamic from "next/dynamic";
+import { useRouter } from "next/navigation";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ccc } from "@ckb-ccc/core";
 import {
-  formatFiberOutpoint,
   friendlyKeyWayError,
   KeyWayProvider,
-  type ActivationStage,
-  type KeyWay,
-  useKeyWay,
+  toKeyWayError,
   useCkbWallet,
   useFiber,
+  useKeyWay,
+  type KeyWayChannel,
+  type KeyWayLifecycleEvent,
 } from "@ckb-keyway/react";
-
-type Phase = "recovering" | "ready" | "activating" | "paying" | "receiving" | "error";
-type FiberChannel = Awaited<ReturnType<KeyWay["listChannels"]>>["channels"][number];
+import { DemoView, type DemoActions, type DemoActivity, type DemoChannel, type DemoModel, type LifecycleEvent, type NodeMode } from "./app/demo-view";
+import { parseCkb, toHex } from "./app/format";
 
 // Fiber's new_invoice `expiry` is in seconds.
 const INVOICE_EXPIRY_SECONDS = 60n * 60n;
+const PAYMENT_OPTIONS = { timeout: toHex(120_000n), max_fee_amount: toHex(parseCkb("1")) };
 
-export function AuthPanel({ nodeMode = "managed" }: { nodeMode?: "browser" | "managed" }) {
+/** Development-only state previews (`/app?screen=…`); never bundled in production. */
+const DevScreen = process.env.NODE_ENV !== "production"
+  ? dynamic(() => import("./app/dev-screens").then((module) => module.DevScreen), { ssr: false })
+  : () => null;
+
+export function AuthPanel({ nodeMode = "managed", devScreen }: { nodeMode?: NodeMode; devScreen?: string }) {
+  const router = useRouter();
+  const theme = useSystemTheme();
+  const setMode = useCallback((mode: NodeMode) => router.push(mode === "browser" ? "/app?mode=browser" : "/app"), [router]);
+  if (process.env.NODE_ENV !== "production" && devScreen) return <DevScreen screen={devScreen} nodeMode={nodeMode} />;
+  return <LiveDemo key={nodeMode} nodeMode={nodeMode} theme={theme} setMode={setMode} />;
+}
+
+function LiveDemo({ nodeMode, theme, setMode }: { nodeMode: NodeMode; theme: "light" | "dark"; setMode: (mode: NodeMode) => void }) {
+  const [events, setEvents] = useState<LifecycleEvent[]>([]);
+  const onLifecycle = useCallback((event: KeyWayLifecycleEvent) => {
+    setEvents((current) => event.stage === "recovering_identity" ? [event] : [...current, event]);
+  }, []);
   return (
-    <KeyWayProvider appId={process.env.NEXT_PUBLIC_KEYWAY_APP_ID} nodeMode={nodeMode}>
-      <WalletPanel />
+    <KeyWayProvider appId={process.env.NEXT_PUBLIC_KEYWAY_APP_ID} nodeMode={nodeMode} theme={theme} onLifecycle={onLifecycle}>
+      <LiveWallet nodeMode={nodeMode} events={events} resetEvents={() => setEvents([])} setMode={setMode} />
     </KeyWayProvider>
   );
 }
 
-function WalletPanel() {
-  const {
-    ready,
-    authenticated,
-    login,
-    logout,
-  } = useKeyWay();
+function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
+  nodeMode: NodeMode;
+  events: LifecycleEvent[];
+  resetEvents: () => void;
+  setMode: (mode: NodeMode) => void;
+}) {
+  const { ready, authenticated, login, logout } = useKeyWay();
   const account = useCkbWallet();
   const fiber = useFiber();
-  const connected = fiber.connection;
-  const connectionError = fiber.error ?? account.error;
-  const status = fiber.status;
-  const connect = fiber.connect;
-  const [phase, setPhase] = useState<Phase>("recovering");
-  const [channelReady, setChannelReady] = useState(false);
-  const [channelEvidence, setChannelEvidence] = useState<{ channelId: string; fundingOutpoint: string }>();
-  const [fundingResult, setFundingResult] = useState<string>();
-  const [activationStage, setActivationStage] = useState<ActivationStage>();
-  const [invoiceToPay, setInvoiceToPay] = useState("");
-  const [paymentPreview, setPaymentPreview] = useState<{ amountCkb: string }>();
-  const [paymentResult, setPaymentResult] = useState<string>();
-  const [receiveCkb, setReceiveCkb] = useState("1");
-  const [receiveDescription, setReceiveDescription] = useState("CKB KeyWay payment");
-  const [createdInvoice, setCreatedInvoice] = useState<string>();
-  const [error, setError] = useState<string>();
-  const [notice, setNotice] = useState<string>();
-  const [closingChannel, setClosingChannel] = useState<FiberChannel>();
-  const [closing, setClosing] = useState<string>();
-  const [balanceShannons, setBalanceShannons] = useState<bigint>();
-  const [channels, setChannels] = useState<FiberChannel[]>([]);
+  const [walletRecovery, setWalletRecovery] = useState<{ at: number; durationMs?: number }>();
+  const [failedAt, setFailedAt] = useState<number>();
+  const [activity, setActivity] = useState<DemoActivity[]>([]);
+  const reserved = useChannelReserves(fiber.channels);
+  const receiving = useRef(new Map<string, bigint>());
+  const fiberRef = useRef(fiber);
+  fiberRef.current = fiber;
+  const refreshBalanceRef = useRef(account.refreshBalance);
+  refreshBalanceRef.current = account.refreshBalance;
+
+  // Time the wallet recovery that follows sign-in, so the log has something real to show before Fiber starts.
+  useEffect(() => {
+    if (account.status === "recovering") setWalletRecovery((current) => current ?? { at: Date.now() });
+    else if (account.status === "ready") setWalletRecovery((current) => current && current.durationMs === undefined ? { ...current, durationMs: Date.now() - current.at } : current);
+    else if (account.status === "disconnected") setWalletRecovery(undefined);
+  }, [account.status]);
+
+  useEffect(() => { setFailedAt(fiber.status === "error" ? Date.now() : undefined); }, [fiber.status]);
 
   useEffect(() => {
-    if (!connected) {
-      setBalanceShannons(undefined);
-      setChannels([]);
-      return;
+    if (account.status !== "ready") return;
+    const timer = window.setInterval(() => void refreshBalanceRef.current().catch(() => undefined), 15_000);
+    return () => window.clearInterval(timer);
+  }, [account.status]);
+
+  const actions = useMemo<DemoActions>(() => ({
+    login,
+    logout: async () => {
+      await logout();
+      resetEvents();
+      setActivity([]);
+    },
+    setMode,
+    connect: () => fiberRef.current.connect(),
+    openChannel: async (amount, peer, onStage) => {
+      try {
+        const { channelId } = await fiberRef.current.openChannel({ fundingAmount: amount, peer, public: true }, onStage);
+        setActivity((current) => [...current, { id: `opened-${channelId}`, kind: "opened", amount, at: Date.now() }]);
+      } catch (cause) {
+        throw new Error(readable(cause, "The channel couldn't be opened. Your CKB balance is unaffected."));
+      }
+      await refreshBalanceRef.current().catch(() => undefined);
+    },
+    closeChannel: async (channelId) => {
+      try {
+        await fiberRef.current.closeChannel(channelId as `0x${string}`);
+      } catch (cause) {
+        throw new Error(readable(cause, "The channel couldn't be closed. Try again in a moment."));
+      }
+      await refreshBalanceRef.current().catch(() => undefined);
+    },
+    checkInvoice: async (invoice) => {
+      const { invoice: parsed } = await fiberRef.current.parseInvoice({ invoice }).catch(() => { throw new Error("This doesn't look like a valid Fiber invoice."); });
+      if (!parsed.amount) return { amount: 0n, error: "This invoice has no amount. Ask the payee for one with a fixed amount." };
+      const amount = BigInt(parsed.amount);
+      const description = parsed.data.attrs.flatMap((attr) => "description" in attr ? [attr.description] : [])[0];
+      const preflight = await fiberRef.current.preflightPayment({ invoice, ...PAYMENT_OPTIONS });
+      if (!preflight.routable) return { amount, description, error: readable(preflight.error, "No route was found for this payment.") };
+      return { amount, description, fee: preflight.feeShannons };
+    },
+    pay: async (invoice, check) => {
+      try {
+        await fiberRef.current.payInvoice(invoice, PAYMENT_OPTIONS);
+      } catch (cause) {
+        throw new Error(readable(cause, "The payment didn't go through. Your balance is unchanged."));
+      }
+      setActivity((current) => [...current, { id: `paid-${Date.now()}`, kind: "paid", amount: check.amount, at: Date.now() }]);
+    },
+    createInvoice: async (amount, description) => {
+      const result = await fiberRef.current.createInvoice({ amount: toHex(amount), currency: "Fibt", description: description || undefined, expiry: toHex(INVOICE_EXPIRY_SECONDS) });
+      receiving.current.set(result.invoice.data.payment_hash, amount);
+      return { address: result.invoice_address, amount, description: description || undefined, createdAt: Date.now(), paymentHash: result.invoice.data.payment_hash };
+    },
+    invoiceStatus: async (paymentHash) => {
+      const { status } = await fiberRef.current.getInvoice({ payment_hash: paymentHash as `0x${string}` });
+      const amount = receiving.current.get(paymentHash);
+      if (status === "Paid" && amount !== undefined) {
+        receiving.current.delete(paymentHash);
+        setActivity((current) => [...current, { id: `received-${paymentHash}`, kind: "received", amount, at: Date.now() }]);
+        void fiberRef.current.refreshChannels().catch(() => undefined);
+      }
+      return status;
+    },
+  }), [login, logout, resetEvents, setMode]);
+
+  const channels: DemoChannel[] = fiber.channels.map((channel) => ({
+    id: channel.id,
+    peer: channel.peer,
+    // The SDK's status mapping misses Fiber's SHUTTING_DOWN state, so read the raw state for it.
+    status: channel.status === "unknown" && String(channel.raw.state.state_name).includes("SHUTTING") ? "closing" : channel.status,
+    local: channel.localBalanceShannons,
+    remote: channel.remoteBalanceShannons,
+    reserved: reserved[channel.id],
+    fundingTx: fundingOutpoint(channel.raw.channel_outpoint)?.txHash,
+  }));
+  const error = fiber.error ? toKeyWayError(fiber.error) : undefined;
+
+  const model: DemoModel = {
+    nodeMode,
+    auth: !ready ? "loading" : authenticated ? "signedIn" : "signedOut",
+    account: account.status === "ready" ? "ready" : account.status === "error" ? "error" : "recovering",
+    accountError: account.status === "error" ? readable(account.error, "KeyWay couldn't finish setting up this account.") : undefined,
+    address: account.address,
+    balance: account.balance,
+    fiber: fiber.status,
+    fiberError: error ? { code: error.code, message: readable(error, "The Fiber node didn't start.") } : undefined,
+    walletRecovery,
+    events,
+    failedAt,
+    channels,
+    activity,
+  };
+  return <DemoView model={model} actions={actions} />;
+}
+
+/** Uses the SDK's friendly wording; long or garbled server text is replaced by a plain sentence. */
+function readable(cause: unknown, fallback: string): string {
+  const raw = cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "";
+  if (!raw) return fallback;
+  const friendly = friendlyKeyWayError(raw);
+  if (friendly !== raw) return friendly;
+  return raw.length > 160 || /[\u001b\n]|\[[0-9;]*m/.test(raw) ? fallback : raw;
+}
+
+/**
+ * Fiber serializes a channel outpoint either as { tx_hash, index } or as 36 molecule bytes:
+ * the 32-byte transaction hash followed by a little-endian u32 index.
+ */
+function fundingOutpoint(value: unknown): { txHash: string; index: number } | undefined {
+  if (typeof value === "string") {
+    const hex = value.replace(/^0x/i, "");
+    if (/^[0-9a-f]{72}$/i.test(hex)) {
+      const index = Number.parseInt(hex.slice(64).match(/../g)!.reverse().join(""), 16);
+      return { txHash: `0x${hex.slice(0, 64)}`, index };
     }
-    let cancelled = false;
-    setBalanceShannons(connected.balanceShannons);
-    const refresh = async () => {
-      const [balance, channelResult] = await Promise.allSettled([
-        connected.keyway.getCkbBalance(),
-        connected.keyway.listChannels({ include_closed: false }),
-      ]);
-      if (cancelled) return;
-      if (balance.status === "fulfilled") setBalanceShannons(balance.value);
-      if (channelResult.status === "fulfilled") setChannels(channelResult.value.channels);
-    };
-    void refresh();
-    const interval = window.setInterval(refresh, 10_000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-    };
-  }, [connected]);
+    return undefined;
+  }
+  if (value && typeof value === "object" && "tx_hash" in value && "index" in value) {
+    const { tx_hash: txHash, index } = value as { tx_hash: string; index: string | number };
+    return { txHash, index: Number(index) };
+  }
+  return undefined;
+}
+
+/**
+ * The reserve is whatever the funding cell holds beyond the two spendable balances and in-flight TLCs.
+ * It is read from the channel's funding cell on CKB testnet.
+ */
+function useChannelReserves(channels: KeyWayChannel[]): Record<string, bigint> {
+  const [capacities, setCapacities] = useState<Record<string, bigint>>({});
+  const client = useMemo(() => new ccc.ClientPublicTestnet(), []);
+  const outpoints = channels.flatMap((channel) => {
+    const outpoint = fundingOutpoint(channel.raw.channel_outpoint);
+    return outpoint ? [[channel.id, outpoint] as const] : [];
+  });
+  const key = outpoints.map(([id]) => id).join(",");
 
   useEffect(() => {
-    if (!connected) return;
     let cancelled = false;
-    setPhase("recovering");
-    setError(undefined);
-    void connected.keyway.listChannels({ include_closed: false }).then(({ channels }) => {
-      if (cancelled) return;
-      const readyChannel = channels.find(({ state }) => state.state_name === "CHANNEL_READY");
-      setChannels(channels);
-      setChannelReady(Boolean(readyChannel));
-      setChannelEvidence(readyChannel ? {
-        channelId: readyChannel.channel_id,
-        fundingOutpoint: formatFiberOutpoint(readyChannel.channel_outpoint),
-      } : undefined);
-      setPhase("ready");
-      if (!readyChannel) void connected.keyway.prepareCkbChannel(parseCkb("1000")).catch(() => undefined);
-    }).catch((cause) => {
-      if (cancelled) return;
-      setPhase("error");
-      setError(cause instanceof Error ? cause.message : "KeyWay recovery failed");
-    });
+    for (const [id, outpoint] of outpoints) {
+      if (capacities[id] !== undefined) continue;
+      void client.getCell({ txHash: outpoint.txHash, index: outpoint.index })
+        .then((cell) => { if (!cancelled && cell) setCapacities((current) => ({ ...current, [id]: cell.cellOutput.capacity })); })
+        .catch(() => undefined);
+    }
     return () => { cancelled = true; };
-  }, [connected]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, client]);
 
-  async function activatePayments() {
-    const current = connected;
-    if (!current) return;
-    setPhase("activating");
-    setActivationStage("connecting");
-    setError(undefined);
-    try {
-      const result = await fiber.openChannel(
-        { fundingAmount: parseCkb("1000"), public: true },
-        setActivationStage,
-      );
-      setFundingResult(result.fundingTxHash);
-      setActivationStage("waiting");
-      const { channels } = await current.keyway.listChannels({ include_closed: false });
-      const readyChannel = channels.find(({ channel_id }) => channel_id === result.channelId);
-      setChannels(channels);
-      setChannelReady(true);
-      setChannelEvidence({
-        channelId: result.channelId,
-        fundingOutpoint: formatFiberOutpoint(readyChannel?.channel_outpoint ?? null, result.fundingTxHash),
-      });
-      setPhase("ready");
-      setActivationStage(undefined);
-    } catch (cause) {
-      setPhase("ready");
-      setActivationStage(undefined);
-      setError(cause instanceof Error ? cause.message : "Fiber activation failed");
-    }
+  const reserves: Record<string, bigint> = {};
+  for (const channel of channels) {
+    const capacity = capacities[channel.id];
+    if (capacity === undefined) continue;
+    const inFlight = BigInt(channel.raw.offered_tlc_balance) + BigInt(channel.raw.received_tlc_balance);
+    const rest = capacity - channel.localBalanceShannons - channel.remoteBalanceShannons - inFlight;
+    reserves[channel.id] = rest > 0n ? rest : 0n;
   }
-
-  async function reviewPayment() {
-    const current = connected;
-    if (!current || !invoiceToPay.trim()) return;
-    setError(undefined);
-    try {
-      const { invoice } = await fiber.parseInvoice({ invoice: invoiceToPay.trim() });
-      if (!invoice.amount) throw new Error("Enter an invoice with a fixed amount");
-      const preflight = await fiber.preflightPayment({
-        invoice: invoiceToPay.trim(),
-        timeout: "0x1d4c0",
-        max_fee_amount: toHex(parseCkb("1")),
-      });
-      if (!preflight.routable) throw preflight.error;
-      setPaymentPreview({ amountCkb: formatCkb(BigInt(invoice.amount)) });
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Invoice could not be read");
-    }
-  }
-
-  async function confirmPayment() {
-    const current = connected;
-    if (!current || !invoiceToPay.trim()) return;
-    setPaymentPreview(undefined);
-    setPhase("paying");
-    setError(undefined);
-    setPaymentResult(undefined);
-    try {
-      const settled = await fiber.payInvoice(invoiceToPay.trim(), {
-        timeout: "0x1d4c0",
-        max_fee_amount: toHex(parseCkb("1")),
-      });
-      if (settled.status !== "Success") throw new Error(settled.failed_error ?? "Fiber payment failed");
-      const refreshed = await current.keyway.listChannels({ include_closed: false });
-      setChannels(refreshed.channels);
-      setPaymentResult(`Payment ${settled.payment_hash} settled`);
-      setInvoiceToPay("");
-      setPhase("ready");
-    } catch (cause) {
-      setPhase("ready");
-      setError(cause instanceof Error ? cause.message : "Fiber payment failed");
-    }
-  }
-
-  async function createInvoice() {
-    const current = connected;
-    if (!current) return;
-    setPhase("receiving");
-    setError(undefined);
-    try {
-      const result = await fiber.createInvoice({
-        amount: toHex(parseCkb(receiveCkb)),
-        currency: "Fibt",
-        description: receiveDescription.trim() || undefined,
-        expiry: toHex(INVOICE_EXPIRY_SECONDS),
-      });
-      setCreatedInvoice(result.invoice_address);
-      setPhase("ready");
-    } catch (cause) {
-      setPhase("ready");
-      setError(cause instanceof Error ? cause.message : "Invoice creation failed");
-    }
-  }
-
-  async function closeChannel() {
-    const current = connected;
-    const target = closingChannel;
-    if (!current || !target) return;
-    setClosingChannel(undefined);
-    setClosing(target.channel_id);
-    setError(undefined);
-    setNotice(undefined);
-    try {
-      await fiber.closeChannel(target.channel_id);
-      const { channels: refreshed } = await current.keyway.listChannels({ include_closed: false });
-      const ready = refreshed.find(({ state }) => state.state_name === "CHANNEL_READY");
-      setChannels(refreshed);
-      setChannelReady(Boolean(ready));
-      setChannelEvidence(ready ? {
-        channelId: ready.channel_id,
-        fundingOutpoint: formatFiberOutpoint(ready.channel_outpoint),
-      } : undefined);
-      setNotice(`Channel ${shorten(target.channel_id)} is closing. Your balance settles back on CKB once the close confirms.`);
-      setBalanceShannons(await current.keyway.getCkbBalance());
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Channel close failed");
-    } finally {
-      setClosing(undefined);
-    }
-  }
-
-  if (!ready) return <WalletProgress label="Loading secure email login" />;
-  if (!authenticated) {
-    return (
-      <section className="activation-card auth">
-        <p className="step-label">Email-secured wallet</p>
-        <h2>Enter Fiber with just your email.</h2>
-        <p>Use a one-time email code. No wallet extension or crypto onboarding required.</p>
-        <button onClick={login}>Log in with email</button>
-      </section>
-    );
-  }
-  if (!connected) {
-    return (
-      <section className="wallet-shell">
-        {!account.wallet ? <WalletProgress label={account.error ? "Wallet needs attention" : "Recovering your CKB account"} /> : (
-          <section className="activation-card">
-            <p className="step-label">CKB account ready</p>
-            <h2>Your account. Fiber when you need it.</h2>
-            <p>{account.address}</p>
-            <p>On-chain balance: {account.balance === undefined ? "Loading..." : `${formatCkb(account.balance)} CKB`}</p>
-            <button disabled={status === "connecting"} onClick={() => void connect().catch(() => undefined)}>
-              {status === "connecting" ? "Connecting Fiber..." : "Connect Fiber"}
-            </button>
-          </section>
-        )}
-        {(connectionError || error) && <p className="error">{friendlyError(connectionError?.message ?? error ?? "Wallet recovery failed")}</p>}
-        <button className="text-button" onClick={() => void logout()}>Use another email</button>
-      </section>
-    );
-  }
-
-  const currentBalance = balanceShannons ?? connected.balanceShannons;
-  const balanceCkb = formatCkb(currentBalance);
-  const readyChannels = channels.filter(({ state }) => state.state_name === "CHANNEL_READY");
-  const fiberBalance = readyChannels.reduce((total, channel) => total + BigInt(channel.local_balance), 0n);
-  const busy = phase !== "ready" && phase !== "error";
-
-  return (
-    <section className="wallet-shell">
-      <header className="wallet-header">
-        <div>
-          <p className="status"><span /> Wallet ready</p>
-          <p className="address" title={connected.wallet.ckbAddress}>{shorten(connected.wallet.ckbAddress)}</p>
-        </div>
-        <button className="text-button" onClick={() => void logout()}>Log out</button>
-      </header>
-
-      <section className="balance-overview" aria-label="Wallet balances">
-        <div className="fiber-balance-card">
-          <div className="balance-heading"><span>Total Fiber balance</span><span>{readyChannels.length} active {readyChannels.length === 1 ? "channel" : "channels"}</span></div>
-          <strong>{formatCkb(fiberBalance)} <small>CKB</small></strong>
-          <p>Available inside your payment channels.</p>
-        </div>
-        <div className="chain-balance-card">
-          <span>Available on CKB</span>
-          <strong>{balanceCkb} <small>CKB</small></strong>
-          <a href={`https://faucet.nervos.org/?address=${connected.wallet.ckbAddress}`} target="_blank" rel="noreferrer">Add testnet CKB</a>
-        </div>
-      </section>
-
-      {!channelReady ? (
-        <section className="activation-card">
-          <p className="step-label">One-time setup</p>
-          <h2>Activate instant payments</h2>
-          <p>Lock 1,000 testnet CKB in your Fiber channel. You still own it, and normal payments happen off-chain.</p>
-          <button onClick={activatePayments} disabled={busy || currentBalance < parseCkb("1100")}>
-            {phase === "activating" ? activationLabel(activationStage) : "Activate Fiber payments"}
-          </button>
-          {phase === "activating" && activationStage && <p className="hint" role="status">{activationDetail(activationStage)}</p>}
-          {currentBalance < parseCkb("1100") && <p className="hint">Add testnet CKB before activating.</p>}
-          {fundingResult && <p className="hint">Funding submitted: {shorten(fundingResult)}</p>}
-        </section>
-      ) : (
-        <>
-          <ChannelList channels={channels} closing={closing} onClose={setClosingChannel} />
-          <div className="payment-grid">
-            <section className="payment-card">
-              <p className="step-label">Send</p>
-              <h2>Pay an invoice</h2>
-              <textarea value={invoiceToPay} onChange={(event) => setInvoiceToPay(event.target.value)} placeholder="Paste a Fiber invoice" />
-              <button onClick={reviewPayment} disabled={busy || !invoiceToPay.trim()}>
-                {phase === "paying" ? "Paying..." : "Review payment"}
-              </button>
-            </section>
-
-            <section className="payment-card">
-              <p className="step-label">Receive</p>
-              <h2>Create an invoice</h2>
-              <label>Amount in CKB<input value={receiveCkb} onChange={(event) => setReceiveCkb(event.target.value)} /></label>
-              <label>Note<input value={receiveDescription} onChange={(event) => setReceiveDescription(event.target.value)} /></label>
-              <button onClick={createInvoice} disabled={busy}>
-                {phase === "receiving" ? "Creating..." : "Create invoice"}
-              </button>
-            </section>
-          </div>
-        </>
-      )}
-
-      {createdInvoice && <OutputCard label="Invoice" value={createdInvoice} />}
-      {paymentResult && <p className="success">{paymentResult}</p>}
-      {notice && <p className="success">{notice}</p>}
-      {error && <p className="error">{friendlyError(error)}</p>}
-
-      <details className="diagnostics">
-        <summary>Developer diagnostics</summary>
-        <dl>
-          <dt>CKB address</dt><dd>{connected.wallet.ckbAddress}</dd>
-          <dt>Fiber node</dt><dd>{connected.node.pubkey}</dd>
-          <dt>Connected peers</dt><dd>{connected.peers.length}</dd>
-          {channelEvidence && <><dt>Channel ID</dt><dd>{channelEvidence.channelId}</dd></>}
-          {channelEvidence && <><dt>Funding outpoint</dt><dd>{channelEvidence.fundingOutpoint}</dd></>}
-          <dt>Identity storage</dt><dd>This browser</dd>
-        </dl>
-      </details>
-
-      {paymentPreview && (
-        <div className="modal-backdrop" role="presentation">
-          <section className="confirm-sheet" role="dialog" aria-modal="true" aria-labelledby="payment-confirm-title">
-            <p className="step-label">Payment confirmation</p>
-            <h2 id="payment-confirm-title">Send {paymentPreview.amountCkb} CKB?</h2>
-            <dl>
-              <dt>Amount</dt><dd>{paymentPreview.amountCkb} CKB</dd>
-              <dt>Maximum fee</dt><dd>1 CKB</dd>
-              <dt>Network</dt><dd>Fiber testnet</dd>
-            </dl>
-            <p className="hint">The payment moves through Fiber and does not create a separate CKB transaction.</p>
-            <div className="confirm-actions">
-              <button className="quiet" onClick={() => setPaymentPreview(undefined)}>Cancel</button>
-              <button onClick={confirmPayment}>Confirm payment</button>
-            </div>
-          </section>
-        </div>
-      )}
-
-      {closingChannel && (
-        <div className="modal-backdrop" role="presentation">
-          <section className="confirm-sheet" role="dialog" aria-modal="true" aria-labelledby="close-confirm-title">
-            <p className="step-label">Channel confirmation</p>
-            <h2 id="close-confirm-title">Close this channel?</h2>
-            <dl>
-              <dt>Your balance</dt><dd>{formatCkb(BigInt(closingChannel.local_balance))} CKB</dd>
-              <dt>Peer</dt><dd>{shorten(closingChannel.pubkey)}</dd>
-              <dt>Network</dt><dd>Fiber testnet</dd>
-            </dl>
-            <p className="hint">Closing settles your channel balance back on CKB and stops off-chain payments on this channel.</p>
-            <div className="confirm-actions">
-              <button className="quiet" onClick={() => setClosingChannel(undefined)}>Cancel</button>
-              <button onClick={closeChannel}>Confirm close</button>
-            </div>
-          </section>
-        </div>
-      )}
-    </section>
-  );
+  return reserves;
 }
 
-function WalletProgress({ label }: { label: string }) {
-  return <p className="status loading"><span /> {label}</p>;
-}
-
-function activationLabel(stage?: ActivationStage): string {
-  if (stage === "confirming") return "Review the transaction";
-  if (stage === "signing") return "Authorizing...";
-  if (stage === "broadcasting") return "Submitting...";
-  if (stage === "waiting") return "Confirming on CKB...";
-  if (stage === "negotiating") return "Preparing transaction...";
-  return "Connecting to Fiber...";
-}
-
-function activationDetail(stage: ActivationStage): string {
-  if (stage === "connecting") return "Connecting to an official Fiber testnet channel provider.";
-  if (stage === "negotiating") return "Fiber is agreeing the channel details and building the exact CKB transaction.";
-  if (stage === "confirming") return "Review the exact funding amount and network fee.";
-  if (stage === "signing") return "Lit is authorizing the transaction you approved.";
-  if (stage === "waiting") return "The channel transaction was submitted. CKB testnet is confirming it now.";
-  return "The signed channel transaction is being submitted to CKB testnet.";
-}
-
-function OutputCard({ label, value }: { label: string; value: string }) {
-  return <section className="output-card"><span>{label}</span><code>{value}</code></section>;
-}
-
-function ChannelList({ channels, closing, onClose }: {
-  channels: FiberChannel[];
-  closing?: string;
-  onClose: (channel: FiberChannel) => void;
-}) {
-  return (
-    <section className="channel-section">
-      <header><div><p className="step-label">Liquidity</p><h2>Your channels</h2></div><span>{channels.length} open</span></header>
-      <div className="channel-list">
-        {channels.map((channel, index) => {
-          const local = BigInt(channel.local_balance);
-          const remote = BigInt(channel.remote_balance);
-          const capacity = local + remote;
-          const share = capacity === 0n ? 0 : Number((local * 10_000n) / capacity) / 100;
-          return (
-            <article className="channel-row" key={channel.channel_id}>
-              <div className="channel-identity">
-                <span className="channel-index">{String(index + 1).padStart(2, "0")}</span>
-                <div><strong>{shorten(channel.pubkey)}</strong><span>Peer node</span></div>
-              </div>
-              <div className="channel-liquidity">
-                <div className="channel-sides"><span><small>You</small><strong>{formatCkb(local)} CKB</strong></span><span><small>Peer</small><strong>{formatCkb(remote)} CKB</strong></span></div>
-                <div className="liquidity-track" aria-label={`${formatCkb(local)} CKB on your side and ${formatCkb(remote)} CKB on the peer side`}>
-                  <span style={{ width: `${share}%` }} />
-                </div>
-                <small className="channel-capacity">{formatCkb(capacity)} CKB total capacity</small>
-              </div>
-              <div className="channel-actions">
-                <span className="channel-state">{formatChannelState(channel.state.state_name)}</span>
-                <button
-                  className="channel-close"
-                  onClick={() => onClose(channel)}
-                  disabled={Boolean(closing) || channel.state.state_name === "SHUTTING_DOWN"}
-                >
-                  {closing === channel.channel_id ? "Closing..." : channel.state.state_name === "SHUTTING_DOWN" ? "Closing" : "Close"}
-                </button>
-              </div>
-            </article>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
-function parseCkb(value: string): bigint {
-  const match = /^(\d{1,7})(?:\.(\d{1,8}))?$/.exec(value.trim());
-  if (!match) throw new Error("Enter a valid CKB amount with at most 8 decimal places");
-  const result = BigInt(match[1]) * 100_000_000n + BigInt((match[2] ?? "").padEnd(8, "0") || "0");
-  if (result <= 0n) throw new Error("Amount must be greater than zero");
-  return result;
-}
-
-function formatChannelState(value: string): string {
-  if (value === "CHANNEL_READY") return "Ready";
-  return value.toLowerCase().replaceAll("_", " ").replace(/^\w/, (letter) => letter.toUpperCase());
-}
-
-function formatCkb(shannons: bigint): string {
-  const whole = shannons / 100_000_000n;
-  const fraction = (shannons % 100_000_000n).toString().padStart(8, "0").replace(/0+$/, "");
-  return fraction ? `${whole}.${fraction}` : whole.toString();
-}
-
-function toHex(value: bigint): `0x${string}` {
-  return `0x${value.toString(16)}`;
-}
-
-function shorten(value: string): string {
-  return value.length <= 22 ? value : `${value.slice(0, 12)}…${value.slice(-8)}`;
-}
-
-function friendlyError(value: string): string {
-  return friendlyKeyWayError(value);
+function useSystemTheme(): "light" | "dark" {
+  const [theme, setTheme] = useState<"light" | "dark">("light");
+  useEffect(() => {
+    const query = window.matchMedia("(prefers-color-scheme: dark)");
+    const update = () => setTheme(query.matches ? "dark" : "light");
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
+  return theme;
 }

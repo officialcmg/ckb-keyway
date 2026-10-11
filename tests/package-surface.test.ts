@@ -56,8 +56,10 @@ test("reference invoices expire after one hour in Fiber's seconds unit", async (
 test("defaults to managed testnet while retaining an explicit browser-wallet route", async () => {
   const provider = await readFile(new URL("../src/sdk/react/keyway-provider.tsx", import.meta.url), "utf8");
   const page = await readFile(new URL("../app/app/page.tsx", import.meta.url), "utf8");
+  const demo = await readFile(new URL("../app/auth-panel.tsx", import.meta.url), "utf8");
+  const view = await readFile(new URL("../app/app/demo-view.tsx", import.meta.url), "utf8");
   assert.match(provider, /nodeMode = "managed"/);
   assert.match(page, /mode === "browser"/);
-  assert.match(page, /\/app\?mode=browser/);
-  assert.match(page, /switching modes does not migrate channels/);
+  assert.match(demo, /\/app\?mode=browser/);
+  assert.match(view, /Each mode runs its own Fiber node\. Switching doesn&apos;t move open channels\./);
 });
