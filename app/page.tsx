@@ -239,10 +239,10 @@ export default function Home() {
   );
 }
 
-/** Product shot: a fictional customer app with KeyWay sign-in. Always light. */
+/** Product shot: a fictional customer app with KeyWay sign-in. */
 function HeroShot() {
   return (
-    <div className="lp-shot light-locked" role="img" aria-label="Product preview: Acme Pay with KeyWay sign-in">
+    <div className="lp-shot" role="img" aria-label="Product preview: Acme Pay with KeyWay sign-in">
       <div className="lp-shot__wallet">
         <div className="lp-shot__bar">
           <span className="lp-shot__logo" />

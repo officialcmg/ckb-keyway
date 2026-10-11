@@ -28,19 +28,18 @@ const DevScreen = process.env.NODE_ENV !== "production"
 
 export function AuthPanel({ nodeMode = "managed", devScreen }: { nodeMode?: NodeMode; devScreen?: string }) {
   const router = useRouter();
-  const theme = useSystemTheme();
   const setMode = useCallback((mode: NodeMode) => router.push(mode === "browser" ? "/app?mode=browser" : "/app"), [router]);
   if (process.env.NODE_ENV !== "production" && devScreen) return <DevScreen screen={devScreen} nodeMode={nodeMode} />;
-  return <LiveDemo key={nodeMode} nodeMode={nodeMode} theme={theme} setMode={setMode} />;
+  return <LiveDemo key={nodeMode} nodeMode={nodeMode} setMode={setMode} />;
 }
 
-function LiveDemo({ nodeMode, theme, setMode }: { nodeMode: NodeMode; theme: "light" | "dark"; setMode: (mode: NodeMode) => void }) {
+function LiveDemo({ nodeMode, setMode }: { nodeMode: NodeMode; setMode: (mode: NodeMode) => void }) {
   const [events, setEvents] = useState<LifecycleEvent[]>([]);
   const onLifecycle = useCallback((event: KeyWayLifecycleEvent) => {
     setEvents((current) => event.stage === "recovering_identity" ? [event] : [...current, event]);
   }, []);
   return (
-    <KeyWayProvider appId={process.env.NEXT_PUBLIC_KEYWAY_APP_ID} nodeMode={nodeMode} theme={theme} onLifecycle={onLifecycle}>
+    <KeyWayProvider appId={process.env.NEXT_PUBLIC_KEYWAY_APP_ID} nodeMode={nodeMode} theme="light" onLifecycle={onLifecycle}>
       <LiveWallet nodeMode={nodeMode} events={events} resetEvents={() => setEvents([])} setMode={setMode} />
     </KeyWayProvider>
   );
@@ -233,16 +232,4 @@ function useChannelReserves(channels: KeyWayChannel[]): Record<string, bigint> {
     reserves[channel.id] = rest > 0n ? rest : 0n;
   }
   return reserves;
-}
-
-function useSystemTheme(): "light" | "dark" {
-  const [theme, setTheme] = useState<"light" | "dark">("light");
-  useEffect(() => {
-    const query = window.matchMedia("(prefers-color-scheme: dark)");
-    const update = () => setTheme(query.matches ? "dark" : "light");
-    update();
-    query.addEventListener("change", update);
-    return () => query.removeEventListener("change", update);
-  }, []);
-  return theme;
 }
