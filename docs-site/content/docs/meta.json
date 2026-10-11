@@ -1,0 +1,18 @@
+{
+  "title": "CKB KeyWay",
+  "pages": [
+    "---Get started---",
+    "index",
+    "quickstart",
+    "---Concepts---",
+    "core-concepts",
+    "---Guides---",
+    "authentication",
+    "fiber-payments",
+    "email-branding",
+    "---Reference---",
+    "react-sdk",
+    "---Resources---",
+    "troubleshooting"
+  ]
+}

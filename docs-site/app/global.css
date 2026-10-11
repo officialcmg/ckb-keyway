@@ -1,0 +1,116 @@
+@import 'tailwindcss';
+@import 'fumadocs-ui/css/neutral.css';
+@import 'fumadocs-ui/css/preset.css';
+
+/* CKB KeyWay design system tokens mapped onto Fumadocs UI. */
+@theme {
+  --font-sans: var(--font-keyway-sans), 'Avenir Next', system-ui, sans-serif;
+  --font-mono: var(--font-keyway-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-fd-background: #f7f5eb;
+  --color-fd-foreground: #111b35;
+  --color-fd-muted: #efecdf;
+  --color-fd-muted-foreground: #4a5370;
+  --color-fd-popover: #fffdf8;
+  --color-fd-popover-foreground: #111b35;
+  --color-fd-card: #fffdf8;
+  --color-fd-card-foreground: #111b35;
+  --color-fd-border: #dedbd0;
+  --color-fd-primary: #2f54e8;
+  --color-fd-primary-foreground: #ffffff;
+  --color-fd-secondary: #efecdf;
+  --color-fd-secondary-foreground: #111b35;
+  --color-fd-accent: #efecdf;
+  --color-fd-accent-foreground: #111b35;
+  --color-fd-ring: #2f54e8;
+}
+
+.dark {
+  --color-fd-background: #0e1529;
+  --color-fd-foreground: #f3f1e6;
+  --color-fd-muted: #0a1020;
+  --color-fd-muted-foreground: #a9b0c6;
+  --color-fd-popover: #18213b;
+  --color-fd-popover-foreground: #f3f1e6;
+  --color-fd-card: #18213b;
+  --color-fd-card-foreground: #f3f1e6;
+  --color-fd-border: #2a3452;
+  --color-fd-primary: #8da2ff;
+  --color-fd-primary-foreground: #0e1529;
+  --color-fd-secondary: #18213b;
+  --color-fd-secondary-foreground: #f3f1e6;
+  --color-fd-accent: #18213b;
+  --color-fd-accent-foreground: #f3f1e6;
+  --color-fd-ring: #8da2ff;
+}
+
+:root {
+  --keyway-logo: #2f54e8;
+  --keyway-warning: #8a5a00;
+  --keyway-danger: #b42318;
+  --keyway-success: #1e7a45;
+  --fd-layout-width: 1440px;
+}
+
+.dark {
+  --keyway-logo: #f3f1e6;
+  --keyway-warning: #f2c14e;
+  --keyway-danger: #ff6b6b;
+  --keyway-success: #5fd08a;
+}
+
+html {
+  scrollbar-gutter: stable;
+}
+
+html > body[data-scroll-locked] {
+  margin-right: 0px !important;
+  --removed-body-scroll-bar-size: 0px !important;
+}
+
+body {
+  font-family: var(--font-sans);
+}
+
+/* Headings: heavy and tight, as in the design system's type scale. */
+.prose :is(h1, h2, h3),
+h1 {
+  letter-spacing: -0.02em;
+}
+
+h1 {
+  font-weight: 800;
+  letter-spacing: -0.04em;
+}
+
+/* Code blocks stay dark in both themes (design system code tokens). */
+figure.shiki {
+  background-color: #111b35;
+  color: #f3f1e6;
+  border-color: #2a3452;
+  border-radius: 12px;
+}
+
+figure.shiki > div:first-child:not(pre) {
+  color: #a9b0c6;
+  border-color: #2a3452;
+}
+
+/* Package-manager tabs around a code block share its dark surface. */
+.prose div:has(> [role='tablist']):has(figure.shiki) {
+  background-color: #111b35;
+  border-color: #2a3452;
+}
+
+.prose div:has(> [role='tablist']):has(figure.shiki) [role='tab'] {
+  color: #a9b0c6;
+}
+
+.prose div:has(> [role='tablist']):has(figure.shiki) [role='tab'][data-state='active'],
+.prose div:has(> [role='tablist']):has(figure.shiki) [role='tab'][aria-selected='true'] {
+  color: #8da2ff;
+}
+
+.prose :not(pre) > code {
+  border-radius: 6px;
+}

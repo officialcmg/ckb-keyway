@@ -1,24 +1,22 @@
 ---
 title: "Quickstart"
 description: "Add CKB KeyWay to a React or Next.js application."
-icon: "rocket"
+icon: Rocket
 ---
 
 ## 1. Install the SDK
 
-<CodeGroup>
-```bash npm
+```bash tab="npm"
 npm install @ckb-keyway/react
 ```
 
-```bash pnpm
+```bash tab="pnpm"
 pnpm add @ckb-keyway/react
 ```
 
-```bash yarn
+```bash tab="yarn"
 yarn add @ckb-keyway/react
 ```
-</CodeGroup>
 
 ## 2. Register your application
 
@@ -28,7 +26,7 @@ Open the [KeyWay developer console](https://ckbkeyway.dev/dashboard), create an 
 
 Render `KeyWayProvider` in a client component above every component that uses KeyWay.
 
-```tsx app/providers.tsx
+```tsx title="app/providers.tsx"
 "use client";
 
 import { KeyWayProvider } from "@ckb-keyway/react";
@@ -42,7 +40,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
 }
 ```
 
-```tsx app/layout.tsx
+```tsx title="app/layout.tsx"
 import { Providers } from "./providers";
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
@@ -56,7 +54,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 
 ## 4. Add login and wallet state
 
-```tsx app/wallet.tsx
+```tsx title="app/wallet.tsx"
 "use client";
 
 import { KeyWayLoginButton, useKeyWay, useCkbWallet, useFiber } from "@ckb-keyway/react";
