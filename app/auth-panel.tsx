@@ -142,8 +142,7 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
   const channels: DemoChannel[] = fiber.channels.map((channel) => ({
     id: channel.id,
     peer: channel.peer,
-    // The SDK's status mapping misses Fiber's SHUTTING_DOWN state, so read the raw state for it.
-    status: channel.status === "unknown" && String(channel.raw.state.state_name).includes("SHUTTING") ? "closing" : channel.status,
+    status: channel.status,
     local: channel.localBalanceShannons,
     remote: channel.remoteBalanceShannons,
     reserved: reserved[channel.id],
