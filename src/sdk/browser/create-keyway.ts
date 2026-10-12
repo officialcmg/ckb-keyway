@@ -327,7 +327,7 @@ export function normalizeChannel(channel: Channel): KeyWayChannel {
   const remoteBalanceShannons = BigInt(channel.remote_balance);
   const state = String(channel.state.state_name);
   const status: KeyWayChannelStatus = state === "CHANNEL_READY" ? "ready"
-    : state.includes("SHUTDOWN") || state.includes("CLOSING") ? "closing"
+    : state.includes("SHUTDOWN") || state.includes("SHUTTING") || state.includes("CLOSING") ? "closing"
     : state.includes("CLOSED") ? "closed"
     : state.includes("FAILED") ? "failed"
     : state.includes("NEGOTIATING") || state.includes("AWAITING") ? "pending"
