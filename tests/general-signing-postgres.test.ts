@@ -17,7 +17,7 @@ function signWithKey(digest: ccc.Hex): ccc.Hex {
   return formatCkbSignature({ recoveryParam: raw[0] as 0 | 1, r: ccc.hexFrom(raw.slice(1, 33)), s: ccc.hexFrom(raw.slice(33, 65)) });
 }
 
-function harness(outflow: bigint) {
+function harness(outflow: bigint, tokensLeaving = false) {
   const emails: Array<{ to: string; subject: string; plaintext: string }> = [];
   const user = { id: crypto.randomUUID() };
   const wallet = { litPkpId: `0x${"11".repeat(20)}`, litPublicKey: publicKey, status: "ready" } as unknown as ReadyWallet;
@@ -34,6 +34,7 @@ function harness(outflow: bigint) {
         unrecognized: [], otherSigners: 0, details: { inputs: [], outputs: [] }, transactionHash: transaction.hash(),
       },
       outflowShannons: outflow,
+      tokensLeaving,
     };
   };
   const context: SigningContext = {
@@ -78,6 +79,16 @@ test("general signing binds approvals, email codes and threshold changes", { ski
     await assert.rejects(() => transactionSigning(context, { operation: "sign", transaction: tx(3), confirmationNonce: preview.confirmationNonce, emailCode: wrong }), /isn't right/);
     const signed = await transactionSigning(context, { operation: "sign", transaction: tx(3), confirmationNonce: preview.confirmationNonce, emailCode: codeFrom() });
     assert.ok(signed);
+  });
+
+  await t.test("asks for the code when tokens leave, even below the CKB amount", async () => {
+    const { context } = harness(1n * CKB, true);
+    await signingSettings(context, { operation: "set", emailThresholdShannons: (1_000n * CKB).toString() });
+    const preview = await transactionSigning(context, { operation: "preview", transaction: tx(5) }) as { requiresEmailCode: boolean };
+    assert.equal(preview.requiresEmailCode, true);
+    const off = harness(1n * CKB, true);
+    const free = await transactionSigning(off.context, { operation: "preview", transaction: tx(6) }) as { requiresEmailCode: boolean };
+    assert.equal(free.requiresEmailCode, false);
   });
 
   await t.test("stops after five wrong codes", async () => {

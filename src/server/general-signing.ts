@@ -40,7 +40,8 @@ export async function transactionSigning(context: SigningContext, body: Record<s
   if (body.operation === "preview") {
     await limit(context, "sign", { max: 10, window: 60 });
     const threshold = await readThreshold(context.user);
-    const requiresEmailCode = threshold !== null && validated.outflowShannons >= threshold;
+    // With a threshold set, CKB at or above it, or any token leaving the account, needs the emailed code.
+    const requiresEmailCode = threshold !== null && (validated.outflowShannons >= threshold || validated.tokensLeaving);
     const confirmationNonce = await issueRequest(context.user, "transaction", digest, { lines: previewSummaryLines(validated.preview) }, requiresEmailCode);
     return { preview: validated.preview, confirmationNonce, requiresEmailCode };
   }

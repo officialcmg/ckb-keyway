@@ -178,7 +178,7 @@ export async function prepareOtpSend(input: {
       from keyway_otp_events
       where outcome = 'requested'
     `;
-    if (limits.app_count >= appLimit || limits.email_count >= 5 || limits.ip_count >= 20) {
+    if (limits.app_count >= appLimit || limits.email_count >= 5 || limits.ip_count >= 60) {
       await insertOtpEvent(transaction as unknown as DatabaseSql, appId, emailHash, ipHash, "rate_limited");
       return true;
     }

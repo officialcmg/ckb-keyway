@@ -317,7 +317,6 @@ async function developerAppsRequest(request: Request): Promise<Response> {
     if (typeof body.name !== "string") throw new Error("Application name is required");
     return Response.json(await createApplication(user, {
       name: body.name,
-      otpLimitPerMinute: optionalNumber(body.otpLimitPerMinute),
     }));
   }
   if (typeof body.appId !== "string") throw new Error("Application ID is required");
@@ -326,7 +325,6 @@ async function developerAppsRequest(request: Request): Promise<Response> {
       appId: body.appId,
       name: optionalString(body.name),
       disabled: optionalBoolean(body.disabled),
-      otpLimitPerMinute: optionalNumber(body.otpLimitPerMinute),
     }));
   }
   if (operation === "add-origin") {

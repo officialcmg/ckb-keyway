@@ -56,6 +56,14 @@ test("describes a plain CKB transfer, its recipient and the fee", () => {
   assert.equal(preview.otherSigners, 0);
 });
 
+test("receiving tokens doesn't count as tokens leaving", () => {
+  const { tokensLeaving } = build(
+    [{ lock: own, capacity: 500n * CKB }, { lock: alice, capacity: 200n * CKB, type: xudt, data: u128(10n) }],
+    [{ lock: own, capacity: 200n * CKB, type: xudt, data: u128(10n) }, { lock: own, capacity: 500n * CKB - 2_000n }],
+  );
+  assert.equal(tokensLeaving, false);
+});
+
 test("refuses a fee above the size-based cap but accepts a generous normal one", () => {
   assert.throws(() => build([{ lock: own, capacity: 1_000n * CKB }], [{ lock: alice, capacity: 990n * CKB }]), /above the KeyWay limit/);
   const { preview } = build([{ lock: own, capacity: 1_000n * CKB }], [{ lock: alice, capacity: 1_000n * CKB - 50_000n }]);
@@ -63,7 +71,7 @@ test("refuses a fee above the size-based cap but accepts a generous normal one",
 });
 
 test("reports token amounts leaving the account and who receives them", () => {
-  const { preview } = build(
+  const { preview, tokensLeaving } = build(
     [{ lock: own, capacity: 200n * CKB, type: xudt, data: u128(1_000n) }, { lock: own, capacity: 500n * CKB }],
     [
       { lock: alice, capacity: 143n * CKB, type: xudt, data: u128(250n) },
@@ -74,6 +82,7 @@ test("reports token amounts leaving the account and who receives them", () => {
   assert.deepEqual(preview.tokens.map(({ standard, amount }) => ({ standard, amount })), [{ standard: "xUDT", amount: "-250" }]);
   assert.equal(preview.recipients[0].tokens[0].amount, "250");
   assert.equal(preview.recipients[0].ckb, "143");
+  assert.equal(tokensLeaving, true);
 });
 
 test("recognizes a Nervos DAO deposit", () => {
