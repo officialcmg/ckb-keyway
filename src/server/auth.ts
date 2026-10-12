@@ -17,6 +17,8 @@ export type AuthScope = { id: string; name: string; origins: string[] };
 export type EmailDelivery = (message: { email: string; otp: string; scope: AuthScope; challengeId: string }) => Promise<void>;
 const deliveryContext = new AsyncLocalStorage<{ challengeId: string; delivered: boolean }>();
 const requestSessions = new WeakMap<Request, Promise<{ user: User; expiresAt: string; sessionToken?: string }>>();
+// Kept apart from the session result so the email never appears in the /session response.
+const requestEmails = new WeakMap<Request, string>();
 let pool: Pool | undefined;
 const instances = new Map<string, Promise<Awaited<ReturnType<typeof createScopedAuth>>>>();
 let delivery: EmailDelivery = sendOtpEmail;
@@ -194,12 +196,34 @@ export async function sessionForRequest(request: Request) {
     const response = await callAuthEndpoint(request, scope, "/get-session");
     const result = await response.json();
     if (!response.ok || !result?.session || result.session.scopeId !== scope.id) throw new Error("Session is invalid for this application");
+    if (typeof result.user.email === "string") requestEmails.set(request, result.user.email);
     return { user: await keywayUser(result.user.id, scope.id), expiresAt: result.session.expiresAt as string, sessionToken: response.headers.get("set-auth-token") ?? undefined };
   })());
   return requestSessions.get(request)!;
 }
 
 export async function authenticateUser(request: Request): Promise<User> { return (await sessionForRequest(request)).user; }
+
+/** The signed-in user's email address, for server-side confirmation emails only. */
+export async function sessionEmail(request: Request): Promise<string> {
+  await sessionForRequest(request);
+  const email = requestEmails.get(request);
+  if (!email) throw new Error("Session has no email address");
+  return email;
+}
+
+/** Sends a server-rendered email through the configured provider. */
+export async function sendTransactionalEmail(to: string, message: { subject: string; html: string; plaintext: string }, idempotencyKey: string): Promise<void> {
+  const key = process.env.RESEND_API_KEY;
+  const from = process.env.KEYWAY_AUTH_EMAIL_FROM;
+  if (!key || !from) throw new Error("Confirmation email delivery is not configured");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const { error } = await new Resend(key).emails.send({ from, to, subject: message.subject, html: message.html, text: message.plaintext }, { idempotencyKey, signal: controller.signal });
+    if (error) throw new Error("Could not send the confirmation email");
+  } finally { clearTimeout(timer); }
+}
 export function publicUser(user: User) { return { id: user.id }; }
 
 export async function revokeSession(request: Request): Promise<void> {

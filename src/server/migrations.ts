@@ -226,4 +226,29 @@ export const migrations: Array<{
       await sql`alter table keyway_applications drop column if exists owner_stytch_user_id`;
     },
   },
+  {
+    version: 12, name: "general-signing",
+    up: async (sql) => {
+      // One pending approval per user and purpose, bound to the exact transaction or message it previewed.
+      await sql`create table keyway_v2_signature_requests (
+        user_id uuid not null,
+        purpose text not null check (purpose in ('transaction', 'message', 'settings')),
+        nonce uuid not null,
+        request_digest text not null,
+        summary jsonb not null,
+        requires_email_code boolean not null default false,
+        email_code_hash text,
+        email_code_expires_at timestamptz,
+        email_attempts integer not null default 0,
+        expires_at timestamptz not null,
+        primary key (user_id, purpose)
+      )`;
+      // The user's own email-confirmation threshold, in shannons; null means off.
+      await sql`create table keyway_v2_signing_settings (
+        user_id uuid primary key,
+        email_threshold_shannons numeric(30, 0),
+        updated_at timestamptz not null default now()
+      )`;
+    },
+  },
 ];

@@ -8,6 +8,9 @@ import {
   verifyEmailCode,
   sessionForRequest,
   resolveAuthScope,
+  sessionEmail,
+  sendTransactionalEmail,
+  consumeRateLimit,
 } from "./auth.ts";
 import { acquireLease, heartbeatLease, releaseLease, requireLease } from "./device-lease.ts";
 import { loadLitAction } from "./lit-actions.ts";
@@ -30,6 +33,7 @@ import {
 import { managedNodeReady, managedNodeRequest } from "./managed-node.ts";
 import { runIdempotentMutation } from "./idempotency.ts";
 import { recordSigningEvent } from "./security-alerts.ts";
+import { messageSigning, signingSettings, transactionSigning, type SigningContext } from "./general-signing.ts";
 
 export async function handleKeyWayRequest(request: Request): Promise<Response> {
   const cors = await corsHeaders(request);
@@ -68,6 +72,8 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
       : path === "/api/keyway/node-backup/load" ? await loadNodeBackupRequest(request)
       : path === "/api/keyway/node-backup/confirm" ? await confirmNodeBackupRequest(request)
       : path === "/api/keyway/sign-transaction" ? await signTransactionRequest(request)
+      : path === "/api/keyway/sign-message" ? await generalSigningRequest(request, "message")
+      : path === "/api/keyway/signing-settings" ? await generalSigningRequest(request, "settings")
       : path === "/api/keyway/developer/apps" ? await developerAppsRequest(request)
       : path === "/api/keyway/managed-node" ? await managedNodeHttpRequest(request)
       : jsonError("Not found", 404);
@@ -252,6 +258,8 @@ async function confirmNodeBackupRequest(request: Request): Promise<Response> {
 async function signTransactionRequest(request: Request): Promise<Response> {
   const user = await authenticateUser(request);
   const body = await objectBody(request, "Invalid signing request");
+  // General transactions go through the general policy; requests without a purpose are channel funding.
+  if (body.purpose === "transaction") return generalSigningRequest(request, "transaction", body);
   const { operation, transaction, confirmationNonce } = body;
   const wallet = await readWallet(user);
   if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
@@ -272,6 +280,31 @@ async function signTransactionRequest(request: Request): Promise<Response> {
     const signed = await signFundingTransaction(user, wallet, validated);
     return { transaction: serializeTransaction(signed) };
   }));
+}
+
+async function generalSigningRequest(
+  request: Request,
+  kind: "transaction" | "message" | "settings",
+  parsedBody?: Record<string, unknown>,
+): Promise<Response> {
+  const user = await authenticateUser(request);
+  const body = parsedBody ?? await objectBody(request, "Invalid signing request");
+  const wallet = await readWallet(user);
+  if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
+  const scope = await resolveAuthScope(request);
+  const context: SigningContext = {
+    user,
+    wallet,
+    appName: scope.name,
+    email: () => sessionEmail(request),
+    sendEmail: sendTransactionalEmail,
+    rateLimit: consumeRateLimit,
+    recordSigning: recordSigningEvent,
+  };
+  const run = () => kind === "transaction" ? transactionSigning(context, body) : kind === "message" ? messageSigning(context, body) : signingSettings(context, body);
+  const mutating = body.operation === "sign" || (kind === "settings" && body.operation === "set");
+  const result = mutating ? await versionedMutation(request, user.id, `general-${kind}`, body, run) : await run();
+  return Response.json(result, { headers: { "Cache-Control": "no-store" } });
 }
 
 async function developerAppsRequest(request: Request): Promise<Response> {
