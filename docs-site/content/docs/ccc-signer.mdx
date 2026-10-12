@@ -1,0 +1,73 @@
+---
+title: "Signing transactions"
+description: "Use the KeyWay account as a CCC signer to send CKB, move tokens and NFTs, and sign messages."
+icon: PenLine
+---
+
+`useCkbWallet().signer` is a [CCC](https://github.com/ckb-devrel/ccc) signer for the signed-in account. Write the CCC code you already know. KeyWay shows the user what each transaction does and signs only after they approve.
+
+```tsx
+import { ccc } from "@ckb-ccc/core";
+import { useCkbWallet } from "@ckb-keyway/react";
+
+function SendButton({ to }: { to: string }) {
+  const { signer } = useCkbWallet();
+
+  async function send() {
+    if (!signer) return;
+    const { script } = await ccc.Address.fromString(to, signer.client);
+    const tx = ccc.Transaction.from({ outputs: [{ lock: script, capacity: ccc.fixedPointFrom(100) }] });
+    await tx.completeInputsByCapacity(signer);
+    await tx.completeFeeBy(signer);
+    const hash = await signer.sendTransaction(tx); // approval dialog, then broadcast
+  }
+
+  return <button onClick={send} disabled={!signer}>Send 100 CKB</button>;
+}
+```
+
+`signer` is undefined until the account is ready. It doesn't need Fiber. `getAddresses`, `getBalance`, `findCells`, `signMessage` and `verifyMessage` work as they do with any CCC signer. Tokens (xUDT, sUDT), Spore NFTs and Nervos DAO transactions work too: CCC builds them, and KeyWay signs the user's part.
+
+## What the user approves
+
+KeyWay's backend reads every input from the chain and decodes what the transaction does to the user's account. The approval dialog shows:
+
+- the CKB they send or receive, and the network fee;
+- token amounts by token, and NFTs sent, received, minted or burned;
+- Nervos DAO deposits and withdrawals;
+- each recipient, labelled as a wallet, a contract or a Fiber channel;
+- any script KeyWay doesn't recognize, as a warning;
+- inputs that other people must sign.
+
+The backend signs only the exact transaction it previewed, and only the user's own account. A changed transaction is refused. To use your own approval UI, pass `confirmTransaction` to `KeyWayProvider`. It receives the same preview and returns `true` to approve.
+
+## Signing messages
+
+```ts
+const signature = await signer.signMessage("Log in to Acme Pay");
+const valid = await signer.verifyMessage("Log in to Acme Pay", signature);
+```
+
+Messages use CKB's standard `Nervos Message:` format and are shown to the user word for word. Pass `confirmMessage` to replace the dialog.
+
+## Email confirmation for large transfers
+
+Users can require a code from their inbox before any transfer of at least an amount they choose:
+
+```ts
+await signer.setEmailConfirmationThreshold(ccc.fixedPointFrom(500)); // 500 CKB, in shannons
+await signer.getEmailConfirmationThreshold(); // bigint or null
+await signer.setEmailConfirmationThreshold(null); // turn it off
+```
+
+Turning it on or lowering the amount applies at once. Raising the amount or turning it off emails the user a code first. The code prompt is always the SDK's own, even when you replace the approval dialog.
+
+## Limits
+
+- Testnet only.
+- The network fee may be at most 100 shannons per byte of the transaction (about 100 times the normal rate), and never less than 0.01 CKB. Normal transactions pay far less.
+- Each user can start up to 10 signing requests a minute.
+
+<Callout type="warn">
+The approval dialog runs inside your app's page. If your app has an XSS bug, or a user's session token leaks, an attacker could request and approve transactions below the user's email-confirmation amount. Protect your app with a strict Content Security Policy, and encourage users to set a confirmation amount.
+</Callout>

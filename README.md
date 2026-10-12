@@ -177,6 +177,7 @@ The public package pins its tested Fiber WASM version. Node upgrades require exp
 - Web Locks, `BroadcastChannel`, and an atomic Postgres lease enforce one active browser node.
 - Fiber state backups are encrypted in the browser and stored as ciphertext. Explicit logout appends an immutable generation; only the newest can be auto-claimed, older generations stay for rollback, and a restore refuses to overwrite Fiber state that already exists on the device.
 - Session bearer tokens live in the embedding app's `localStorage`, so an XSS bug in that app can read them.
+- `useCkbWallet().signer` is a CCC signer. The backend signs only the user's own lock, only the exact transaction it decoded and showed in the approval dialog, with a size-based fee cap and rate limits. Users can require an emailed code for transfers above an amount they choose. The dialog runs in the embedding app's page, so a compromised page can approve transactions below that amount.
 - Email compromise can authorize recovery. This testnet prototype is experimental, unaudited, and not production custody software.
 
 ## Verified testnet result

@@ -20,6 +20,8 @@ icon: Code
 | `nodeMode` | `managed` | Managed native hosting or optional browser WASM. |
 | `autoConnect` | `false` | Opt into Fiber connection after login. Account recovery is always automatic. |
 | `confirmFunding` | built-in modal | Optional approval callback for validated channel funding. |
+| `confirmTransaction` | built-in modal | Optional approval callback for signer transactions; receives the decoded preview. |
+| `confirmMessage` | built-in modal | Optional approval callback for message signing. |
 | `onError` | none | Recovery, connection, and lease errors. |
 | `onLifecycle` | none | Structured connection stages and elapsed timings. |
 
@@ -34,10 +36,10 @@ const { ready, authenticated, user, login, logout } = useKeyWay();
 ## Account: `useCkbWallet()`
 
 ```ts
-const { status, wallet, address, balance, refreshing, refreshBalance, error } = useCkbWallet();
+const { status, wallet, signer, address, balance, refreshing, refreshBalance, error } = useCkbWallet();
 ```
 
-`status` is `disconnected`, `recovering`, `ready`, or `error`. `wallet` contains public identity metadata. `balance` is a bigint in shannons, undefined until the independent on-chain read completes. `refreshBalance()` updates it without Fiber. A balance error does not invalidate the recovered account.
+`status` is `disconnected`, `recovering`, `ready`, or `error`. `wallet` contains public identity metadata. `balance` is a bigint in shannons, undefined until the independent on-chain read completes. `refreshBalance()` updates it without Fiber. A balance error does not invalidate the recovered account. `signer` is a CCC signer for the account once it's ready; see [Signing transactions](/ccc-signer).
 
 Arbitrary CKB signing is not exposed by this hook. The remote signer currently authorizes channel funding under backend policy.
 
