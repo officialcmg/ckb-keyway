@@ -70,6 +70,20 @@ Managed mode keeps the node online after logout, so another browser can reconnec
 
 `appName` does not alter the email itself. The backend uses the registered application's name with KeyWay's template and verified Resend sender. No provider template IDs are needed.
 
+## Limits
+
+KeyWay limits sign-in codes so one app, inbox or network can't flood the system:
+
+| Limit | Value |
+| --- | --- |
+| Codes per email address | 5 every 10 minutes |
+| Codes per IP address | 60 every 10 minutes |
+| Codes per app | 30 a minute, shared by all of the app's users |
+| Code lifetime | 10 minutes |
+| Wrong attempts per code | 5, then request a new code |
+
+When a limit is reached, the sign-in modal shows "Too many login codes requested. Try again later". If your app needs more than 30 codes a minute (for a launch, say), open an issue on [GitHub](https://github.com/officialcmg/ckb-keyway/issues) and we'll raise it for your app.
+
 ## Recovery and logout
 
 Better Auth verifies email ownership; KeyWay maps its permanent application account ID to the Lit PKP. Email is not converted into a private key. Login does not automatically start Fiber.
