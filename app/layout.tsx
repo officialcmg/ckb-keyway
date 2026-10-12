@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import { Albert_Sans, IBM_Plex_Mono } from "next/font/google";
+import { connection } from "next/server";
 import type { ReactNode } from "react";
 import "./styles.css";
 
@@ -26,7 +27,9 @@ export const viewport: Viewport = {
   themeColor: "#F7F5EB",
 };
 
-export default function RootLayout({ children }: Readonly<{ children: ReactNode }>) {
+export default async function RootLayout({ children }: Readonly<{ children: ReactNode }>) {
+  // Every page renders per request, so Next.js can stamp it with the nonce from proxy.ts.
+  await connection();
   return (
     <html lang="en" className={`${sans.variable} ${mono.variable}`}>
       <body>{children}</body>
