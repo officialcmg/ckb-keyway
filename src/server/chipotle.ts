@@ -31,7 +31,8 @@ async function request(operation: string, path: string, apiKey: string, init: Re
   if (!apiKey) throw new Error("Lit usage API key is missing");
   const response = await fetch(`${BASE_URL}${path}`, {
     ...init,
-    signal: AbortSignal.timeout(15_000),
+    // Management calls wait for Base confirmations and can take several seconds.
+    signal: AbortSignal.timeout(60_000),
     headers: { ...init.headers, "X-Api-Key": apiKey },
   });
   const body: unknown = await response.json().catch(() => null);

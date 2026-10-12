@@ -78,7 +78,7 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
     const unauthorized = /session|bearer/i.test(message);
     const rateLimited = /too many/i.test(message);
     console.error("[keyway] request failed", { status: unauthorized ? 401 : rateLimited ? 429 : 400 });
-    return jsonError(message, unauthorized ? 401 : rateLimited ? 429 : 400, cors);
+    return jsonError(publicErrorMessage(message), unauthorized ? 401 : rateLimited ? 429 : 400, cors);
   }
 }
 
@@ -357,6 +357,7 @@ async function corsHeaders(request: Request): Promise<Headers | Response> {
     "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, X-KeyWay-App-Id, X-KeyWay-Auth-Scope",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Vary": "Origin",
+    ...SECURITY_HEADERS,
   });
   if (origin) headers.set("Access-Control-Allow-Origin", origin);
   return headers;
@@ -401,8 +402,28 @@ function optionalNumber(value: unknown): number | undefined {
   return value;
 }
 
+/** Every API response is private, uncacheable JSON. */
+const SECURITY_HEADERS = {
+  "Cache-Control": "no-store",
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer",
+  "X-Frame-Options": "DENY",
+} as const;
+
+const PROVIDER_ERROR = /lit_node::|Actions failed|Lit Action failed|Lit returned|Lit has not granted|Lit could not|Chipotle|Resend|ECONN|fetch failed/i;
+
+/**
+ * Error text that is safe to show in a browser: provider internals (Lit stack traces, upstream responses)
+ * become one plain sentence, control characters are stripped, and the length is capped.
+ */
+export function publicErrorMessage(message: string): string {
+  if (PROVIDER_ERROR.test(message)) return "The Lit signature service is temporarily unavailable. Try again in a moment.";
+  const clean = message.replace(/\u001b\[[0-9;]*m/g, "").replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  return clean.length > 240 ? `${clean.slice(0, 237)}...` : clean || "KeyWay request failed";
+}
+
 function jsonError(message: string, status: number, headers?: Headers): Response {
-  return Response.json({ error: message }, { status, headers });
+  return Response.json({ error: message }, { status, headers: headers ?? new Headers(SECURITY_HEADERS) });
 }
 
 function publicLease(lease: { leaseId: string; expiresAt: string }) {

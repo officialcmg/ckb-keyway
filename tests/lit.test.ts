@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { decryptFiberKey, encryptFiberKey, signCkbDigest } from "../src/server/lit.ts";
+import { litActionCid } from "../src/server/lit-cid.ts";
 
 const config = { apiKey: "test", actionCid: "QmTest" };
 const pkpId = `0x${"11".repeat(20)}`;
@@ -94,7 +95,7 @@ test("submits inline Action source when provided", async () => {
   try {
     await encryptFiberKey(new Uint8Array(32), pkpId, {
       apiKey: "test",
-      actionCid: "QmRegistered",
+      actionCid: litActionCid("async function main() {}"),
       actionCode: "async function main() {}",
     });
   } finally {

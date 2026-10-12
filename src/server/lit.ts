@@ -1,3 +1,5 @@
+import { litActionCid } from "./lit-cid.ts";
+
 const CHIPOTLE_ACTION_URL = "https://api.chipotle.litprotocol.com/core/v1/lit_action";
 const HEX_32 = /^0x[0-9a-fA-F]{64}$/;
 const EVM_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
@@ -62,20 +64,66 @@ export async function decryptFiberKey(
   return fiberKey;
 }
 
+/** A Lit failure that is worth retrying: rate limiting, a dependency outage, a network error, or a grant that hasn't propagated yet. */
+export class LitTransientError extends Error {
+  constructor(message: string, readonly reason: "unavailable" | "not-granted") { super(message); }
+}
+
+const NOT_GRANTED = /cannot use selected wallet/i;
+
 async function executeAction(config: LitRuntimeConfig, js_params: Record<string, unknown>): Promise<unknown> {
   if (!config.apiKey || !config.actionCid) throw new Error("Lit runtime configuration is incomplete");
+  // Lit allows only Action code whose CID is in the KeyWay group; refuse to send code that isn't the pinned CID.
+  if (config.actionCode && litActionCid(config.actionCode) !== config.actionCid) {
+    throw new Error("Lit Action code does not match its pinned CID");
+  }
   const action = config.actionCode ? { code: config.actionCode } : { ipfs_id: config.actionCid };
-  const response = await fetch(CHIPOTLE_ACTION_URL, {
-    method: "POST",
-    signal: AbortSignal.timeout(15_000),
-    headers: { "Content-Type": "application/json", "X-Api-Key": config.apiKey },
-    body: JSON.stringify({ ...action, js_params }),
+  return withLitRetry(async () => {
+    let response: Response;
+    try {
+      response = await fetch(CHIPOTLE_ACTION_URL, {
+        method: "POST",
+        signal: AbortSignal.timeout(30_000),
+        // Privacy mode keeps js_params (such as a Fiber key) and Action output out of Chipotle's logs.
+        headers: { "Content-Type": "application/json", "X-Api-Key": config.apiKey, "X-Privacy-Mode": "true" },
+        body: JSON.stringify({ ...action, js_params }),
+      });
+    } catch {
+      throw new LitTransientError("Lit could not be reached", "unavailable");
+    }
+    const body: unknown = await response.json().catch(() => null);
+    if (!response.ok) {
+      const message = readApiError(body, `Lit returned HTTP ${response.status}`);
+      if (NOT_GRANTED.test(message)) throw new LitTransientError("Lit has not granted this wallet to the Action yet", "not-granted");
+      if ([429, 502, 503, 504].includes(response.status)) throw new LitTransientError(`Lit returned HTTP ${response.status}`, "unavailable");
+      throw new Error(message);
+    }
+    if (!isActionResponse(body)) throw new Error("Lit returned an invalid Action response");
+    if (body.has_error) {
+      if (NOT_GRANTED.test(body.logs)) throw new LitTransientError("Lit has not granted this wallet to the Action yet", "not-granted");
+      throw new Error(`Lit Action failed${body.logs ? `: ${body.logs}` : ""}`);
+    }
+    return body.response;
   });
-  const body: unknown = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(readApiError(body, `Lit returned HTTP ${response.status}`));
-  if (!isActionResponse(body)) throw new Error("Lit returned an invalid Action response");
-  if (body.has_error) throw new Error(`Lit Action failed${body.logs ? `: ${body.logs}` : ""}`);
-  return body.response;
+}
+
+type RetryOptions = { budgetMs?: number; sleep?: (ms: number) => Promise<void>; now?: () => number };
+
+/**
+ * Retries transient Lit failures with backoff (0.5, 1, 2, 4, 8 s...). The default budget outlasts
+ * Chipotle's 30-second cached denial after a wallet is first added to the group.
+ */
+export async function withLitRetry<T>(operation: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
+  const { budgetMs = 40_000, sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)), now = Date.now } = options;
+  const deadline = now() + budgetMs;
+  for (let delay = 500; ; delay = Math.min(delay * 2, 8_000)) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (!(error instanceof LitTransientError) || now() + delay > deadline) throw error;
+      await sleep(delay);
+    }
+  }
 }
 
 function isActionResponse(value: unknown): value is LitActionResponse {
