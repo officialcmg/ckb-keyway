@@ -28,7 +28,7 @@ LIT_USAGE_API_KEY
 LIT_PROVISIONING_API_KEY
 ```
 
-The three public, pinned Lit Action CIDs are already configured on staging. Without the four private credentials above, `keyway-api-staging` serves `/healthz` and `/readyz` but cannot send OTP codes or authorize Lit operations, so the two-account Fiber test cannot run there yet.
+The three pinned Lit Action CIDs (public identifiers) are already configured on staging. Without the four private credentials above, `keyway-api-staging` serves `/healthz` and `/readyz` but cannot send OTP codes or authorize Lit operations, so the two-account Fiber test cannot run there yet.
 
 Before deploying managed-host backup encryption, set `KEYWAY_MANAGED_BACKUP_KEY` on the target managed host to a random 32-byte hex key (for example, `openssl rand -hex 32`). Preserve the key outside Railway as part of disaster recovery: losing it makes that environment's encrypted snapshots unrestorable. Existing plaintext snapshot generations remain restorable during migration, but must be removed after encrypted generations are verified. This runtime encryption key is required for the host being deployed; configuring another environment is not a release gate.
 
@@ -59,7 +59,7 @@ The following setup is deferred until mainnet preparation. Do not spend addition
 1. Create a second Stytch Consumer project in the test environment, dedicated to staging.
 2. Set `STYTCH_PROJECT_ID` and `STYTCH_SECRET` on `keyway-api-staging` from that project, and keep `STYTCH_ENVIRONMENT=test`.
 3. Create a second Lit Chipotle account, or a second API key on a separate Lit billing boundary, for staging.
-4. Set `LIT_USAGE_API_KEY` and `LIT_PROVISIONING_API_KEY` on `keyway-api-staging`. The pinned Action CIDs are public IPFS content and already configured on staging.
+4. Set `LIT_USAGE_API_KEY` and `LIT_PROVISIONING_API_KEY` on `keyway-api-staging`. The pinned Action CIDs are public identifiers and already configured on staging.
 5. Keep `KEYWAY_ALLOWED_ORIGINS` limited to the staging frontend origin, and confirm it does not list `https://ckb-keyway.vercel.app`.
 6. Generate a distinct `KEYWAY_MANAGED_FIBER_HOST_TOKEN` for `keyway-managed-host`, and a distinct `KEYWAY_MANAGED_FIBER_RPC_TOKEN` for `keyway-managed-fnn-staging`.
 7. Confirm every staging secret differs from production. Compare fingerprints with:

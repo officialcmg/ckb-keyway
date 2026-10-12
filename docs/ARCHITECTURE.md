@@ -76,7 +76,7 @@ The reference wallet lives at `/app`; `/` is the pitch-oriented project landing 
 
 - Better Auth verifies application-isolated email OTPs and binds database sessions to validated application scope. Resend delivers email.
 - The KeyWay backend is trusted to map users to PKPs, enforce transaction policy, hold provider credentials, and authorize Lit calls.
-- Lit protects PKP key material and executes only configured Actions for the permitted account resources.
+- Lit protects PKP key material inside a single attested TEE (Chipotle) and executes only Actions whose CIDs are allow-listed in the KeyWay group for the permitted PKPs. KeyWay's Lit admin credential controls that allow-list, and the backend refuses to send code that doesn't match its pinned CID.
 - The backend can observe the Fiber key during the current decrypt flow.
 - `fiber-js` owns live channel-state correctness and local persistence.
 - CKB enforces the final funding and settlement scripts.

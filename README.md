@@ -171,11 +171,12 @@ The public package pins its tested Fiber WASM version. Node upgrades require exp
 
 ## Security model
 
-- The Lit PKP private key is not returned to the browser or KeyWay backend.
-- The backend accepts a complete CKB transaction, enforces testnet funding and fee limits, computes CCC's exact sighash, and invokes only a pinned Lit Action.
-- The stored Fiber identity key is encrypted at rest. The backend can observe it during recovery. Browser mode loads it into WASM memory; managed mode trusts the host with the native node's operational keys and channel state.
+- The Lit PKP private key is not returned to the browser or KeyWay backend by KeyWay's Actions. Lit Chipotle is a single attested TEE: any Action allow-listed in the KeyWay Lit group can read the key inside it, and KeyWay's Lit admin credential controls that allow-list.
+- The backend accepts a complete CKB transaction, enforces testnet funding and fee limits, computes CCC's exact sighash, and invokes only a pinned Lit Action: the backend refuses to send Action code whose IPFS CID differs from the configured one, and Lit runs only CIDs allow-listed in the KeyWay group.
+- The stored Fiber identity key is encrypted at rest. The backend can observe it during recovery. Lit calls that carry it use Lit's privacy mode so it stays out of Lit's logs. Browser mode loads it into WASM memory; managed mode trusts the host with the native node's operational keys and channel state.
 - Web Locks, `BroadcastChannel`, and an atomic Postgres lease enforce one active browser node.
 - Fiber state backups are encrypted in the browser and stored as ciphertext. Explicit logout appends an immutable generation; only the newest can be auto-claimed, older generations stay for rollback, and a restore refuses to overwrite Fiber state that already exists on the device.
+- Session bearer tokens live in the embedding app's `localStorage`, so an XSS bug in that app can read them.
 - Email compromise can authorize recovery. This testnet prototype is experimental, unaudited, and not production custody software.
 
 ## Verified testnet result
@@ -218,7 +219,7 @@ The production deployment also sends `Cross-Origin-Opener-Policy: same-origin` a
 - `@fiber-pay/sdk` `0.2.7`
 - `@ckb-ccc/core` `1.16.1`
 - Better Auth `1.7.7` and Resend `6.32.1` (private backend only)
-- Lit Chipotle Actions pinned by immutable IPFS CID
+- Lit Chipotle Actions pinned by IPFS CID (checked by the backend and allow-listed in the KeyWay Lit group)
 
 CKB KeyWay is independent experimental infrastructure and is not affiliated with or endorsed by these projects.
 

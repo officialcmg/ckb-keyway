@@ -37,7 +37,7 @@ function SignIn() {
 
 ## Session state
 
-The SDK stores its session in application-specific browser `localStorage` and validates it on mount and focus. Sessions expire after seven days and renew through Better Auth after 24 hours of age while the SDK is active. Expired or revoked sessions require login again. Use `ready` before reading authentication state. Application A's session cannot authorize Application B or the developer dashboard.
+The SDK stores its session in application-specific browser `localStorage` and validates it on mount and focus. Sessions expire after seven days and renew through Better Auth after 24 hours of age while the SDK is active. Expired or revoked sessions require login again. Use `ready` before reading authentication state. Application A's session cannot authorize Application B or the developer dashboard. Because the session lives in `localStorage`, any script that runs on your origin can read it: protect your app against XSS, for example with a strict Content Security Policy.
 
 ```tsx
 const { ready, authenticated, user } = useKeyWay();
