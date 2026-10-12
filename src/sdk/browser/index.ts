@@ -23,6 +23,16 @@ export { acquireDeviceLock, type DeviceLock } from "./device-lock";
 export { acquireDeviceLease, type DeviceLease } from "./device-lease";
 export { RemoteCkbSigner, type ConfirmFunding, type FundingPreview } from "./remote-ckb-signer";
 export {
+  KeyWaySigner,
+  type CellSummary,
+  type ConfirmMessage,
+  type ConfirmTransaction,
+  type KeyWaySignerHandlers,
+  type MessagePreview,
+  type RequestEmailCode,
+  type TransactionPreview,
+} from "./keyway-signer";
+export {
   connectKeyWay,
   type ConnectedKeyWay,
   type KeyWayLifecycleEvent,

@@ -6,7 +6,7 @@ import type { KeyWay, KeyWayChannel, OpenKeyWayChannelOptions, ActivationProgres
 import { useKeyWayContext } from "./keyway-provider";
 
 export function useCkbWallet() {
-  const { authenticated, wallet, error: recoveryError } = useKeyWayContext();
+  const { authenticated, wallet, signer, error: recoveryError } = useKeyWayContext();
   const [balance, setBalance] = useState<bigint>();
   const [balanceError, setBalanceError] = useState<Error>();
   const [refreshing, setRefreshing] = useState(false);
@@ -41,6 +41,8 @@ export function useCkbWallet() {
   return {
     status: !authenticated ? "disconnected" as const : !wallet ? recoveryError ? "error" as const : "recovering" as const : "ready" as const,
     wallet,
+    /** A CCC signer for this account. Every transaction and message is shown to the user before signing. */
+    signer,
     address: wallet?.ckbAddress,
     balance,
     refreshing,

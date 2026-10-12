@@ -89,6 +89,18 @@ export class KeyWayApiClient {
       : this.json(`${KEYWAY_API_PATH}/sign-transaction`, authToken, body);
   }
 
+  signMessage(authToken: string, body: Record<string, unknown>) {
+    return body.operation === "sign"
+      ? this.idempotentJson(`${KEYWAY_API_PATH}/sign-message`, authToken, body)
+      : this.json(`${KEYWAY_API_PATH}/sign-message`, authToken, body);
+  }
+
+  signingSettings(authToken: string, body: Record<string, unknown>) {
+    return body.operation === "set"
+      ? this.idempotentJson(`${KEYWAY_API_PATH}/signing-settings`, authToken, body)
+      : this.json(`${KEYWAY_API_PATH}/signing-settings`, authToken, body);
+  }
+
   managedNode<T>(
     authToken: string,
     body: Record<string, unknown>,
