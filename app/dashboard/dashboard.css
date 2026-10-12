@@ -41,7 +41,6 @@
 .dash-row__name { flex: 2 1 200px; font-size: 16px; font-weight: 700; }
 .dash-row__id { flex: 2 1 260px; font: 400 13px var(--mono); color: var(--ink-muted); }
 .dash-row__meta { flex: 1 1 100px; font-size: 14px; color: var(--ink-muted); }
-.dash-row__codes { flex: 1 1 140px; font-variant-numeric: tabular-nums; }
 .dash-row__status { flex: 0 0 96px; }
 
 /* Create dialog */

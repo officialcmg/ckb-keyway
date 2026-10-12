@@ -24,8 +24,8 @@ function LiveHome() {
   if (session.status === "checking") return null;
   if (session.status === "signedOut") return <SignInCard onSendCode={session.sendCode} onVerify={session.verifyCode} />;
 
-  async function create(name: string, otpLimitPerMinute: number) {
-    const app = await session.request<DeveloperApplication>({ operation: "create", name, otpLimitPerMinute });
+  async function create(name: string) {
+    const app = await session.request<DeveloperApplication>({ operation: "create", name });
     session.replace(app);
     router.push(`/dashboard/${app.appId}`);
   }

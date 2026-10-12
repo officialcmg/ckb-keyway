@@ -104,7 +104,6 @@ export function ApplicationRows({ applications }: { applications: DeveloperAppli
           <span className="dash-row__name">{app.name}</span>
           <span className="dash-row__id">{app.appId}</span>
           <span className="dash-row__meta">{app.origins.length} {app.origins.length === 1 ? "origin" : "origins"}</span>
-          <span className="dash-row__meta dash-row__codes">{app.usage.sent24h} {app.usage.sent24h === 1 ? "code" : "codes"} in 24 h</span>
           <EnabledStatus disabled={app.disabled} className="dash-row__status" />
         </Link>
       ))}
@@ -118,9 +117,8 @@ function EnabledStatus({ disabled, className = "" }: { disabled: boolean; classN
     : <span className={`status status--success ${className}`}><span className="status__dot" />Enabled</span>;
 }
 
-export function CreateDialog({ initialName = "", onCancel, onCreate }: { initialName?: string; onCancel: () => void; onCreate: (name: string, otpLimit: number) => Promise<void> }) {
+export function CreateDialog({ initialName = "", onCancel, onCreate }: { initialName?: string; onCancel: () => void; onCreate: (name: string) => Promise<void> }) {
   const [name, setName] = useState(initialName);
-  const [limit, setLimit] = useState("30");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string>();
   useEffect(() => {
@@ -131,12 +129,10 @@ export function CreateDialog({ initialName = "", onCancel, onCreate }: { initial
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    const otpLimit = Number(limit);
     if (!name.trim()) return setError("Enter an application name.");
-    if (!Number.isInteger(otpLimit) || otpLimit < OTP_LIMIT_MIN || otpLimit > OTP_LIMIT_MAX) return setError("Sign-in codes per minute must be a whole number from 1 to 120.");
     setPending(true);
     setError(undefined);
-    try { await onCreate(name.trim(), otpLimit); } catch (cause) { setError(cause instanceof Error ? cause.message : "The application could not be created"); setPending(false); }
+    try { await onCreate(name.trim()); } catch (cause) { setError(cause instanceof Error ? cause.message : "The application could not be created"); setPending(false); }
   }
 
   return (
@@ -144,7 +140,6 @@ export function CreateDialog({ initialName = "", onCancel, onCreate }: { initial
       <form role="dialog" aria-modal="true" aria-labelledby="create-title" className="dialog dash-dialog" onSubmit={submit}>
         <div className="dash-dialog__head"><h2 id="create-title" className="dialog__title">New application</h2><p>You&apos;ll get an app ID right away. Add allowed origins on the next screen.</p></div>
         <label htmlFor="create-name" className="field">Application name<input id="create-name" className="input" type="text" autoFocus required maxLength={APP_NAME_MAX} value={name} onChange={(event) => setName(event.target.value)} /><span className="field__hint">Your users see this in the sign-in modal and email.</span></label>
-        <label htmlFor="create-limit" className="field">Sign-in codes per minute<input id="create-limit" className="input dash-number" type="number" min={OTP_LIMIT_MIN} max={OTP_LIMIT_MAX} value={limit} onChange={(event) => setLimit(event.target.value)} /><span className="field__hint">30 suits most apps. You can change it later.</span></label>
         {error && <p className="field-error"><AlertIcon />{error}</p>}
         <div className="dash-dialog__actions"><button type="button" className="btn btn--outline" onClick={onCancel}>Cancel</button><button type="submit" className={`btn btn--route${pending ? " btn--busy" : ""}`} disabled={pending}>{pending ? "Creating…" : "Create application"}</button></div>
       </form>
