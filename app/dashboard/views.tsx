@@ -6,7 +6,7 @@ import { createOtpEmailTemplate } from "../../src/server/email-template";
 import { CopyButton } from "../_components/copy-button";
 import { AlertIcon, ChevronDown, LogoMark, PlusIcon, SpinnerIcon } from "../_components/icons";
 import { QUICKSTART_URL, TROUBLESHOOTING_URL } from "../_components/links";
-import { APP_NAME_MAX, checkOrigin, OTP_LIMIT_MAX, OTP_LIMIT_MIN, type ApplicationOrigin, type DeveloperApplication } from "./api";
+import { APP_NAME_MAX, checkOrigin, type ApplicationOrigin, type DeveloperApplication } from "./api";
 
 /* Sign in */
 
@@ -150,7 +150,7 @@ export function CreateDialog({ initialName = "", onCancel, onCreate }: { initial
 /* Application detail */
 
 export type DetailActions = {
-  update: (changes: { name?: string; otpLimitPerMinute?: number; disabled?: boolean }) => Promise<void>;
+  update: (changes: { name?: string; disabled?: boolean }) => Promise<void>;
   addOrigin: (origin: string, environment: ApplicationOrigin["environment"]) => Promise<void>;
   removeOrigin: (origin: string) => Promise<void>;
 };
@@ -302,14 +302,13 @@ function Origins({ app, actions, initialOrigin }: { app: DeveloperApplication; a
 
 function Settings({ app, actions }: { app: DeveloperApplication; actions: DetailActions }) {
   const [name, setName] = useState(app.name);
-  const [limit, setLimit] = useState(String(app.otpLimitPerMinute));
   const [pending, setPending] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string>();
   const [confirming, setConfirming] = useConfirm();
   const [disabling, setDisabling] = useState(false);
 
-  useEffect(() => { setName(app.name); setLimit(String(app.otpLimitPerMinute)); }, [app.name, app.otpLimitPerMinute]);
+  useEffect(() => { setName(app.name); }, [app.name]);
   useEffect(() => {
     if (!saved) return;
     const timer = window.setTimeout(() => setSaved(false), 3000);
@@ -318,12 +317,10 @@ function Settings({ app, actions }: { app: DeveloperApplication; actions: Detail
 
   async function save(event: FormEvent) {
     event.preventDefault();
-    const otpLimit = Number(limit);
     if (!name.trim()) return setError("Enter an application name.");
-    if (!Number.isInteger(otpLimit) || otpLimit < OTP_LIMIT_MIN || otpLimit > OTP_LIMIT_MAX) return setError("Sign-in codes per minute must be a whole number from 1 to 120.");
     setPending(true);
     setError(undefined);
-    try { await actions.update({ name: name.trim(), otpLimitPerMinute: otpLimit }); setSaved(true); } catch (cause) { setError(cause instanceof Error ? cause.message : "Your changes could not be saved"); } finally { setPending(false); }
+    try { await actions.update({ name: name.trim() }); setSaved(true); } catch (cause) { setError(cause instanceof Error ? cause.message : "Your changes could not be saved"); } finally { setPending(false); }
   }
 
   async function disable() {
@@ -337,7 +334,6 @@ function Settings({ app, actions }: { app: DeveloperApplication; actions: Detail
     <form className="card dash-card" onSubmit={save}>
       <h2 className="dash-card__h">Settings</h2>
       <label htmlFor="app-name" className="field">Application name<input id="app-name" className="input" type="text" required maxLength={APP_NAME_MAX} value={name} onChange={(event) => setName(event.target.value)} /><span className="field__hint">Shown in the sign-in modal and email. Up to 80 characters.</span></label>
-      <label htmlFor="otp-limit" className="field">Sign-in codes per minute<span className="dash-inline"><input id="otp-limit" className="input dash-number" type="number" min={OTP_LIMIT_MIN} max={OTP_LIMIT_MAX} value={limit} onChange={(event) => setLimit(event.target.value)} /><span className="field__hint">for the whole app, 1 to 120</span></span></label>
       {error && <p className="field-error"><AlertIcon />{error}</p>}
       <div className="dash-save"><button type="submit" className={`btn btn--ink${pending ? " btn--busy" : ""}`} disabled={pending}>{pending ? "Saving…" : "Save changes"}</button>{saved && <span className="dash-saved" role="status">Saved</span>}</div>
       {!app.disabled && (

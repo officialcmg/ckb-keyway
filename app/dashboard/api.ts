@@ -55,5 +55,3 @@ export function checkOrigin(value: string): { origin?: string; error?: string } 
 }
 
 export const APP_NAME_MAX = 80;
-export const OTP_LIMIT_MIN = 1;
-export const OTP_LIMIT_MAX = 120;
