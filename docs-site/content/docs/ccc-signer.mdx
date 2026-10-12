@@ -52,10 +52,10 @@ Messages use CKB's standard `Nervos Message:` format and are shown to the user w
 
 ## Email confirmation for large transfers
 
-Users can require a code from their inbox before any transfer of at least an amount of CKB they choose. Once it's set, any transaction that sends tokens (xUDT or sUDT) out of the account needs the code too, whatever its CKB amount:
+Users can require a code from their inbox once the CKB they send within 24 hours reaches an amount they choose. Every transaction signed in the last 24 hours counts toward it, so splitting a transfer into smaller ones doesn't avoid the code. Once it's set, any transaction that sends tokens (xUDT or sUDT) out of the account needs the code too, whatever its CKB amount. It's off until the user (or your app) turns it on:
 
 ```ts
-await signer.setEmailConfirmationThreshold(ccc.fixedPointFrom(500)); // 500 CKB, in shannons
+await signer.setEmailConfirmationThreshold(ccc.fixedPointFrom(500)); // 500 CKB a day, in shannons
 await signer.getEmailConfirmationThreshold(); // bigint or null
 await signer.setEmailConfirmationThreshold(null); // turn it off
 ```
@@ -70,5 +70,5 @@ Turning it on or lowering the amount applies at once. Raising the amount or turn
 - Email confirmation codes: up to 5 every 10 minutes per user. Each code lasts 10 minutes and allows 5 wrong attempts.
 
 <Callout type="warn">
-The approval dialog runs inside your app's page. If your app has an XSS bug, or a user's session token leaks, an attacker could request and approve transactions below the user's email-confirmation amount. Protect your app with a strict Content Security Policy, and encourage users to set a confirmation amount.
+The approval dialog runs inside your app's page. If your app has an XSS bug, or a user's session token leaks, an attacker could request and approve transactions until the user's 24-hour email-confirmation amount is reached. Protect your app with a strict Content Security Policy, and encourage users to set a confirmation amount.
 </Callout>

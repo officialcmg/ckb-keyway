@@ -81,7 +81,7 @@ export function KeyWayTransactionModal({ theme, appName, preview, answer }: { th
             <dt>Network</dt><dd style={rowValue}>{preview.network}</dd>
           </dl>
           {preview.otherSigners > 0 && <p style={note(palette)}>{preview.otherSigners} input{preview.otherSigners === 1 ? "" : "s"} belong to someone else, who must sign too.</p>}
-          {preview.requiresEmailCode && <p style={note(palette)}>This is at or above your confirmation amount, so we&apos;ll email you a code next.</p>}
+          {preview.requiresEmailCode && <p style={note(palette)}>This reaches your email confirmation amount, so we&apos;ll email you a code next.</p>}
           <details style={{ textAlign: "left", fontSize: 12, color: palette.muted, margin: "8px 0 0" }}>
             <summary style={{ cursor: "pointer" }}>Details</summary>
             <CellList title="Inputs" cells={preview.details.inputs} />

@@ -39,9 +39,7 @@ export async function transactionSigning(context: SigningContext, body: Record<s
 
   if (body.operation === "preview") {
     await limit(context, "sign", { max: 10, window: 60 });
-    const threshold = await readThreshold(context.user);
-    // With a threshold set, CKB at or above it, or any token leaving the account, needs the emailed code.
-    const requiresEmailCode = threshold !== null && (validated.outflowShannons >= threshold || validated.tokensLeaving);
+    const requiresEmailCode = await needsEmailCode(context.user, validated);
     const confirmationNonce = await issueRequest(context.user, "transaction", digest, { lines: previewSummaryLines(validated.preview) }, requiresEmailCode);
     return { preview: validated.preview, confirmationNonce, requiresEmailCode };
   }
@@ -54,10 +52,51 @@ export async function transactionSigning(context: SigningContext, body: Record<s
   }
   if (body.operation !== "sign") throw new Error("A valid signing operation is required");
   const request = await loadRequest(context.user, "transaction", nonce, digest);
+  // Checked again here, because the threshold or the day's total may have changed since the preview.
+  if (!request.requires_email_code && await needsEmailCode(context.user, validated)) {
+    throw new Error("This transaction now needs an email code. Review it again");
+  }
   if (request.requires_email_code) await verifyCode(context.user, "transaction", nonce, body.emailCode);
   await consumeRequest(context.user, "transaction", nonce);
   await context.recordSigning(context.user.id);
-  return { transaction: serializeTransaction(await signTransaction(context, validated)) };
+  const signed = await signTransaction(context, validated);
+  await recordOutflow(context.user, validated);
+  return { transaction: serializeTransaction(signed) };
+}
+
+const OUTFLOW_WINDOW = "24 hours";
+
+/**
+ * With a threshold set, the emailed code is needed once the CKB this transaction sends, plus everything
+ * signed in the last 24 hours, reaches it, so splitting a transfer into smaller ones doesn't avoid it.
+ * Any token leaving the account needs the code too.
+ */
+async function needsEmailCode(user: User, validated: ValidatedTransaction): Promise<boolean> {
+  const threshold = await readThreshold(user);
+  if (threshold === null) return false;
+  if (validated.tokensLeaving) return true;
+  return await recentOutflow(user, validated.preview.transactionHash) + validated.outflowShannons >= threshold;
+}
+
+/** CKB sent by transactions signed in the last 24 hours, not counting this one if it was signed before. */
+async function recentOutflow(user: User, transactionHash: string): Promise<bigint> {
+  const sql = await database();
+  const [row] = await sql<Array<{ total: string | null }>>`
+    select sum(outflow_shannons)::text as total from keyway_v2_signed_outflows
+    where user_id = ${user.id} and signed_at > now() - ${OUTFLOW_WINDOW}::interval and transaction_hash <> ${transactionHash}
+  `;
+  return BigInt(row?.total ?? "0");
+}
+
+async function recordOutflow(user: User, validated: ValidatedTransaction): Promise<void> {
+  if (validated.outflowShannons === 0n) return;
+  const sql = await database();
+  await sql`delete from keyway_v2_signed_outflows where user_id = ${user.id} and signed_at <= now() - ${OUTFLOW_WINDOW}::interval`;
+  await sql`
+    insert into keyway_v2_signed_outflows (user_id, transaction_hash, outflow_shannons)
+    values (${user.id}, ${validated.preview.transactionHash}, ${validated.outflowShannons.toString()})
+    on conflict (user_id, transaction_hash) do update set outflow_shannons = excluded.outflow_shannons, signed_at = now()
+  `;
 }
 
 /** Messages: preview, sign. Signed in CKB's "Nervos Message:" format, so CCC's verifyMessage accepts them. */
@@ -81,7 +120,7 @@ export async function messageSigning(context: SigningContext, body: Record<strin
 }
 
 /**
- * The user's email-confirmation threshold. Strengthening it (turning it on, or lowering the amount)
+ * The user's email-confirmation threshold, a rolling 24-hour total. Strengthening it (turning it on, or lowering the amount)
  * applies at once; weakening it (raising the amount, or turning it off) needs a code from the user's inbox.
  */
 export async function signingSettings(context: SigningContext, body: Record<string, unknown>): Promise<unknown> {
@@ -97,8 +136,8 @@ export async function signingSettings(context: SigningContext, body: Record<stri
   const digest = hashText(`threshold:${next?.toString() ?? "off"}`);
   if (body.confirmationNonce === undefined) {
     const lines = [
-      `Email confirmation for transfers: currently ${formatCkb(current!)} CKB and above`,
-      next === null ? "Change: turn it off" : `Change: only ${formatCkb(next)} CKB and above`,
+      `Email confirmation: currently once ${formatCkb(current!)} CKB is sent in 24 hours`,
+      next === null ? "Change: turn it off" : `Change: once ${formatCkb(next)} CKB is sent in 24 hours`,
     ];
     const confirmationNonce = await issueRequest(context.user, "settings", digest, { lines }, true);
     await sendCode(context, "settings", confirmationNonce, "Confirm a security change", lines);

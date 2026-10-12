@@ -300,8 +300,8 @@ function SignerCard({ actions }: { actions: DemoActions }) {
       {signed && <p className={`demo-route${signed.verified ? "" : " demo-route--muted"}`}><CheckIcon size={16} />{signed.verified ? "Signed, and verified with CCC's verifyMessage" : "Signed"} <code className="demo-card__code">{shortHash(signed.signature)}</code></p>}
 
       <div className="demo-signer-row">
-        <label className="field demo-signer-row__grow">Email me a code for transfers of
-          <span className="demo-affix"><input value={thresholdInput} inputMode="decimal" onChange={(event) => setThresholdInput(event.target.value)} /><span>CKB or more</span></span>
+        <label className="field demo-signer-row__grow">Email me a code once I send
+          <span className="demo-affix"><input value={thresholdInput} inputMode="decimal" onChange={(event) => setThresholdInput(event.target.value)} /><span>CKB in a day</span></span>
         </label>
         <button type="button" className={`btn btn--outline${busy === "threshold" ? " btn--busy" : ""}`} disabled={Boolean(busy)} onClick={() => void run("threshold", async () => {
           const next = parseCkb(thresholdInput);
@@ -312,7 +312,7 @@ function SignerCard({ actions }: { actions: DemoActions }) {
           <button type="button" className="btn btn--outline" disabled={Boolean(busy)} onClick={() => void run("threshold", async () => { await actions.setEmailThreshold(null); setThreshold(null); })}>Turn off</button>
         )}
       </div>
-      <p className="demo-card__muted demo-signer-status">{threshold === undefined ? "Checking your email confirmation setting…" : threshold === null ? "Email confirmation is off." : `Transfers of ${formatCkb(threshold)} CKB or more need a code from your email.`}</p>
+      <p className="demo-card__muted demo-signer-status">{threshold === undefined ? "Checking your email confirmation setting…" : threshold === null ? "Email confirmation is off." : `Once you send ${formatCkb(threshold)} CKB within 24 hours, you'll need a code from your email.`}</p>
       {error && <p className="field-error"><AlertIcon />{error}</p>}
     </section>
   );

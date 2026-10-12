@@ -91,6 +91,30 @@ test("general signing binds approvals, email codes and threshold changes", { ski
     assert.equal(free.requiresEmailCode, false);
   });
 
+  await t.test("counts everything signed in the last 24 hours toward the threshold", async () => {
+    const { context } = harness(40n * CKB);
+    await signingSettings(context, { operation: "set", emailThresholdShannons: (100n * CKB).toString() });
+    const signFree = async (marker: number) => {
+      const preview = await transactionSigning(context, { operation: "preview", transaction: tx(marker) }) as { confirmationNonce: string; requiresEmailCode: boolean };
+      assert.equal(preview.requiresEmailCode, false);
+      await transactionSigning(context, { operation: "sign", transaction: tx(marker), confirmationNonce: preview.confirmationNonce });
+    };
+    await signFree(10);
+    await signFree(11);
+    // Signing the same transaction again doesn't count it twice.
+    await signFree(11);
+    const third = await transactionSigning(context, { operation: "preview", transaction: tx(12) }) as { requiresEmailCode: boolean };
+    assert.equal(third.requiresEmailCode, true);
+  });
+
+  await t.test("refuses to sign without a code if the threshold tightened after the preview", async () => {
+    const { context } = harness(40n * CKB);
+    const preview = await transactionSigning(context, { operation: "preview", transaction: tx(13) }) as { confirmationNonce: string; requiresEmailCode: boolean };
+    assert.equal(preview.requiresEmailCode, false);
+    await signingSettings(context, { operation: "set", emailThresholdShannons: (10n * CKB).toString() });
+    await assert.rejects(() => transactionSigning(context, { operation: "sign", transaction: tx(13), confirmationNonce: preview.confirmationNonce }), /now needs an email code/);
+  });
+
   await t.test("stops after five wrong codes", async () => {
     const { context, codeFrom } = harness(100n * CKB);
     await signingSettings(context, { operation: "set", emailThresholdShannons: "1" });

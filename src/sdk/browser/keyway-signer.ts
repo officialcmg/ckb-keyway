@@ -27,7 +27,7 @@ export type TransactionPreview = {
   otherSigners: number;
   details: { inputs: CellSummary[]; outputs: CellSummary[] };
   transactionHash: string;
-  /** True when the amount is at or above the user's email-confirmation threshold. */
+  /** True when this transaction, plus everything signed in the last 24 hours, reaches the user's email-confirmation threshold, or when it sends tokens while a threshold is set. */
   requiresEmailCode: boolean;
 };
 
@@ -105,7 +105,7 @@ export class KeyWaySigner extends ccc.SignerCkbPublicKey {
   }
 
   /**
-   * Requires an emailed code for transfers at or above `shannons` (null turns it off). Turning it on or
+   * Requires an emailed code once the CKB sent in 24 hours reaches `shannons` (null turns it off). Turning it on or
    * lowering it applies at once; raising it or turning it off asks the user for a code from their inbox.
    */
   async setEmailConfirmationThreshold(shannons: bigint | null): Promise<void> {

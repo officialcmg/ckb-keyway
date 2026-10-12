@@ -251,4 +251,18 @@ export const migrations: Array<{
       )`;
     },
   },
+  {
+    version: 13, name: "signed-outflows",
+    up: async (sql) => {
+      // CKB each signed transaction sends out of the account, so the email threshold can cover a rolling 24 hours.
+      await sql`create table keyway_v2_signed_outflows (
+        user_id uuid not null,
+        transaction_hash text not null,
+        outflow_shannons numeric(30, 0) not null,
+        signed_at timestamptz not null default now(),
+        primary key (user_id, transaction_hash)
+      )`;
+      await sql`create index keyway_v2_signed_outflows_recent on keyway_v2_signed_outflows (user_id, signed_at)`;
+    },
+  },
 ];
