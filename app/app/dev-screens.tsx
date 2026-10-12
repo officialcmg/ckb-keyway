@@ -75,6 +75,10 @@ export function DevScreen({ screen, nodeMode }: { screen: string; nodeMode: Node
     pay: noop,
     createInvoice: async () => RECEIVE,
     invoiceStatus: async () => "Open",
+    sendCkb: async () => "0x00",
+    signMessage: async () => ({ signature: "0x00", verified: true }),
+    getEmailThreshold: async () => null,
+    setEmailThreshold: noop,
   };
   return (
     <>

@@ -152,3 +152,12 @@
 .demo-receive__meta { flex: 1 1 180px; min-width: 0; display: flex; flex-direction: column; gap: 8px; font-size: 14px; color: var(--ink-muted); }
 .demo-receive__status { font-size: 14px; }
 .demo-receive__note { margin: 0; font-size: 13px; line-height: 1.5; color: var(--ink-muted); }
+
+/* Send CKB card */
+.demo-card__code { font: 400 12px var(--mono); color: var(--ink-muted); }
+.demo-mono { font: 400 14px var(--mono); width: 100%; box-sizing: border-box; }
+.demo-tx-link { font-family: var(--mono); color: var(--route); }
+.demo-signer-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; padding-top: 16px; border-top: 1px solid var(--line); }
+.demo-signer-row__grow { flex: 1 1 260px; }
+.demo-signer-row .input { width: 100%; box-sizing: border-box; }
+.demo-signer-status { font-size: 14px; margin-top: -8px; }

@@ -61,6 +61,11 @@ export type DemoActions = {
   pay: (invoice: string, check: InvoiceCheck) => Promise<void>;
   createInvoice: (amount: bigint, description: string) => Promise<CreatedInvoice>;
   invoiceStatus: (paymentHash: string) => Promise<string>;
+  /** Plain CCC through the KeyWay signer: build, complete, approve, send. */
+  sendCkb: (address: string, amount: bigint) => Promise<string>;
+  signMessage: (message: string) => Promise<{ signature: string; verified: boolean }>;
+  getEmailThreshold: () => Promise<bigint | null>;
+  setEmailThreshold: (shannons: bigint | null) => Promise<void>;
 };
 
 /** Initial UI for development screenshots; production always starts closed. */
@@ -151,6 +156,7 @@ export function DemoView({ model, actions, initialUi }: { model: DemoModel; acti
             : (
               <>
                 <AccountCard model={model} />
+                {model.balance !== 0n && <SignerCard actions={actions} />}
                 <FiberCard model={model} now={now} actions={actions} activation={activation} setActivation={setActivation} onPay={() => setDialog("pay")} onReceive={() => setDialog("receive")} channels={openChannels} />
                 {hasChannels && model.activity.length > 0 && <ActivityCard activity={model.activity} />}
               </>
@@ -244,6 +250,70 @@ function AccountCard({ model }: { model: DemoModel }) {
           <a className="demo-faucet__link" href={`https://faucet.nervos.org/?address=${model.address}`} target="_blank" rel="noreferrer">Open the faucet<ExternalIcon size={14} /></a>
         </div>
       )}
+    </section>
+  );
+}
+
+function SignerCard({ actions }: { actions: DemoActions }) {
+  const [address, setAddress] = useState("");
+  const [amount, setAmount] = useState("100");
+  const [sending, setSending] = useState(false);
+  const [sent, setSent] = useState<string>();
+  const [message, setMessage] = useState("Log in to Acme Pay");
+  const [signed, setSigned] = useState<{ signature: string; verified: boolean }>();
+  const [threshold, setThreshold] = useState<bigint | null | undefined>(undefined);
+  const [thresholdInput, setThresholdInput] = useState("500");
+  const [error, setError] = useState<string>();
+  const [busy, setBusy] = useState<string>();
+
+  useEffect(() => { void actions.getEmailThreshold().then(setThreshold).catch(() => setThreshold(null)); }, [actions]);
+
+  async function run<T>(label: string, task: () => Promise<T>): Promise<T | undefined> {
+    setBusy(label);
+    setError(undefined);
+    try { return await task(); } catch (cause) { setError(cause instanceof Error ? cause.message : "Something went wrong"); return undefined; } finally { setBusy(undefined); }
+  }
+
+  return (
+    <section className="card demo-card demo-card--16">
+      <CardHead title="Send CKB"><code className="demo-card__code">useCkbWallet().signer</code></CardHead>
+      <p className="demo-card__body">Ordinary CCC code against your KeyWay account. You approve every transaction before KeyWay signs it.</p>
+      <div className="demo-open">
+        <label className="field demo-open__peer">To address<input className="input demo-mono" value={address} spellCheck={false} placeholder="ckt1…" onChange={(event) => setAddress(event.target.value.trim())} /></label>
+        <label className="field demo-open__amount">Amount
+          <span className="demo-affix"><input value={amount} inputMode="decimal" onChange={(event) => setAmount(event.target.value)} /><span>CKB</span></span>
+        </label>
+        <button type="button" className={`btn btn--route${sending ? " btn--busy" : ""}`} disabled={sending || !address} onClick={() => void (async () => {
+          setSending(true);
+          setSent(undefined);
+          const hash = await run("send", () => actions.sendCkb(address, parseCkb(amount)));
+          if (hash) setSent(hash);
+          setSending(false);
+        })()}>{sending ? "Sending…" : "Send"}</button>
+      </div>
+      {sent && <p className="demo-route"><CheckIcon size={16} />Sent. <a className="demo-tx-link" href={`${EXPLORER}/transaction/${sent}`} target="_blank" rel="noreferrer">{shortHash(sent)}</a></p>}
+
+      <div className="demo-signer-row">
+        <label className="field demo-signer-row__grow">Message<input className="input" value={message} maxLength={500} onChange={(event) => setMessage(event.target.value)} /></label>
+        <button type="button" className={`btn btn--outline${busy === "sign" ? " btn--busy" : ""}`} disabled={Boolean(busy) || !message.trim()} onClick={() => void run("sign", () => actions.signMessage(message)).then((result) => result && setSigned(result))}>Sign message</button>
+      </div>
+      {signed && <p className={`demo-route${signed.verified ? "" : " demo-route--muted"}`}><CheckIcon size={16} />{signed.verified ? "Signed, and verified with CCC's verifyMessage" : "Signed"} <code className="demo-card__code">{shortHash(signed.signature)}</code></p>}
+
+      <div className="demo-signer-row">
+        <label className="field demo-signer-row__grow">Email me a code for transfers of
+          <span className="demo-affix"><input value={thresholdInput} inputMode="decimal" onChange={(event) => setThresholdInput(event.target.value)} /><span>CKB or more</span></span>
+        </label>
+        <button type="button" className={`btn btn--outline${busy === "threshold" ? " btn--busy" : ""}`} disabled={Boolean(busy)} onClick={() => void run("threshold", async () => {
+          const next = parseCkb(thresholdInput);
+          await actions.setEmailThreshold(next);
+          setThreshold(next);
+        })}>Save</button>
+        {threshold !== null && threshold !== undefined && (
+          <button type="button" className="btn btn--outline" disabled={Boolean(busy)} onClick={() => void run("threshold", async () => { await actions.setEmailThreshold(null); setThreshold(null); })}>Turn off</button>
+        )}
+      </div>
+      <p className="demo-card__muted demo-signer-status">{threshold === undefined ? "Checking your email confirmation setting…" : threshold === null ? "Email confirmation is off." : `Transfers of ${formatCkb(threshold)} CKB or more need a code from your email.`}</p>
+      {error && <p className="field-error"><AlertIcon />{error}</p>}
     </section>
   );
 }

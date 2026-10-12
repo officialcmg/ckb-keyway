@@ -63,6 +63,8 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
   fiberRef.current = fiber;
   const refreshBalanceRef = useRef(account.refreshBalance);
   refreshBalanceRef.current = account.refreshBalance;
+  const signerRef = useRef(account.signer);
+  signerRef.current = account.signer;
 
   // Time the wallet recovery that follows sign-in, so the log has something real to show before Fiber starts.
   useEffect(() => {
@@ -127,6 +129,23 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
       receiving.current.set(result.invoice.data.payment_hash, amount);
       return { address: result.invoice_address, amount, description: description || undefined, createdAt: Date.now(), paymentHash: result.invoice.data.payment_hash };
     },
+    sendCkb: async (address, amount) => {
+      const signer = requireSigner(signerRef.current);
+      const to = await ccc.Address.fromString(address, signer.client).catch(() => { throw new Error("Enter a valid CKB testnet address"); });
+      const transaction = ccc.Transaction.from({ outputs: [{ lock: to.script, capacity: amount }] });
+      await transaction.completeInputsByCapacity(signer);
+      await transaction.completeFeeBy(signer);
+      const hash = await signer.sendTransaction(transaction);
+      await refreshBalanceRef.current().catch(() => undefined);
+      return hash;
+    },
+    signMessage: async (message) => {
+      const signer = requireSigner(signerRef.current);
+      const signature = await signer.signMessage(message);
+      return { signature: signature.signature, verified: await signer.verifyMessage(message, signature) };
+    },
+    getEmailThreshold: () => requireSigner(signerRef.current).getEmailConfirmationThreshold(),
+    setEmailThreshold: (shannons) => requireSigner(signerRef.current).setEmailConfirmationThreshold(shannons),
     invoiceStatus: async (paymentHash) => {
       const { status } = await fiberRef.current.getInvoice({ payment_hash: paymentHash as `0x${string}` });
       const amount = receiving.current.get(paymentHash);
@@ -231,4 +250,9 @@ function useChannelReserves(channels: KeyWayChannel[]): Record<string, bigint> {
     reserves[channel.id] = rest > 0n ? rest : 0n;
   }
   return reserves;
+}
+
+function requireSigner<T>(signer: T | undefined): T {
+  if (!signer) throw new Error("Your account is still being prepared. Try again in a moment.");
+  return signer;
 }
