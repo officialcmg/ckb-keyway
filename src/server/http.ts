@@ -1,3 +1,5 @@
+import * as ccc from "@ckb-ccc/core";
+import type { User } from "./auth-user.ts";
 import { bootstrap } from "./bootstrap.ts";
 import { markChannelOpened, readWallet } from "./user-wallet.ts";
 import {
@@ -98,12 +100,20 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
       `managed:${operation}`,
       request.headers.get("idempotency-key") ?? "",
       body,
-      () => managedNodeRequest(user.id, body),
+      () => managedNodeRequest(user.id, body, undefined, () => ownLockScript(user)),
     )
     : await managedNodeRequest(user.id, body);
   return Response.json(result, {
     headers: { "Cache-Control": "no-store" },
   });
+}
+
+/** The user's own CKB lock, in Fiber RPC shape. */
+async function ownLockScript(user: User) {
+  const wallet = await readWallet(user);
+  if (wallet?.status !== "ready") throw new Error("KeyWay wallet is not ready");
+  const { script } = await ccc.Address.fromString(wallet.ckbAddress, new ccc.ClientPublicTestnet());
+  return { code_hash: script.codeHash, hash_type: script.hashType, args: script.args } as never;
 }
 
 async function sendCodeRequest(request: Request): Promise<Response> {

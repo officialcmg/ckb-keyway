@@ -38,10 +38,13 @@ type ManagedNodeClient = Pick<
 const clients = new Map<string, ManagedNodeClient>();
 const mutations = new Map<string, Promise<void>>();
 
+type RpcScript = NonNullable<OpenChannelWithExternalFundingParams["shutdown_script"]>;
+
 export async function managedNodeRequest(
   userId: string,
   body: Record<string, unknown>,
   override?: ManagedNodeClient,
+  ownLock?: () => Promise<RpcScript>,
 ): Promise<unknown> {
   const node = override ?? managedNodeClient(userId);
 
@@ -94,6 +97,9 @@ export async function managedNodeRequest(
   }
   if (body.operation === "open-channel") {
     const params = openChannelParams(body.params);
+    if (!ownLock) throw new Error("The account's own lock is required to open a channel");
+    // Fiber pays the channel out to the shutdown script when it closes, so it must be the user's own lock.
+    params.shutdown_script = ownShutdownScript(body.params, await ownLock());
     await connectManagedPeer(node, params.pubkey);
     await assertChannelCapacity(node);
     return serializeMutation(userId, () => node.openChannelWithExternalFunding(params));
@@ -232,12 +238,22 @@ function openChannelParams(value: unknown): OpenChannelWithExternalFundingParams
     pubkey: pubkey(params.pubkey),
     funding_amount: positiveHex(params.funding_amount, "Funding amount"),
     public: params.public === undefined ? true : boolean(params.public, "Channel visibility"),
-    shutdown_script: script(params.shutdown_script),
+    shutdown_script: params.shutdown_script === undefined ? undefined as never : script(params.shutdown_script),
     funding_lock_script: script(params.funding_lock_script),
     funding_lock_script_cell_deps: cellDeps(params.funding_lock_script_cell_deps),
     funding_fee_rate: optionalHex(params.funding_fee_rate, "Funding fee rate"),
     commitment_fee_rate: optionalHex(params.commitment_fee_rate, "Commitment fee rate"),
   };
+}
+
+function ownShutdownScript(value: unknown, own: RpcScript): RpcScript {
+  const requested = (value as { shutdown_script?: unknown } | undefined)?.shutdown_script;
+  if (requested === undefined) return own;
+  const candidate = script(requested);
+  const same = candidate.code_hash.toLowerCase() === own.code_hash.toLowerCase() &&
+    candidate.hash_type === own.hash_type && candidate.args.toLowerCase() === own.args.toLowerCase();
+  if (!same) throw new Error("Channels can only close to your own KeyWay address");
+  return own;
 }
 
 function submitFundingParams(value: unknown): SubmitSignedFundingTxParams {

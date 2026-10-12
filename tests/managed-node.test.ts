@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { managedNodeRequest, parseManagedNodeAssignments } from "../src/server/managed-node.ts";
 
+const ownLock = async () => ({ code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" }) as never;
+
 let lastInvoiceParams: Record<string, unknown> | undefined;
 
 const node = {
@@ -85,7 +87,7 @@ test("managed beta exposes only bounded authenticated node operations", async ()
       funding_lock_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x12" },
       funding_lock_script_cell_deps: [],
     },
-  }, node as never) as { channel_id: string };
+  }, node as never, async () => ({ code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x12" }) as never) as { channel_id: string };
   assert.equal(channel.channel_id, `0x${"33".repeat(32)}`);
 
   await assert.rejects(
@@ -105,7 +107,7 @@ test("managed beta exposes only bounded authenticated node operations", async ()
         shutdown_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" },
         funding_lock_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" },
       },
-    }, node as never),
+    }, node as never, ownLock),
     /approved testnet channel peers/,
   );
 });
@@ -121,7 +123,7 @@ test("managed beta refuses funding beyond the open-channel capacity", async () =
         shutdown_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" },
         funding_lock_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" },
       },
-    }, full as never),
+    }, full as never, ownLock),
     /at most 5 open channels/,
   );
 });
@@ -170,6 +172,26 @@ test("managed funding strips older SDK input caches before native RPC submission
   } as never);
 });
 
+test("managed channels can only close to the user's own lock", async () => {
+  const opened: Array<{ shutdown_script: unknown }> = [];
+  const recording = { ...node, openChannelWithExternalFunding: async (params: { shutdown_script: unknown }) => { opened.push(params); return node.openChannelWithExternalFunding(); } };
+  const open = (shutdown?: unknown) => managedNodeRequest("own-lock-test", {
+    operation: "open-channel",
+    params: {
+      pubkey: "0x02b6d4e3ab86a2ca2fad6fae0ecb2e1e559e0b911939872a90abdda6d20302be71",
+      funding_amount: "0x5f5e100",
+      ...(shutdown === undefined ? {} : { shutdown_script: shutdown }),
+      funding_lock_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" },
+    },
+  }, recording as never, ownLock);
+  await assert.rejects(() => open({ code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x99" }), /only close to your own KeyWay address/);
+  await open();
+  await open({ code_hash: `0x${"11".repeat(32)}`.toUpperCase().replace("0X", "0x"), hash_type: "type", args: "0x" });
+  assert.equal(opened.length, 2);
+  for (const params of opened) assert.deepEqual(params.shutdown_script, await ownLock());
+  await assert.rejects(() => managedNodeRequest("own-lock-test", { operation: "open-channel", params: { pubkey: "0x02b6d4e3ab86a2ca2fad6fae0ecb2e1e559e0b911939872a90abdda6d20302be71", funding_amount: "0x5f5e100", funding_lock_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" } } }, recording as never), /own lock is required/);
+});
+
 test("managed funding waits until the requested peer handshake is visible", async () => {
   let polls = 0;
   const delayed = {
@@ -193,7 +215,7 @@ test("managed funding waits until the requested peer handshake is visible", asyn
       shutdown_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" },
       funding_lock_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" },
     },
-  }, delayed as never);
+  }, delayed as never, ownLock);
 });
 
 test("a fresh managed node uses a TCP bootstrap hint when gossip has no address", async () => {
@@ -215,7 +237,7 @@ test("a fresh managed node uses a TCP bootstrap hint when gossip has no address"
       shutdown_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" },
       funding_lock_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" },
     },
-  }, fresh as never);
+  }, fresh as never, ownLock);
   assert.equal(calls.length, 2);
   assert.equal(calls[0].addr_type, "tcp");
 });
