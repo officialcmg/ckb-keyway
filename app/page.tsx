@@ -67,7 +67,7 @@ export default function Home() {
               <span>Fiber payments are live on CKB testnet</span>
               <ChevronRight size={14} />
             </a>
-            <h1 className="lp-hero__title">Embedded wallets for CKB.</h1>
+            <h1 className="lp-hero__title">Onboard anyone to CKB with an email address.</h1>
             <p className="lp-hero__lede">Give every user a CKB account the moment they sign in with email. No seed phrases or extensions, and Fiber payments built in.</p>
             <div className="lp-actions">
               <a className="btn btn--route btn--lg" href={QUICKSTART_URL}>Get started</a>
