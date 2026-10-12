@@ -32,11 +32,13 @@ Do not publish an npm tag before backend/email readiness. Do not roll back by re
 
 Read-only production inventory: 40 Stytch test users; 29 wallet mappings; 10 leases; 7 backup rows; 110 idempotency records; no signing or managed-confirmation rows. Preserve three application registrations. Some wallets report previously opened channels; flags cannot establish settlement.
 
-`scripts/inventory-legacy.ts` reads the configured Stytch test project and legacy rows without migrations or node startup. Repeat for staging and any legacy service. Save inventories privately without credentials.
+Completed 2026-10-12: the retired Stytch test users were deleted from the Stytch test project, migration 11 dropped the Stytch-era tables after a private backup, the retired managed-node directories were removed, and the inventory and reset scripts were deleted. The notes below record the procedure that was followed.
+
+`scripts/inventory-legacy.ts` (since removed) read the configured Stytch test project and legacy rows without migrations or node startup. Repeat for staging and any legacy service. Save inventories privately without credentials.
 
 Reset all obsolete KeyWay test users, including auth-only users, their provider sessions, wallet mappings, leases, nonces, node/channel databases and backups. Do not delete unrelated users in a shared provider project, entire volumes, applications, Lit PKPs or unrelated deployment configuration.
 
-Record each node's channels, pending payments, close transactions and final settlement. Force-close needs separate approval. Preserve state throughout settlement, retire the node against automatic restart, then delete only its exact directory/backups. `scripts/reset-legacy.ts --report <private-report>` validates complete scope without deletion; `--execute` also requires an explicit legacy-auth freeze and replacement migrations. It refuses a selected subset, unknown browser state or missing settlement evidence. The Stytch supported API is used, not the removed SDK dependency. Browser deletion uses settlement-approved rows in `keyway_legacy_cleanup`, scoped to the returning origin and exact wallet prefix. The table is empty until reviewed closure evidence is inserted. Non-returning devices cannot be remotely erased.
+Record each node's channels, pending payments, close transactions and final settlement. Force-close needs separate approval. Preserve state throughout settlement, retire the node against automatic restart, then delete only its exact directory/backups. `scripts/reset-legacy.ts --report <private-report>` (since removed) validated complete scope without deletion; `--execute` also requires an explicit legacy-auth freeze and replacement migrations. It refuses a selected subset, unknown browser state or missing settlement evidence. The Stytch supported API is used, not the removed SDK dependency. Browser deletion uses settlement-approved rows in `keyway_legacy_cleanup`, scoped to the returning origin and exact wallet prefix. The table is empty until reviewed closure evidence is inserted. Non-returning devices cannot be remotely erased.
 
 ## Managed channel closure evidence
 

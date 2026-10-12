@@ -215,4 +215,15 @@ export const migrations: Array<{
       primary key (origin, database_prefix)
     )`,
   },
+  {
+    // The Stytch-era tables hold only retired test accounts with no open channels (verified 2026-10-12);
+    // no current code reads them. A private JSON backup was taken before this ran.
+    version: 11, name: "drop-stytch-era-tables",
+    up: async (sql) => {
+      for (const table of ["keyway_device_leases", "keyway_signing_confirmations", "keyway_node_backups", "keyway_managed_confirmations", "keyway_idempotency_keys", "keyway_otp_methods", "keyway_wallets"]) {
+        await sql.unsafe(`drop table if exists ${table}`);
+      }
+      await sql`alter table keyway_applications drop column if exists owner_stytch_user_id`;
+    },
+  },
 ];
