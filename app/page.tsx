@@ -28,19 +28,19 @@ export function Checkout({ invoice }) {
 
 const HOOKS = [
   ["useKeyWay", "Sign in, sign out and session state."],
-  ["useCkbWallet", "Address and balance, without starting Fiber."],
+  ["useCkbWallet", "Address, balance and a CCC signer, without starting Fiber."],
   ["useFiber", "Connect, open channels, create and pay invoices."],
 ] as const;
 
 const BUILT_IN = [
   "The CKB signing key lives in Lit's secure hardware and is never exported to your app.",
-  "Users approve the amount, fee and destination before any channel is funded.",
+  "Users approve every transaction before it's signed, and can require an emailed code for large transfers.",
   "Fiber keys and node backups are encrypted at rest.",
   "Each app has its own users, sessions and one-time codes.",
 ];
 
 const GOOD_TO_KNOW = [
-  "KeyWay's backend authorizes signing. Lit does not yet verify the user on its own.",
+  "KeyWay's backend authorizes signing, and approvals appear inside your app's page. Lit doesn't yet verify the user on its own.",
   "Managed nodes run on KeyWay's infrastructure, which holds their fiber keys.",
   "Access to a user's inbox can recover their account until 2FA ships.",
   "KeyWay runs on CKB testnet and has not been audited yet.",
