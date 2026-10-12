@@ -30,9 +30,9 @@ async function webRequest(incoming: IncomingMessage): Promise<Request> {
   }
   headers.delete("x-keyway-client-ip");
   const socketIp = incoming.socket.remoteAddress ?? "unknown";
-  // Enable only behind Railway's edge; use its appended (rightmost) address,
-  // never a browser-supplied leftmost X-Forwarded-For value.
-  const forwarded = headers.get("x-forwarded-for")?.split(",").at(-1)?.trim();
+  // Enable only behind Railway's edge. Railway replaces any browser-supplied X-Forwarded-For and sets
+  // X-Real-IP to the connecting client; the rightmost forwarded entry is Railway's own edge (verified 2026-10-12).
+  const forwarded = headers.get("x-real-ip")?.trim();
   headers.set("x-keyway-client-ip", process.env.KEYWAY_TRUST_PROXY === "railway" && forwarded && isIP(forwarded) ? forwarded : socketIp);
   const method = incoming.method ?? "GET";
   const pathname = incoming.url?.split("?", 1)[0] ?? "/";
