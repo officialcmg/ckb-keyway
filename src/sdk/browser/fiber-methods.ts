@@ -225,7 +225,12 @@ export function approveFiberParams(method: string, input: unknown): Record<strin
         fee_rate: (value) => cappedHex(value, MAX_CLOSE_FEE_RATE, "fee_rate"),
       }), ["channel_id"]);
     case "connectPeer": {
-      const peer = pick(params, { pubkey, address: multiaddr, addr_type: (value) => oneOf(value, ["tcp", "ws", "wss"], "addr_type") });
+      const peer = pick(params, {
+        pubkey,
+        address: multiaddr,
+        addr_type: (value) => oneOf(value, ["tcp", "ws", "wss"], "addr_type"),
+        save: (value) => { if (value !== false) throw new Error("Peers can't be saved to the node's permanent peer store"); return value; },
+      });
       if (peer.pubkey === undefined && peer.address === undefined) throw new Error("Pass a peer pubkey or address");
       // Peers are never saved to the node's permanent peer store on an app's say-so.
       return { ...peer, save: false };

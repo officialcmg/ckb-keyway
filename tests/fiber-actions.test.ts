@@ -15,6 +15,17 @@ test("dialog methods: KeyWay keeps the scripts, caps fees, and never saves peers
   assert.throws(() => approveFiberParams("updateChannel", { channel_id: id, tlc_fee_proportional_millionths: "0x186a1" }), /at most 100000/);
   assert.deepEqual(approveFiberParams("connectPeer", { pubkey: channel.pubkey }), { pubkey: channel.pubkey, save: false });
   assert.throws(() => approveFiberParams("connectPeer", {}), /pubkey or address/);
+  assert.throws(() => approveFiberParams("connectPeer", { pubkey: channel.pubkey, save: true }), /can't be saved/);
+  // The SDK checks first and the backend checks again, so each check must accept the other's output.
+  for (const [method, input] of [
+    ["connectPeer", { address: "/dns4/bottle.fiber.channel/tcp/443/wss" }],
+    ["shutdownChannel", { channel_id: id, force: true }],
+    ["updateChannel", { channel_id: id, enabled: false }],
+    ["disconnectPeer", { pubkey: channel.pubkey }],
+  ] as const) {
+    const once = approveFiberParams(method, input);
+    assert.deepEqual(approveFiberParams(method, once), once, method);
+  }
   assert.throws(() => approveFiberParams("abandonChannel", {}), /isn't available/);
 });
 
