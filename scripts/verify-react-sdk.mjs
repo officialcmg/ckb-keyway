@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { build } from "esbuild";
 
-const { chromium } = await import(process.env.PLAYWRIGHT_MODULE ?? "playwright");
+const playwright = await import(process.env.PLAYWRIGHT_MODULE ?? "playwright");
+const { chromium } = playwright.chromium ? playwright : playwright.default;
 const bundle = await build({ entryPoints: ["tests/fixtures/react-sdk.tsx"], bundle: true, write: false, platform: "browser", format: "iife", jsx: "automatic", define: { "process.env.KEYWAY_API_TARGET": '"production"', "process.env.NODE_ENV": '"development"' } });
 const server = createServer((request, response) => {
   response.setHeader("Content-Type", request.url === "/fixture.js" ? "text/javascript" : "text/html");
@@ -55,31 +56,31 @@ try {
     if (scenario === "logout-race") {
       await page.evaluate(() => window.probe.auth.logout()); release();
       await page.waitForTimeout(100);
-      assert.equal(await page.evaluate(() => window.probe.account.wallet), undefined);
+      assert.equal(await page.evaluate(() => window.probe.account.address), undefined);
     } else if (scenario === "recovery-failure") {
       await page.waitForFunction(() => window.probe.account.error);
-      assert.equal(await page.evaluate(() => window.probe.fiber.status), "disconnected");
+      assert.equal(await page.evaluate(() => window.probe.fiber.status), "stopped");
     } else {
-      await page.waitForFunction(() => window.probe.account.wallet);
-      if (scenario === "auto") await page.waitForFunction(() => window.probe.fiber.status === "connected");
+      await page.waitForFunction(() => window.probe.account.address);
+      if (scenario === "auto") await page.waitForFunction(() => window.probe.fiber.status === "running");
       else {
         assert.equal(calls.some(call => call.url.endsWith("/managed-node")), false);
-        assert.equal(await page.evaluate(() => window.probe.fiber.status), "disconnected");
+        assert.equal(await page.evaluate(() => window.probe.fiber.status), "stopped");
         if (scenario === "balance-failure") await page.waitForFunction(() => window.probe.account.error);
         else await page.waitForFunction(() => window.probe.account.balance === 0n);
         if (scenario === "default" || scenario === "payment-refresh-failure") {
           await page.evaluate(async () => {
             const fiber = window.probe.fiber;
-            await fiber.connect();
+            await fiber.start();
             await fiber.refreshChannels();
           });
-          assert.equal(await page.evaluate(() => window.probe.fiber.status), "connected");
+          assert.equal(await page.evaluate(() => window.probe.fiber.status), "running");
           if (scenario === "payment-refresh-failure") {
             const result = await page.evaluate(() => window.probe.fiber.payInvoice("mock-invoice"));
             assert.equal(result.status, "Success");
           }
-          await page.evaluate(() => window.probe.fiber.disconnect());
-          assert.equal(await page.evaluate(() => window.probe.fiber.status), "disconnected");
+          await page.evaluate(() => window.probe.fiber.stop());
+          assert.equal(await page.evaluate(() => window.probe.fiber.status), "stopped");
           assert.equal(await page.evaluate(() => window.probe.account.status), "ready");
         }
       }

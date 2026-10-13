@@ -49,7 +49,7 @@ The Next.js reference app imports only the published `@ckb-keyway/react` package
 1. Fiber negotiates a collaborative transaction with the selected peer.
 2. CCC converts the transaction into KeyWay's signer representation.
 3. `/api/keyway/sign-transaction` resolves every input cell and requires at least one KeyWay-controlled input.
-4. Policy requires exactly one testnet Fiber FundingLock output, no UDT outputs, at most 1,000 CKB of KeyWay funding, and at most 1 CKB total fee.
+4. Policy requires exactly one testnet Fiber FundingLock output, no UDT outputs, and at most 1 CKB total fee. There is no cap on the channel size.
 5. CCC identifies exactly one KeyWay signing group and computes its CKB sighash.
 6. The pinned Lit Action signs the 32-byte digest. The backend recovers and compares the PKP public key.
 7. KeyWay inserts only that group's witness. Fiber verifies the transaction structure is otherwise unchanged and submits it.
@@ -91,7 +91,7 @@ Managed channel connections use the approved public peer's key with `addr_type: 
 
 Funding transactions use CCC's native JSON-RPC transformer before submission, excluding cached input metadata while preserving the transaction hash and witnesses. The gateway applies the same transformation for older SDK versions, which native Fiber otherwise rejects as invalid parameters.
 
-The managed host caps load with `KEYWAY_MANAGED_MAX_NODES` (default 16 concurrent nodes) and `KEYWAY_MANAGED_MAX_CHANNELS` (default 5 open channels per managed account, enforced in the backend before funding). State is protected by an operator-driven snapshot API on the same bearer-token boundary:
+The managed host caps load with `KEYWAY_MANAGED_MAX_NODES` (default 16 concurrent nodes). State is protected by an operator-driven snapshot API on the same bearer-token boundary:
 
 | Request | Effect |
 | --- | --- |

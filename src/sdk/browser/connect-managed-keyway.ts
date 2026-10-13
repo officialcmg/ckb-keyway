@@ -1,11 +1,13 @@
 import { bootstrapKeyWay, type PublicWallet } from "./bootstrap";
 import { KeyWayApiClient } from "./api-client";
 import { createManagedKeyWay, type ManagedKeyWay } from "./create-managed-keyway";
-import type { ConfirmFunding } from "./remote-ckb-signer";
-import type { KeyWayLifecycleEvent, KeyWayLifecycleStage } from "./connect-keyway";
+import type { ApproveFiberChannelOpen } from "./remote-ckb-signer";
+import type { ApproveFiberPayment } from "./fiber-payment";
+import type { RequestEmailCode } from "./email-code";
+import type { FiberStartupEvent, FiberStartupStage } from "./connect-keyway";
 
 export type ConnectedManagedKeyWay = {
-  mode: "managed";
+  mode: "hosted";
   keyway: ManagedKeyWay;
   wallet: PublicWallet;
   node: Awaited<ReturnType<ManagedKeyWay["nodeInfo"]>>;
@@ -15,34 +17,38 @@ export type ConnectedManagedKeyWay = {
 
 export async function connectManagedKeyWay(options: {
   authToken: string;
-  confirmFunding: ConfirmFunding;
+  approveFiberChannelOpen: ApproveFiberChannelOpen;
+  approveFiberPayment?: ApproveFiberPayment;
+  requestEmailCode?: RequestEmailCode;
   apiClient?: KeyWayApiClient;
   onWalletReady?: (wallet: PublicWallet) => void;
-  onLifecycle?: (event: KeyWayLifecycleEvent) => void;
+  onFiberStartup?: (event: FiberStartupEvent) => void;
 }): Promise<ConnectedManagedKeyWay> {
   const startedAt = Date.now();
-  const stage = (next: KeyWayLifecycleStage) => options.onLifecycle?.({
+  const stage = (next: FiberStartupStage) => options.onFiberStartup?.({
     stage: next,
     at: Date.now(),
     elapsedMs: Date.now() - startedAt,
   });
   const api = options.apiClient ?? new KeyWayApiClient();
-  stage("recovering_identity");
+  stage("loading_account");
   const { wallet } = await bootstrapKeyWay(options.authToken, api, "managed");
   options.onWalletReady?.(wallet);
   const keyway = createManagedKeyWay({
     authToken: options.authToken,
     ckbPublicKey: wallet.litPublicKey,
-    confirmFunding: options.confirmFunding,
+    approveFiberChannelOpen: options.approveFiberChannelOpen,
+    approveFiberPayment: options.approveFiberPayment,
+    requestEmailCode: options.requestEmailCode,
     apiClient: api,
   });
-  stage("starting_managed");
+  stage("starting_hosted_node");
   try {
     const node = await keyway.start();
     const status = await api.managedNode<{ peers: Array<{ pubkey: string }> }>(options.authToken, { operation: "status" });
     stage("synchronizing");
     const connection = {
-      mode: "managed" as const,
+      mode: "hosted" as const,
       keyway,
       wallet,
       node,

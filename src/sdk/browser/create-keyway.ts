@@ -10,21 +10,25 @@ import {
   type ChannelId,
   type NewInvoiceParams,
   type OpenChannelWithExternalFundingParams,
+  type Script,
   type SendPaymentParams,
 } from "@fiber-pay/sdk/browser";
 import { KeyWayCredentialProvider, type FiberKeyLoader } from "./credential-provider";
 import { acquireDeviceLock, type DeviceLock } from "./device-lock";
 import { acquireDeviceLease, type DeviceLease } from "./device-lease";
 import { serializeCccTransactionForRpc } from "./ccc-transaction";
-import { RemoteCkbSigner, type ConfirmFunding } from "./remote-ckb-signer";
+import { RemoteCkbSigner, type ApproveFiberChannelOpen } from "./remote-ckb-signer";
 import { getDeviceIdHash, markChannelOpened } from "./bootstrap";
-import { connectChannelPeers, type ChannelPeer } from "./channel-peers";
+import { ANY_FUNDING, connectChannelPeers, type ChannelPeer } from "./channel-peers";
 import { normalizeFiberPubkey } from "./fiber-pubkey";
 import { KeyWayApiClient } from "./api-client";
 import { createEncryptedNodeBackup, restoreEncryptedNodeBackup } from "./node-backup";
 import { backUpBeforeLogout, restoreBeforeStart } from "./node-migration";
 import { toKeyWayError, type KeyWayError } from "./keyway-error";
-import { withDefaultInvoiceExpiry } from "./invoice-expiry";
+import { freeFiberParams, paymentFiberParams } from "./fiber-methods";
+import { describePayment, type ApproveFiberPayment } from "./fiber-payment";
+import { createFiberNode, listLoggedPayments, type ListPaymentsParams } from "./fiber-node";
+import { createPaymentLog } from "./payment-log";
 
 export type KeyWayFundingParams = Omit<
   OpenChannelWithExternalFundingParams,
@@ -35,38 +39,49 @@ export type CreateKeyWayOptions = {
   identifier: string;
   authToken: string;
   ckbPublicKey: string;
-  confirmFunding: ConfirmFunding;
+  approveFiberChannelOpen: ApproveFiberChannelOpen;
+  /** The app's own payment confirmation, if any. KeyWay draws no payment dialog. */
+  approveFiberPayment?: ApproveFiberPayment;
   loadFiberKey: (leaseId: string) => ReturnType<FiberKeyLoader>;
   network?: "testnet" | "mainnet";
   apiClient?: KeyWayApiClient;
   restoreRequired?: boolean;
   onLeaseLost?: (error: Error) => void;
-  onLifecycle?: (stage: KeyWayNodeStage) => void;
+  onFiberStartup?: (stage: BrowserNodeStage) => void;
 };
 
-export type ActivationStage = "connecting" | "negotiating" | "confirming" | "signing" | "broadcasting" | "waiting";
-export type ActivationProgress = (stage: ActivationStage) => void;
-export type KeyWayNodeStage = "acquiring_lease" | "restoring_database" | "starting_wasm";
+export type ChannelOpenStage = "connecting" | "negotiating" | "confirming" | "signing" | "broadcasting" | "waiting";
+export type ChannelOpenProgress = (stage: ChannelOpenStage) => void;
+export type BrowserNodeStage = "claiming_device" | "restoring_channels" | "starting_browser_node";
 export type OpenKeyWayChannelOptions = {
+  /** Shannons for a CKB channel (default 1,000 CKB), or the token's smallest unit for a token channel. */
   fundingAmount?: bigint;
+  /** Opens a token channel instead, for a token the peer accepts (on testnet, RUSD). Requires `fundingAmount`. */
+  udtTypeScript?: Script;
   peer?: string;
   public?: boolean;
   fundingFeeRate?: bigint;
   commitmentFeeRate?: bigint;
 };
 export type KeyWayChannelStatus = "pending" | "ready" | "closing" | "closed" | "failed" | "unknown";
+/** The asset a channel or payment moves: CKB, or a token identified by its type script. */
+export type KeyWayAsset = { kind: "ckb" } | { kind: "token"; typeScript: Script };
 export type KeyWayChannel = {
   id: ChannelId;
   peer: string;
   status: KeyWayChannelStatus;
-  localBalanceShannons: bigint;
-  remoteBalanceShannons: bigint;
-  totalBalanceShannons: bigint;
+  asset: KeyWayAsset;
+  /** What the user can still send through this channel, in the asset's smallest unit (shannons for CKB). */
+  canSend: bigint;
+  /** What the user can still receive through this channel. */
+  canReceive: bigint;
+  /** The channel's total size: canSend plus canReceive. */
+  capacity: bigint;
   public: boolean;
   raw: Channel;
 };
-export type PaymentPreflight =
-  | { routable: true; feeShannons: bigint }
+export type PaymentEstimate =
+  | { routable: true; fee: bigint }
   | { routable: false; error: KeyWayError };
 
 const DEFAULT_CHANNEL_FUNDING = 1_000n * 100_000_000n;
@@ -83,12 +98,12 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   });
   let deviceLock: DeviceLock | undefined;
   const api = options.apiClient ?? new KeyWayApiClient();
-  let activationProgress: ActivationProgress | undefined;
+  let activationProgress: ChannelOpenProgress | undefined;
   let preparedPeers: Promise<ChannelPeer[]> | undefined;
   let preparedFundingAmount: bigint | undefined;
   const fundingSigner = new RemoteCkbSigner(options.authToken, options.ckbPublicKey, async (preview) => {
     activationProgress?.("confirming");
-    const approved = await options.confirmFunding(preview);
+    const approved = await options.approveFiberChannelOpen(preview);
     if (approved) activationProgress?.("signing");
     return approved;
   }, undefined, api);
@@ -101,6 +116,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   });
   const ckbRpcUrl = "https://testnet.ckbapp.dev/";
   const databasePrefix = `/wasm-${options.identifier}`;
+  const paymentLog = createPaymentLog(databasePrefix);
   let restoreRequired = options.restoreRequired ?? false;
 
   async function start() {
@@ -108,7 +124,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     if (typeof window !== "undefined" && window.crossOriginIsolated !== true) {
       throw toKeyWayError(new Error("Cross-origin isolated browser context is required"));
     }
-    options.onLifecycle?.("acquiring_lease");
+    options.onFiberStartup?.("claiming_device");
     deviceLock = await acquireDeviceLock(options.identifier);
     try {
       deviceLease = await acquireDeviceLease(options.authToken, api, (cause) => {
@@ -116,10 +132,10 @@ export function createKeyWay(options: CreateKeyWayOptions) {
         void stop().finally(() => options.onLeaseLost?.(error));
       });
       if (restoreRequired) {
-        options.onLifecycle?.("restoring_database");
+        options.onFiberStartup?.("restoring_channels");
         await restoreClaimedBackup();
       }
-      options.onLifecycle?.("starting_wasm");
+      options.onFiberStartup?.("starting_browser_node");
       return await node.start();
     } catch (error) {
       await releaseGuards();
@@ -212,16 +228,18 @@ export function createKeyWay(options: CreateKeyWayOptions) {
 
   async function activateCkbChannel(
     input: bigint | OpenKeyWayChannelOptions = DEFAULT_CHANNEL_FUNDING,
-    onProgress?: ActivationProgress,
+    onProgress?: ChannelOpenProgress,
   ) {
-    const config = typeof input === "bigint" ? { fundingAmount: input } : input;
+    const config: OpenKeyWayChannelOptions = typeof input === "bigint" ? { fundingAmount: input } : input;
+    if (config.udtTypeScript && config.fundingAmount === undefined) throw new Error("A token channel needs a fundingAmount");
     const fundingAmount = config.fundingAmount ?? DEFAULT_CHANNEL_FUNDING;
     activationProgress = onProgress;
     activationProgress?.("connecting");
     try {
       const candidates = config.peer
         ? [{ pubkey: normalizeFiberPubkey(config.peer), nodeName: "selected peer" }]
-        : await prepareCkbChannel(fundingAmount);
+        // The official peers' minimums are in CKB, so any of them will do for a token channel.
+        : await prepareCkbChannel(config.udtTypeScript ? ANY_FUNDING : fundingAmount);
       let lastAbort: unknown;
       for (const candidate of candidates) {
         try {
@@ -230,6 +248,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
             pubkey: normalizeFiberPubkey(candidate.pubkey),
             funding_amount: `0x${fundingAmount.toString(16)}`,
             public: config.public ?? true,
+            ...(config.udtTypeScript ? { funding_udt_type_script: config.udtTypeScript } : {}),
             funding_fee_rate: config.fundingFeeRate === undefined ? undefined : toHex(config.fundingFeeRate),
             commitment_fee_rate: config.commitmentFeeRate === undefined ? undefined : toHex(config.commitmentFeeRate),
           });
@@ -271,10 +290,10 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     }
   }
 
-  async function preflightPayment(params: Omit<SendPaymentParams, "dry_run">): Promise<PaymentPreflight> {
+  async function estimatePayment(params: Omit<SendPaymentParams, "dry_run">): Promise<PaymentEstimate> {
     try {
       const payment = await node.sendPayment({ ...params, dry_run: true });
-      return { routable: true, feeShannons: BigInt(payment.fee) };
+      return { routable: true, fee: BigInt(payment.fee) };
     } catch (error) {
       return { routable: false, error: toKeyWayError(error, "PAYMENT_FAILED") };
     }
@@ -282,13 +301,41 @@ export function createKeyWay(options: CreateKeyWayOptions) {
 
   async function sendPayment(params: SendPaymentParams) {
     try {
-      return await node.sendPayment(params);
+      return await fiberNode.sendPayment(params);
     } catch (error) {
       throw toKeyWayError(error, "PAYMENT_FAILED");
     }
   }
 
+  const network = options.network ?? "testnet";
+  // The same method table as hosted nodes, applied in the page because this node runs here.
+  const fiberNode = createFiberNode(async (method, input) => {
+    if (!node.isRunning) throw new Error("Start Fiber before using the node");
+    const params = freeFiberParams(method, input, network);
+    switch (method) {
+      case "nodeInfo": return node.nodeInfo();
+      case "listPeers": return node.listPeers();
+      case "listPayments": return listLoggedPayments(await paymentLog.hashes(), params as ListPaymentsParams, (query) => node.getPayment(query));
+      default: return (node[method] as (params: unknown) => Promise<unknown>).call(node, params);
+    }
+  }, async (method, input) => {
+    if (!node.isRunning) throw new Error("Start Fiber before using the node");
+    const params = paymentFiberParams(method, input, network);
+    const run = (next: Record<string, unknown>) => (node[method] as (params: unknown) => Promise<{ payment_hash: string; fee: string }>).call(node, next);
+    if (params.dry_run === true) return run(params);
+    // The node runs in this page, so there is no server to count this payment or ask for an email code.
+    if (options.approveFiberPayment) {
+      const { preview } = await describePayment(method, params, { parseInvoice: (invoice) => node.parseInvoice({ invoice }), dryRun: run });
+      if (!await options.approveFiberPayment({ ...preview, requiresEmailCode: false })) throw new Error("The payment was not approved");
+    }
+    const payment = await run(params);
+    // Browser nodes have no payment history of their own; failing to log never fails the payment.
+    await paymentLog.record(payment.payment_hash).catch(() => undefined);
+    return payment;
+  });
+
   return {
+    node: fiberNode,
     start,
     stop,
     stopForLogout,
@@ -302,10 +349,10 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     graphNodes: node.graphNodes.bind(node),
     graphChannels: node.graphChannels.bind(node),
     waitForChannelReady: node.waitForChannelReady.bind(node),
-    newInvoice: (params: NewInvoiceParams) => node.newInvoice(withDefaultInvoiceExpiry(params)),
+    newInvoice: (params: Omit<NewInvoiceParams, "currency"> & { currency?: NewInvoiceParams["currency"] }) => fiberNode.newInvoice(params),
     getInvoice: node.getInvoice.bind(node),
     parseInvoice: node.parseInvoice.bind(node),
-    preflightPayment,
+    estimatePayment,
     sendPayment,
     buildRouter: node.buildRouter.bind(node),
     sendPaymentWithRouter: node.sendPaymentWithRouter.bind(node),
@@ -323,8 +370,9 @@ export function createKeyWay(options: CreateKeyWayOptions) {
 }
 
 export function normalizeChannel(channel: Channel): KeyWayChannel {
-  const localBalanceShannons = BigInt(channel.local_balance);
-  const remoteBalanceShannons = BigInt(channel.remote_balance);
+  const canSend = BigInt(channel.local_balance);
+  const canReceive = BigInt(channel.remote_balance);
+  const typeScript = (channel as Channel & { funding_udt_type_script?: Script | null }).funding_udt_type_script;
   const state = String(channel.state.state_name);
   const status: KeyWayChannelStatus = state === "CHANNEL_READY" ? "ready"
     : state.includes("SHUTDOWN") || state.includes("SHUTTING") || state.includes("CLOSING") ? "closing"
@@ -336,9 +384,10 @@ export function normalizeChannel(channel: Channel): KeyWayChannel {
     id: channel.channel_id,
     peer: channel.pubkey,
     status,
-    localBalanceShannons,
-    remoteBalanceShannons,
-    totalBalanceShannons: localBalanceShannons + remoteBalanceShannons,
+    asset: typeScript ? { kind: "token", typeScript } : { kind: "ckb" },
+    canSend,
+    canReceive,
+    capacity: canSend + canReceive,
     public: channel.is_public,
     raw: channel,
   };

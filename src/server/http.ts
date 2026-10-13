@@ -32,7 +32,8 @@ import {
   removeApplicationOrigin,
   updateApplication,
 } from "./applications.ts";
-import { managedNodeReady, managedNodeRequest } from "./managed-node.ts";
+import { managedFiberNode, managedNodeReady, managedNodeRequest } from "./managed-node.ts";
+import { fiberPayment } from "./fiber-payments.ts";
 import { runIdempotentMutation } from "./idempotency.ts";
 import { recordSigningEvent } from "./security-alerts.ts";
 import { messageSigning, signingSettings, transactionSigning, type SigningContext } from "./general-signing.ts";
@@ -85,7 +86,9 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
     const message = error instanceof Error ? error.message : "KeyWay request failed";
     const unauthorized = /session|bearer/i.test(message);
     const rateLimited = /too many/i.test(message);
-    console.error("[keyway] request failed", { status: unauthorized ? 401 : rateLimited ? 429 : 400 });
+    // A sanitized cause for operators: Lit refuses everything once the account's credit runs out.
+    const cause = /payment_required|HTTP 402/i.test(message) ? "lit-out-of-credit" : PROVIDER_ERROR.test(message) ? "provider" : undefined;
+    console.error("[keyway] request failed", { status: unauthorized ? 401 : rateLimited ? 429 : 400, ...(cause ? { cause } : {}) });
     return jsonError(publicErrorMessage(message), unauthorized ? 401 : rateLimited ? 429 : 400, cors);
   }
 }
@@ -94,6 +97,16 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
   const user = await authenticateUser(request);
   const body = await objectBody(request, "Invalid managed-node request");
   const operation = typeof body.operation === "string" ? body.operation : "unknown";
+  if (operation === "call") {
+    const limit = await consumeRateLimit(`fiber-call:${user.id}`, { max: 120, window: 60 });
+    if (!limit.allowed) throw new Error(`Too many Fiber node requests. Try again in ${limit.retryAfter ?? 60} seconds`);
+  }
+  if (operation === "pay") {
+    const scope = await resolveAuthScope(request);
+    const context = { user, appName: scope.name, email: () => sessionEmail(request), sendEmail: sendTransactionalEmail, rateLimit: consumeRateLimit };
+    const result = await fiberPayment(context, managedFiberNode(user.id), body);
+    return Response.json(result, { headers: { "Cache-Control": "no-store" } });
+  }
   const result = ["new-invoice", "send-payment", "open-channel", "submit-channel-funding", "close-channel"].includes(operation)
     ? await runIdempotentMutation(
       user.id,

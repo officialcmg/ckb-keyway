@@ -16,16 +16,18 @@ import { cleanupLegacyDatabases } from "../browser/legacy-cleanup";
 import {
   connectKeyWay,
   type ConnectedKeyWay,
-  type KeyWayLifecycleEvent,
-  type KeyWayLifecycleStage,
+  type FiberStartupEvent,
+  type FiberStartupStage,
 } from "../browser/connect-keyway";
 import {
   connectManagedKeyWay,
   type ConnectedManagedKeyWay,
 } from "../browser/connect-managed-keyway";
 import { bootstrapKeyWay, type PublicWallet } from "../browser/bootstrap";
-import type { ConfirmFunding, FundingPreview } from "../browser/remote-ckb-signer";
-import { KeyWaySigner, type ConfirmMessage, type ConfirmTransaction, type MessagePreview, type TransactionPreview } from "../browser/keyway-signer";
+import type { ApproveFiberChannelOpen, FiberChannelOpenPreview } from "../browser/remote-ckb-signer";
+import type { ApproveFiberPayment } from "../browser/fiber-payment";
+import type { RequestEmailCode } from "../browser/email-code";
+import { KeyWaySigner, type ApproveCkbMessage, type ApproveCkbTransaction, type MessagePreview, type TransactionPreview } from "../browser/keyway-signer";
 import { KeyWayEmailCodeModal, KeyWayMessageModal, KeyWayTransactionModal } from "./signing-modals";
 import {
   modalBackdrop,
@@ -64,18 +66,27 @@ export type KeyWayProviderProps = {
   appId?: string;
   appName?: string;
   theme?: "light" | "dark";
-  confirmFunding?: ConfirmFunding;
-  /** Replaces the built-in transaction approval dialog. Return false to cancel. */
-  confirmTransaction?: ConfirmTransaction;
-  /** Replaces the built-in message-signing dialog. Return false to cancel. */
-  confirmMessage?: ConfirmMessage;
-  autoConnect?: boolean;
-  nodeMode?: KeyWayNodeMode;
+  /** Replaces the built-in dialog for opening a Fiber channel. Return false to cancel. */
+  approveFiberChannelOpen?: ApproveFiberChannelOpen;
+  /**
+   * Your own confirmation for Fiber payments. Off by default: Fiber is for fast payments, so KeyWay shows no
+   * payment dialog. Payments still count toward the user's daily email-confirmation amount.
+   */
+  approveFiberPayment?: ApproveFiberPayment;
+  /** Replaces the built-in dialog for signing a CKB transaction. Return false to cancel. */
+  approveCkbTransaction?: ApproveCkbTransaction;
+  /** Replaces the built-in dialog for signing a message. Return false to cancel. */
+  approveCkbMessage?: ApproveCkbMessage;
+  /** Starts Fiber as soon as the user signs in. Off by default; call `useFiber().start()` instead. */
+  autoStartFiber?: boolean;
+  /** Where the user's Fiber node runs: on KeyWay's servers (default) or in this page. */
+  fiberNode?: FiberNodeKind;
   onError?: (error: Error) => void;
-  onLifecycle?: (event: KeyWayLifecycleEvent) => void;
+  /** Reports each step of starting the Fiber node after `useFiber().start()`. */
+  onFiberStartup?: (event: FiberStartupEvent) => void;
 };
 
-export type KeyWayNodeMode = "browser" | "managed";
+export type FiberNodeKind = "hosted" | "browser";
 export type KeyWayConnection = ConnectedKeyWay | ConnectedManagedKeyWay;
 
 export type KeyWayUser = { id: string };
@@ -84,7 +95,7 @@ export type KeyWayContextValue = {
   ready: boolean;
   authenticated: boolean;
   user?: KeyWayUser;
-  nodeMode: KeyWayNodeMode;
+  fiberNode: FiberNodeKind;
   connection?: KeyWayConnection;
   wallet?: PublicWallet;
   /** A CCC signer for the signed-in account, once its wallet is ready. */
@@ -95,12 +106,12 @@ export type KeyWayContextValue = {
   fiberStarting: boolean;
   fiberReady: boolean;
   fiberError?: Error;
-  lifecycleStage?: KeyWayLifecycleStage;
-  lifecycleTimings: Partial<Record<KeyWayLifecycleStage, number>>;
+  fiberStartupStage?: FiberStartupStage;
+  fiberStartupTimings: Partial<Record<FiberStartupStage, number>>;
   login: () => void;
   logout: () => Promise<void>;
-  connect: () => Promise<KeyWayConnection>;
-  disconnect: () => Promise<void>;
+  startFiber: () => Promise<KeyWayConnection>;
+  stopFiber: () => Promise<void>;
 };
 
 const KeyWayContext = createContext<KeyWayContextValue | undefined>(undefined);
@@ -110,28 +121,29 @@ export function KeyWayProvider({
   appId,
   appName = "CKB KeyWay",
   theme = "light",
-  confirmFunding,
-  confirmTransaction,
-  confirmMessage,
-  autoConnect = false,
-  nodeMode = "managed",
+  approveFiberChannelOpen,
+  approveFiberPayment,
+  approveCkbTransaction,
+  approveCkbMessage,
+  autoStartFiber = false,
+  fiberNode = "hosted",
   onError,
-  onLifecycle,
+  onFiberStartup,
 }: KeyWayProviderProps) {
   const resolvedAppName = appName.trim().slice(0, 64) || "CKB KeyWay";
   const api = new KeyWayApiClient({ appId });
   const connectionRef = useRef<KeyWayConnection | undefined>(undefined);
   const operationRef = useRef<Promise<void>>(Promise.resolve());
   const runRef = useRef(0);
-  const callbacksRef = useRef({ confirmFunding, confirmTransaction, confirmMessage, onError, onLifecycle });
-  callbacksRef.current = { confirmFunding, confirmTransaction, confirmMessage, onError, onLifecycle };
+  const callbacksRef = useRef({ approveFiberChannelOpen, approveFiberPayment, approveCkbTransaction, approveCkbMessage, onError, onFiberStartup });
+  callbacksRef.current = { approveFiberChannelOpen, approveFiberPayment, approveCkbTransaction, approveCkbMessage, onError, onFiberStartup };
   const [connection, setConnection] = useState<KeyWayConnection>();
   const [wallet, setWallet] = useState<PublicWallet>();
   const [status, setStatus] = useState<KeyWayStatus>("idle");
   const [error, setError] = useState<Error>();
   const [fiberError, setFiberError] = useState<Error>();
-  const [lifecycleStage, setLifecycleStage] = useState<KeyWayLifecycleStage>();
-  const [lifecycleTimings, setLifecycleTimings] = useState<Partial<Record<KeyWayLifecycleStage, number>>>({});
+  const [fiberStartupStage, setFiberStartupStage] = useState<FiberStartupStage>();
+  const [fiberStartupTimings, setFiberStartupTimings] = useState<Partial<Record<FiberStartupStage, number>>>({});
   const [authToken, setAuthToken] = useState<string>();
   const [expiresAt, setExpiresAt] = useState<string>();
   const [user, setUser] = useState<KeyWayUser>();
@@ -140,16 +152,19 @@ export function KeyWayProvider({
   const [transactionRequest, setTransactionRequest] = useState<{ preview: TransactionPreview; resolve: (approved: boolean) => void }>();
   const [messageRequest, setMessageRequest] = useState<{ preview: MessagePreview; resolve: (approved: boolean) => void }>();
   const [codeRequest, setCodeRequest] = useState<{
-    reason: "transaction" | "settings";
+    reason: "transaction" | "settings" | "payment";
     error?: string;
     resend: () => Promise<void>;
     resolve: (code: string | undefined) => void;
   }>();
   const [fundingRequest, setFundingRequest] = useState<{
-    preview: FundingPreview;
+    preview: FiberChannelOpenPreview;
     resolve: (approved: boolean) => void;
   }>();
   const authenticated = ready && Boolean(authToken && user);
+
+  // The code prompt is always the SDK's own, even when an app brings its own approval UI.
+  const requestEmailCode: RequestEmailCode = (request) => new Promise<string | undefined>((resolve) => setCodeRequest({ ...request, resolve }));
 
   async function connect() {
     if (!authToken) throw new Error("Log in before connecting KeyWay");
@@ -157,7 +172,7 @@ export function KeyWayProvider({
     setStatus("connecting");
     setError(undefined);
     setFiberError(undefined);
-    setLifecycleTimings({});
+    setFiberStartupTimings({});
     const previousOperation = operationRef.current;
     const operation = (async () => {
       await previousOperation;
@@ -168,16 +183,19 @@ export function KeyWayProvider({
       if (previous) await previous.keyway.stop();
 
       try {
-        const connectNode = nodeMode === "managed" ? connectManagedKeyWay : connectKeyWay;
+        const connectNode = fiberNode === "hosted" ? connectManagedKeyWay : connectKeyWay;
         const next = await connectNode({
           authToken,
           apiClient: api,
-          confirmFunding: (preview) => {
+          approveFiberChannelOpen: (preview) => {
             if (run !== runRef.current) return false;
-            return callbacksRef.current.confirmFunding?.(preview) ??
+            return callbacksRef.current.approveFiberChannelOpen?.(preview) ??
               new Promise<boolean>((resolve) => setFundingRequest({ preview, resolve }));
           },
-          ...(nodeMode === "browser" ? { onLeaseLost: (leaseError: Error) => {
+          // Read at payment time, so an app can add or drop its own confirmation without restarting Fiber.
+          approveFiberPayment: (preview) => callbacksRef.current.approveFiberPayment?.(preview) ?? true,
+          requestEmailCode,
+          ...(fiberNode === "browser" ? { onLeaseLost: (leaseError: Error) => {
             if (run !== runRef.current) return;
             connectionRef.current = undefined;
             setConnection(undefined);
@@ -189,11 +207,11 @@ export function KeyWayProvider({
           onWalletReady: (nextWallet) => {
             if (run === runRef.current) setWallet(nextWallet);
           },
-          onLifecycle: (event) => {
+          onFiberStartup: (event) => {
             if (run !== runRef.current) return;
-            setLifecycleStage(event.stage);
-            setLifecycleTimings((current) => ({ ...current, [event.stage]: event.elapsedMs }));
-            callbacksRef.current.onLifecycle?.(event);
+            setFiberStartupStage(event.stage);
+            setFiberStartupTimings((current) => ({ ...current, [event.stage]: event.elapsedMs }));
+            callbacksRef.current.onFiberStartup?.(event);
           },
         });
         if (run !== runRef.current) {
@@ -228,7 +246,7 @@ export function KeyWayProvider({
     setConnection(undefined);
     if (!current) {
       setStatus("idle");
-      setLifecycleStage(undefined);
+      setFiberStartupStage(undefined);
       return;
     }
     setStatus("disconnecting");
@@ -236,7 +254,7 @@ export function KeyWayProvider({
       await current.keyway.stop();
     } finally {
       setStatus("idle");
-      setLifecycleStage(undefined);
+      setFiberStartupStage(undefined);
     }
   }
 
@@ -267,7 +285,7 @@ export function KeyWayProvider({
       setUser(undefined);
       setStatus("idle");
       setFiberError(undefined);
-      setLifecycleStage(undefined);
+      setFiberStartupStage(undefined);
     } catch (cause) {
       const logoutError = cause instanceof Error ? cause : new Error("Could not safely back up and log out");
       if (current) await connect().catch(() => undefined);
@@ -352,13 +370,13 @@ export function KeyWayProvider({
       setError(undefined);
       setWallet(undefined);
       setFiberError(undefined);
-      setLifecycleStage(undefined);
+      setFiberStartupStage(undefined);
       if (ready) setStatus(loginOpen ? "authenticating" : "idle");
       return;
     }
     setLoginOpen(false);
     let active = true;
-    if (autoConnect) {
+    if (autoStartFiber) {
       void connect().catch(() => undefined);
     } else {
       setError(undefined);
@@ -381,17 +399,16 @@ export function KeyWayProvider({
       connectionRef.current = undefined;
       if (current) void current.keyway.stop();
     };
-  }, [authenticated, authToken, appId, autoConnect, nodeMode]);
+  }, [authenticated, authToken, appId, autoStartFiber, fiberNode]);
 
   const signer = useMemo(() => {
     if (!wallet || !authToken) return undefined;
     return new KeyWaySigner(authToken, wallet.litPublicKey, {
-      confirmTransaction: (preview) => callbacksRef.current.confirmTransaction?.(preview) ??
+      approveCkbTransaction: (preview) => callbacksRef.current.approveCkbTransaction?.(preview) ??
         new Promise<boolean>((resolve) => setTransactionRequest({ preview, resolve })),
-      confirmMessage: (preview) => callbacksRef.current.confirmMessage?.(preview) ??
+      approveCkbMessage: (preview) => callbacksRef.current.approveCkbMessage?.(preview) ??
         new Promise<boolean>((resolve) => setMessageRequest({ preview, resolve })),
-      // The code prompt is always the SDK's own, even when an app brings its own approval UI.
-      requestEmailCode: (request) => new Promise<string | undefined>((resolve) => setCodeRequest({ ...request, resolve })),
+      requestEmailCode,
     }, undefined, new KeyWayApiClient({ appId }));
   }, [wallet?.litPublicKey, authToken, appId]);
 
@@ -400,7 +417,7 @@ export function KeyWayProvider({
       ready,
       authenticated,
       user,
-      nodeMode,
+      fiberNode,
       connection,
       wallet,
       signer,
@@ -410,12 +427,12 @@ export function KeyWayProvider({
       fiberStarting: status === "connecting",
       fiberReady: Boolean(connection),
       fiberError,
-      lifecycleStage,
-      lifecycleTimings,
+      fiberStartupStage,
+      fiberStartupTimings,
       login,
       logout,
-      connect,
-      disconnect,
+      startFiber: connect,
+      stopFiber: disconnect,
     }}>
       {children}
       {loginOpen && !authenticated ? (
@@ -520,21 +537,22 @@ export function KeyWayLoginButton({
   );
 }
 
-export type KeyWayConnectButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
-  connectLabel?: ReactNode;
-  connectedLabel?: ReactNode;
-  connectingLabel?: ReactNode;
+export type KeyWayFiberButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
+  startLabel?: ReactNode;
+  stopLabel?: ReactNode;
+  startingLabel?: ReactNode;
 };
 
-export function KeyWayConnectButton({
-  connectLabel = "Start Fiber",
-  connectedLabel = "Stop Fiber",
-  connectingLabel = "Starting...",
+/** Starts or stops the user's Fiber node, asking them to sign in first if needed. */
+export function KeyWayFiberButton({
+  startLabel = "Start Fiber",
+  stopLabel = "Stop Fiber",
+  startingLabel = "Starting...",
   disabled,
   onClick,
   ...props
-}: KeyWayConnectButtonProps) {
-  const { authenticated, connection, status, login, connect, disconnect } = useKeyWayContext();
+}: KeyWayFiberButtonProps) {
+  const { authenticated, connection, status, login, startFiber: connect, stopFiber: disconnect } = useKeyWayContext();
   const pending = status === "connecting" || status === "disconnecting";
   return (
     <button
@@ -548,7 +566,7 @@ export function KeyWayConnectButton({
         void (connection ? disconnect() : connect()).catch(() => undefined);
       }}
     >
-      {pending ? connectingLabel : connection ? connectedLabel : connectLabel}
+      {pending ? startingLabel : connection ? stopLabel : startLabel}
     </button>
   );
 }
@@ -763,7 +781,7 @@ function KeyWayFundingModal({
   answer,
 }: {
   theme: "light" | "dark";
-  preview: FundingPreview;
+  preview: FiberChannelOpenPreview;
   answer: (approved: boolean) => void;
 }) {
   const palette = modalPalette(theme);
@@ -781,11 +799,12 @@ function KeyWayFundingModal({
         <p style={{ ...modalEyebrow, color: palette.muted }}>ON-CHAIN CONFIRMATION</p>
         <h2 id="keyway-funding-title" style={modalTitle}>Activate Fiber payments?</h2>
         <dl style={fundingDetails}>
-          <dt>Channel funding</dt><dd>{preview.amountCkb} CKB</dd>
+          {preview.token && <><dt>Channel funding</dt><dd>{preview.token.amountText}</dd></>}
+          <dt>{preview.token ? "CKB reserve" : "Channel funding"}</dt><dd>{preview.amountCkb} CKB</dd>
           <dt>Network fee</dt><dd>{preview.feeCkb} CKB</dd>
           <dt>Network</dt><dd>CKB testnet</dd>
         </dl>
-        <p style={{ ...modalCopy, color: palette.muted }}>This locks testnet CKB into a payment channel. It does not send funds to another wallet.</p>
+        <p style={{ ...modalCopy, color: palette.muted }}>{preview.token ? "This locks the token, and some CKB as a reserve," : "This locks testnet CKB"} into a payment channel. It does not send funds to another wallet.</p>
         <div style={modalActions}>
           <button type="button" autoFocus style={{ ...modalButton, borderColor: palette.border, color: palette.text }} onClick={() => answer(false)}>Cancel</button>
           <button type="button" style={{ ...modalButton, ...modalPrimaryButton, background: palette.primary, color: palette.primaryText }} onClick={() => answer(true)}>Confirm activation</button>

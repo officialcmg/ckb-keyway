@@ -10,6 +10,7 @@ export type KeyWayErrorCode =
   | "PAYMENT_TIMEOUT"
   | "PAYMENT_FAILED"
   | "CHANNEL_FAILED"
+  | "UNSUPPORTED_METHOD"
   | "UNKNOWN";
 
 export class KeyWayError extends Error {
@@ -30,6 +31,9 @@ export function toKeyWayError(value: unknown, fallback: KeyWayErrorCode = "UNKNO
   const message = cause.message;
   const normalized = message.toLowerCase();
 
+  if (normalized.includes("isn't available through keyway")) {
+    return error("UNSUPPORTED_METHOD", message, false, cause);
+  }
   if (normalized.includes("cross-origin isolated")) {
     return error("CROSS_ORIGIN_ISOLATION_REQUIRED", "Fiber requires COOP and COEP headers before its browser node can start.", false, cause);
   }

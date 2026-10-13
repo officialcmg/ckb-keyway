@@ -1,7 +1,9 @@
 import type { ListPeersResult, NodeInfoResult } from "@fiber-pay/sdk/browser";
 import { bootstrapKeyWay, loadFiberKey, type PublicWallet } from "./bootstrap";
 import { createKeyWay, type KeyWay } from "./create-keyway";
-import type { ConfirmFunding } from "./remote-ckb-signer";
+import type { ApproveFiberChannelOpen } from "./remote-ckb-signer";
+import type { ApproveFiberPayment } from "./fiber-payment";
+import type { RequestEmailCode } from "./email-code";
 import { connectTestnetPeers } from "./testnet-peers";
 import { KeyWayApiClient } from "./api-client";
 
@@ -14,50 +16,54 @@ export type ConnectedKeyWay = {
   balanceShannons: bigint;
 };
 
-export type KeyWayLifecycleStage =
-  | "recovering_identity"
-  | "acquiring_lease"
-  | "restoring_database"
-  | "starting_wasm"
-  | "starting_managed"
+/** Steps a Fiber node goes through after `start()`, reported to `onFiberStartup`. */
+export type FiberStartupStage =
+  | "loading_account"
+  | "claiming_device"
+  | "restoring_channels"
+  | "starting_browser_node"
+  | "starting_hosted_node"
   | "connecting_peer"
   | "synchronizing"
   | "ready";
 
-export type KeyWayLifecycleEvent = {
-  stage: KeyWayLifecycleStage;
+export type FiberStartupEvent = {
+  stage: FiberStartupStage;
   at: number;
   elapsedMs: number;
 };
 
 export async function connectKeyWay(options: {
   authToken: string;
-  confirmFunding: ConfirmFunding;
+  approveFiberChannelOpen: ApproveFiberChannelOpen;
+  approveFiberPayment?: ApproveFiberPayment;
+  requestEmailCode?: RequestEmailCode;
   apiClient?: KeyWayApiClient;
   onLeaseLost?: (error: Error) => void;
   onWalletReady?: (wallet: PublicWallet) => void;
-  onLifecycle?: (event: KeyWayLifecycleEvent) => void;
+  onFiberStartup?: (event: FiberStartupEvent) => void;
 }): Promise<ConnectedKeyWay> {
   const startedAt = Date.now();
-  const stage = (next: KeyWayLifecycleStage) => options.onLifecycle?.({
+  const stage = (next: FiberStartupStage) => options.onFiberStartup?.({
     stage: next,
     at: Date.now(),
     elapsedMs: Date.now() - startedAt,
   });
   const apiClient = options.apiClient ?? new KeyWayApiClient();
-  stage("recovering_identity");
+  stage("loading_account");
   const { wallet, restoreRequired } = await bootstrapKeyWay(options.authToken, apiClient);
   options.onWalletReady?.(wallet);
   const keyway = createKeyWay({
     identifier: wallet.litPkpId,
     authToken: options.authToken,
     ckbPublicKey: wallet.litPublicKey,
-    confirmFunding: options.confirmFunding,
+    approveFiberChannelOpen: options.approveFiberChannelOpen,
+    approveFiberPayment: options.approveFiberPayment,
     loadFiberKey: (leaseId) => loadFiberKey(options.authToken, leaseId, apiClient),
     apiClient,
     restoreRequired,
     onLeaseLost: options.onLeaseLost,
-    onLifecycle: stage,
+    onFiberStartup: stage,
   });
 
   try {

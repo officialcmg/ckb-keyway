@@ -26,17 +26,21 @@ import {
   type SubmitSignedFundingTxResult,
 } from "@fiber-pay/sdk/browser";
 import { KeyWayApiClient } from "./api-client";
-import { TESTNET_CHANNEL_PEERS } from "./channel-peers";
+import { ANY_FUNDING, TESTNET_CHANNEL_PEERS } from "./channel-peers";
 import {
   normalizeChannel,
-  type ActivationProgress,
+  type ChannelOpenProgress,
   type KeyWayChannel,
   type KeyWayFundingParams,
   type OpenKeyWayChannelOptions,
-  type PaymentPreflight,
+  type PaymentEstimate,
 } from "./create-keyway";
+import { createFiberNode } from "./fiber-node";
+import type { PaymentFiberMethod } from "./fiber-methods";
+import type { ApproveFiberPayment, FiberPaymentPreview } from "./fiber-payment";
+import { withEmailCode, type RequestEmailCode } from "./email-code";
 import { normalizeFiberPubkey } from "./fiber-pubkey";
-import { RemoteCkbSigner, type ConfirmFunding } from "./remote-ckb-signer";
+import { RemoteCkbSigner, type ApproveFiberChannelOpen } from "./remote-ckb-signer";
 import { serializeCccTransactionForRpc } from "./ccc-transaction";
 import { toKeyWayError } from "./keyway-error";
 
@@ -47,23 +51,22 @@ type ManagedStatus = {
   custody: "keyway-managed";
 };
 
-type ManagedPreflight =
-  | { routable: true; fee: string; confirmationNonce: string }
-  | { routable: false; error: { code: string; message: string; retryable: boolean } };
-
 const DEFAULT_CHANNEL_FUNDING = 1_000n * 100_000_000n;
 
 export function createManagedKeyWay(options: {
   authToken: string;
   ckbPublicKey: string;
-  confirmFunding: ConfirmFunding;
+  approveFiberChannelOpen: ApproveFiberChannelOpen;
+  /** The app's own payment confirmation, if any. KeyWay draws no payment dialog. */
+  approveFiberPayment?: ApproveFiberPayment;
+  requestEmailCode?: RequestEmailCode;
   apiClient?: KeyWayApiClient;
 }) {
   const api = options.apiClient ?? new KeyWayApiClient();
   const fundingSigner = new RemoteCkbSigner(
     options.authToken,
     options.ckbPublicKey,
-    options.confirmFunding,
+    options.approveFiberChannelOpen,
     undefined,
     api,
   );
@@ -75,7 +78,6 @@ export function createManagedKeyWay(options: {
   });
   let running = false;
   let status: ManagedStatus | undefined;
-  let paymentConfirmation: { payload: string; nonce: string } | undefined;
 
   async function start(): Promise<NodeInfoResult> {
     status = await api.managedNode<ManagedStatus>(options.authToken, { operation: "status" });
@@ -140,19 +142,22 @@ export function createManagedKeyWay(options: {
 
   async function activateCkbChannel(
     input: bigint | OpenKeyWayChannelOptions = DEFAULT_CHANNEL_FUNDING,
-    onProgress?: ActivationProgress,
+    onProgress?: ChannelOpenProgress,
   ) {
-    const config = typeof input === "bigint" ? { fundingAmount: input } : input;
+    const config: OpenKeyWayChannelOptions = typeof input === "bigint" ? { fundingAmount: input } : input;
+    if (config.udtTypeScript && config.fundingAmount === undefined) throw new Error("A token channel needs a fundingAmount");
     const fundingAmount = config.fundingAmount ?? DEFAULT_CHANNEL_FUNDING;
     onProgress?.("connecting");
     const peer = config.peer
       ? normalizeFiberPubkey(config.peer)
-      : (await prepareCkbChannel(fundingAmount))[0].pubkey;
+      // The official peers' minimums are in CKB, so any of them will do for a token channel.
+      : (await prepareCkbChannel(config.udtTypeScript ? ANY_FUNDING : fundingAmount))[0].pubkey;
     onProgress?.("negotiating");
     const result = await openFundedChannel({
       pubkey: peer,
       funding_amount: toHex(fundingAmount),
       public: config.public ?? true,
+      ...(config.udtTypeScript ? { funding_udt_type_script: config.udtTypeScript } : {}),
       funding_fee_rate: config.fundingFeeRate === undefined ? undefined : toHex(config.fundingFeeRate),
       commitment_fee_rate: config.commitmentFeeRate === undefined ? undefined : toHex(config.commitmentFeeRate),
     });
@@ -178,13 +183,25 @@ export function createManagedKeyWay(options: {
     }, crypto.randomUUID());
   }
 
-  async function newInvoice(params: NewInvoiceParams): Promise<NewInvoiceResult> {
-    return api.managedNode(options.authToken, {
-      operation: "new-invoice",
-      amount: params.amount,
-      description: params.description,
-      expiry: params.expiry,
-    }, crypto.randomUUID());
+  // Free methods go through the backend's copy of the shared method table; payments through its payment flow.
+  const call = (method: string, params?: unknown) => api.managedNode(options.authToken, { operation: "call", method, params });
+  const fiberNode = createFiberNode(call, pay);
+
+  async function pay(method: PaymentFiberMethod, params: unknown): Promise<unknown> {
+    if ((params as { dry_run?: unknown } | undefined)?.dry_run === true) return call(method, params);
+    const reviewed = await api.managedNode<{ preview: FiberPaymentPreview; confirmationNonce: string; requiresEmailCode: boolean }>(
+      options.authToken, { operation: "pay", stage: "preview", method, params },
+    );
+    if (options.approveFiberPayment && !await options.approveFiberPayment(reviewed.preview)) throw new Error("The payment was not approved");
+    const base = { operation: "pay", method, params, confirmationNonce: reviewed.confirmationNonce };
+    const send = (emailCode?: string) => api.managedNode(options.authToken, { ...base, stage: "send", ...(emailCode ? { emailCode } : {}) }, crypto.randomUUID());
+    if (!reviewed.requiresEmailCode) return send();
+    if (!options.requestEmailCode) throw new Error("This payment needs an email code");
+    return withEmailCode(options.requestEmailCode, "payment", () => api.managedNode(options.authToken, { ...base, stage: "request-email-code" }).then(() => undefined), send);
+  }
+
+  function newInvoice(params: Omit<NewInvoiceParams, "currency"> & { currency?: NewInvoiceParams["currency"] }): Promise<NewInvoiceResult> {
+    return fiberNode.newInvoice(params);
   }
 
   async function parseInvoice(params: ParseInvoiceParams): Promise<ParseInvoiceResult> {
@@ -195,34 +212,21 @@ export function createManagedKeyWay(options: {
     return api.managedNode(options.authToken, { operation: "get-invoice", paymentHash: params.payment_hash });
   }
 
-  async function preflightPayment(params: Omit<SendPaymentParams, "dry_run">): Promise<PaymentPreflight> {
+  async function estimatePayment(params: Omit<SendPaymentParams, "dry_run">): Promise<PaymentEstimate> {
     try {
-      const result = await managedPreflight(params);
-      if (!result.routable) {
-        return { routable: false, error: toKeyWayError(new Error(result.error.message), "PAYMENT_FAILED") };
-      }
-      paymentConfirmation = { payload: paymentPayload(params), nonce: result.confirmationNonce };
-      return { routable: true, feeShannons: BigInt(result.fee) };
+      const result = await fiberNode.sendPayment({ ...params, dry_run: true });
+      return { routable: true, fee: BigInt(result.fee) };
     } catch (error) {
       return { routable: false, error: toKeyWayError(error, "PAYMENT_FAILED") };
     }
   }
 
   async function sendPayment(params: SendPaymentParams): Promise<SendPaymentResult> {
-    const payload = paymentPayload(params);
-    if (paymentConfirmation?.payload !== payload) {
-      const preflight = await managedPreflight(params);
-      if (!preflight.routable) throw toKeyWayError(new Error(preflight.error.message), "PAYMENT_FAILED");
-      paymentConfirmation = { payload, nonce: preflight.confirmationNonce };
+    try {
+      return await fiberNode.sendPayment(params);
+    } catch (error) {
+      throw toKeyWayError(error, "PAYMENT_FAILED");
     }
-    const nonce = paymentConfirmation.nonce;
-    paymentConfirmation = undefined;
-    return api.managedNode(options.authToken, {
-      operation: "send-payment",
-      invoice: requiredInvoice(params),
-      maxFeeAmount: params.max_fee_amount,
-      confirmationNonce: nonce,
-    }, crypto.randomUUID());
   }
 
   async function getPayment(params: GetPaymentParams): Promise<GetPaymentResult> {
@@ -233,20 +237,13 @@ export function createManagedKeyWay(options: {
     return api.managedNode(options.authToken, { operation: "wait-for-payment", paymentHash });
   }
 
-  async function managedPreflight(params: Omit<SendPaymentParams, "dry_run">): Promise<ManagedPreflight> {
-    return api.managedNode(options.authToken, {
-      operation: "preflight-payment",
-      invoice: requiredInvoice(params),
-      maxFeeAmount: params.max_fee_amount,
-    });
-  }
-
   async function getCkbBalance(): Promise<bigint> {
     const address = await fundingSigner.getRecommendedAddressObj();
     return getLockBalanceShannons("https://testnet.ckbapp.dev/", cccScriptToFiberScript(address.script));
   }
 
   return {
+    node: fiberNode,
     start,
     stop,
     stopForLogout: stop,
@@ -259,7 +256,7 @@ export function createManagedKeyWay(options: {
     newInvoice,
     getInvoice,
     parseInvoice,
-    preflightPayment,
+    estimatePayment,
     sendPayment,
     getPayment,
     waitForPayment,
@@ -272,15 +269,6 @@ export function createManagedKeyWay(options: {
     get state() { return running ? "running" : "stopped"; },
     get isRunning() { return running; },
   };
-}
-
-function requiredInvoice(params: SendPaymentParams): string {
-  if (typeof params.invoice !== "string") throw new Error("Managed payments require a Fiber invoice");
-  return params.invoice;
-}
-
-function paymentPayload(params: SendPaymentParams): string {
-  return JSON.stringify({ invoice: requiredInvoice(params), maxFeeAmount: params.max_fee_amount });
 }
 
 function toHex(value: bigint): `0x${string}` {

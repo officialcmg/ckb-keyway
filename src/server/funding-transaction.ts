@@ -6,15 +6,17 @@ import { recoverPkpPublicKey } from "./pkp-identity.ts";
 import type { ReadyWallet } from "./user-wallet.ts";
 
 const SHANNONS_PER_CKB = 100_000_000n;
-const MAX_FUNDING = 1_000n * SHANNONS_PER_CKB;
 const MAX_FEE = SHANNONS_PER_CKB;
 const TESTNET_FUNDING_LOCK_CODE_HASH = "0x6c67887fe201ee0c7853f1682c0b77c0e6214044c156c7558269390a8afa6d7c";
 
 export type FundingPreview = {
+  /** CKB put into the channel: its full size for a CKB channel, or the required reserve for a token channel. */
   amountCkb: string;
   feeCkb: string;
   destination: string;
   transactionHash: string;
+  /** For a token channel: the token (by type script hash) and the amount put in, in its smallest unit. */
+  token?: { asset: string; amount: string };
 };
 
 type ValidatedFunding = {
@@ -45,14 +47,8 @@ export async function previewFundingTransaction(wallet: ReadyWallet, input: unkn
     lock.codeHash.toLowerCase() === TESTNET_FUNDING_LOCK_CODE_HASH && lock.hashType === "type"
   ));
   if (fundingOutputs.length !== 1) throw new Error("Funding transaction must contain exactly one channel output");
-  if (transaction.outputs.some((output) => output.type !== undefined)) {
-    throw new Error("Only CKB channel funding is allowed");
-  }
-  if (transaction.outputsData.some((data) => data !== "0x")) {
-    throw new Error("Unexpected funding output data");
-  }
-
   const fundingOutput = fundingOutputs[0];
+  const token = await checkTokenFunding(client, transaction, inputCells, signerScript, fundingOutput);
   const spend = calculateFundingSpend({
     ownedInputCapacity: sumCapacities(ownedInputs.map(({ cellOutput }) => cellOutput.capacity)),
     ownedChangeCapacity: sumCapacities(transaction.outputs.filter(({ lock }) => lock.eq(signerScript)).map(({ capacity }) => capacity)),
@@ -74,8 +70,46 @@ export async function previewFundingTransaction(wallet: ReadyWallet, input: unkn
       feeCkb: formatCkb(spend.fee),
       destination: `${fundingOutput.lock.codeHash}:${fundingOutput.lock.args}`,
       transactionHash: transaction.hash(),
+      ...(token ? { token: { asset: token.asset, amount: token.amount.toString() } } : {}),
     },
   };
+}
+
+/**
+ * A token channel carries one standard token (xUDT or sUDT) on the channel output. The token may appear only
+ * on that output and on the account's own change, so none of it can be sent anywhere else. Plain CKB outputs
+ * carry no data. Returns the token put into the channel, or undefined for a CKB channel.
+ */
+export async function checkTokenFunding(
+  client: ccc.Client,
+  transaction: ccc.Transaction,
+  inputCells: Array<{ cellOutput: ccc.CellOutput; outputData: ccc.Hex }>,
+  own: ccc.Script,
+  fundingOutput: ccc.CellOutput,
+): Promise<{ asset: string; amount: bigint } | undefined> {
+  const outputs = transaction.outputs.map((cellOutput, index) => ({ cellOutput, outputData: ccc.hexFrom(transaction.outputsData[index] ?? "0x") }));
+  for (const { cellOutput, outputData } of outputs) {
+    if (!cellOutput.type && outputData !== "0x") throw new Error("Unexpected funding output data");
+  }
+  const typed = [...outputs, ...inputCells].filter(({ cellOutput }) => cellOutput.type);
+  if (typed.length === 0) return undefined;
+  const type = fundingOutput.type;
+  if (!type) throw new Error("Only the channel output and your own change may carry a token");
+  const [xudt, sudt] = await Promise.all([client.getKnownScript(ccc.KnownScript.XUdt), client.getKnownScript(ccc.KnownScript.SUdt)]);
+  const standard = [xudt, sudt].some((known) => known.codeHash === type.codeHash && known.hashType === type.hashType);
+  if (!standard) throw new Error("Only standard xUDT or sUDT tokens can fund a channel");
+  for (const { cellOutput, outputData } of typed) {
+    if (!cellOutput.type!.eq(type)) throw new Error("A channel can hold only one token");
+    if ((outputData.length - 2) / 2 < 16) throw new Error("Token cells must hold a 16-byte amount");
+  }
+  for (const { cellOutput } of outputs.filter(({ cellOutput }) => cellOutput.type)) {
+    if (cellOutput !== fundingOutput && !cellOutput.lock.eq(own)) throw new Error("Only the channel output and your own change may carry a token");
+  }
+  const tokenAmount = (cells: typeof typed) => cells.reduce((sum, { outputData }) => sum + ccc.numLeFromBytes(ccc.bytesFrom(outputData).slice(0, 16)), 0n);
+  const amount = tokenAmount(inputCells.filter((cell) => cell.cellOutput.type && cell.cellOutput.lock.eq(own)))
+    - tokenAmount(outputs.filter((cell) => cell.cellOutput.type && cell.cellOutput !== fundingOutput && cell.cellOutput.lock.eq(own)));
+  if (amount <= 0n) throw new Error("A token channel must take the token from the KeyWay wallet");
+  return { asset: type.hash(), amount };
 }
 
 export function calculateFundingSpend(capacities: {
@@ -89,9 +123,7 @@ export function calculateFundingSpend(capacities: {
 
   const ownedDebit = capacities.ownedInputCapacity - capacities.ownedChangeCapacity;
   const fundingAmount = ownedDebit - fee;
-  if (fundingAmount <= 0n || fundingAmount > MAX_FUNDING) {
-    throw new Error("Channel funding exceeds the KeyWay testnet limit");
-  }
+  if (fundingAmount <= 0n) throw new Error("Channel funding must spend from the KeyWay wallet");
   return { fundingAmount, fee };
 }
 

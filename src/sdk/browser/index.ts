@@ -1,52 +1,25 @@
-export {
-  createKeyWay,
-  type CreateKeyWayOptions,
-  type ActivationProgress,
-  type ActivationStage,
-  type KeyWay,
-  type KeyWayFundingParams,
-  type KeyWayChannel,
-  type KeyWayChannelStatus,
-  type KeyWayNodeStage,
-  type OpenKeyWayChannelOptions,
-  type PaymentPreflight,
+// The public SDK surface. Everything else in this folder is internal plumbing and isn't exported.
+export type {
+  ChannelOpenProgress,
+  ChannelOpenStage,
+  KeyWayAsset,
+  KeyWayChannel,
+  KeyWayChannelStatus,
+  OpenKeyWayChannelOptions,
+  PaymentEstimate,
 } from "./create-keyway";
-export { KeyWayCredentialProvider, type FiberKeyLoader } from "./credential-provider";
-export {
-  bootstrapKeyWay,
-  getDeviceIdHash,
-  loadFiberKey,
-  markChannelOpened,
-  type PublicWallet,
-} from "./bootstrap";
-export { acquireDeviceLock, type DeviceLock } from "./device-lock";
-export { acquireDeviceLease, type DeviceLease } from "./device-lease";
-export { RemoteCkbSigner, type ConfirmFunding, type FundingPreview } from "./remote-ckb-signer";
+export type { FiberStartupEvent, FiberStartupStage } from "./connect-keyway";
+export type { ApproveFiberChannelOpen, FiberChannelOpenPreview } from "./remote-ckb-signer";
 export {
   KeyWaySigner,
+  type ApproveCkbMessage,
+  type ApproveCkbTransaction,
   type CellSummary,
-  type ConfirmMessage,
-  type ConfirmTransaction,
-  type KeyWaySignerHandlers,
   type MessagePreview,
-  type RequestEmailCode,
   type TransactionPreview,
 } from "./keyway-signer";
-export {
-  connectKeyWay,
-  type ConnectedKeyWay,
-  type KeyWayLifecycleEvent,
-  type KeyWayLifecycleStage,
-} from "./connect-keyway";
-export {
-  connectManagedKeyWay,
-  type ConnectedManagedKeyWay,
-} from "./connect-managed-keyway";
-export { createManagedKeyWay, type ManagedKeyWay } from "./create-managed-keyway";
-export { connectTestnetPeers, TESTNET_RELAYS } from "./testnet-peers";
-export { normalizeFiberPubkey } from "./fiber-pubkey";
-export { KeyWayApiClient, type KeyWayApiClientOptions } from "./api-client";
+export type { ApproveFiberPayment, FiberPaymentPreview } from "./fiber-payment";
+export type { KeyWayFiberNode, KeyWayNewInvoiceParams, ListPaymentsParams, ListPaymentsResult } from "./fiber-node";
+export { FIBER_METHODS, type FiberMethod, type FiberMethodKind } from "./fiber-methods";
 export { friendlyKeyWayError } from "./friendly-error";
 export { KeyWayError, toKeyWayError, type KeyWayErrorCode } from "./keyway-error";
-export { formatFiberOutpoint } from "./channel-evidence";
-export { getCkbAccountBalance } from "./ckb-balance";

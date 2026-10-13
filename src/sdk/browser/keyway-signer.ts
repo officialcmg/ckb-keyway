@@ -1,6 +1,9 @@
 import * as ccc from "@ckb-ccc/core";
 import { KeyWayApiClient } from "./api-client";
 import { serializeCccTransaction } from "./ccc-transaction";
+import { withEmailCode, type RequestEmailCode } from "./email-code";
+
+export type { RequestEmailCode };
 
 /** What a transaction does to the user's account, decoded by the KeyWay backend from the chain. */
 export type TransactionPreview = {
@@ -27,29 +30,21 @@ export type TransactionPreview = {
   otherSigners: number;
   details: { inputs: CellSummary[]; outputs: CellSummary[] };
   transactionHash: string;
-  /** True when this transaction, plus everything signed in the last 24 hours, reaches the user's email-confirmation threshold, or when it sends tokens while a threshold is set. */
+  /** True when this transaction, with everything sent in the last 24 hours, reaches one of the user's daily confirmation amounts. */
   requiresEmailCode: boolean;
 };
 
 export type CellSummary = { lock: string; type?: string; capacityCkb: string; dataBytes: number };
 export type MessagePreview = { message: string };
 
-export type ConfirmTransaction = (preview: TransactionPreview) => boolean | Promise<boolean>;
-export type ConfirmMessage = (preview: MessagePreview) => boolean | Promise<boolean>;
-/** Asks the user for the code KeyWay emailed them. Resolve undefined if they cancel. */
-export type RequestEmailCode = (request: {
-  reason: "transaction" | "settings";
-  error?: string;
-  resend: () => Promise<void>;
-}) => Promise<string | undefined>;
+export type ApproveCkbTransaction = (preview: TransactionPreview) => boolean | Promise<boolean>;
+export type ApproveCkbMessage = (preview: MessagePreview) => boolean | Promise<boolean>;
 
 export type KeyWaySignerHandlers = {
-  confirmTransaction: ConfirmTransaction;
-  confirmMessage: ConfirmMessage;
+  approveCkbTransaction: ApproveCkbTransaction;
+  approveCkbMessage: ApproveCkbMessage;
   requestEmailCode: RequestEmailCode;
 };
-
-const WRONG_CODE = /isn't right|six-digit code/i;
 
 /**
  * A CCC signer for the signed-in KeyWay account. Every transaction and message is shown to the user
@@ -75,7 +70,7 @@ export class KeyWaySigner extends ccc.SignerCkbPublicKey {
     };
     if (!reviewed?.preview || typeof reviewed.confirmationNonce !== "string") throw new Error("KeyWay returned an invalid transaction preview");
     const preview = { ...reviewed.preview, requiresEmailCode: Boolean(reviewed.requiresEmailCode) };
-    if (!await this.handlers.confirmTransaction(preview)) throw new Error("The transaction was not approved");
+    if (!await this.handlers.approveCkbTransaction(preview)) throw new Error("The transaction was not approved");
 
     const base = { purpose: "transaction", transaction, confirmationNonce: reviewed.confirmationNonce };
     const sign = (emailCode?: string) => this.api.signTransaction(this.authToken, { ...base, operation: "sign", ...(emailCode ? { emailCode } : {}) });
@@ -92,25 +87,29 @@ export class KeyWaySigner extends ccc.SignerCkbPublicKey {
     const text = typeof message === "string" ? message : ccc.hexFrom(message);
     const reviewed = await this.api.signMessage(this.authToken, { operation: "preview", message: text }) as { preview: MessagePreview; confirmationNonce: string };
     if (!reviewed?.preview || typeof reviewed.confirmationNonce !== "string") throw new Error("KeyWay returned an invalid message preview");
-    if (!await this.handlers.confirmMessage(reviewed.preview)) throw new Error("The message was not approved");
+    if (!await this.handlers.approveCkbMessage(reviewed.preview)) throw new Error("The message was not approved");
     const signed = await this.api.signMessage(this.authToken, { operation: "sign", message: text, confirmationNonce: reviewed.confirmationNonce }) as { signature?: string };
     if (typeof signed?.signature !== "string") throw new Error("KeyWay returned an invalid message signature");
     return ccc.hexFrom(signed.signature);
   }
 
-  /** The user's email-confirmation threshold in shannons, or null when it's off. */
-  async getEmailConfirmationThreshold(): Promise<bigint | null> {
-    const result = await this.api.signingSettings(this.authToken, { operation: "get" }) as { emailThresholdShannons: string | null };
-    return result.emailThresholdShannons === null ? null : BigInt(result.emailThresholdShannons);
+  /**
+   * The user's daily email-confirmation amounts, by asset: "ckb" (in shannons) or a token's type script hash
+   * (in the token's smallest unit). Empty means email confirmation is off.
+   */
+  async getDailyConfirmationAmounts(): Promise<Record<string, bigint>> {
+    const result = await this.api.signingSettings(this.authToken, { operation: "get" }) as { dailyAmounts?: Record<string, string> };
+    return Object.fromEntries(Object.entries(result.dailyAmounts ?? {}).map(([asset, amount]) => [asset, BigInt(amount)]));
   }
 
   /**
-   * Requires an emailed code once the CKB sent in 24 hours reaches `shannons` (null turns it off). Turning it on or
-   * lowering it applies at once; raising it or turning it off asks the user for a code from their inbox.
+   * Requires an emailed code once this much of an asset leaves the account within 24 hours (CKB sends, token
+   * transfers and Fiber payments together); null removes the amount. Once any amount is set, a token with no
+   * amount of its own always needs the code. Strengthening applies at once; weakening asks for an emailed code.
    */
-  async setEmailConfirmationThreshold(shannons: bigint | null): Promise<void> {
-    const value = shannons === null ? null : ccc.numFrom(shannons).toString();
-    const set = (extra: Record<string, unknown> = {}) => this.api.signingSettings(this.authToken, { operation: "set", emailThresholdShannons: value, ...extra }) as Promise<{ requiresEmailCode?: boolean; confirmationNonce?: string }>;
+  async setDailyConfirmationAmount(asset: "ckb" | `0x${string}`, amount: bigint | null): Promise<void> {
+    const value = amount === null ? null : ccc.numFrom(amount).toString();
+    const set = (extra: Record<string, unknown> = {}) => this.api.signingSettings(this.authToken, { operation: "set-daily-amount", asset, amount: value, ...extra }) as Promise<{ requiresEmailCode?: boolean; confirmationNonce?: string }>;
     let pending = await set();
     if (!pending.requiresEmailCode) return;
     await this.withEmailCode(
@@ -120,19 +119,7 @@ export class KeyWaySigner extends ccc.SignerCkbPublicKey {
     );
   }
 
-  private async withEmailCode<T>(reason: "transaction" | "settings", send: () => Promise<void>, complete: (code: string) => Promise<T>): Promise<T> {
-    if (reason === "transaction") await send();
-    let error: string | undefined;
-    for (;;) {
-      const code = await this.handlers.requestEmailCode({ reason, error, resend: send });
-      if (code === undefined) throw new Error("Email confirmation was cancelled");
-      try {
-        return await complete(code);
-      } catch (cause) {
-        const message = cause instanceof Error ? cause.message : "";
-        if (!WRONG_CODE.test(message)) throw cause;
-        error = message;
-      }
-    }
+  private withEmailCode<T>(reason: "transaction" | "settings", send: () => Promise<void>, complete: (code: string) => Promise<T>): Promise<T> {
+    return withEmailCode(this.handlers.requestEmailCode, reason, send, complete);
   }
 }

@@ -12,7 +12,7 @@ import {
   useFiber,
   useKeyWay,
   type KeyWayChannel,
-  type KeyWayLifecycleEvent,
+  type FiberStartupEvent,
 } from "@ckb-keyway/react";
 import { DemoView, type DemoActions, type DemoActivity, type DemoChannel, type DemoModel, type LifecycleEvent, type NodeMode } from "./app/demo-view";
 import { parseCkb, toHex } from "./app/format";
@@ -26,7 +26,7 @@ const DevScreen = process.env.NODE_ENV !== "production"
   ? dynamic(() => import("./app/dev-screens").then((module) => module.DevScreen), { ssr: false })
   : () => null;
 
-export function AuthPanel({ nodeMode = "managed", devScreen }: { nodeMode?: NodeMode; devScreen?: string }) {
+export function AuthPanel({ nodeMode = "hosted", devScreen }: { nodeMode?: NodeMode; devScreen?: string }) {
   const router = useRouter();
   const setMode = useCallback((mode: NodeMode) => router.push(mode === "browser" ? "/app?mode=browser" : "/app"), [router]);
   if (process.env.NODE_ENV !== "production" && devScreen) return <DevScreen screen={devScreen} nodeMode={nodeMode} />;
@@ -35,11 +35,11 @@ export function AuthPanel({ nodeMode = "managed", devScreen }: { nodeMode?: Node
 
 function LiveDemo({ nodeMode, setMode }: { nodeMode: NodeMode; setMode: (mode: NodeMode) => void }) {
   const [events, setEvents] = useState<LifecycleEvent[]>([]);
-  const onLifecycle = useCallback((event: KeyWayLifecycleEvent) => {
-    setEvents((current) => event.stage === "recovering_identity" ? [event] : [...current, event]);
+  const onFiberStartup = useCallback((event: FiberStartupEvent) => {
+    setEvents((current) => event.stage === "loading_account" ? [event] : [...current, event]);
   }, []);
   return (
-    <KeyWayProvider appId={process.env.NEXT_PUBLIC_KEYWAY_APP_ID} nodeMode={nodeMode} theme="light" onLifecycle={onLifecycle}>
+    <KeyWayProvider appId={process.env.NEXT_PUBLIC_KEYWAY_APP_ID} fiberNode={nodeMode} theme="light" onFiberStartup={onFiberStartup}>
       <LiveWallet nodeMode={nodeMode} events={events} resetEvents={() => setEvents([])} setMode={setMode} />
     </KeyWayProvider>
   );
@@ -68,7 +68,7 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
 
   // Time the wallet recovery that follows sign-in, so the log has something real to show before Fiber starts.
   useEffect(() => {
-    if (account.status === "recovering") setWalletRecovery((current) => current ?? { at: Date.now() });
+    if (account.status === "loading") setWalletRecovery((current) => current ?? { at: Date.now() });
     else if (account.status === "ready") setWalletRecovery((current) => current && current.durationMs === undefined ? { ...current, durationMs: Date.now() - current.at } : current);
     else if (account.status === "disconnected") setWalletRecovery(undefined);
   }, [account.status]);
@@ -89,7 +89,7 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
       setActivity([]);
     },
     setMode,
-    connect: () => fiberRef.current.connect(),
+    startFiber: () => fiberRef.current.start(),
     openChannel: async (amount, peer, onStage) => {
       try {
         const { channelId } = await fiberRef.current.openChannel({ fundingAmount: amount, peer, public: true }, onStage);
@@ -112,9 +112,9 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
       if (!parsed.amount) return { amount: 0n, error: "This invoice has no amount. Ask the payee for one with a fixed amount." };
       const amount = BigInt(parsed.amount);
       const description = parsed.data.attrs.flatMap((attr) => "description" in attr ? [attr.description] : [])[0];
-      const preflight = await fiberRef.current.preflightPayment({ invoice, ...PAYMENT_OPTIONS });
-      if (!preflight.routable) return { amount, description, error: readable(preflight.error, "No route was found for this payment.") };
-      return { amount, description, fee: preflight.feeShannons };
+      const estimate = await fiberRef.current.estimatePayment({ invoice, ...PAYMENT_OPTIONS });
+      if (!estimate.routable) return { amount, description, error: readable(estimate.error, "No route was found for this payment.") };
+      return { amount, description, fee: estimate.fee };
     },
     pay: async (invoice, check) => {
       try {
@@ -144,8 +144,8 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
       const signature = await signer.signMessage(message);
       return { signature: signature.signature, verified: await signer.verifyMessage(message, signature) };
     },
-    getEmailThreshold: () => requireSigner(signerRef.current).getEmailConfirmationThreshold(),
-    setEmailThreshold: (shannons) => requireSigner(signerRef.current).setEmailConfirmationThreshold(shannons),
+    getEmailThreshold: async () => (await requireSigner(signerRef.current).getDailyConfirmationAmounts()).ckb ?? null,
+    setEmailThreshold: (shannons) => requireSigner(signerRef.current).setDailyConfirmationAmount("ckb", shannons),
     invoiceStatus: async (paymentHash) => {
       const { status } = await fiberRef.current.getInvoice({ payment_hash: paymentHash as `0x${string}` });
       const amount = receiving.current.get(paymentHash);
@@ -162,8 +162,8 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
     id: channel.id,
     peer: channel.peer,
     status: channel.status,
-    local: channel.localBalanceShannons,
-    remote: channel.remoteBalanceShannons,
+    local: channel.canSend,
+    remote: channel.canReceive,
     reserved: reserved[channel.id],
     fundingTx: fundingOutpoint(channel.raw.channel_outpoint)?.txHash,
   }));
@@ -172,7 +172,7 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
   const model: DemoModel = {
     nodeMode,
     auth: !ready ? "loading" : authenticated ? "signedIn" : "signedOut",
-    account: account.status === "ready" ? "ready" : account.status === "error" ? "error" : "recovering",
+    account: account.status === "ready" ? "ready" : account.status === "error" ? "error" : "loading",
     accountError: account.status === "error" ? readable(account.error, "KeyWay couldn't finish setting up this account.") : undefined,
     address: account.address,
     balance: account.balance,
@@ -246,7 +246,7 @@ function useChannelReserves(channels: KeyWayChannel[]): Record<string, bigint> {
     const capacity = capacities[channel.id];
     if (capacity === undefined) continue;
     const inFlight = BigInt(channel.raw.offered_tlc_balance) + BigInt(channel.raw.received_tlc_balance);
-    const rest = capacity - channel.localBalanceShannons - channel.remoteBalanceShannons - inFlight;
+    const rest = capacity - channel.capacity - inFlight;
     reserves[channel.id] = rest > 0n ? rest : 0n;
   }
   return reserves;

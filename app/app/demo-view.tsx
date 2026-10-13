@@ -7,7 +7,7 @@ import { CopyButton } from "../_components/copy-button";
 import { TROUBLESHOOTING_URL } from "../_components/links";
 import { clockTime, duration, formatBalance, formatCkb, parseCkb, seconds, shortHash } from "./format";
 
-export type NodeMode = "managed" | "browser";
+export type NodeMode = "hosted" | "browser";
 export type ChannelStatus = "pending" | "ready" | "closing" | "closed" | "failed" | "unknown";
 export type ActivationStage = "connecting" | "negotiating" | "confirming" | "signing" | "broadcasting" | "waiting";
 
@@ -29,15 +29,15 @@ export type DemoActivity = { id: string; kind: "received" | "paid" | "opened"; a
 export type DemoModel = {
   nodeMode: NodeMode;
   auth: "loading" | "signedOut" | "signedIn";
-  account: "recovering" | "ready" | "error";
+  account: "loading" | "ready" | "error";
   accountError?: string;
   address?: string;
   balance?: bigint;
-  fiber: "disconnected" | "connecting" | "connected" | "error";
+  fiber: "stopped" | "starting" | "running" | "error";
   fiberError?: { code: string; message: string };
   /** Wallet recovery measured on this page before Fiber starts. */
   walletRecovery?: { at: number; durationMs?: number };
-  /** Events from the SDK's onLifecycle for the latest connect() run. */
+  /** Events from the SDK's onFiberStartup for the latest start() run. */
   events: LifecycleEvent[];
   /** When the latest run failed, for the failed stage's duration. */
   failedAt?: number;
@@ -54,7 +54,7 @@ export type DemoActions = {
   login: () => void;
   logout: () => Promise<void>;
   setMode: (mode: NodeMode) => void;
-  connect: () => Promise<unknown>;
+  startFiber: () => Promise<unknown>;
   openChannel: (amount: bigint, peer: string, onStage: (stage: ActivationStage) => void) => Promise<void>;
   closeChannel: (channelId: string) => Promise<void>;
   checkInvoice: (invoice: string) => Promise<InvoiceCheck>;
@@ -83,23 +83,23 @@ export const CHANNEL_PEERS = [
 ];
 
 const STAGES: Record<NodeMode, string[]> = {
-  managed: ["recovering_identity", "starting_managed", "synchronizing", "ready"],
-  browser: ["recovering_identity", "acquiring_lease", "restoring_database", "starting_wasm", "connecting_peer", "synchronizing", "ready"],
+  hosted: ["loading_account", "starting_hosted_node", "synchronizing", "ready"],
+  browser: ["loading_account", "claiming_device", "restoring_channels", "starting_browser_node", "connecting_peer", "synchronizing", "ready"],
 };
 
 const STAGE_LABELS: Record<string, string> = {
-  recovering_identity: "Recovering identity",
-  starting_managed: "Starting managed node",
+  loading_account: "Loading the account",
+  starting_hosted_node: "Starting the hosted node",
   connecting_peer: "Connecting to a Fiber peer",
   synchronizing: "Synchronizing channels",
   ready: "Ready",
-  acquiring_lease: "Claiming this device",
-  restoring_database: "Restoring channel data",
-  starting_wasm: "Starting the in-browser node",
+  claiming_device: "Claiming this device",
+  restoring_channels: "Restoring channel data",
+  starting_browser_node: "Starting the in-browser node",
 };
 
 const EXPLORER = "https://testnet.explorer.nervos.org";
-const NODE_LABEL: Record<NodeMode, string> = { managed: "managed node", browser: "in-browser node" };
+const NODE_LABEL: Record<NodeMode, string> = { hosted: "hosted node", browser: "in-browser node" };
 
 const bareKey = (value: string) => value.replace(/^0x/i, "").toLowerCase();
 
@@ -110,15 +110,15 @@ export function peerLabel(pubkey: string): string {
 export function DemoView({ model, actions, initialUi }: { model: DemoModel; actions: DemoActions; initialUi?: DemoUi }) {
   const [dialog, setDialog] = useState(initialUi?.dialog);
   const [activation, setActivation] = useState<ActivationStage | undefined>(initialUi?.activation);
-  const liveNow = useNow(model.clock === undefined && model.fiber === "connecting");
+  const liveNow = useNow(model.clock === undefined && model.fiber === "starting");
   const now = model.clock ?? liveNow;
   const signedIn = model.auth === "signedIn";
-  const connected = model.fiber === "connected";
+  const connected = model.fiber === "running";
   const openChannels = model.channels.filter(({ status }) => status !== "closed");
   const hasChannels = connected && openChannels.length > 0;
 
   const code = !signedIn ? "login"
-    : model.account === "recovering" ? "wallet"
+    : model.account === "loading" ? "wallet"
     : dialog === "pay" ? "pay"
     : dialog === "receive" ? "receive"
     : !connected ? "connect"
@@ -136,9 +136,9 @@ export function DemoView({ model, actions, initialUi }: { model: DemoModel; acti
         <div className="demo-intro__side">
           <div className="demo-intro__controls">
             <div role="radiogroup" aria-label="Fiber node" aria-describedby="mode-note" className="segmented">
-              {(["managed", "browser"] as const).map((mode) => (
+              {(["hosted", "browser"] as const).map((mode) => (
                 <button key={mode} type="button" role="radio" aria-checked={model.nodeMode === mode} onClick={() => model.nodeMode !== mode && actions.setMode(mode)}>
-                  {mode === "managed" ? "Managed node" : "In-browser node"}
+                  {mode === "hosted" ? "Hosted node" : "In-browser node"}
                 </button>
               ))}
             </div>
@@ -151,7 +151,7 @@ export function DemoView({ model, actions, initialUi }: { model: DemoModel; acti
       <div className="demo-grid">
         <div className="demo-col">
           {!signedIn ? <SignInCard loading={model.auth === "loading"} onLogin={actions.login} />
-            : model.account === "recovering" ? <RecoveringCards />
+            : model.account === "loading" ? <RecoveringCards />
             : model.account === "error" ? <AccountErrorCard message={model.accountError} />
             : (
               <>
@@ -328,21 +328,21 @@ function FiberCard({ model, now, actions, activation, setActivation, onPay, onRe
   onReceive: () => void;
   channels: DemoChannel[];
 }) {
-  if (model.fiber === "connecting") return <ConnectingCard model={model} now={now} />;
-  if (model.fiber === "error") return <FiberErrorCard model={model} onRetry={() => void actions.connect().catch(() => undefined)} />;
-  if (model.fiber === "disconnected") {
+  if (model.fiber === "starting") return <ConnectingCard model={model} now={now} />;
+  if (model.fiber === "error") return <FiberErrorCard model={model} onRetry={() => void actions.startFiber().catch(() => undefined)} />;
+  if (model.fiber === "stopped") {
     return (
       <section className="card demo-card demo-card--14">
         <CardHead title="Fiber"><span className="status status--muted"><span className="status__ring" />Off</span></CardHead>
-        <p className="demo-card__title">Fiber isn&apos;t connected</p>
-        <p className="demo-card__body">{model.nodeMode === "managed"
-          ? "Connecting starts a managed Fiber node for this account. Signing in never starts one on its own."
-          : "Connecting starts a Fiber node in this browser tab. Signing in never starts one on its own."}</p>
-        <button type="button" className="btn btn--route demo-card__action" onClick={() => void actions.connect().catch(() => undefined)}>Connect Fiber</button>
+        <p className="demo-card__title">Fiber isn&apos;t running</p>
+        <p className="demo-card__body">{model.nodeMode === "hosted"
+          ? "Starting Fiber runs a hosted Fiber node for this account. Signing in never starts one on its own."
+          : "Starting Fiber runs a Fiber node in this browser tab. Signing in never starts one on its own."}</p>
+        <button type="button" className="btn btn--route demo-card__action" onClick={() => void actions.startFiber().catch(() => undefined)}>Start Fiber</button>
       </section>
     );
   }
-  const status = <span className="status status--success"><span className="status__dot" />Connected · {NODE_LABEL[model.nodeMode]}</span>;
+  const status = <span className="status status--success"><span className="status__dot" />Running · {NODE_LABEL[model.nodeMode]}</span>;
   if (!channels.length || activation) return <OpenChannelCard status={status} actions={actions} activation={activation} setActivation={setActivation} />;
   return (
     <section className="card demo-card demo-card--18">
@@ -362,7 +362,7 @@ function ConnectingCard({ model, now }: { model: DemoModel; now: number }) {
   const current = reached.at(-1);
   return (
     <section aria-busy="true" className="card demo-card demo-card--16">
-      <CardHead title="Fiber"><span className="status status--warning"><span className="status__dot" />Connecting</span></CardHead>
+      <CardHead title="Fiber"><span className="status status--warning"><span className="status__dot" />Starting</span></CardHead>
       <p className="demo-card__title">Starting your Fiber node…</p>
       <ol className="demo-progress">
         {steps.map((stage) => {
@@ -543,11 +543,11 @@ function LifecycleCard({ model }: { model: DemoModel }) {
     });
   } else if (model.walletRecovery) {
     const { at, durationMs } = model.walletRecovery;
-    rows.push({ key: "wallet", at, stage: "recovering_identity", time: durationMs === undefined ? "…" : duration(durationMs) });
+    rows.push({ key: "wallet", at, stage: "loading_account", time: durationMs === undefined ? "…" : duration(durationMs) });
   }
   return (
     <section className="card demo-lifecycle">
-      <div className="demo-lifecycle__head"><h2>Lifecycle events</h2><code>onLifecycle</code></div>
+      <div className="demo-lifecycle__head"><h2>Fiber startup</h2><code>onFiberStartup</code></div>
       {rows.length ? (
         <ol>
           {rows.map((row) => (
@@ -718,11 +718,11 @@ function useNow(active: boolean): number {
 
 const CODE: Record<string, ReactNode> = {
   login: <><span className="tk-k">const</span>{" { authenticated, login } =\n  useKeyWay();\n\n"}<span className="tk-k">if</span>{" (!authenticated) {\n  "}<span className="tk-k">return</span>{" <"}<span className="tk-c">button</span>{" onClick={login}>\n    Sign in with email\n  </"}<span className="tk-c">button</span>{">;\n}"}</>,
-  wallet: <><span className="tk-k">const</span>{" { status, address, balance } =\n  useCkbWallet();\n\n"}<span className="tk-m">{"// \"recovering\" until it is ready"}</span>{"\n"}<span className="tk-k">if</span>{" (status === "}<span className="tk-s">&quot;recovering&quot;</span>{") {\n  "}<span className="tk-k">return</span>{" <"}<span className="tk-c">Spinner</span>{" />;\n}"}</>,
-  connect: <><span className="tk-k">const</span>{" fiber = useFiber();\n\n"}<span className="tk-m">{"// Fiber starts only when you ask"}</span>{"\n<"}<span className="tk-c">button</span>{" onClick={() => fiber.connect()}>\n  Connect Fiber\n</"}<span className="tk-c">button</span>{">\n\n"}<span className="tk-m">{"// \"disconnected\" | \"connecting\""}</span>{"\n"}<span className="tk-m">{"// | \"connected\" | \"error\""}</span>{"\nfiber.status;"}</>,
+  wallet: <><span className="tk-k">const</span>{" { status, address, balance } =\n  useCkbWallet();\n\n"}<span className="tk-m">{"// \"loading\" until it is ready"}</span>{"\n"}<span className="tk-k">if</span>{" (status === "}<span className="tk-s">&quot;loading&quot;</span>{") {\n  "}<span className="tk-k">return</span>{" <"}<span className="tk-c">Spinner</span>{" />;\n}"}</>,
+  connect: <><span className="tk-k">const</span>{" fiber = useFiber();\n\n"}<span className="tk-m">{"// Fiber starts only when you ask"}</span>{"\n<"}<span className="tk-c">button</span>{" onClick={() => fiber.start()}>\n  Start Fiber\n</"}<span className="tk-c">button</span>{">\n\n"}<span className="tk-m">{"// \"stopped\" | \"starting\""}</span>{"\n"}<span className="tk-m">{"// | \"running\" | \"error\""}</span>{"\nfiber.status;"}</>,
   open: <><span className="tk-k">const</span>{" fiber = useFiber();\n\n"}<span className="tk-m">{"// 1,000 CKB, in shannons"}</span>{"\n"}<span className="tk-k">await</span>{" fiber.openChannel({\n  fundingAmount: "}<span className="tk-s">1_000n</span>{" * "}<span className="tk-s">100_000_000n</span>{",\n});"}</>,
-  funding: <><span className="tk-m">{"// Built-in dialog by default."}</span>{"\n"}<span className="tk-m">{"// Or bring your own:"}</span>{"\n<"}<span className="tk-c">KeyWayProvider</span>{"\n  appId={APP_ID}\n  confirmFunding={(preview) =>\n    askUser(\n      preview.amountCkb,\n      preview.feeCkb,\n    )\n  }\n/>"}</>,
+  funding: <><span className="tk-m">{"// Built-in dialog by default."}</span>{"\n"}<span className="tk-m">{"// Or bring your own:"}</span>{"\n<"}<span className="tk-c">KeyWayProvider</span>{"\n  appId={APP_ID}\n  approveFiberChannelOpen={(preview) =>\n    askUser(\n      preview.amountCkb,\n      preview.feeCkb,\n    )\n  }\n/>"}</>,
   channels: <><span className="tk-k">const</span>{" { channels } = useFiber();\n\nchannels.map((c) => (\n  <"}<span className="tk-c">Channel</span>{"\n    key={c.id}\n    peer={c.peer}\n    status={c.status}\n  />\n));"}</>,
-  pay: <><span className="tk-k">const</span>{" fiber = useFiber();\n\n"}<span className="tk-k">const</span>{" check = "}<span className="tk-k">await</span>{" fiber\n  .preflightPayment({ invoice });\n\n"}<span className="tk-k">if</span>{" (check.routable) {\n  "}<span className="tk-k">await</span>{" fiber.payInvoice(invoice);\n}"}</>,
+  pay: <><span className="tk-k">const</span>{" fiber = useFiber();\n\n"}<span className="tk-k">const</span>{" check = "}<span className="tk-k">await</span>{" fiber\n  .estimatePayment({ invoice });\n\n"}<span className="tk-k">if</span>{" (check.routable) {\n  "}<span className="tk-k">await</span>{" fiber.payInvoice(invoice);\n}"}</>,
   receive: <><span className="tk-k">const</span>{" amount = "}<span className="tk-s">5n</span>{" * "}<span className="tk-s">100_000_000n</span>{";\n\n"}<span className="tk-k">const</span>{" invoice = "}<span className="tk-k">await</span>{" fiber\n  .createInvoice({\n    amount: "}<span className="tk-s">{"`0x${amount.toString(16)}`"}</span>{",\n    currency: "}<span className="tk-s">&quot;Fibt&quot;</span>{",\n    description: "}<span className="tk-s">&quot;Order #1042&quot;</span>{",\n  });"}</>,
 };

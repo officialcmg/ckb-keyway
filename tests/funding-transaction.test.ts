@@ -34,11 +34,17 @@ test("allows peer inputs while limiting the KeyWay wallet's own channel spend", 
   });
 });
 
-test("rejects collaborative funding that overspends the KeyWay wallet", () => {
+test("allows any channel size and rejects funding that spends nothing from the wallet", () => {
+  assert.equal(calculateFundingSpend({
+    ownedInputCapacity: 50_000n * 100_000_000n,
+    ownedChangeCapacity: 0n,
+    totalInputCapacity: 50_000n * 100_000_000n,
+    totalOutputCapacity: 50_000n * 100_000_000n - 100_000n,
+  }).fundingAmount, 50_000n * 100_000_000n - 100_000n);
   assert.throws(() => calculateFundingSpend({
-    ownedInputCapacity: 1200n * 100_000_000n,
-    ownedChangeCapacity: 9_999_900_000n,
-    totalInputCapacity: 1450n * 100_000_000n,
-    totalOutputCapacity: 144_999_900_000n,
-  }), /funding exceeds/);
+    ownedInputCapacity: 100n * 100_000_000n,
+    ownedChangeCapacity: 100n * 100_000_000n,
+    totalInputCapacity: 100n * 100_000_000n,
+    totalOutputCapacity: 100n * 100_000_000n,
+  }), /must spend from the KeyWay wallet/);
 });

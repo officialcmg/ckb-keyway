@@ -27,6 +27,9 @@ export const TESTNET_CHANNEL_PEERS: readonly ChannelPeer[] = [
   },
 ] as const;
 
+/** Pass as the funding amount to accept any official peer, whatever its CKB minimum. */
+export const ANY_FUNDING = 2n ** 128n;
+
 type ChannelPeerClient = {
   connectPeer(params: ConnectPeerParams): Promise<unknown>;
   graphNodes(params?: GraphNodesParams): Promise<GraphNodesResult>;

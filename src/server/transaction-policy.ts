@@ -61,9 +61,13 @@ export type ValidatedTransaction = {
   preview: TransactionPreview;
   /** All CKB leaving the user's account including any fee they pay; compared with the email threshold. */
   outflowShannons: bigint;
-  /** True when any token (xUDT or sUDT) leaves the user's account; it also triggers the email code. */
+  /** True when any token (xUDT or sUDT) leaves the user's account. */
   tokensLeaving: boolean;
+  /** Each token leaving the account, by its type script hash, with the amount in the token's smallest unit. */
+  tokenOutflows: TokenOutflow[];
 };
+
+export type TokenOutflow = { asset: string; amount: bigint };
 
 export async function loadKnownScripts(client: ccc.Client): Promise<KnownScripts> {
   const get = (script: ccc.KnownScript) => client.getKnownScript(script);
@@ -109,7 +113,10 @@ export async function previewGeneralTransaction(
 
   const known = await loadKnownScripts(client);
   const described = describeTransaction(transaction, inputCells, own, known, client);
-  return { transaction, signer, script: related[0].script, preview: described.preview, outflowShannons: described.outflowShannons, tokensLeaving: described.tokensLeaving };
+  return {
+    transaction, signer, script: related[0].script, preview: described.preview,
+    outflowShannons: described.outflowShannons, tokensLeaving: described.tokensLeaving, tokenOutflows: described.tokenOutflows,
+  };
 }
 
 /**
@@ -123,7 +130,7 @@ export function describeTransaction(
   known: KnownScripts,
   client: ccc.Client,
   maxFeeRate = feeRateCap(),
-): { preview: TransactionPreview; outflowShannons: bigint; tokensLeaving: boolean } {
+): { preview: TransactionPreview; outflowShannons: bigint; tokensLeaving: boolean; tokenOutflows: TokenOutflow[] } {
   const outputs = transaction.outputs.map((cellOutput, index) => ({ cellOutput, outputData: ccc.hexFrom(transaction.outputsData[index] ?? "0x") }));
   const totalIn = sum(inputCells.map(({ cellOutput }) => cellOutput.capacity));
   const totalOut = sum(outputs.map(({ cellOutput }) => cellOutput.capacity));
@@ -253,6 +260,7 @@ export function describeTransaction(
   return {
     outflowShannons: outflow,
     tokensLeaving: [...tokenTotals.values()].some(({ delta }) => delta < 0n),
+    tokenOutflows: [...tokenTotals].filter(([, { delta }]) => delta < 0n).map(([asset, { delta }]) => ({ asset, amount: -delta })),
     preview: {
       network: "CKB testnet",
       sendingCkb: formatCkb(sending),

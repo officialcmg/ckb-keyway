@@ -137,7 +137,7 @@ export function KeyWayMessageModal({ theme, appName, preview, answer }: { theme:
 /** Asks for the code KeyWay emailed the user. Always drawn by the SDK, even when an app brings its own approval UI. */
 export function KeyWayEmailCodeModal({ theme, reason, error, resend, answer }: {
   theme: Theme;
-  reason: "transaction" | "settings";
+  reason: "transaction" | "settings" | "payment";
   error?: string;
   resend: () => Promise<void>;
   answer: (code: string | undefined) => void;
@@ -152,7 +152,7 @@ export function KeyWayEmailCodeModal({ theme, reason, error, resend, answer }: {
           <p style={{ ...modalEyebrow, color: palette.muted }}>EMAIL CONFIRMATION</p>
           <h2 id="keyway-code-title" style={modalTitle}>Check your email</h2>
           <p style={{ ...modalCopy, color: palette.muted }}>
-            {reason === "transaction" ? "We emailed you a code to confirm this transaction." : "We emailed you a code to confirm this security change."} It expires in 10 minutes.
+            {reason === "transaction" ? "We emailed you a code to confirm this transaction." : reason === "payment" ? "We emailed you a code to confirm this payment." : "We emailed you a code to confirm this security change."} It expires in 10 minutes.
           </p>
           <label style={modalLabel}>Confirmation code
             <input

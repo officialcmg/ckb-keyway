@@ -7,7 +7,7 @@ export const metadata = { title: "Live demo · CKB KeyWay" };
 
 export default async function DemoPage({ searchParams }: { searchParams: Promise<{ mode?: string; screen?: string }> }) {
   const params = await searchParams;
-  const nodeMode = params.mode === "browser" ? "browser" : "managed";
+  const nodeMode = params.mode === "browser" ? "browser" : "hosted";
   const devScreen = process.env.NODE_ENV !== "production" ? params.screen : undefined;
   return (
     <div className="demo-page">

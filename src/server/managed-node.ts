@@ -16,6 +16,7 @@ import { connectCandidates, TESTNET_CHANNEL_PEERS } from "../sdk/browser/channel
 import { normalizeCkbTransactionForCcc } from "@fiber-pay/sdk/browser";
 import { serializeCccTransactionForRpc } from "../sdk/browser/ccc-transaction.ts";
 import { DEFAULT_INVOICE_EXPIRY } from "../sdk/browser/invoice-expiry.ts";
+import { FIBER_METHODS, freeFiberParams, paymentFiberParams, type FiberMethod } from "../sdk/browser/fiber-methods.ts";
 
 type ManagedNodeClient = Pick<
   FiberRpcClient,
@@ -33,6 +34,7 @@ type ManagedNodeClient = Pick<
   | "getPayment"
   | "waitForPayment"
   | "shutdownChannel"
+  | "call"
 >;
 
 const clients = new Map<string, ManagedNodeClient>();
@@ -48,6 +50,19 @@ export async function managedNodeRequest(
 ): Promise<unknown> {
   const node = override ?? managedNodeClient(userId);
 
+  if (body.operation === "call") {
+    // Free methods from the shared table; anything else is refused before it reaches the node.
+    const method = typeof body.method === "string" ? body.method : "";
+    // A payment's dry run moves nothing, so it is free; real payments go through the payment flow.
+    if ((method === "sendPayment" || method === "sendPaymentWithRouter") && (body.params as { dry_run?: unknown } | undefined)?.dry_run === true) {
+      return node.call(FIBER_METHODS[method].rpc, [paymentFiberParams(method, body.params, "testnet")]);
+    }
+    const params = freeFiberParams(method, body.params, "testnet");
+    if (method === "nodeInfo") return publicNodeInfo(await node.nodeInfo());
+    const rpc = FIBER_METHODS[method as FiberMethod].rpc;
+    const run = () => node.call(rpc, method === "listPeers" ? [] : [params]);
+    return ["newInvoice", "settleInvoice", "cancelInvoice"].includes(method) ? serializeMutation(userId, run) : run();
+  }
   if (body.operation === "status") {
     return {
       node: await node.nodeInfo(),
@@ -101,7 +116,6 @@ export async function managedNodeRequest(
     // Fiber pays the channel out to the shutdown script when it closes, so it must be the user's own lock.
     params.shutdown_script = ownShutdownScript(body.params, await ownLock());
     await connectManagedPeer(node, params.pubkey);
-    await assertChannelCapacity(node);
     return serializeMutation(userId, () => node.openChannelWithExternalFunding(params));
   }
   if (body.operation === "submit-channel-funding") {
@@ -124,6 +138,11 @@ export async function managedNodeRequest(
     return { closed: true };
   }
   throw new Error("Unsupported managed-node operation");
+}
+
+/** The user's hosted node, for the payment flow. */
+export function managedFiberNode(userId: string): Pick<ManagedNodeClient, "call"> {
+  return managedNodeClient(userId);
 }
 
 export async function managedNodeReady(): Promise<unknown> {
@@ -238,6 +257,8 @@ function openChannelParams(value: unknown): OpenChannelWithExternalFundingParams
     pubkey: pubkey(params.pubkey),
     funding_amount: positiveHex(params.funding_amount, "Funding amount"),
     public: params.public === undefined ? true : boolean(params.public, "Channel visibility"),
+    // The node accepts only tokens on its whitelist; funding signing accepts only standard tokens.
+    ...(params.funding_udt_type_script === undefined ? {} : { funding_udt_type_script: script(params.funding_udt_type_script) }),
     shutdown_script: params.shutdown_script === undefined ? undefined as never : script(params.shutdown_script),
     funding_lock_script: script(params.funding_lock_script),
     funding_lock_script_cell_deps: cellDeps(params.funding_lock_script_cell_deps),
@@ -280,13 +301,6 @@ async function connectManagedPeer(node: ManagedNodeClient, peer: Pubkey): Promis
   if ((await connectCandidates(node, [nativeCandidate], 10_000, 250)).length === 0) {
     throw new Error("Could not connect to the selected Fiber channel peer");
   }
-}
-
-async function assertChannelCapacity(node: ManagedNodeClient): Promise<void> {
-  const limit = Number(process.env.KEYWAY_MANAGED_MAX_CHANNELS ?? 5);
-  if (!Number.isInteger(limit) || limit <= 0) return;
-  const { channels } = await node.listChannels({ include_closed: false });
-  if (channels.length >= limit) throw new Error(`Managed beta allows at most ${limit} open channels`);
 }
 
 function pubkey(value: unknown): Pubkey {
@@ -353,7 +367,6 @@ function invoiceParams(body: Record<string, unknown>): NewInvoiceParams {
   if (typeof body.amount !== "string" || !/^0x[0-9a-f]+$/i.test(body.amount) || BigInt(body.amount) <= 0n) {
     throw new Error("Invoice amount must be a positive hexadecimal amount");
   }
-  if (BigInt(body.amount) > 10_000n * 100_000_000n) throw new Error("Managed beta invoices are limited to 10,000 CKB");
   if (body.description !== undefined && (typeof body.description !== "string" || body.description.length > 160)) {
     throw new Error("Invoice description is too long");
   }
@@ -375,6 +388,12 @@ function invoiceExpiry(value: unknown): `0x${string}` {
 
 function confirmationPayload(params: SendPaymentParams): string {
   return JSON.stringify({ managedPayment: params });
+}
+
+/** The host's internal addresses and the node's own funding lock aren't the app's business. */
+function publicNodeInfo<T extends object>(info: T): Omit<T, "addresses" | "default_funding_lock_script"> {
+  const { addresses: _addresses, default_funding_lock_script: _lock, ...rest } = info as T & { addresses?: unknown; default_funding_lock_script?: unknown };
+  return rest as Omit<T, "addresses" | "default_funding_lock_script">;
 }
 
 function closeParams(body: Record<string, unknown>) {

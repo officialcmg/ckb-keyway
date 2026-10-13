@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { getCkbAccountBalance } from "../browser/ckb-balance";
-import type { KeyWay, KeyWayChannel, OpenKeyWayChannelOptions, ActivationProgress } from "../browser/create-keyway";
+import type { KeyWay, KeyWayChannel, OpenKeyWayChannelOptions, ChannelOpenProgress } from "../browser/create-keyway";
 import { useKeyWayContext } from "./keyway-provider";
 
 export function useCkbWallet() {
@@ -39,11 +39,12 @@ export function useCkbWallet() {
   }, [wallet?.litPublicKey]);
 
   return {
-    status: !authenticated ? "disconnected" as const : !wallet ? recoveryError ? "error" as const : "recovering" as const : "ready" as const,
-    wallet,
+    status: !authenticated ? "disconnected" as const : !wallet ? recoveryError ? "error" as const : "loading" as const : "ready" as const,
     /** A CCC signer for this account. Every transaction and message is shown to the user before signing. */
     signer,
     address: wallet?.ckbAddress,
+    /** The account's compressed secp256k1 public key. */
+    publicKey: wallet?.litPublicKey,
     balance,
     refreshing,
     refreshBalance,
@@ -52,7 +53,7 @@ export function useCkbWallet() {
 }
 
 export function useFiber() {
-  const { connection, connect, disconnect, fiberStarting, fiberError, nodeMode } = useKeyWayContext();
+  const { connection, startFiber, stopFiber, fiberStarting, fiberError, fiberNode, fiberStartupStage } = useKeyWayContext();
   const connectionRef = useRef(connection);
   connectionRef.current = connection;
   const [channels, setChannels] = useState<KeyWayChannel[]>([]);
@@ -60,18 +61,17 @@ export function useFiber() {
   const generation = useRef(0);
 
   function client() {
-    if (!connectionRef.current) throw new Error("Connect Fiber before using channels or payments");
+    if (!connectionRef.current) throw new Error("Start Fiber before using channels or payments");
     return connectionRef.current.keyway;
   }
 
-  async function connectFiber() {
-    const next = await connect();
+  async function start() {
+    const next = await startFiber();
     connectionRef.current = next;
-    return next;
   }
 
-  async function disconnectFiber() {
-    await disconnect();
+  async function stop() {
+    await stopFiber();
     connectionRef.current = undefined;
   }
 
@@ -98,7 +98,7 @@ export function useFiber() {
     return () => { ++generation.current; clearInterval(timer); };
   }, [connection]);
 
-  async function openChannel(options: OpenKeyWayChannelOptions = {}, onProgress?: ActivationProgress) {
+  async function openChannel(options: OpenKeyWayChannelOptions = {}, onProgress?: ChannelOpenProgress) {
     const current = client();
     const result = await current.activateCkbChannel(options, onProgress);
     await current.waitForChannelReady(result.channelId, { timeout: 180_000, interval: 3_000 });
@@ -121,10 +121,15 @@ export function useFiber() {
   }
 
   return {
-    status: fiberStarting ? "connecting" as const : connection ? "connected" as const : fiberError ? "error" as const : "disconnected" as const,
-    nodeMode,
-    connect: connectFiber,
-    disconnect: disconnectFiber,
+    status: fiberStarting ? "starting" as const : connection ? "running" as const : fiberError ? "error" as const : "stopped" as const,
+    /** Where the node runs: "hosted" on KeyWay's servers, or "browser" in this page. */
+    fiberNode,
+    /** The current step while the node starts. */
+    startupStage: fiberStartupStage,
+    start,
+    stop,
+    /** The user's Fiber node, with Fiber's own method names. Available once `status` is "running". */
+    node: connection?.keyway.node,
     channels,
     refreshChannels,
     openChannel,
@@ -132,10 +137,8 @@ export function useFiber() {
     createInvoice: (...args: Parameters<KeyWay["newInvoice"]>) => client().newInvoice(...args),
     getInvoice: (...args: Parameters<KeyWay["getInvoice"]>) => client().getInvoice(...args),
     parseInvoice: (...args: Parameters<KeyWay["parseInvoice"]>) => client().parseInvoice(...args),
-    preflightPayment: (...args: Parameters<KeyWay["preflightPayment"]>) => client().preflightPayment(...args),
+    estimatePayment: (...args: Parameters<KeyWay["estimatePayment"]>) => client().estimatePayment(...args),
     payInvoice,
     error: fiberError ?? channelError,
-    // Raw Fiber access is an escape hatch, not required for normal payments.
-    connection,
   };
 }

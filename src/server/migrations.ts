@@ -265,4 +265,43 @@ export const migrations: Array<{
       await sql`create index keyway_v2_signed_outflows_recent on keyway_v2_signed_outflows (user_id, signed_at)`;
     },
   },
+  {
+    version: 14, name: "fiber-payment-approvals",
+    up: async (sql) => {
+      // Fiber payments are fast and may overlap, so a user can hold several pending payment approvals at once.
+      await sql`alter table keyway_v2_signature_requests drop constraint keyway_v2_signature_requests_pkey`;
+      await sql`alter table keyway_v2_signature_requests add primary key (nonce)`;
+      await sql`create index keyway_v2_signature_requests_user on keyway_v2_signature_requests (user_id, purpose)`;
+      await sql`alter table keyway_v2_signature_requests drop constraint keyway_v2_signature_requests_purpose_check`;
+      await sql`alter table keyway_v2_signature_requests add constraint keyway_v2_signature_requests_purpose_check
+        check (purpose in ('transaction', 'message', 'settings', 'payment'))`;
+    },
+  },
+  {
+    version: 15, name: "daily-amounts-per-asset",
+    up: async (sql) => {
+      // The user's daily email-confirmation amount per asset: "ckb", or a token's type script hash.
+      await sql`create table keyway_v2_daily_amounts (
+        user_id uuid not null,
+        asset text not null check (asset = 'ckb' or asset ~ '^0x[0-9a-f]{64}$'),
+        amount numeric(40, 0) not null check (amount > 0),
+        updated_at timestamptz not null default now(),
+        primary key (user_id, asset)
+      )`;
+      await sql`
+        insert into keyway_v2_daily_amounts (user_id, asset, amount)
+        select user_id, 'ckb', email_threshold_shannons from keyway_v2_signing_settings where email_threshold_shannons is not null
+      `;
+      // Tokens sent, counted toward each token's daily amount. CKB stays in keyway_v2_signed_outflows.
+      await sql`create table keyway_v2_token_outflows (
+        user_id uuid not null,
+        outflow_id text not null,
+        asset text not null,
+        amount numeric(40, 0) not null,
+        signed_at timestamptz not null default now(),
+        primary key (user_id, outflow_id, asset)
+      )`;
+      await sql`create index keyway_v2_token_outflows_recent on keyway_v2_token_outflows (user_id, asset, signed_at)`;
+    },
+  },
 ];

@@ -11,4 +11,10 @@ function Probe() {
 const params = new URLSearchParams(location.search);
 const root = createRoot(document.getElementById("root")!);
 Object.assign(window, { unmount: () => root.unmount() });
-root.render(<KeyWayProvider appId={params.get("app") ?? undefined} nodeMode={params.has("browser") ? "browser" : "managed"} autoConnect={params.has("auto")}><Probe /></KeyWayProvider>);
+// `?approve` adds an app-side payment confirmation that tests control through window.allowPayments.
+const approvals: unknown[] = [];
+Object.assign(window, { paymentApprovals: approvals, allowPayments: true });
+const approveFiberPayment = params.has("approve")
+  ? (preview: unknown) => { approvals.push(preview); return (window as unknown as { allowPayments: boolean }).allowPayments; }
+  : undefined;
+root.render(<KeyWayProvider appId={params.get("app") ?? undefined} fiberNode={params.has("browser") ? "browser" : "hosted"} autoStartFiber={params.has("auto")} approveFiberPayment={approveFiberPayment}><Probe /></KeyWayProvider>);

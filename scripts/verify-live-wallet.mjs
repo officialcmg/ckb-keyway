@@ -87,7 +87,7 @@ try {
       const address = await page.evaluate(() => window.probe.account.address);
       if (expectedAddress) assert.equal(address, expectedAddress); else expectedAddress = address;
       await page.waitForFunction(() => window.probe.account.balance !== undefined, undefined, { timeout: 60_000 });
-      await page.evaluate(() => window.probe.fiber.connect());
+      await page.evaluate(() => window.probe.fiber.start());
       const node = await page.evaluate(() => window.probe.fiber.connection.node.pubkey);
       assert.equal(typeof node, "string");
       assert.ok(node.length > 60);
@@ -127,7 +127,7 @@ try {
       const invoice = await receiver.evaluate(async () => (await window.probe.fiber.createInvoice({ amount: "0x5f5e100", currency: "Fibt", description: "KeyWay disposable verification", expiry: "0xe10" })).invoice_address);
       let routable = false;
       for (let attempt = 0; attempt < 20; attempt++) {
-        routable = await sender.evaluate(async invoice => (await window.probe.fiber.preflightPayment({ invoice, max_fee_amount: "0x5f5e100" })).routable, invoice);
+        routable = await sender.evaluate(async invoice => (await window.probe.fiber.estimatePayment({ invoice, max_fee_amount: "0x5f5e100" })).routable, invoice);
         if (routable) break;
         await new Promise(resolve => setTimeout(resolve, 3000));
       }

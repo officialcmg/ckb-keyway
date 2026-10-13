@@ -20,17 +20,22 @@ test("publishes only the React SDK entrypoint", async () => {
   assert.match(repositoryPackage.scripts["build:sdk"], /--external react\/jsx-runtime(?:\s|$)/);
 });
 
-test("exports React and headless KeyWay APIs from one public entrypoint", async () => {
+test("exports only the public SDK from one entrypoint", async () => {
   const sdk = await import("../src/sdk/react/index.ts");
 
-  assert.equal(typeof sdk.KeyWayProvider, "function");
-  assert.equal(typeof sdk.KeyWayLoginButton, "function");
-  assert.equal(typeof sdk.KeyWayConnectButton, "function");
-  assert.equal(typeof sdk.useKeyWay, "function");
-  assert.equal(typeof sdk.useCkbWallet, "function");
-  assert.equal(typeof sdk.useFiber, "function");
-  assert.equal(typeof sdk.getCkbAccountBalance, "function");
-  assert.equal(typeof sdk.connectKeyWay, "function");
+  assert.deepEqual(Object.keys(sdk).sort(), [
+    "FIBER_METHODS",
+    "KeyWayError",
+    "KeyWayFiberButton",
+    "KeyWayLoginButton",
+    "KeyWayProvider",
+    "KeyWaySigner",
+    "friendlyKeyWayError",
+    "toKeyWayError",
+    "useCkbWallet",
+    "useFiber",
+    "useKeyWay",
+  ]);
 });
 
 test("the reference app imports the SDK package", async () => {
@@ -58,7 +63,7 @@ test("defaults to managed testnet while retaining an explicit browser-wallet rou
   const page = await readFile(new URL("../app/app/page.tsx", import.meta.url), "utf8");
   const demo = await readFile(new URL("../app/auth-panel.tsx", import.meta.url), "utf8");
   const view = await readFile(new URL("../app/app/demo-view.tsx", import.meta.url), "utf8");
-  assert.match(provider, /nodeMode = "managed"/);
+  assert.match(provider, /fiberNode = "hosted"/);
   assert.match(page, /mode === "browser"/);
   assert.match(demo, /\/app\?mode=browser/);
   assert.match(view, /Each mode runs its own Fiber node\. Switching doesn&apos;t move open channels\./);

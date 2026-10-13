@@ -9,6 +9,7 @@ import type { ReadyWallet } from "../src/server/user-wallet.ts";
 
 const enabled = Boolean(process.env.KEYWAY_AUTH_TEST_DATABASE_URL);
 const CKB = 100_000_000n;
+const RUSD = `0x${"ee".repeat(32)}`;
 const privateKey = secp256k1.utils.randomSecretKey();
 const publicKey = ccc.hexFrom(secp256k1.getPublicKey(privateKey, true));
 
@@ -17,7 +18,7 @@ function signWithKey(digest: ccc.Hex): ccc.Hex {
   return formatCkbSignature({ recoveryParam: raw[0] as 0 | 1, r: ccc.hexFrom(raw.slice(1, 33)), s: ccc.hexFrom(raw.slice(33, 65)) });
 }
 
-function harness(outflow: bigint, tokensLeaving = false) {
+function harness(outflow: bigint, tokenOutflows: Array<{ asset: string; amount: bigint }> = []) {
   const emails: Array<{ to: string; subject: string; plaintext: string }> = [];
   const user = { id: crypto.randomUUID() };
   const wallet = { litPkpId: `0x${"11".repeat(20)}`, litPublicKey: publicKey, status: "ready" } as unknown as ReadyWallet;
@@ -34,7 +35,8 @@ function harness(outflow: bigint, tokensLeaving = false) {
         unrecognized: [], otherSigners: 0, details: { inputs: [], outputs: [] }, transactionHash: transaction.hash(),
       },
       outflowShannons: outflow,
-      tokensLeaving,
+      tokensLeaving: tokenOutflows.length > 0,
+      tokenOutflows,
     };
   };
   const context: SigningContext = {
@@ -81,14 +83,38 @@ test("general signing binds approvals, email codes and threshold changes", { ski
     assert.ok(signed);
   });
 
-  await t.test("asks for the code when tokens leave, even below the CKB amount", async () => {
-    const { context } = harness(1n * CKB, true);
+  await t.test("a token with no daily amount of its own needs the code once confirmation is on", async () => {
+    const { context } = harness(1n * CKB, [{ asset: RUSD, amount: 5n }]);
     await signingSettings(context, { operation: "set", emailThresholdShannons: (1_000n * CKB).toString() });
     const preview = await transactionSigning(context, { operation: "preview", transaction: tx(5) }) as { requiresEmailCode: boolean };
     assert.equal(preview.requiresEmailCode, true);
-    const off = harness(1n * CKB, true);
+    const off = harness(1n * CKB, [{ asset: RUSD, amount: 5n }]);
     const free = await transactionSigning(off.context, { operation: "preview", transaction: tx(6) }) as { requiresEmailCode: boolean };
     assert.equal(free.requiresEmailCode, false);
+  });
+
+  await t.test("tokens with their own daily amount count toward it, separately from CKB", async () => {
+    const { context, emails, codeFrom } = harness(1n * CKB, [{ asset: RUSD, amount: 40n }]);
+    await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (1_000n * CKB).toString() });
+    // Giving a token its own amount lets more of it through without a code, so it needs the emailed code.
+    const pending = await signingSettings(context, { operation: "set-daily-amount", asset: RUSD, amount: "100" }) as { requiresEmailCode: boolean; confirmationNonce: string };
+    assert.equal(pending.requiresEmailCode, true);
+    assert.match(emails.at(-1)!.plaintext, /token 0x/);
+    await signingSettings(context, { operation: "set-daily-amount", asset: RUSD, amount: "100", confirmationNonce: pending.confirmationNonce, emailCode: codeFrom() });
+    assert.deepEqual(await signingSettings(context, { operation: "get" }), {
+      emailThresholdShannons: (1_000n * CKB).toString(),
+      dailyAmounts: { ckb: (1_000n * CKB).toString(), [RUSD]: "100" },
+    });
+    for (const [marker, needsCode] of [[20, false], [21, false], [22, true]] as const) {
+      const preview = await transactionSigning(context, { operation: "preview", transaction: tx(marker) }) as { confirmationNonce: string; requiresEmailCode: boolean };
+      assert.equal(preview.requiresEmailCode, needsCode, `transfer ${marker}`);
+      if (!needsCode) await transactionSigning(context, { operation: "sign", transaction: tx(marker), confirmationNonce: preview.confirmationNonce });
+    }
+    // Removing the token's amount makes it need the code every time again: that's stronger, so no code.
+    assert.deepEqual(await signingSettings(context, { operation: "set-daily-amount", asset: RUSD, amount: null }), {
+      emailThresholdShannons: (1_000n * CKB).toString(),
+      dailyAmounts: { ckb: (1_000n * CKB).toString() },
+    });
   });
 
   await t.test("counts everything signed in the last 24 hours toward the threshold", async () => {
@@ -129,16 +155,16 @@ test("general signing binds approvals, email codes and threshold changes", { ski
 
   await t.test("strengthening applies at once; weakening needs the emailed code", async () => {
     const { context, emails, codeFrom } = harness(0n);
-    assert.deepEqual(await signingSettings(context, { operation: "set", emailThresholdShannons: (500n * CKB).toString() }), { emailThresholdShannons: (500n * CKB).toString() });
-    assert.deepEqual(await signingSettings(context, { operation: "set", emailThresholdShannons: (100n * CKB).toString() }), { emailThresholdShannons: (100n * CKB).toString() });
+    assert.deepEqual(await signingSettings(context, { operation: "set", emailThresholdShannons: (500n * CKB).toString() }), { emailThresholdShannons: (500n * CKB).toString(), dailyAmounts: { ckb: (500n * CKB).toString() } });
+    assert.deepEqual(await signingSettings(context, { operation: "set", emailThresholdShannons: (100n * CKB).toString() }), { emailThresholdShannons: (100n * CKB).toString(), dailyAmounts: { ckb: (100n * CKB).toString() } });
     assert.equal(emails.length, 0);
     const pending = await signingSettings(context, { operation: "set", emailThresholdShannons: null }) as { requiresEmailCode: boolean; confirmationNonce: string };
     assert.equal(pending.requiresEmailCode, true);
-    assert.match(emails[0].plaintext, /turn it off/);
-    assert.deepEqual(await signingSettings(context, { operation: "get" }), { emailThresholdShannons: (100n * CKB).toString() });
+    assert.match(emails[0].plaintext, /turn email confirmation off/);
+    assert.deepEqual(await signingSettings(context, { operation: "get" }), { emailThresholdShannons: (100n * CKB).toString(), dailyAmounts: { ckb: (100n * CKB).toString() } });
     await assert.rejects(() => signingSettings(context, { operation: "set", emailThresholdShannons: (900n * CKB).toString(), confirmationNonce: pending.confirmationNonce, emailCode: codeFrom() }), /invalid or expired/);
     await signingSettings(context, { operation: "set", emailThresholdShannons: null, confirmationNonce: pending.confirmationNonce, emailCode: codeFrom() });
-    assert.deepEqual(await signingSettings(context, { operation: "get" }), { emailThresholdShannons: null });
+    assert.deepEqual(await signingSettings(context, { operation: "get" }), { emailThresholdShannons: null, dailyAmounts: {} });
   });
 
   await t.test("signs approved messages in CKB's message format", async () => {
