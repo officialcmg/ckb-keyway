@@ -4,7 +4,7 @@ description: "Email-native CKB accounts and Fiber payments for React application
 icon: Route
 ---
 
-CKB KeyWay gives a React application email OTP login, a recoverable CKB testnet account, and optional managed or browser Fiber connectivity. Login does not start Fiber.
+CKB KeyWay gives a React application email OTP login, a recoverable CKB testnet account with a CCC signer, and the user's own Fiber node, hosted by KeyWay or run in the browser. Login does not start Fiber.
 
 ```bash
 npm install @ckb-keyway/react
@@ -26,14 +26,14 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
 export function WalletStatus() {
   const { ready, authenticated } = useKeyWay();
-  const { address } = useCkbWallet();
+  const { status, address } = useCkbWallet();
 
   if (!ready) return <p>Loading...</p>;
 
   return (
     <div>
       <KeyWayLoginButton />
-      {authenticated && !address ? <p>Recovering wallet...</p> : null}
+      {authenticated && status === "loading" ? <p>Loading wallet...</p> : null}
       {address ? <p>{address}</p> : null}
     </div>
   );
@@ -45,7 +45,10 @@ export function WalletStatus() {
     Install the SDK and recover your first wallet.
   </Card>
   <Card title="Fiber payments" icon="bolt" href="/fiber-payments">
-    Fund a channel, create invoices, and send payments.
+    Open a channel, create invoices, and send payments.
+  </Card>
+  <Card title="Fiber node" icon="network" href="/fiber-node">
+    Every Fiber method under its own name, and what the user approves.
   </Card>
   <Card title="React SDK" icon="brackets-curly" href="/react-sdk">
     Provider, hook, components, and client methods.
@@ -63,9 +66,11 @@ export function WalletStatus() {
 
 - Email OTP UI and session recovery
 - Stable CKB account recovery through Lit
-- Browser Fiber node startup and testnet peer connection
-- Externally funded Fiber channel activation
-- Fiber invoices, routed payments, channels, and balances
+- A CCC signer for CKB, token, NFT and Nervos DAO transactions, with an approval dialog
+- A hosted or browser Fiber node for each user, with Fiber's full method set
+- Fiber channels funded from the user's account, in CKB or tokens such as RUSD
+- Fiber invoices, routed payments, keysend and hold invoices
+- Optional emailed confirmation codes past a daily amount per asset
 
 ## Requirements
 

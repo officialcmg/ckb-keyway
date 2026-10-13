@@ -69,11 +69,11 @@ export function Wallet() {
   return (
     <section>
       <KeyWayLoginButton />
-      {authenticated && !account.wallet ? <p>Recovering wallet...</p> : null}
+      {authenticated && account.status === "loading" ? <p>Loading wallet...</p> : null}
       {account.address ? <p>CKB address: {account.address}</p> : null}
-      {account.wallet && fiber.status !== "connected" ? (
-        <button disabled={fiber.status === "connecting"} onClick={() => void fiber.connect().catch(() => undefined)}>
-          {fiber.status === "connecting" ? "Starting Fiber..." : "Connect Fiber"}
+      {account.status === "ready" && fiber.status !== "running" ? (
+        <button disabled={fiber.status === "starting"} onClick={() => void fiber.start().catch(() => undefined)}>
+          {fiber.status === "starting" ? "Starting Fiber..." : "Start Fiber"}
         </button>
       ) : null}
       {account.error || fiber.error ? <p role="alert">{(account.error ?? fiber.error)?.message}</p> : null}
@@ -82,7 +82,7 @@ export function Wallet() {
 }
 ```
 
-From SDK 0.1.0, login recovers the CKB account without starting Fiber. Calling `connect()` from `useFiber()` starts or attaches to Fiber; it does not fund a channel. Set `autoConnect` to opt into automatic Fiber connection. Managed mode requires no WASM isolation headers.
+Login recovers the CKB account without starting Fiber. Calling `start()` from `useFiber()` starts the user's Fiber node, or connects to it when it's hosted; it does not fund a channel. Set `autoStartFiber` to start Fiber as soon as the user signs in, or use `KeyWayFiberButton`. The hosted node, the default, needs no cross-origin isolation headers.
 
 <Info>
   The app ID is public. It identifies the integration and lets KeyWay enforce its registered origins; it is not a secret credential.
@@ -92,9 +92,9 @@ From SDK 0.1.0, login recovers the CKB account without starting Fiber. Calling `
 
 Select **Log in**, enter an email address, and submit the six-digit code. The same email recovers the same CKB account.
 
-## Optional browser mode
+## Optional browser node
 
-Set `nodeMode="browser"` on the provider to run Fiber WASM locally. This requires cross-origin isolation. For Next.js, add these response headers in `next.config.ts`:
+Set `fiberNode="browser"` on the provider to run the user's Fiber node in the page, as WebAssembly. This requires cross-origin isolation. For Next.js, add these response headers in `next.config.ts`:
 
 ```ts
 export default {
@@ -110,8 +110,8 @@ export default {
 };
 ```
 
-For Vite, configure the same headers under `server.headers` for local development and on your production host. Verify `window.crossOriginIsolated === true` before startup. Browser state moves between devices only after a successful explicit logout backup. Switching between browser and managed mode does not migrate channels.
+For Vite, configure the same headers under `server.headers` for local development and on your production host. Verify `window.crossOriginIsolated === true` before startup. Browser state moves between devices only after a successful explicit logout backup. Browser and hosted nodes are separate nodes, so switching between them doesn't move channels.
 
-<Card title="Next: activate Fiber payments" icon="arrow-right" href="/fiber-payments">
+<Card title="Next: Fiber payments" icon="arrow-right" href="/fiber-payments">
   Open a channel and make the account ready to send and receive.
 </Card>

@@ -15,7 +15,12 @@ import {
   type FiberStartupEvent,
 } from "@ckb-keyway/react";
 import { DemoView, type DemoActions, type DemoActivity, type DemoChannel, type DemoModel, type LifecycleEvent, type NodeMode } from "./app/demo-view";
-import { parseCkb, toHex } from "./app/format";
+import { CKB, parseCkb, toHex, type Unit } from "./app/format";
+
+// Tokens the demo names, by type script hash. Stable++ RUSD is the token Fiber's testnet nodes accept.
+const TOKENS: Record<string, Unit> = {
+  "0x45b32a2bc4285d0a09678eb11960ddc8707bc2779887a09d482e9bfe9a2cdf52": { symbol: "RUSD", decimals: 8 },
+};
 
 // Fiber's new_invoice `expiry` is in seconds.
 const INVOICE_EXPIRY_SECONDS = 60n * 60n;
@@ -60,6 +65,7 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
   const [walletRecovery, setWalletRecovery] = useState<{ at: number; durationMs?: number }>();
   const [failedAt, setFailedAt] = useState<number>();
   const [activity, setActivity] = useState<DemoActivity[]>([]);
+  const [payments, setPayments] = useState<DemoActivity[]>([]);
   const reserved = useChannelReserves(fiber.channels);
   const receiving = useRef(new Map<string, bigint>());
   const fiberRef = useRef(fiber);
@@ -77,6 +83,30 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
   }, [account.status]);
 
   useEffect(() => { setFailedAt(fiber.status === "error" ? Date.now() : undefined); }, [fiber.status]);
+
+  // Sent payments come from the node itself (`listPayments`), so they survive reloads and other devices.
+  const loadPayments = useCallback(async () => {
+    const node = fiberRef.current.node;
+    if (!node) return;
+    const [{ payments: sent }, { channels }] = await Promise.all([node.listPayments({ limit: toHex(20n) }), node.listChannels({ include_closed: true })]);
+    setPayments(sent.flatMap((payment) => {
+      const routes = payment.routers ?? [];
+      if (payment.status !== "Success" || routes.length === 0) return [];
+      // The first hop carries what left the user's channel: the amount plus every routing fee.
+      const amount = routes.reduce((total, route) => total + BigInt(route.nodes[0]?.amount ?? 0), 0n);
+      const firstHop = fundingOutpoint(routes[0].nodes[0]?.channel_outpoint)?.txHash;
+      const channel = channels.find((item) => fundingOutpoint(item.channel_outpoint)?.txHash === firstHop);
+      const unit = channel ? channelUnit(channel) : CKB;
+      return [{ id: `paid-${payment.payment_hash}`, kind: "paid" as const, amount, unit, at: Number(BigInt(payment.created_at)) }];
+    }));
+  }, []);
+
+  useEffect(() => {
+    if (fiber.status !== "running") { setPayments([]); return; }
+    void loadPayments().catch(() => undefined);
+    const timer = window.setInterval(() => void loadPayments().catch(() => undefined), 15_000);
+    return () => window.clearInterval(timer);
+  }, [fiber.status, loadPayments]);
 
   useEffect(() => {
     if (account.status !== "ready") return;
@@ -96,7 +126,7 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
     openChannel: async (amount, peer, onStage) => {
       try {
         const { channelId } = await fiberRef.current.openChannel({ fundingAmount: amount, peer, public: true }, onStage);
-        setActivity((current) => [...current, { id: `opened-${channelId}`, kind: "opened", amount, at: Date.now() }]);
+        setActivity((current) => [...current, { id: `opened-${channelId}`, kind: "opened", amount, unit: CKB, at: Date.now() }]);
       } catch (cause) {
         throw new Error(readable(cause, "The channel couldn't be opened. Your CKB balance is unaffected."));
       }
@@ -112,20 +142,23 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
     },
     checkInvoice: async (invoice) => {
       const { invoice: parsed } = await fiberRef.current.parseInvoice({ invoice }).catch(() => { throw new Error("This doesn't look like a valid Fiber invoice."); });
-      if (!parsed.amount) return { amount: 0n, error: "This invoice has no amount. Ask the payee for one with a fixed amount." };
+      const udtScript = parsed.data.attrs.flatMap((attr) => "udt_script" in attr ? [attr.udt_script as string] : [])[0];
+      const unit = udtScript ? TOKENS[ccc.hashCkb(udtScript)] : CKB;
+      if (!unit) return { amount: 0n, unit: CKB, error: "This invoice is for a token this demo doesn't recognize." };
+      if (!parsed.amount) return { amount: 0n, unit, error: "This invoice has no amount. Ask the payee for one with a fixed amount." };
       const amount = BigInt(parsed.amount);
       const description = parsed.data.attrs.flatMap((attr) => "description" in attr ? [attr.description] : [])[0];
       const estimate = await fiberRef.current.estimatePayment({ invoice, ...PAYMENT_OPTIONS });
-      if (!estimate.routable) return { amount, description, error: readable(estimate.error, "No route was found for this payment.") };
-      return { amount, description, fee: estimate.fee };
+      if (!estimate.routable) return { amount, unit, description, error: readable(estimate.error, "No route was found for this payment.") };
+      return { amount, unit, description, fee: estimate.fee };
     },
-    pay: async (invoice, check) => {
+    pay: async (invoice) => {
       try {
         await fiberRef.current.payInvoice(invoice, PAYMENT_OPTIONS);
       } catch (cause) {
         throw new Error(readable(cause, "The payment didn't go through. Your balance is unchanged."));
       }
-      setActivity((current) => [...current, { id: `paid-${Date.now()}`, kind: "paid", amount: check.amount, at: Date.now() }]);
+      await loadPayments().catch(() => undefined);
     },
     createInvoice: async (amount, description) => {
       const result = await fiberRef.current.createInvoice({ amount: toHex(amount), currency: "Fibt", description: description || undefined, expiry: toHex(INVOICE_EXPIRY_SECONDS) });
@@ -154,12 +187,12 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
       const amount = receiving.current.get(paymentHash);
       if (status === "Paid" && amount !== undefined) {
         receiving.current.delete(paymentHash);
-        setActivity((current) => [...current, { id: `received-${paymentHash}`, kind: "received", amount, at: Date.now() }]);
+        setActivity((current) => [...current, { id: `received-${paymentHash}`, kind: "received", amount, unit: CKB, at: Date.now() }]);
         void fiberRef.current.refreshChannels().catch(() => undefined);
       }
       return status;
     },
-  }), [login, logout, resetEvents, setMode]);
+  }), [login, logout, resetEvents, setMode, loadPayments]);
 
   const channels: DemoChannel[] = fiber.channels.map((channel) => ({
     id: channel.id,
@@ -169,6 +202,7 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
     remote: channel.canReceive,
     reserved: reserved[channel.id],
     fundingTx: fundingOutpoint(channel.raw.channel_outpoint)?.txHash,
+    unit: channelUnit(channel.raw),
   }));
   const error = fiber.error ? toKeyWayError(fiber.error) : undefined;
 
@@ -185,7 +219,7 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
     events,
     failedAt,
     channels,
-    activity,
+    activity: [...activity, ...payments],
   };
   return <DemoView model={model} actions={actions} />;
 }
@@ -197,6 +231,14 @@ function readable(cause: unknown, fallback: string): string {
   const friendly = friendlyKeyWayError(raw);
   if (friendly !== raw) return friendly;
   return raw.length > 160 || /[\u001b\n]|\[[0-9;]*m/.test(raw) ? fallback : raw;
+}
+
+/** CKB, or the channel's token: named when the demo knows it, otherwise by the start of its hash. */
+function channelUnit(channel: { funding_udt_type_script?: { code_hash: string; hash_type: string; args: string } | null }): Unit {
+  const script = channel.funding_udt_type_script;
+  if (!script) return CKB;
+  const hash = ccc.Script.from({ codeHash: script.code_hash, hashType: script.hash_type as ccc.HashType, args: script.args }).hash();
+  return TOKENS[hash] ?? { symbol: `token ${hash.slice(0, 8)}…`, decimals: 0 };
 }
 
 /**

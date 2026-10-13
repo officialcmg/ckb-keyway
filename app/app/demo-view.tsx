@@ -5,7 +5,7 @@ import { encode } from "uqr";
 import { AlertIcon, CheckIcon, ChevronDown, CloseIcon, CopyIcon, ExternalIcon, SpinnerIcon } from "../_components/icons";
 import { CopyButton } from "../_components/copy-button";
 import { TROUBLESHOOTING_URL } from "../_components/links";
-import { clockTime, duration, formatBalance, formatCkb, parseCkb, seconds, shortHash } from "./format";
+import { CKB, clockTime, duration, formatBalance, formatCkb, formatUnits, parseCkb, seconds, shortHash, type Unit } from "./format";
 
 export type NodeMode = "hosted" | "browser";
 export type ChannelStatus = "pending" | "ready" | "closing" | "closed" | "failed" | "unknown";
@@ -22,9 +22,11 @@ export type DemoChannel = {
   remote: bigint;
   reserved?: bigint;
   fundingTx?: string;
+  /** What the channel holds: CKB, or a token such as RUSD. */
+  unit: Unit;
 };
 
-export type DemoActivity = { id: string; kind: "received" | "paid" | "opened"; amount: bigint; at: number };
+export type DemoActivity = { id: string; kind: "received" | "paid" | "opened"; amount: bigint; unit: Unit; at: number };
 
 export type DemoModel = {
   nodeMode: NodeMode;
@@ -47,7 +49,7 @@ export type DemoModel = {
   activity: DemoActivity[];
 };
 
-export type InvoiceCheck = { amount: bigint; description?: string; fee?: bigint; error?: string };
+export type InvoiceCheck = { amount: bigint; unit: Unit; description?: string; fee?: bigint; error?: string };
 export type CreatedInvoice = { address: string; amount: bigint; description?: string; createdAt: number; paymentHash: string };
 
 export type DemoActions = {
@@ -473,7 +475,8 @@ function ChannelBox({ channel, actions }: { channel: DemoChannel; actions: DemoA
     const timer = window.setTimeout(() => setConfirming(false), 5000);
     return () => window.clearTimeout(timer);
   }, [confirming]);
-  const reserved = channel.reserved ?? 0n;
+  // A token channel's CKB reserve is counted in CKB, not in the token, so only CKB channels show it.
+  const reserved = channel.unit.symbol === CKB.symbol ? channel.reserved ?? 0n : 0n;
   const statusClass = channel.status === "ready" ? "success" : channel.status === "pending" ? "warning" : channel.status === "failed" ? "danger" : "muted";
   const statusLabel = { ready: "Ready", pending: "Opening", closing: "Closing", closed: "Closed", failed: "Failed", unknown: "Unknown" }[channel.status];
 
@@ -493,9 +496,9 @@ function ChannelBox({ channel, actions }: { channel: DemoChannel; actions: DemoA
         <span style={{ flex: Number(channel.remote / 1_000_000n) }} className="is-receive" />
       </div>
       <dl className="demo-channel__amounts">
-        <div><dt><span className="is-send" />You can send</dt><dd>{formatCkb(channel.local)}</dd></div>
-        <div><dt><span className="is-reserved" />Reserved</dt><dd>{channel.reserved === undefined ? "—" : formatCkb(channel.reserved)}</dd></div>
-        <div><dt><span className="is-receive" />You can receive</dt><dd>{formatCkb(channel.remote)}</dd></div>
+        <div><dt><span className="is-send" />You can send</dt><dd>{formatUnits(channel.local, channel.unit)}{channel.unit.symbol === CKB.symbol ? "" : ` ${channel.unit.symbol}`}</dd></div>
+        {channel.unit.symbol === CKB.symbol && <div><dt><span className="is-reserved" />Reserved</dt><dd>{channel.reserved === undefined ? "—" : formatCkb(channel.reserved)}</dd></div>}
+        <div><dt><span className="is-receive" />You can receive</dt><dd>{formatUnits(channel.remote, channel.unit)}{channel.unit.symbol === CKB.symbol ? "" : ` ${channel.unit.symbol}`}</dd></div>
       </dl>
       <div className="demo-channel__foot">
         <span>{channel.fundingTx ? <>Funded by <a href={`${EXPLORER}/transaction/${channel.fundingTx}`} target="_blank" rel="noreferrer">{shortHash(channel.fundingTx)}</a></> : "Funding pending"}</span>
@@ -522,7 +525,7 @@ function ActivityCard({ activity }: { activity: DemoActivity[] }) {
         <div key={item.id} className="demo-activity__row">
           <span className={`demo-activity__dot is-${item.kind}`} />
           <span className="demo-activity__what">{label[item.kind]}</span>
-          <span className="demo-activity__amount">{item.kind === "received" ? "+" : item.kind === "paid" ? "−" : ""}{formatCkb(item.amount)}</span>
+          <span className="demo-activity__amount">{item.kind === "received" ? "+" : item.kind === "paid" ? "−" : ""}{formatUnits(item.amount, item.unit)}{item.unit.symbol === CKB.symbol ? "" : ` ${item.unit.symbol}`}</span>
           <span className="demo-activity__when">{clockTime(item.at, false)}</span>
         </div>
       ))}
@@ -622,16 +625,16 @@ function PayDialog({ actions, initialInvoice, onClose }: { actions: DemoActions;
       </label>
       {check && (
         <dl className="detail-list">
-          <div><dt>Amount</dt><dd className="demo-strong">{formatCkb(check.amount)} CKB</dd></div>
+          <div><dt>Amount</dt><dd className="demo-strong">{formatUnits(check.amount, check.unit)} {check.unit.symbol}</dd></div>
           {check.description && <div><dt>Description</dt><dd>{check.description}</dd></div>}
-          {check.fee !== undefined && <div><dt>Routing fee</dt><dd>{formatCkb(check.fee)} CKB</dd></div>}
+          {check.fee !== undefined && <div><dt>Routing fee</dt><dd>{formatUnits(check.fee, check.unit)} {check.unit.symbol}</dd></div>}
         </dl>
       )}
       {checking && <p className="demo-route demo-route--muted"><SpinnerIcon size={16} />Checking the invoice…</p>}
       {payable && <p className="demo-route"><CheckIcon size={16} />Route found through your channel</p>}
       {(check?.error || error) && <p className="field-error"><AlertIcon />{check?.error ?? error}</p>}
       <button type="button" className={`btn btn--route btn--lg demo-pay${paying ? " btn--busy" : ""}`} disabled={!payable || paying} onClick={() => void pay()}>
-        {paying ? "Paying…" : payable ? `Pay ${formatCkb(check.amount + (check.fee ?? 0n))} CKB` : "Pay"}
+        {paying ? "Paying…" : payable ? `Pay ${formatUnits(check.amount + (check.fee ?? 0n), check.unit)} ${check.unit.symbol}` : "Pay"}
       </button>
     </Dialog>
   );
@@ -723,6 +726,6 @@ const CODE: Record<string, ReactNode> = {
   open: <><span className="tk-k">const</span>{" fiber = useFiber();\n\n"}<span className="tk-m">{"// 1,000 CKB, in shannons"}</span>{"\n"}<span className="tk-k">await</span>{" fiber.openChannel({\n  fundingAmount: "}<span className="tk-s">1_000n</span>{" * "}<span className="tk-s">100_000_000n</span>{",\n});"}</>,
   funding: <><span className="tk-m">{"// Built-in dialog by default."}</span>{"\n"}<span className="tk-m">{"// Or bring your own:"}</span>{"\n<"}<span className="tk-c">KeyWayProvider</span>{"\n  appId={APP_ID}\n  approveFiberChannelOpen={(preview) =>\n    askUser(\n      preview.amountCkb,\n      preview.feeCkb,\n    )\n  }\n/>"}</>,
   channels: <><span className="tk-k">const</span>{" { channels } = useFiber();\n\nchannels.map((c) => (\n  <"}<span className="tk-c">Channel</span>{"\n    key={c.id}\n    peer={c.peer}\n    status={c.status}\n  />\n));"}</>,
-  pay: <><span className="tk-k">const</span>{" fiber = useFiber();\n\n"}<span className="tk-k">const</span>{" check = "}<span className="tk-k">await</span>{" fiber\n  .estimatePayment({ invoice });\n\n"}<span className="tk-k">if</span>{" (check.routable) {\n  "}<span className="tk-k">await</span>{" fiber.payInvoice(invoice);\n}"}</>,
+  pay: <><span className="tk-k">const</span>{" fiber = useFiber();\n\n"}<span className="tk-m">{"// CKB and token (RUSD) invoices alike"}</span>{"\n"}<span className="tk-k">const</span>{" check = "}<span className="tk-k">await</span>{" fiber\n  .estimatePayment({ invoice });\n\n"}<span className="tk-k">if</span>{" (check.routable) {\n  "}<span className="tk-k">await</span>{" fiber.payInvoice(invoice);\n}"}</>,
   receive: <><span className="tk-k">const</span>{" amount = "}<span className="tk-s">5n</span>{" * "}<span className="tk-s">100_000_000n</span>{";\n\n"}<span className="tk-k">const</span>{" invoice = "}<span className="tk-k">await</span>{" fiber\n  .createInvoice({\n    amount: "}<span className="tk-s">{"`0x${amount.toString(16)}`"}</span>{",\n    currency: "}<span className="tk-s">&quot;Fibt&quot;</span>{",\n    description: "}<span className="tk-s">&quot;Order #1042&quot;</span>{",\n  });"}</>,
 };

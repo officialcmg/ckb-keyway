@@ -9,7 +9,7 @@ CKB KeyWay deliberately uses two unrelated secp256k1 identities.
 | Identity | Responsibility | Custody in the MVP |
 | --- | --- | --- |
 | Lit PKP | CKB cells and on-chain channel funding witness | Private key remains inside Lit; KeyWay receives signatures |
-| Fiber node key | P2P identity and off-chain channel-state signing | Encrypted at rest; recovered through the backend into browser/WASM memory |
+| Fiber node key | P2P identity and off-chain channel-state signing | Browser node: created inside Lit and re-encrypted inside Lit to a one-time browser key, so the backend relays only ciphertext into WASM memory. Hosted node: held by KeyWay's host |
 
 The Fiber key is never derived from the PKP, an OTP, or an ECDSA signature.
 
@@ -29,7 +29,7 @@ managed KeyWay backend -- server-side Better Auth OTP/session and Resend deliver
 pinned Lit Chipotle Actions
        |
        +-- sign validated CKB sighash
-       +-- encrypt/decrypt Fiber key
+       +-- create Fiber key, re-encrypt it to the browser
 
 Browser mode                         Managed beta
   Web Lock + backend lease            Railway private network
@@ -49,7 +49,7 @@ The Next.js reference app imports only the published `@ckb-keyway/react` package
 1. Fiber negotiates a collaborative transaction with the selected peer.
 2. CCC converts the transaction into KeyWay's signer representation.
 3. `/api/keyway/sign-transaction` resolves every input cell and requires at least one KeyWay-controlled input.
-4. Policy requires exactly one testnet Fiber FundingLock output, no UDT outputs, and at most 1 CKB total fee. There is no cap on the channel size.
+4. Policy requires exactly one testnet Fiber FundingLock output and at most 1 CKB total fee. A token channel may carry one standard token (xUDT or sUDT), only on the channel output and the user's own change. There is no cap on the channel size.
 5. CCC identifies exactly one KeyWay signing group and computes its CKB sighash.
 6. The pinned Lit Action signs the 32-byte digest. The backend recovers and compares the PKP public key.
 7. KeyWay inserts only that group's witness. Fiber verifies the transaction structure is otherwise unchanged and submits it.
@@ -64,11 +64,11 @@ Within the primary browser, a Web Lock and `BroadcastChannel` prevent duplicate 
 
 The browser sends a lease heartbeat every 30 seconds and the backend expires an abandoned lease after 120 seconds. SDK lifecycle events separate wallet recovery from Fiber startup, so applications can show the recovered CKB identity while the node restores state and connects.
 
-`KeyWayProvider` starts Fiber automatically after OTP when `autoConnect` is true. Startup recovers the wallet, acquires the browser lock and backend lease, restores a claimed backup when present, decrypts the Fiber key, starts the WASM node, connects testnet relays, and reads the initial CKB balance. `disconnect()`, logout, provider unmount, and page refresh stop the running instance; only explicit logout performs the encrypted handoff. A rejected lease heartbeat stops the node and surfaces an SDK error instead of leaving a stale instance running.
+`KeyWayProvider` starts Fiber automatically after OTP when `autoStartFiber` is true; otherwise the app calls `useFiber().start()`. Browser-node startup recovers the wallet, acquires the browser lock and backend lease, restores a claimed backup when present, unwraps the Fiber key, starts the WASM node, connects testnet relays, and reads the initial CKB balance. `useFiber().stop()`, logout, provider unmount, and page refresh stop the running instance; only explicit logout performs the encrypted handoff. A rejected lease heartbeat stops the node and surfaces an SDK error instead of leaving a stale instance running.
 
 Relay connections provide P2P reachability and gossip; they are not payment channels. The reference activation flow opens a public channel with an official browser-reachable testnet channel provider (`bottle` or `bracer`). Each node builds routes from its gossiped network graph, so two KeyWay users can pay through a shared routing provider without having a direct channel. The exact balance split of remote channels is not globally reliable, so `dry_run` can test a requested amount but cannot promise a stable sender-to-recipient maximum.
 
-`listChannels` exposes local, remote, offered-TLC, and received-TLC balances for channels known to the browser node. A channel's `channel_outpoint` is the CKB funding cell reference (`tx_hash` plus output `index`) that anchors the off-chain state. Cooperative or forced `shutdownChannel` eventually consumes that funding cell and creates settlement cells from the latest enforceable allocation; forced settlement may remain pending for the negotiated commitment delay.
+`listChannels` exposes local, remote, offered-TLC, and received-TLC balances for channels known to the browser node. A channel's `channel_outpoint` is the CKB funding cell reference (`tx_hash` plus output `index`) that anchors the off-chain state. Cooperative or forced `shutdownChannel` eventually consumes that funding cell and creates settlement cells from the latest enforceable allocation; forced settlement may remain pending for the negotiated commitment delay. A cooperative close pays the user's side to their own address. In Fiber 0.9.1 a forced close settles to the node's own key instead; until Fiber pays it to the close address, KeyWay sweeps it to the user's address (browser nodes settle to a key derived from the Fiber key and the SDK sweeps it on start and every 10 minutes; hosted settlements are swept by the backend while the user's node is in use).
 
 The reference wallet lives at `/app`; `/` is the pitch-oriented project landing page. The wallet treats ready-channel `local_balance` values as the user's Fiber balance and displays the on-chain CKB cell balance separately. Its transit-map channel list includes every non-closed channel and renders `local_balance` as "You" and `remote_balance` as "Peer", so pending lifecycle states and both sides of each channel remain visible. Each row offers a cooperative close behind an explicit confirmation sheet that shows the user's balance, the peer, and the network; a shutting-down channel is shown as closing until settlement returns the balance to CKB.
 
@@ -77,7 +77,7 @@ The reference wallet lives at `/app`; `/` is the pitch-oriented project landing 
 - Better Auth verifies application-isolated email OTPs and binds database sessions to validated application scope. Resend delivers email.
 - The KeyWay backend is trusted to map users to PKPs, enforce transaction policy, hold provider credentials, and authorize Lit calls.
 - Lit protects PKP key material inside a single attested TEE (Chipotle) and executes only Actions whose CIDs are allow-listed in the KeyWay group for the permitted PKPs. KeyWay's Lit admin credential controls that allow-list, and the backend refuses to send code that doesn't match its pinned CID.
-- The backend can observe the Fiber key during the current decrypt flow.
+- The backend relays only ciphertext of a browser node's Fiber key in normal operation, but remains trusted to authorize Lit unwraps. It holds hosted nodes' keys.
 - `fiber-js` owns live channel-state correctness and local persistence.
 - CKB enforces the final funding and settlement scripts.
 
@@ -85,7 +85,7 @@ The reference wallet lives at `/app`; `/` is the pitch-oriented project landing 
 
 The backend contains a controlled testnet gateway that gives each managed account its own native `fnn` process, CKB key, Fiber identity, and data directory. A managed-host service starts known nodes from one persistent Railway volume and lazily provisions new users. Native RPC ports bind to loopback; the HTTPS operator gateway requires a shared bearer token and an opaque hash of the permanent application-scoped KeyWay account ID. No unauthenticated RPC is exposed. Explicit account-to-node assignments take precedence so an existing node can keep its identity and channels during migration. Duplicate assigned URLs are rejected so two users cannot share a Fiber database. Payment submission requires a successful dry run and a one-use confirmation bound to the exact invoice and fee limit. Mutating requests are serialized per user and carry idempotency keys to prevent duplicate operations during retries.
 
-From SDK 0.0.7, `nodeMode="managed"` is the default; `nodeMode="browser"` remains available explicitly. Browser and native Fiber databases are not interchangeable, so existing browser channels cannot be silently moved into the native node. Funded payment and recovery checks in both modes, plus production headless managed login without isolation headers, are recorded in `TESTNET_EVIDENCE.md`. These checks used disposable testnet accounts on the existing deployment; isolated staging identity-provider credentials are deferred to mainnet preparation. Managed hosting trusts KeyWay's host with operational Fiber keys and channel state.
+`fiberNode="hosted"` is the default; `fiberNode="browser"` remains available explicitly. Browser and native Fiber databases are not interchangeable, so existing browser channels cannot be silently moved into the native node. Funded payment and recovery checks in both modes, plus production headless managed login without isolation headers, are recorded in `TESTNET_EVIDENCE.md`. These checks used disposable testnet accounts on the existing deployment; isolated staging identity-provider credentials are deferred to mainnet preparation. Managed hosting trusts KeyWay's host with operational Fiber keys and channel state.
 
 Managed channel connections use the approved public peer's key with `addr_type: "tcp"`, allowing native Fiber to resolve current addresses from gossip. A fresh node can fall back to a verified TCP bootstrap hint when gossip has no address yet; the handshake must still match the approved public key. Bootstrap addresses can become stale and are not identity authorities. Browser connections continue to use WSS seeds. Both paths wait for the peer handshake before negotiating a channel.
 

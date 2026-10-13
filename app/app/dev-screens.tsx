@@ -6,6 +6,7 @@
  * "production", so none of this reaches the deployed site.
  */
 import { useRouter } from "next/navigation";
+import { CKB as CKB_UNIT } from "./format";
 import { DemoView, type CreatedInvoice, type DemoActions, type DemoModel, type DemoUi, type LifecycleEvent, type NodeMode } from "./demo-view";
 
 const ADDRESS = "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqfdlq4x9etd0uj4xnpxzguymra6k6cz5kqg5uk4g";
@@ -38,11 +39,12 @@ function fixture(screen: string, nodeMode: NodeMode): { model: DemoModel; ui?: D
     balance: 899_999n * CKB / 100n,
     fiber: "running" as const,
     events: CONNECTED,
-    channels: [{ id: "0x1", peer: "0x02b6d4e3ab86a2ca2fad6fae0ecb2e1e559e0b911939872a90abdda6d20302be71", status: "ready" as const, local: 803n * CKB, remote: 151n * CKB, reserved: 98n * CKB, fundingTx: "0x6cbe00000000000000000000000000000000000000000000000000000000c319" }],
+    channels: [{ id: "0x1", peer: "0x02b6d4e3ab86a2ca2fad6fae0ecb2e1e559e0b911939872a90abdda6d20302be71", status: "ready" as const, local: 803n * CKB, remote: 151n * CKB, reserved: 98n * CKB, fundingTx: "0x6cbe00000000000000000000000000000000000000000000000000000000c319", unit: CKB_UNIT }],
     activity: [
-      { id: "a", kind: "received" as const, amount: 1n * CKB, at: new Date(2026, 9, 11, 12, 46).getTime() },
-      { id: "b", kind: "paid" as const, amount: 1n * CKB, at: new Date(2026, 9, 11, 12, 44).getTime() },
-      { id: "c", kind: "opened" as const, amount: 1000n * CKB, at: new Date(2026, 9, 11, 12, 39).getTime() },
+      { id: "t", kind: "paid" as const, amount: 25n * CKB, unit: { symbol: "RUSD", decimals: 8 }, at: new Date(2026, 9, 11, 12, 48).getTime() },
+      { id: "a", kind: "received" as const, amount: 1n * CKB, unit: CKB_UNIT, at: new Date(2026, 9, 11, 12, 46).getTime() },
+      { id: "b", kind: "paid" as const, amount: 1n * CKB, unit: CKB_UNIT, at: new Date(2026, 9, 11, 12, 44).getTime() },
+      { id: "c", kind: "opened" as const, amount: 1000n * CKB, unit: CKB_UNIT, at: new Date(2026, 9, 11, 12, 39).getTime() },
     ],
   };
   switch (screen) {
@@ -71,7 +73,7 @@ export function DevScreen({ screen, nodeMode }: { screen: string; nodeMode: Node
     startFiber: noop,
     openChannel: noop,
     closeChannel: noop,
-    checkInvoice: async () => ({ amount: 1n * CKB, description: "Coffee, Bottle Café", fee: CKB / 1000n }),
+    checkInvoice: async () => ({ amount: 1n * CKB, unit: CKB_UNIT, description: "Coffee, Bottle Café", fee: CKB / 1000n }),
     pay: noop,
     createInvoice: async () => RECEIVE,
     invoiceStatus: async () => "Open",

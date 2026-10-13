@@ -1,13 +1,13 @@
 ---
 title: "React SDK"
-description: "Authentication, CKB accounts, and optional Fiber connections."
+description: "Provider, hooks and components for authentication, CKB accounts and the user's Fiber node."
 icon: Code
 ---
 
 ## Provider
 
 ```tsx
-<KeyWayProvider appId="keyway_..." appName="Your app" theme="light" nodeMode="managed">
+<KeyWayProvider appId="keyway_..." appName="Your app" theme="light" fiberNode="hosted">
   <App />
 </KeyWayProvider>
 ```
@@ -15,15 +15,23 @@ icon: Code
 | Prop | Default | Purpose |
 | --- | --- | --- |
 | `appId` | none | Public application ID. Requests require a registered origin. |
-| `appName` | `CKB KeyWay` | Modal branding, not the email sender or subject. |
-| `theme` | `light` | Light or dark login/funding modals. |
-| `nodeMode` | `managed` | Managed native hosting or optional browser WASM. |
-| `autoConnect` | `false` | Opt into Fiber connection after login. Account recovery is always automatic. |
-| `confirmFunding` | built-in modal | Optional approval callback for validated channel funding. |
-| `confirmTransaction` | built-in modal | Optional approval callback for signer transactions; receives the decoded preview. |
-| `confirmMessage` | built-in modal | Optional approval callback for message signing. |
-| `onError` | none | Recovery, connection, and lease errors. |
-| `onLifecycle` | none | Structured connection stages and elapsed timings. |
+| `appName` | `CKB KeyWay` | Name shown in KeyWay's dialogs. Not the email sender or subject. |
+| `theme` | `light` | Light or dark dialogs. |
+| `fiberNode` | `hosted` | Where the user's Fiber node runs: `hosted` on KeyWay's servers, or `browser` in this page. |
+| `autoStartFiber` | `false` | Start Fiber as soon as the user signs in. Account recovery is always automatic. |
+| `approveFiberChannelOpen` | built-in dialog | Your own approval for opening a channel. Receives `FiberChannelOpenPreview`. |
+| `approveFiberChannelClose` | built-in dialog | Your own approval for closing a channel. Receives `FiberChannelClosePreview`. |
+| `approveFiberPeerConnect` | built-in dialog | Your own approval for connecting to or disconnecting from a peer. Receives `FiberPeerPreview`. |
+| `approveFiberChannelSettings` | built-in dialog | Your own approval for changing a channel's forwarding settings. Receives `FiberChannelSettingsPreview`. |
+| `approveFiberPayment` | none | Your own confirmation for Fiber payments, which have no built-in dialog. Receives `FiberPaymentPreview`. |
+| `approveCkbTransaction` | built-in dialog | Your own approval for signer transactions. Receives the decoded `TransactionPreview`. |
+| `approveCkbMessage` | built-in dialog | Your own approval for message signing. Receives `MessagePreview`. |
+| `onError` | none | Account recovery, Fiber startup and device lease errors. |
+| `onFiberStartup` | none | Each step of starting the Fiber node, with elapsed time. |
+
+Every approval prop returns `true` to go ahead or `false` to cancel, or a promise of either. The emailed-code prompt is always KeyWay's own.
+
+`onFiberStartup` receives `{ stage, at, elapsedMs }`. A browser node goes through `loading_account`, `claiming_device`, `restoring_channels` (only when restoring a backup), `starting_browser_node`, `connecting_peer`, `synchronizing` and `ready`. A hosted node goes through `loading_account`, `starting_hosted_node`, `synchronizing` and `ready`.
 
 ## Authentication: `useKeyWay()`
 
@@ -31,42 +39,78 @@ icon: Code
 const { ready, authenticated, user, login, logout } = useKeyWay();
 ```
 
-`ready` means session validation finished, not that the account or Fiber is ready. `user` contains the stable user ID. `login()` opens the OTP modal. `logout()` revokes the session; connected browser mode first performs its safe database backup. Managed nodes remain online.
+`ready` means session validation finished, not that the account or Fiber is ready. `user.id` is the stable user ID. `login()` opens the sign-in dialog. `logout()` revokes the session; a running browser node first backs up its channel state. A hosted node stays online.
 
 ## Account: `useCkbWallet()`
 
 ```ts
-const { status, wallet, signer, address, balance, refreshing, refreshBalance, error } = useCkbWallet();
+const { status, signer, address, publicKey, balance, refreshing, refreshBalance, error } = useCkbWallet();
 ```
 
-`status` is `disconnected`, `recovering`, `ready`, or `error`. `wallet` contains public identity metadata. `balance` is a bigint in shannons, undefined until the independent on-chain read completes. `refreshBalance()` updates it without Fiber. A balance error does not invalidate the recovered account. `signer` is a CCC signer for the account once it's ready; see [Signing transactions](/ccc-signer).
-
-Arbitrary CKB signing is not exposed by this hook. The remote signer currently authorizes channel funding under backend policy.
+| Member | Behavior |
+| --- | --- |
+| `status` | `disconnected` (signed out), `loading`, `ready` or `error`. |
+| `signer` | A CCC signer for the account once it's ready. See [Signing transactions](/ccc-signer). |
+| `address` | The account's CKB testnet address. |
+| `publicKey` | The account's compressed secp256k1 public key. |
+| `balance` | On-chain CKB in shannons, as a bigint. Undefined until the first read completes. |
+| `refreshBalance()` | Reads the balance again. Doesn't need Fiber. |
+| `error` | An account recovery error, or a balance error once the account is ready. A balance error doesn't invalidate the account. |
 
 ## Fiber: `useFiber()`
 
 ```ts
 const {
-  status, nodeMode, connect, disconnect, channels, refreshChannels,
-  openChannel, closeChannel, createInvoice, getInvoice, parseInvoice,
-  preflightPayment, payInvoice, error, connection,
+  status, fiberNode, startupStage, start, stop, node,
+  channels, refreshChannels, openChannel, closeChannel,
+  createInvoice, getInvoice, parseInvoice, estimatePayment, payInvoice, error,
 } = useFiber();
 ```
 
 | Member | Behavior |
 | --- | --- |
-| `status` | disconnected, connecting, connected, or error. Connected does not imply a funded channel. |
-| `connect()` | Start browser Fiber or attach to/provision managed Fiber. Does not fund a channel. |
-| `disconnect()` | Disconnect the client; only browser mode stops the node. Does not settle channels. |
-| `channels` | Normalized channels refreshed every ten seconds while connected. |
-| `refreshChannels()` | Read channels and update React state. |
-| `openChannel(options, onProgress?)` | Confirm/fund, wait for readiness, and refresh channels. |
-| `closeChannel(id, options?)` | Request closure and refresh. On-chain settlement is asynchronous. |
-| `createInvoice(params)` | Create a Fiber testnet invoice. `expiry` is hex seconds; it defaults to 24 hours (`0x15180`), and managed mode accepts 60 seconds to 24 hours. |
-| `getInvoice(params)` / `parseInvoice(params)` | Read invoice status or decode contents. |
-| `preflightPayment(params)` | Test routing for an invoice/fee limit at that moment. |
-| `payInvoice(invoice, options?)` | Submit, wait for successful settlement, and refresh. Show confirmation before calling. |
-| `error` | Connection or channel-listing error. Mutation promises also reject and must be caught. |
-| `connection` | Low-level escape hatch. Browser and managed method surfaces differ. |
+| `status` | `stopped`, `starting`, `running` or `error`. Running doesn't imply a funded channel. |
+| `fiberNode` | `hosted` or `browser`, from the provider. |
+| `startupStage` | The current step while the node starts. |
+| `start()` | Starts a browser node, or connects to the user's hosted node. Doesn't fund a channel. |
+| `stop()` | Stops a browser node, or disconnects from a hosted node, which stays online. Doesn't close channels. |
+| `node` | The user's Fiber node with Fiber's own method names, once `status` is `running`. See [Fiber node](/fiber-node). |
+| `channels` | The user's open channels with `canSend`, `canReceive`, `capacity` and `asset`, refreshed every ten seconds while running. |
+| `refreshChannels()` | Reads channels now and updates `channels`. |
+| `openChannel(options?, onProgress?)` | Opens a CKB or token channel after the user approves it, waits until it's ready, and refreshes. Options: `fundingAmount`, `udtTypeScript`, `peer`, `public`, `fundingFeeRate`, `commitmentFeeRate`. |
+| `closeChannel(id, options?)` | Closes a channel after the user approves it. Options: `force`, `feeRate`. On-chain settlement follows. |
+| `createInvoice(params)` | Creates an invoice. `currency` defaults to `Fibt` and `expiry` to 24 hours. |
+| `getInvoice(params)` / `parseInvoice(params)` | Reads an invoice's status, or decodes one. |
+| `estimatePayment(params)` | Checks the route and fee for a payment without sending it. Returns `{ routable: true, fee }` or `{ routable: false, error }`. |
+| `payInvoice(invoice, options?)` | Pays, waits for the payment to succeed, and refreshes. Rejects if it fails. |
+| `error` | A startup or channel-listing error. Calls also reject, so catch them. |
 
-`KeyWayLoginButton` provides login/logout; `KeyWayConnectButton` provides explicit Fiber connection. Headless connection factories and their types remain exported. No backend implementation or credentials are shipped.
+See [Fiber payments](/fiber-payments) for examples.
+
+## Components
+
+`KeyWayLoginButton` signs the user in or out. Labels: `loginLabel`, `logoutLabel`, `pendingLabel`.
+
+`KeyWayFiberButton` starts or stops Fiber, and asks the user to sign in first if needed. Labels: `startLabel`, `stopLabel`, `startingLabel`.
+
+```tsx
+<KeyWayFiberButton startLabel="Start payments" stopLabel="Stop" startingLabel="Starting…" />
+```
+
+Both accept every other `<button>` prop.
+
+## Silent signing
+
+Each approval prop replaces KeyWay's dialog with your app's answer, so an app can sign without showing a dialog:
+
+```tsx
+<KeyWayProvider appId="keyway_..." approveCkbTransaction={() => true}>
+  <App />
+</KeyWayProvider>
+```
+
+This removes the user's confirmation of each action. Only do it for flows the user has already agreed to, and prefer checking the preview over returning `true` unconditionally. The emailed code still applies: once the user's daily amount is reached, KeyWay asks for it whatever your app returns. See [Silent signing](/ccc-signer#silent-signing).
+
+## Other exports
+
+The package also exports the `KeyWaySigner` class, the `FIBER_METHODS` table, `KeyWayError`, `toKeyWayError()` and `friendlyKeyWayError()`, and the preview, approval, channel and node types used above. Backend code and credentials are not part of the package.

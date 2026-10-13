@@ -1,12 +1,22 @@
 const SHANNONS = 100_000_000n;
 
+/** What an amount is counted in: CKB, or a Fiber token such as RUSD. */
+export type Unit = { symbol: string; decimals: number };
+export const CKB: Unit = { symbol: "CKB", decimals: 8 };
+
 /** 899999000000n → "8,999.99" (two decimals, more only when needed). */
 export function formatCkb(shannons: bigint, minDecimals = 2): string {
-  const negative = shannons < 0n;
-  const value = negative ? -shannons : shannons;
-  const whole = (value / SHANNONS).toLocaleString("en-US");
-  let fraction = (value % SHANNONS).toString().padStart(8, "0").replace(/0+$/, "");
-  if (fraction.length < minDecimals) fraction = fraction.padEnd(minDecimals, "0");
+  return formatUnits(shannons, CKB, minDecimals);
+}
+
+/** An amount in a unit's smallest denomination, written in whole units: 2500000000n RUSD → "25.00". */
+export function formatUnits(amount: bigint, unit: Unit, minDecimals = 2): string {
+  const negative = amount < 0n;
+  const value = negative ? -amount : amount;
+  const scale = 10n ** BigInt(unit.decimals);
+  const whole = (value / scale).toLocaleString("en-US");
+  let fraction = unit.decimals ? (value % scale).toString().padStart(unit.decimals, "0").replace(/0+$/, "") : "";
+  if (unit.decimals && fraction.length < minDecimals) fraction = fraction.padEnd(Math.min(minDecimals, unit.decimals), "0");
   return `${negative ? "−" : ""}${whole}${fraction ? `.${fraction}` : ""}`;
 }
 

@@ -22,7 +22,7 @@ function SignIn() {
 
 <Steps>
   <Step title="Send a one-time code">
-    The SDK requests an OTP from the managed KeyWay API. Backend email credentials never enter the browser.
+    The SDK requests an OTP from the KeyWay API. Backend email credentials never enter the browser.
   </Step>
   <Step title="Create a KeyWay session">
     A valid application-specific code returns a database-backed bearer session bound to that application and its permanent KeyWay user ID.
@@ -31,7 +31,7 @@ function SignIn() {
     The user ID maps to the same Lit PKP and CKB address on future logins.
   </Step>
   <Step title="Start Fiber">
-    Login only recovers the CKB identity. Call `connect()` from `useFiber()` to start or attach to Fiber, or enable `autoConnect`. Optional browser mode restores device state and starts WASM.
+    Login only recovers the CKB identity. Call `start()` from `useFiber()` to start Fiber, or set `autoStartFiber`. A hosted node is already running on KeyWay's servers; a browser node restores device state and starts in the page.
   </Step>
 </Steps>
 
@@ -48,11 +48,10 @@ const { ready, authenticated, user } = useKeyWay();
 | `ready` | Stored session validation has completed. |
 | `authenticated` | A valid KeyWay session exists. |
 | `user.id` | Permanent account ID within the registered application. The same email in another application has a different account and wallet. |
-| `status` | Current authentication or connection lifecycle state. |
 
 ## Device behavior
 
-Managed mode keeps the node online after logout, so another browser can reconnect to the same managed identity. In optional browser mode, KeyWay permits one active device lease per account and fails closed if another device holds it. On explicit logout, it encrypts the wallet's Fiber IndexedDB state and uploads only ciphertext. The next device restores that state before starting Fiber.
+A hosted node stays online after logout, so another browser can reconnect to the same node. With an optional browser node, KeyWay permits one active device lease per account and fails closed if another device holds it. On explicit logout, it encrypts the wallet's Fiber IndexedDB state and uploads only ciphertext. The next device restores that state before starting Fiber.
 
 <Warning>
   In browser mode, closing a tab or crashing cannot guarantee a final backup. Use `logout()` before changing devices, and do not clear site data while signed in.
@@ -60,7 +59,7 @@ Managed mode keeps the node online after logout, so another browser can reconnec
 
 ## Branding
 
-`appName` changes the name shown in KeyWay's modal. `theme` selects the built-in light or dark appearance.
+`appName` changes the name shown in KeyWay's dialogs. `theme` selects the built-in light or dark appearance.
 
 ```tsx
 <KeyWayProvider appId="keyway_..." appName="Acme Pay" theme="dark">

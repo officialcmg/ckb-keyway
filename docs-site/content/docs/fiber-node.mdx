@@ -1,0 +1,162 @@
+---
+title: "Fiber node"
+description: "Call the user's Fiber node with Fiber's own method names, and know which calls the user approves."
+icon: Network
+---
+
+Every KeyWay user has their own Fiber node. `useFiber().node` gives your app that node with [fiber-js](https://github.com/nervosnetwork/fiber)'s official method names and parameters, so Fiber code you already have works unchanged.
+
+```ts
+import { useFiber } from "@ckb-keyway/react";
+
+const { node } = useFiber();
+if (!node) throw new Error("Start Fiber first"); // set once status is "running"
+
+const info = await node.nodeInfo();
+const { channels } = await node.listChannels({});
+const { payments } = await node.listPayments({ limit: "0xa" });
+
+const { invoice_address } = await node.newInvoice({
+  amount: "0x5f5e100", // 1 CKB in shannons; currency defaults to Fibt
+  description: "Coffee",
+});
+
+await node.sendPayment({ invoice }); // no dialog; may ask for the emailed code
+```
+
+`node` is available once `useFiber().status` is `"running"`. The same node object and the same rules apply whether the node is hosted by KeyWay or runs in the browser.
+
+## What each method does
+
+Every method is sorted into one of four kinds. Methods that aren't in the table don't exist on `node`, and the hosted backend refuses them with `UNSUPPORTED_METHOD`.
+
+| Kind | Methods | What happens |
+| --- | --- | --- |
+| Free | `nodeInfo`, `listPeers`, `graphNodes`, `graphChannels`, `listChannels`, `getPayment`, `listPayments`, `buildRouter`, `newInvoice`, `getInvoice`, `parseInvoice`, `settleInvoice`, `cancelInvoice` | No dialog. These read state or create and manage invoices, so money only ever comes in. `sendPayment` with `dry_run: true` is free too. |
+| Payment | `sendPayment`, `sendPaymentWithRouter` | No built-in dialog, because Fiber is for fast payments. Your app can add its own with `approveFiberPayment`. With a hosted node, payments count toward the user's 24-hour email-confirmation total. |
+| Approve | `openChannelWithExternalFunding`, `shutdownChannel`, `connectPeer`, `disconnectPeer`, `updateChannel` | KeyWay shows a dialog first. Your app can replace it with its own approval prop. `submitSignedFundingTx` is part of opening a channel and runs inside `openChannelWithExternalFunding`. |
+| Blocked | `openChannel`, `acceptChannel`, `abandonChannel` | Never available. The first two spend the node's internal key instead of the user's account; `abandonChannel` discards channel state. |
+
+The table is exported as `FIBER_METHODS`, so your app can check a method at runtime:
+
+```ts
+import { FIBER_METHODS } from "@ckb-keyway/react";
+
+FIBER_METHODS.sendPayment.kind; // "payment"
+```
+
+### Approvals
+
+| Method | Built-in dialog shows | Replace it with | Preview type |
+| --- | --- | --- | --- |
+| `openChannelWithExternalFunding` | Amount, token, CKB reserve, peer and network fee | `approveFiberChannelOpen` | `FiberChannelOpenPreview` |
+| `shutdownChannel` | The user's side that returns, the peer, and whether it's a force close | `approveFiberChannelClose` | `FiberChannelClosePreview` |
+| `connectPeer`, `disconnectPeer` | The peer, and for a disconnect, how many open channels go offline | `approveFiberPeerConnect` | `FiberPeerPreview` |
+| `updateChannel` | Each setting that changes, from old to new | `approveFiberChannelSettings` | `FiberChannelSettingsPreview` |
+| `sendPayment`, `sendPaymentWithRouter` | No dialog | `approveFiberPayment` (adds one) | `FiberPaymentPreview` |
+
+Each prop goes on `KeyWayProvider` and returns `true` or `false`, or a promise of either. When it returns `false`, the call rejects and nothing reaches the node.
+
+```tsx
+<KeyWayProvider
+  appId="keyway_..."
+  approveFiberPayment={(preview) =>
+    window.confirm(`Pay ${preview.amountText} with a fee of about ${preview.feeText}?`)
+  }
+>
+  <App />
+</KeyWayProvider>
+```
+
+`openChannelWithExternalFunding` builds, signs and submits the funding transaction from the user's CKB account in one call. Channel funding doesn't count toward the email-confirmation total, because the funds stay the user's and a channel can only close back to their own address.
+
+## Parameters
+
+KeyWay passes Fiber's documented parameters through after checking them. Anything Fiber doesn't document for a method is refused with "Unsupported parameter".
+
+- **Amounts** are 0x-prefixed hex strings in the asset's smallest unit: shannons for CKB (`1 CKB = 100,000,000 shannons`), or the token's own unit.
+- **Invoices.** `currency` defaults to `Fibt` (testnet) and `expiry` to 24 hours (`0x15180` seconds). Pass `payment_preimage`, or `payment_hash` for a hold invoice you later settle or cancel, but not both. `fallback_address` is refused, so a payer's money can't be redirected on-chain. Descriptions can be up to 640 characters.
+- **Payments** take a testnet invoice, or `keysend: true` with `target_pubkey` and `amount`. `sendPaymentWithRouter` takes a `router` from `buildRouter`. `custom_records` can hold up to 2 KB.
+- **Channels.** KeyWay sets the funding and close scripts to the user's own account, so `shutdown_script`, `funding_lock_script` and `close_script` are refused. Forwarding fees (`tlc_fee_proportional_millionths`) can be at most 10%, `tlc_expiry_delta` at most 14 days, and a closing `fee_rate` at most 100,000 shannons per KB.
+- **Peers** connect by `pubkey` or by multiaddr `address`. They're never saved to the node's permanent peer store (`save` can only be `false`).
+- **Pages.** `graphNodes` and `graphChannels` return up to 256 entries per call, `listPayments` up to 100.
+
+Hosted nodes also refuse peer addresses that resolve to private or internal networks, accept up to 32 connected peers, and hide the host's own network addresses from `nodeInfo`.
+
+## Tokens
+
+Tokens are first class. Fiber channels and payments work in any token the peer accepts, such as RUSD on testnet. The tokens a node accepts, with their type scripts, are listed in `nodeInfo().udt_cfg_infos`.
+
+```ts
+const info = await node.nodeInfo();
+const rusd = info.udt_cfg_infos.find((token) => token.name === "RUSD")?.script;
+if (!rusd) throw new Error("This node doesn't accept RUSD");
+
+// A 20 RUSD invoice (8 decimals) and a token payment.
+await node.newInvoice({ amount: "0x77359400", udt_type_script: rusd, description: "Order 42" });
+await node.sendPayment({ invoice, udt_type_script: rusd });
+```
+
+To open a token channel, pass `udtTypeScript` to `useFiber().openChannel()`; see [Fiber payments](/fiber-payments#open-a-token-channel). Payment previews and dialogs show token names and decimals for tokens KeyWay knows, and a short token ID and raw amount for others.
+
+## Email confirmation
+
+Users can set a daily amount per asset, in CKB and in each token. Once what leaves their account in a rolling 24 hours reaches it, KeyWay emails a code that your app can't skip. With a hosted node, Fiber payments, including routing fees, count toward that total together with on-chain transfers. See [Email confirmation](/ccc-signer#email-confirmation).
+
+<Warning>
+  A browser node runs in your app's page, so its payments never pass through KeyWay's server. They aren't counted toward the daily amount and never ask for the emailed code. In browser mode, `FiberPaymentPreview.requiresEmailCode` is always `false`.
+</Warning>
+
+## Where the rules are enforced
+
+- **Hosted node** (`fiberNode="hosted"`, the default): KeyWay's backend holds the method table and checks every call before it reaches the node. A compromised page can't call anything outside it. Calls to free methods are limited to 120 a minute per user.
+- **Browser node** (`fiberNode="browser"`): the SDK applies the same table in the page. Because the node runs in your app's page, code that compromises your app could bypass it. Protect the page with a strict Content Security Policy.
+
+In browser mode, `listPayments` lists the payments sent from this device through the SDK, because browser nodes keep no payment history of their own.
+
+## Key custody
+
+- **Hosted node.** The node runs on KeyWay's servers, which hold that node's Fiber key, its CKB key and its channel state.
+- **Browser node.** The node runs in the user's browser and keeps its channel state in IndexedDB. Its Fiber key is created inside Lit and, each time the node starts, re-encrypted inside Lit to a one-time key generated in the user's browser. KeyWay's server only relays ciphertext and never sees the browser node's key. It is still trusted to authorize Lit to release the key to the signed-in user.
+
+The user's CKB account key never leaves Lit in either mode.
+
+## Closing channels
+
+A normal (cooperative) close needs the peer online and returns the user's side to their own address.
+
+A force close (`shutdownChannel({ channel_id, force: true })`) settles on-chain without the peer, after a delay of one epoch, about 4 hours. In Fiber 0.9.1, a force-closed channel settles to the node's own key rather than to the channel's close address. As an interim measure until Fiber pays these settlements to the close address, KeyWay moves them to the user's address:
+
+- **Browser node:** the node settles to a key derived from its Fiber key, and the SDK sweeps that key to the user's address when the node starts and every 10 minutes while it runs. A browser node only settles while it runs, so after the delay the channel settles the next time the user starts Fiber in that browser, and the sweep follows. The channel state needed to settle lives in that browser's IndexedDB until the user signs out, which backs it up to KeyWay encrypted.
+- **Hosted node:** the node settles to its own key on KeyWay's servers, and KeyWay sweeps it to the user's address the next time the user uses Fiber.
+
+The sweep moves CKB and standard tokens. Prefer cooperative closes; use `force` only when the peer is unreachable.
+
+## Errors
+
+Pass any rejection to `toKeyWayError()` to get a `KeyWayError` with a `code` and a `retryable` flag, instead of parsing messages. `estimatePayment()`, `payInvoice()` and `closeChannel()` on `useFiber()` already reject with one.
+
+```ts
+import { toKeyWayError } from "@ckb-keyway/react";
+
+try {
+  await node.sendPayment({ invoice });
+} catch (cause) {
+  const error = toKeyWayError(cause);
+  if (error.retryable) scheduleRetry();
+  showMessage(error.message);
+}
+```
+
+| Code | Meaning |
+| --- | --- |
+| `UNSUPPORTED_METHOD` | The method isn't available through KeyWay. |
+| `NO_ROUTE`, `INSUFFICIENT_ROUTE_LIQUIDITY` | No route can carry this payment right now. |
+| `FEE_LIMIT_EXCEEDED` | The best route costs more than `max_fee_amount` or `max_fee_rate`. |
+| `INVOICE_EXPIRED`, `SELF_PAYMENT` | The invoice has expired, or belongs to the same user. |
+| `PEER_OFFLINE`, `PAYMENT_TIMEOUT` | A peer is offline, or the payment didn't settle in time. |
+| `PAYMENT_FAILED`, `CHANNEL_FAILED` | Another payment or channel failure. |
+| `DEVICE_IN_USE`, `CROSS_ORIGIN_ISOLATION_REQUIRED` | Browser node only: another browser holds the node, or the page isn't cross-origin isolated. |
+| `UNKNOWN` | Anything else; read `error.message`. |
+
+A declined approval rejects with a message such as "The payment was not approved", and a cancelled email code with "Email confirmation was cancelled".

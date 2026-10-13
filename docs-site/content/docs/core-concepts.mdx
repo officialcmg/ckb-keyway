@@ -11,22 +11,22 @@ These are separate pieces of state:
 | Concept | What it is | Where it lives |
 | --- | --- | --- |
 | CKB account | The on-chain identity and cells controlled through the Lit PKP. | Recoverable from the authenticated email identity. |
-| Fiber node | The networking process that creates invoices, finds routes, and updates channels. | Runs as WASM in browser mode or as a persistent native process in managed mode. |
-| Channel database | The latest off-chain state for the user's Fiber channels. | IndexedDB in browser mode or the managed node's durable volume. |
+| Fiber node | The networking process that creates invoices, finds routes, and updates channels. | A persistent native process on KeyWay's servers (hosted), or WebAssembly in the page (browser). |
+| Channel database | The latest off-chain state for the user's Fiber channels. | The hosted node's durable volume, or IndexedDB for a browser node. |
 
-Logging in recovers the CKB identity and connects the persistent managed node by default. Optional browser mode requires its own node identity and channel database, which stays in local IndexedDB during use and can move to the next device through KeyWay's encrypted explicit-logout handoff. The two modes do not share channel state.
+Logging in recovers the CKB identity. `useFiber().start()` then connects to the user's hosted node, the default. An optional browser node has its own node identity and channel database, which stays in local IndexedDB during use and can move to the next device through KeyWay's encrypted explicit-logout handoff. The two kinds of node don't share channel state.
 
 ## Relays are not channels
 
 When KeyWay starts, it connects to public testnet relays. Relay connections provide network reachability and gossip; they do not lock funds and do not give the user payment capacity.
 
-`activateCkbChannel()` separately negotiates and funds a channel with an available channel peer. That channel places capacity into the Fiber graph.
+`useFiber().openChannel()` separately negotiates and funds a channel with a channel peer. That channel places capacity into the Fiber graph.
 
 ## On-chain and Fiber balances
 
 - **On-chain balance** is the sum of live CKB cells controlled by the account's lock script.
-- **Fiber balance** is the sum of `local_balance` across ready channels.
-- Opening a channel moves capacity from ordinary CKB cells into a channel funding cell.
+- **Fiber balance** is the sum of `canSend` across ready channels, per asset: CKB channels and token channels are counted separately.
+- Opening a channel moves funds from ordinary cells into a channel funding cell. A token channel also locks some CKB as a reserve.
 - Fiber payments update channel states off-chain rather than broadcasting one CKB transaction per payment.
 
 ## Routed payments
@@ -37,16 +37,18 @@ A payment can cross several public channels:
 sender -> channel peer -> other public nodes -> receiver's channel peer -> receiver
 ```
 
-Every hop must have enough outbound liquidity. A route may exist for `1 CKB` and fail for `999 CKB` because route existence and route capacity are different questions.
+Every hop must have enough outbound liquidity. A route may exist for `1 CKB` and fail for `999 CKB` because route existence and route capacity are different questions. Use `estimatePayment()` to check a specific amount.
 
-## Browser ownership
+## Browser node
 
-In optional browser mode, one user has both an account identity and a local node identity. Closing the tab stops that node. Explicit logout encrypts and uploads its channel database so the next device can restore it before Fiber starts.
+With an optional browser node, one user has both an account identity and a local node identity. Closing the tab stops that node. Explicit logout encrypts and uploads its channel database so the next device can restore it before Fiber starts.
 
 <Warning>
   Do not treat IndexedDB as disposable cache. It contains the off-chain channel state needed to resume the node safely.
 </Warning>
 
-## Managed mode
+## Hosted node
 
-Managed mode is the testnet default from SDK 0.0.7. It keeps a dedicated native Fiber process and channel database online outside the browser lifecycle. The React API remains the same, but KeyWay operates the node and therefore takes on a larger custody and availability boundary. Host node and channel capacity limits apply. Existing browser channels are not moved into managed mode.
+The hosted node is the default (`fiberNode="hosted"`). It keeps a dedicated native Fiber process and channel database online outside the browser lifecycle. The React API is the same, but the node runs on KeyWay's servers, which hold that node's key and channel state, so KeyWay takes on a larger custody and availability role. Existing browser channels are not moved to a hosted node.
+
+For how each kind of node handles keys, approvals and force-closed channels, see [Fiber node](/fiber-node).

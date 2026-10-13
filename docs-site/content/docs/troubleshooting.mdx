@@ -19,15 +19,15 @@ Cross-Origin-Embedder-Policy: require-corp
 
 Then verify `window.crossOriginIsolated === true`. Browser extensions or third-party resources without compatible cross-origin resource policy headers can also break isolation.
 
-This requirement applies only to `nodeMode="browser"`. Managed mode, the default from SDK 0.0.7, does not load Fiber WASM in the consuming page.
+This requirement applies only to `fiberNode="browser"`. The hosted node, the default, does not load Fiber WebAssembly in the page.
 
 ## `An active device lease is required`
 
-In browser mode, the account's Fiber lease expired or another device took it. Call `connect()` again. Avoid running the same account's channels concurrently in multiple browser profiles.
+With a browser node, the account's Fiber lease expired or another device took it. Call `start()` from `useFiber()` again. Avoid running the same account's channels concurrently in multiple browser profiles.
 
 ## `Fiber wallet is bound to another device`
 
-In browser mode, another browser still holds the Fiber lease, or the previous browser did not complete an explicit logout and encrypted backup. Log out on the active device before moving the account.
+With a browser node, another browser still holds the Fiber lease, or the previous browser did not complete an explicit logout and encrypted backup. Log out on the active device before moving the account.
 
 ## A payment has no route
 
@@ -36,22 +36,39 @@ The public graph did not contain a route with enough outbound liquidity for the 
 - Try a smaller payment.
 - Confirm both sender and receiver have ready public channels.
 - Allow a newly opened channel time to propagate through gossip.
-- Keep browser-mode nodes online while testing; managed nodes persist after logout.
+- Keep browser nodes online while testing; hosted nodes stay online after logout.
+- Check the route first with `estimatePayment()`, which returns a typed error such as `NO_ROUTE` or `INSUFFICIENT_ROUTE_LIQUIDITY`.
 
 ## CKB balance updates slowly
 
 CKB does not store an account balance field. The SDK asks an indexer to sum live cells for the account's lock script. Faucet and newly mined cells may appear after an indexing delay.
 
-## Channel activation takes time
+## Opening a channel takes time
 
-Activation includes peer connection, collaborative funding construction, user confirmation, Lit authorization, CKB transaction broadcast, and on-chain confirmation. Use the progress callback to show the current stage rather than presenting one indefinite loading state.
+Opening a channel includes peer connection, collaborative funding construction, user approval, Lit authorization, CKB transaction broadcast, and on-chain confirmation. Use the progress callback to show the current stage rather than presenting one indefinite loading state.
 
 ```ts
-await connection.keyway.activateCkbChannel(amount, (stage) => {
-  console.log(stage);
+await fiber.openChannel({ fundingAmount }, (stage) => {
+  console.log(stage); // connecting, negotiating, confirming, signing, broadcasting, waiting
 });
 ```
 
+## `isn't available through KeyWay` or `UNSUPPORTED_METHOD`
+
+The Fiber method is blocked or isn't in KeyWay's method table, or a parameter isn't one Fiber documents for that method. See [Fiber node](/fiber-node#what-each-method-does) for the allowed methods and parameters.
+
+## `was not approved`
+
+The user, or your app's approval prop, declined the action: a transaction, message, channel open or close, peer change, channel settings change or payment. Nothing was signed or sent.
+
+## `Email confirmation was cancelled`
+
+The action reached the user's daily confirmation amount and the user closed the code prompt. Ask them to try again and enter the code from their inbox.
+
+## Funds from a force-closed channel haven't arrived
+
+A force close settles on-chain after about 4 hours. KeyWay then moves the settlement to the user's address: a browser node does this when it starts and every 10 minutes while it runs, and a hosted node the next time the user uses Fiber. Start the node, wait, and check the balance again. See [Closing channels](/fiber-node#closing-channels).
+
 ## Supported scope
 
-The current package supports CKB testnet, CKB-funded Fiber channels, invoices, routed payments, and encrypted state handoff after explicit logout. Mainnet, UDT payments, unexpected-close backup, and self-hosted KeyWay infrastructure are not supported.
+The current package supports CKB testnet, Fiber channels and payments in CKB and tokens (xUDT, including RUSD), invoices including hold invoices, keysend, routed payments, the CCC signer, and encrypted state handoff after explicit logout. Mainnet, backups of browser nodes after an unexpected close, and self-hosted KeyWay infrastructure are not supported.

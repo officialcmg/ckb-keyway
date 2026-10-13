@@ -1,88 +1,102 @@
 ---
 title: "Fiber payments"
-description: "Activate a channel, inspect balances, create invoices, and settle payments."
+description: "Open a channel, read balances, create invoices, and send payments."
 icon: Zap
 ---
 
-Use `useFiber()` for channel and payment operations. Connect explicitly before using them.
+Use `useFiber()` for channels and payments. Start the user's Fiber node before using them.
 
 ```ts
 const fiber = useFiber();
-await fiber.connect();
+await fiber.start();
 ```
 
-## Activate a channel
+`fiber.status` is `"stopped"`, `"starting"`, `"running"` or `"error"`. Running doesn't imply a funded channel. For every Fiber method under its official name, see [Fiber node](/fiber-node).
 
-A Fiber channel locks CKB on-chain and makes that capacity available for off-chain payments. Amounts use shannons: `1 CKB = 100,000,000 shannons`.
+## Open a channel
+
+A Fiber channel locks funds on-chain and makes them available for off-chain payments. CKB amounts use shannons: `1 CKB = 100,000,000 shannons`.
 
 ```ts
 const SHANNONS_PER_CKB = 100_000_000n;
-const fundingAmount = 1_000n * SHANNONS_PER_CKB;
 
-const result = await fiber.openChannel(
-  { fundingAmount, public: true },
+const { channelId } = await fiber.openChannel(
+  { fundingAmount: 1_000n * SHANNONS_PER_CKB, public: true },
   (stage) => console.log(stage),
 );
 
-// Resolves after the channel becomes ready.
+// Resolves after the channel is ready.
 ```
 
-### Confirm the funding transaction
+`fundingAmount` defaults to 1,000 CKB. Pass `peer` with a Fiber node ID to choose the channel peer; otherwise KeyWay picks an available public testnet peer. The progress callback receives `connecting`, `negotiating`, `confirming`, `signing`, `broadcasting` and `waiting`.
 
-`confirmFunding` is an optional `KeyWayProvider` callback for approving the on-chain transaction that opens a Fiber channel:
+The channel is funded from the user's CKB account, and KeyWay sets its close address to that same account. Channel funding doesn't count toward the user's email-confirmation total.
+
+### Open a token channel
+
+Pass the token's type script as `udtTypeScript`, with `fundingAmount` in the token's smallest unit. The peer must accept the token; on testnet, Fiber's public peers accept RUSD. A token channel also locks some CKB as a reserve, which the dialog shows.
 
 ```ts
-type ConfirmFunding = (preview: {
-  amountCkb: string;
-  feeCkb: string;
-  destination: string;
-  transactionHash: string;
-}) => boolean | Promise<boolean>;
+const info = await fiber.node!.nodeInfo();
+const rusd = info.udt_cfg_infos.find((token) => token.name === "RUSD")?.script;
+if (!rusd) throw new Error("This node doesn't accept RUSD");
+
+await fiber.openChannel({
+  udtTypeScript: rusd,
+  fundingAmount: 21n * 100_000_000n, // 21 RUSD (8 decimals)
+});
 ```
 
-The callback runs after KeyWay has built and validated the exact funding transaction, but before it requests the Lit-authorized signature. Return `true` to approve signing or `false` to abort.
+### Approve the channel opening
 
-Most applications should omit this prop. KeyWay will display its styled funding confirmation modal, showing the channel amount, network fee, and testnet network. It uses the same rounded panel, theme, typography, and backdrop as the email login modal.
-
-Supply `confirmFunding` only when the application needs to render its own confirmation interface:
+KeyWay shows a built-in dialog before it signs the funding transaction, with the amount, any token and CKB reserve, the peer and the network fee. To use your own interface, pass `approveFiberChannelOpen` to `KeyWayProvider`:
 
 ```tsx
 <KeyWayProvider
-  confirmFunding={async (preview) => {
-    return openYourConfirmationScreen(preview);
+  appId="keyway_..."
+  approveFiberChannelOpen={async (preview) => {
+    // preview: FiberChannelOpenPreview
+    return openYourConfirmationScreen(preview.token?.amountText ?? `${preview.amountCkb} CKB`, preview.feeCkb);
   }}
 >
   <App />
 </KeyWayProvider>
 ```
 
-<Info>
-  `confirmFunding` only approves channel-opening transactions on CKB. Ordinary Fiber invoice payments use the application's payment confirmation flow instead.
-</Info>
+The callback runs after KeyWay has built and checked the exact funding transaction, and before it is signed. Return `true` to sign or `false` to cancel.
 
 ## Read channels and balances
 
 ```ts
 const account = useCkbWallet();
 const onchainShannons = account.balance;
-const channels = fiber.channels;
 
-const readyChannels = channels.filter(
-  (channel) => channel.status === "ready",
+const ckbChannels = fiber.channels.filter(
+  (channel) => channel.status === "ready" && channel.asset.kind === "ckb",
 );
 
-const fiberShannons = readyChannels.reduce(
-  (total, channel) => total + channel.localBalanceShannons,
-  0n,
-);
+const fiberShannons = ckbChannels.reduce((total, channel) => total + channel.canSend, 0n);
 ```
 
-`localBalanceShannons` and `remoteBalanceShannons` report the user's and peer's sides. Reserves, pending transfers, and route liquidity can limit the amount currently payable.
+Each channel has:
+
+| Field | Meaning |
+| --- | --- |
+| `id`, `peer` | The channel ID and the peer's Fiber node ID. |
+| `status` | `pending`, `ready`, `closing`, `closed`, `failed` or `unknown`. |
+| `asset` | `{ kind: "ckb" }`, or `{ kind: "token", typeScript }` for a token channel. |
+| `canSend` | What the user can still send, in the asset's smallest unit. |
+| `canReceive` | What the user can still receive. |
+| `capacity` | The channel's size: `canSend` plus `canReceive`. |
+| `public` | Whether the channel is announced to the network. |
+| `raw` | Fiber's own channel object. |
+
+`fiber.channels` refreshes every ten seconds while the node runs; call `refreshChannels()` to read it now. Reserves, in-flight payments and route liquidity can limit what is payable at a given moment.
 
 ## Create an invoice
 
 ```ts
-function toHex(value: bigint) {
+function toHex(value: bigint): `0x${string}` {
   return `0x${value.toString(16)}`;
 }
 
@@ -91,7 +105,6 @@ const INVOICE_EXPIRY_SECONDS = 60n * 60n;
 
 const created = await fiber.createInvoice({
   amount: toHex(1n * SHANNONS_PER_CKB),
-  currency: "Fibt",
   description: "Order 42",
   expiry: toHex(INVOICE_EXPIRY_SECONDS),
 });
@@ -99,44 +112,59 @@ const created = await fiber.createInvoice({
 console.log(created.invoice_address);
 ```
 
-`expiry` is a hex string of seconds, as Fiber's `new_invoice` RPC expects. If you omit it, the invoice expires after 24 hours (`0x15180`) in both managed and browser mode. Managed mode accepts 60 seconds to 24 hours and rejects anything else with "Invoice expiry must be between 60 seconds and 24 hours". Managed invoices always use the `Fibt` testnet currency.
+`currency` defaults to `Fibt`, Fiber's testnet currency. `expiry` is a hex string of seconds and defaults to 24 hours (`0x15180`). For a token invoice, add `udt_type_script`. Read an invoice's status with `getInvoice({ payment_hash })`, or decode one with `parseInvoice({ invoice })`.
 
 ## Pay an invoice
 
-Preflight the exact invoice and fee limit before showing a confirmation:
+Check that a route exists, and what it costs, before paying:
 
 ```ts
-const preflight = await fiber.preflightPayment({
+const estimate = await fiber.estimatePayment({
   invoice,
   max_fee_amount: toHex(1n * SHANNONS_PER_CKB),
 });
 
-if (!preflight.routable) {
-  console.log(preflight.error.code, preflight.error.retryable);
-  throw preflight.error;
+if (!estimate.routable) {
+  console.log(estimate.error.code, estimate.error.retryable);
+  throw estimate.error;
 }
+
+console.log(`Fee: ${estimate.fee} shannons`);
 ```
 
 ```ts
 const settled = await fiber.payInvoice(invoice, {
-  timeout: "0x1d4c0",
   max_fee_amount: toHex(1n * SHANNONS_PER_CKB),
 });
 
-// Resolves only after successful settlement; rejects on failure.
+// Resolves after the payment succeeds; rejects if it fails.
 ```
 
-The sender does not need a direct channel to the receiver. Fiber uses its public channel graph to find a multi-hop route whose channels have enough outbound liquidity.
+Payments have no built-in dialog, because Fiber is for fast payments. Show your own confirmation before calling `payInvoice`, or pass `approveFiberPayment` to `KeyWayProvider` so every payment from the node goes through it; see [Fiber node](/fiber-node#approvals).
+
+With a hosted node, payments count toward the user's 24-hour email-confirmation total, and KeyWay asks for the emailed code once that total reaches the user's daily amount. Browser-node payments aren't counted; see [Fiber node](/fiber-node#email-confirmation).
+
+The sender doesn't need a direct channel to the receiver. Fiber uses its public channel graph to find a route whose channels have enough liquidity.
 
 <Info>
   A newly opened public channel may need time to propagate through Fiber gossip before other nodes can route through it.
 </Info>
 
-## Disconnect the client
-
-Call `disconnect()` from `useFiber()` to disconnect the SDK client. In browser mode it also stops the local node. The managed native node stays online. Neither closes or settles channels; use `closeChannel()` for that.
+## Close a channel
 
 ```ts
-const { disconnect } = useFiber();
-await disconnect();
+await fiber.closeChannel(channelId);
+```
+
+KeyWay shows a close dialog first, with what returns to the user; replace it with `approveFiberChannelClose`. A normal (cooperative) close returns the user's side to their own address once the closing transaction confirms.
+
+`closeChannel(channelId, { force: true })` closes without the peer and settles after about 4 hours. Fiber 0.9.1 settles force-closed channels to the node's own key, and KeyWay currently sweeps those settlements to the user's address; see [Closing channels](/fiber-node#closing-channels). Prefer a cooperative close whenever the peer is online.
+
+## Stop Fiber
+
+Call `stop()` from `useFiber()` to stop using Fiber in this page. In browser mode it stops the node. A hosted node stays online on KeyWay's servers. Neither closes channels.
+
+```ts
+const { stop } = useFiber();
+await stop();
 ```

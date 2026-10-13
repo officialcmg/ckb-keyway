@@ -32,6 +32,7 @@ import { approveFiberParams } from "./fiber-methods";
 import { createFiberNode, listLoggedPayments, type ListPaymentsParams } from "./fiber-node";
 import { createPaymentLog } from "./payment-log";
 import { sweepSettlement } from "./settlement-sweep";
+import { fiberWasmFactory } from "./fiber-wasm";
 
 export type KeyWayFundingParams = Omit<
   OpenChannelWithExternalFundingParams,
@@ -96,9 +97,11 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     if (!deviceLease) throw new Error("An active device lease is required");
     return options.loadFiberKey(deviceLease.leaseId);
   });
+  const network = options.network ?? "testnet";
   const node = new FiberBrowserNode({
-    network: options.network ?? "testnet",
+    network,
     credential,
+    wasmFactory: fiberWasmFactory(network),
   });
   let deviceLock: DeviceLock | undefined;
   const api = options.apiClient ?? new KeyWayApiClient();
@@ -339,7 +342,6 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     }
   }
 
-  const network = options.network ?? "testnet";
   // The same method table as hosted nodes, applied in the page because this node runs here.
   const fiberNode = createFiberNode(async (method, input) => {
     if (!node.isRunning) throw new Error("Start Fiber before using the node");

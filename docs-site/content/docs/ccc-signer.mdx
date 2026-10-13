@@ -26,7 +26,7 @@ function SendButton({ to }: { to: string }) {
 }
 ```
 
-`signer` is undefined until the account is ready. It doesn't need Fiber. `getAddresses`, `getBalance`, `findCells`, `signMessage` and `verifyMessage` work as they do with any CCC signer. Tokens (xUDT, sUDT), Spore NFTs and Nervos DAO transactions work too: CCC builds them, and KeyWay signs the user's part.
+`signer` is undefined until the account is ready. It doesn't need Fiber. `getAddresses`, `getBalance`, `findCells`, `signMessage` and `verifyMessage` work as they do with any CCC signer. Tokens (xUDT, sUDT, including RUSD on testnet), Spore NFTs and Nervos DAO transactions work too: CCC builds them, and KeyWay signs the user's part.
 
 ## What the user approves
 
@@ -39,7 +39,9 @@ KeyWay's backend reads every input from the chain and decodes what the transacti
 - any script KeyWay doesn't recognize, as a warning;
 - inputs that other people must sign.
 
-The backend signs only the exact transaction it previewed, and only the user's own account. A changed transaction is refused. To use your own approval UI, pass `confirmTransaction` to `KeyWayProvider`. It receives the same preview and returns `true` to approve.
+Token amounts are shown with the token's name and decimals when KeyWay knows the token (for example, "Send 25 RUSD?"), and as a short token ID with the raw amount otherwise.
+
+The backend signs only the exact transaction it previewed, and only the user's own account. A changed transaction is refused. To use your own approval UI, pass `approveCkbTransaction` to `KeyWayProvider`. It receives the same preview (`TransactionPreview`) and returns `true` to approve.
 
 ## Signing messages
 
@@ -48,19 +50,48 @@ const signature = await signer.signMessage("Log in to Acme Pay");
 const valid = await signer.verifyMessage("Log in to Acme Pay", signature);
 ```
 
-Messages use CKB's standard `Nervos Message:` format and are shown to the user word for word. Pass `confirmMessage` to replace the dialog.
+Messages use CKB's standard `Nervos Message:` format and are shown to the user word for word. Pass `approveCkbMessage` to replace the dialog.
 
-## Email confirmation for large transfers
+## Email confirmation
 
-Users can require a code from their inbox once the CKB they send within 24 hours reaches an amount they choose. Every transaction signed in the last 24 hours counts toward it, so splitting a transfer into smaller ones doesn't avoid the code. Once it's set, any transaction that sends tokens (xUDT or sUDT) out of the account needs the code too, whatever its CKB amount. It's off until the user (or your app) turns it on:
+Users can require a code from their inbox once what leaves their account within 24 hours reaches a daily amount they choose. Each asset has its own amount: one for CKB, and one for each token. Everything signed in the last 24 hours counts toward it, so splitting a transfer into smaller ones doesn't avoid the code. With a hosted Fiber node, Fiber payments count toward the same totals. Channel funding doesn't count, because a channel can only close back to the user's own account.
+
+It's off until the user (or your app) sets an amount. Once any amount is set, a token with no amount of its own always needs the code, and so does any cell KeyWay can't read that leaves the account.
 
 ```ts
-await signer.setEmailConfirmationThreshold(ccc.fixedPointFrom(500)); // 500 CKB a day, in shannons
-await signer.getEmailConfirmationThreshold(); // bigint or null
-await signer.setEmailConfirmationThreshold(null); // turn it off
+import { ccc } from "@ckb-ccc/core";
+
+// 500 CKB a day, in shannons.
+await signer.setDailyConfirmationAmount("ckb", ccc.fixedPointFrom(500));
+
+// 100 RUSD a day, in the token's smallest unit (RUSD has 8 decimals).
+// A token is identified by its type script hash: ccc.Script.from(typeScript).hash().
+const RUSD = "0x45b32a2bc4285d0a09678eb11960ddc8707bc2779887a09d482e9bfe9a2cdf52";
+await signer.setDailyConfirmationAmount(RUSD, 100n * 100_000_000n);
+
+await signer.getDailyConfirmationAmounts(); // { ckb: 50000000000n, "0x45b3…df52": 10000000000n }
+await signer.setDailyConfirmationAmount("ckb", null); // remove the CKB amount
 ```
 
-Turning it on or lowering the amount applies at once. Raising the amount or turning it off emails the user a code first. The code prompt is always the SDK's own, even when you replace the approval dialog.
+Changes that make confirmation stricter, such as turning it on or lowering an amount, apply at once. Changes that loosen it email the user a code first: raising or removing an amount, or giving a token its own amount while it still needs the code for every transfer. The code prompt is always the SDK's own, even when you replace the approval dialogs. `TransactionPreview.requiresEmailCode` tells your own dialog whether a code will follow.
+
+## Silent signing
+
+Each approval prop replaces KeyWay's dialog with your app's answer. An app that returns `true` without asking signs silently:
+
+```tsx
+<KeyWayProvider
+  appId="keyway_..."
+  approveCkbTransaction={() => true}
+  approveCkbMessage={() => true}
+>
+  <App />
+</KeyWayProvider>
+```
+
+The same works for the Fiber approvals (`approveFiberChannelOpen`, `approveFiberChannelClose`, `approveFiberPeerConnect`, `approveFiberChannelSettings`). Fiber payments have no dialog by default; see [Fiber node](/fiber-node#approvals).
+
+This removes the user's confirmation of each action, so your app signs for them. Only do it for flows the user has already agreed to, such as a purchase they just confirmed in your own interface, and prefer checking the preview over returning `true` unconditionally. Sign-in and the emailed code still always appear: once the user's daily amount is reached, KeyWay asks for the code whatever your app returns.
 
 ## Limits
 
