@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createReadStream, createWriteStream } from "node:fs";
 import { cp, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
@@ -76,6 +76,12 @@ async function handleRequest(request, response) {
     if (restore) {
       const { name } = await readJsonBody(request);
       return send(response, 200, await withUserOperation(restore[1], () => restoreUser(restore[1], name)));
+    }
+    const settlement = request.method === "GET" && /^\/users\/([0-9a-f]{64})\/settlement-key$/.exec(request.url ?? "");
+    if (settlement) {
+      // Stopgap: Fiber settles force-closed channels to the node's own CKB key, so the KeyWay API sweeps
+      // that key's funds to the user's address. Only the API holds this host's token.
+      return send(response, 200, { key: await readSettlementKey(settlement[1]) });
     }
     const match = request.method === "POST" && /^\/users\/([0-9a-f]{64})$/.exec(request.url ?? "");
     if (!match) return send(response, 404, { error: "Not found" });
@@ -230,6 +236,26 @@ export function waitForExit(child, timeout = 15_000) {
     });
     child.kill("SIGTERM");
   });
+}
+
+/**
+ * The node's CKB key: plain hex until FNN first starts, then FNN's encrypted format (a version byte,
+ * a 16-byte salt, a 12-byte nonce, then AES-256-GCM ciphertext under a scrypt key from the secret-key password).
+ */
+export async function readSettlementKey(userId, password = required("FIBER_SECRET_KEY_PASSWORD")) {
+  const file = await readFile(join(managedDataDir(userId), "ckb", "key"));
+  const text = file.toString("utf8").trim();
+  if (/^[0-9a-f]{64}$/i.test(text)) return text.toLowerCase();
+  if (file[0] !== 0 || file.length < 1 + 16 + 12 + 16) throw new Error("Unsupported node key format");
+  const salt = file.subarray(1, 17);
+  const nonce = file.subarray(17, 29);
+  const sealed = file.subarray(29);
+  const key = await new Promise((resolve, reject) => scrypt(password, salt, 32, { N: 2 ** 17, r: 8, p: 1, maxmem: 256 * 1024 * 1024 }, (error, derived) => error ? reject(error) : resolve(derived)));
+  const decipher = createDecipheriv("aes-256-gcm", key, nonce);
+  decipher.setAuthTag(sealed.subarray(sealed.length - 16));
+  const plain = Buffer.concat([decipher.update(sealed.subarray(0, sealed.length - 16)), decipher.final()]);
+  if (plain.length !== 32) throw new Error("Unsupported node key format");
+  return plain.toString("hex");
 }
 
 export function managedDataDir(userId) {

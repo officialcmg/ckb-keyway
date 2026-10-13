@@ -32,7 +32,7 @@ import {
   removeApplicationOrigin,
   updateApplication,
 } from "./applications.ts";
-import { managedFiberNode, managedNodeReady, managedNodeRequest } from "./managed-node.ts";
+import { managedFiberNode, managedNodeReady, managedNodeRequest, sweepHostedSettlement } from "./managed-node.ts";
 import { fiberPayment } from "./fiber-payments.ts";
 import { runIdempotentMutation } from "./idempotency.ts";
 import { recordSigningEvent } from "./security-alerts.ts";
@@ -97,6 +97,10 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
   const user = await authenticateUser(request);
   const body = await objectBody(request, "Invalid managed-node request");
   const operation = typeof body.operation === "string" ? body.operation : "unknown";
+  // While the user's hosted node is in use, move any force-close settlement to their own address.
+  if (operation === "status" || operation === "list-channels" || operation === "call") {
+    sweepHostedSettlement(user.id, () => ownLockScript(user));
+  }
   if (operation === "call") {
     const limit = await consumeRateLimit(`fiber-call:${user.id}`, { max: 120, window: 60 });
     if (!limit.allowed) throw new Error(`Too many Fiber node requests. Try again in ${limit.retryAfter ?? 60} seconds`);

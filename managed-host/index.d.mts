@@ -8,6 +8,7 @@ export function withUserOperation<T>(userId: string, operation: () => Promise<T>
 export function completeDatabaseOperation<T>(operation: () => Promise<T>, resume: () => Promise<void>): Promise<T>;
 export function waitForExit(child: import("node:child_process").ChildProcess, timeout?: number): Promise<void>;
 export function managedDataDir(userId: string): string;
+export function readSettlementKey(userId: string, password?: string): Promise<string>;
 export function managedBackupDir(userId: string): string;
 export function snapshotDigest(directory: string): Promise<string>;
 export function listSnapshots(input: {

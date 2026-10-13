@@ -1,4 +1,5 @@
 import type { CredentialProvider } from "@fiber-pay/sdk/browser";
+import { deriveSettlementKey } from "./settlement-key";
 
 export type FiberKeyLoader = () => Promise<Uint8Array>;
 
@@ -24,8 +25,10 @@ export class KeyWayCredentialProvider implements CredentialProvider {
     return new Uint8Array(this.#fiberKey);
   }
 
+  /** The node's settlement key, derived from the Fiber key so force-closed funds stay recoverable. */
   async getCkbSecretKey() {
-    return undefined;
+    if (!this.#fiberKey) throw new Error("KeyWay credentials are locked");
+    return deriveSettlementKey(this.#fiberKey);
   }
 
   async lock() {

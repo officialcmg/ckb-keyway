@@ -31,6 +31,7 @@ import { createFiberActions, type FiberActionApprovals } from "./fiber-actions";
 import { approveFiberParams } from "./fiber-methods";
 import { createFiberNode, listLoggedPayments, type ListPaymentsParams } from "./fiber-node";
 import { createPaymentLog } from "./payment-log";
+import { sweepSettlement } from "./settlement-sweep";
 
 export type KeyWayFundingParams = Omit<
   OpenChannelWithExternalFundingParams,
@@ -140,14 +141,38 @@ export function createKeyWay(options: CreateKeyWayOptions) {
         await restoreClaimedBackup();
       }
       options.onFiberStartup?.("starting_browser_node");
-      return await node.start();
+      const info = await node.start();
+      startSweeping();
+      return info;
     } catch (error) {
       await releaseGuards();
       throw error;
     }
   }
 
+  /**
+   * Stopgap until Fiber pays force-closed channels to their close address: the node settles to a key
+   * derived from the user's Fiber key, and this moves anything there to the user's own address.
+   */
+  let sweepTimer: ReturnType<typeof setInterval> | undefined;
+  async function sweepNow() {
+    if (!node.isRunning || !credential.isUnlocked()) return;
+    const key = await credential.getCkbSecretKey();
+    try {
+      const destination = (await fundingSigner.getRecommendedAddressObj()).script;
+      await sweepSettlement(fundingSigner.client, ccc.hexFrom(key), destination);
+    } finally {
+      key.fill(0);
+    }
+  }
+  function startSweeping() {
+    void sweepNow().catch(() => undefined);
+    sweepTimer ??= setInterval(() => void sweepNow().catch(() => undefined), 10 * 60_000);
+  }
+
   async function stop() {
+    if (sweepTimer) clearInterval(sweepTimer);
+    sweepTimer = undefined;
     try {
       await node.stop();
     } finally {
@@ -158,6 +183,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   }
 
   async function stopForLogout() {
+    if (sweepTimer) clearInterval(sweepTimer);
+    sweepTimer = undefined;
     if (!deviceLease) {
       await stop();
       return;

@@ -220,3 +220,26 @@ test("managed host keeps bounded backup generations and enforces a size limit", 
     /backup size limit/,
   );
 });
+
+test("the host reads a node's CKB key in FNN's plain and encrypted formats", async () => {
+  const { readSettlementKey } = await import("../managed-host/index.mjs");
+  const { scryptSync, createCipheriv, randomBytes } = await import("node:crypto");
+  const { mkdir: makeDir, writeFile: write, mkdtemp: makeTemp } = await import("node:fs/promises");
+  const root = await makeTemp(join(tmpdir(), "keyway-settlement-"));
+  process.env.KEYWAY_MANAGED_DATA_DIR = root;
+  const user = "ab".repeat(32);
+  await makeDir(join(root, user, "ckb"), { recursive: true });
+  const key = randomBytes(32);
+
+  await write(join(root, user, "ckb", "key"), key.toString("hex"));
+  assert.equal(await readSettlementKey(user, "password"), key.toString("hex"));
+
+  // FNN 0.9.1: version 0, 16-byte salt, 12-byte nonce, AES-256-GCM ciphertext with the tag, scrypt(N=2^17, r=8, p=1).
+  const salt = randomBytes(16);
+  const nonce = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", scryptSync("password", salt, 32, { N: 2 ** 17, r: 8, p: 1, maxmem: 256 * 1024 * 1024 }), nonce);
+  const sealed = Buffer.concat([cipher.update(key), cipher.final(), cipher.getAuthTag()]);
+  await write(join(root, user, "ckb", "key"), Buffer.concat([Buffer.from([0]), salt, nonce, sealed]));
+  assert.equal(await readSettlementKey(user, "password"), key.toString("hex"));
+  await assert.rejects(() => readSettlementKey(user, "wrong"));
+});

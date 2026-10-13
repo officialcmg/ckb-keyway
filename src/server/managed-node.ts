@@ -18,6 +18,8 @@ import { serializeCccTransactionForRpc } from "../sdk/browser/ccc-transaction.ts
 import { DEFAULT_INVOICE_EXPIRY } from "../sdk/browser/invoice-expiry.ts";
 import { approveFiberParams, FIBER_METHODS, freeFiberParams, paymentFiberParams, type FiberMethod } from "../sdk/browser/fiber-methods.ts";
 import { assertPublicPeerAddress } from "./peer-address.ts";
+import * as ccc from "@ckb-ccc/core";
+import { sweepSettlement } from "../sdk/browser/settlement-sweep.ts";
 
 type ManagedNodeClient = Pick<
   FiberRpcClient,
@@ -154,6 +156,33 @@ export async function managedNodeRequest(
     return { closed: true };
   }
   throw new Error("Unsupported managed-node operation");
+}
+
+const lastSweep = new Map<string, number>();
+const SWEEP_INTERVAL_MS = 10 * 60_000;
+
+/**
+ * Stopgap until Fiber pays force-closed channels to their close address: Fiber settles them to the hosted
+ * node's own CKB key, so while the user's node is in use KeyWay moves anything there to the user's own
+ * address. Runs at most every 10 minutes per user and never fails the request that triggered it.
+ */
+export function sweepHostedSettlement(userId: string, destination: () => Promise<ccc.ScriptLike>): void {
+  if (!process.env.KEYWAY_MANAGED_FIBER_HOST_URL || managedNodeAssignments(false).has(userId)) return;
+  const now = Date.now();
+  if (now - (lastSweep.get(userId) ?? 0) < SWEEP_INTERVAL_MS) return;
+  lastSweep.set(userId, now);
+  void (async () => {
+    const hostUser = createHash("sha256").update(userId).digest("hex");
+    const response = await fetch(new URL(`/users/${hostUser}/settlement-key`, managedHostUrl()), {
+      headers: { Authorization: `Bearer ${requiredEnv("KEYWAY_MANAGED_FIBER_HOST_TOKEN")}` },
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!response.ok) return;
+    const { key } = await response.json() as { key?: string };
+    if (typeof key !== "string" || !/^[0-9a-f]{64}$/.test(key)) return;
+    const hash = await sweepSettlement(new ccc.ClientPublicTestnet(), `0x${key}`, await destination());
+    if (hash) console.info("[keyway] swept a hosted node's settlement funds to the user", { tx: hash });
+  })().catch(() => console.error("[keyway] settlement sweep failed", { cause: "sweep" }));
 }
 
 /** The user's hosted node, for the payment flow. */
