@@ -1,4 +1,5 @@
-FROM nervos/fiber:0.9.0 AS fiber
+# FNN 0.9.1, pinned by digest so the binary matches the backend's method table.
+FROM nervos/fiber:0.9.1@sha256:b4d68916a42d1847b6c562b8710a20b409e3f5da57cfb347b6b7e0a38f57fe8a AS fiber
 
 FROM node:24-bookworm-slim
 RUN apt-get update \
