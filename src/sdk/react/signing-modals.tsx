@@ -209,7 +209,7 @@ export function KeyWayChannelCloseModal({ theme, appName, preview, answer }: { t
           </dl>
           <p style={note(palette)}>
             {preview.force
-              ? "A force close settles on-chain without the peer. Your funds are locked for about 4 hours first, and the closing fee comes out of your side."
+              ? "A force close settles on-chain without the peer, after about 4 hours. With the current Fiber version, force-closed funds may not settle to your own address. Use a normal close whenever the peer is online."
               : "Your side of the channel, minus the closing fee, goes back to your own account."}
           </p>
           <Actions palette={palette} confirm={preview.force ? "Force close" : "Close channel"} answer={answer} />

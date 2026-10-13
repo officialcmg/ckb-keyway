@@ -3,7 +3,7 @@ import { approveFiberParams, type ApproveFiberMethod } from "./fiber-methods";
 import { normalizeChannel } from "./create-keyway";
 import { formatAsset, tokenAsset } from "./tokens";
 
-/** What the close dialog shows. The balance always returns to the user's own KeyWay account. */
+/** What the close dialog shows. A normal (cooperative) close returns the user's side to their own account. */
 export type FiberChannelClosePreview = {
   channelId: string;
   peer: string;

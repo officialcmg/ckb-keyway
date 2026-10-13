@@ -64,10 +64,10 @@ export type KeyWayFiberNode = {
   sendPaymentWithRouter(params: SendPaymentWithRouterParams): Promise<SendPaymentResult>;
   /**
    * Opens a channel funded from the user's account, after the channel-open dialog. KeyWay sets the funding
-   * and close scripts, so the channel always closes back to the user.
+   * and close scripts, so a normal close pays back to the user.
    */
   openChannelWithExternalFunding(params: OpenChannelParams): Promise<{ channelId: string; fundingTxHash?: string }>;
-  /** Closes a channel back to the user's account, after the close dialog. `force` settles without the peer. */
+  /** Closes a channel after the close dialog. A normal close pays the user's side to their own account; see the docs on `force`. */
   shutdownChannel(params: { channel_id: string; force?: boolean; fee_rate?: HexString }): Promise<void>;
   /** Connects to a peer by pubkey or multiaddr, after the peer dialog. */
   connectPeer(params: { pubkey?: string; address?: string; addr_type?: "tcp" | "ws" | "wss" }): Promise<void>;

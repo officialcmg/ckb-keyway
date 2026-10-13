@@ -142,7 +142,7 @@ Browser mode additionally exposes direct peer/channel operations and Fiber's rou
 
 `listChannels({ include_closed: false })` exposes each channel's current `local_balance`, `remote_balance`, and in-flight TLC balances in shannons. These are off-chain allocations inside the channel, not the wallet's on-chain CKB balance. The reference app presents the sum of ready-channel local balances as the primary Fiber balance, keeps loose on-chain CKB separate, and lists every non-closed channel with explicit user-side and peer-side balances.
 
-The SDK also exposes Fiber's low-level close operation. A cooperative close requires the peer to participate and may require an explicit close script and fee rate; `force: true` uses the channel's previously configured shutdown script when the peer cannot cooperate, but settlement is delayed by the channel's commitment delay.
+The SDK also exposes Fiber's low-level close operation. A cooperative close requires the peer to participate and pays the user's side to their own address. `force: true` closes without the peer after the channel's commitment delay. In Fiber 0.9.1 a force-closed channel is settled to the node's own CKB key rather than the channel's shutdown script, so KeyWay doesn't yet promise where force-closed funds land; prefer cooperative closes.
 
 ```ts
 await connection.keyway.shutdownChannel({

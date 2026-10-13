@@ -837,7 +837,7 @@ function KeyWayFundingModal({
           <dt>Network fee</dt><dd>{preview.feeCkb} CKB</dd>
           <dt>Network</dt><dd>CKB testnet</dd>
         </dl>
-        <p style={{ ...modalCopy, color: palette.muted }}>{preview.token ? "This locks the token, and some CKB as a reserve," : "This locks testnet CKB"} into a payment channel. It does not send funds to another wallet, and closing the channel returns your side to your own account.</p>
+        <p style={{ ...modalCopy, color: palette.muted }}>{preview.token ? "This locks the token, and some CKB as a reserve," : "This locks testnet CKB"} into a payment channel. It does not send funds to another wallet, and a normal close returns your side to your own account.</p>
         <div style={modalActions}>
           <button type="button" autoFocus style={{ ...modalButton, borderColor: palette.border, color: palette.text }} onClick={() => answer(false)}>Cancel</button>
           <button type="button" style={{ ...modalButton, ...modalPrimaryButton, background: palette.primary, color: palette.primaryText }} onClick={() => answer(true)}>Confirm activation</button>
