@@ -64,6 +64,38 @@ export async function decryptFiberKey(
   return fiberKey;
 }
 
+/** Creates a Fiber key inside Lit and returns only its ciphertext; no server ever holds the key. */
+export async function generateFiberKey(pkpId: string, config: LitRuntimeConfig): Promise<string> {
+  if (!EVM_ADDRESS.test(pkpId)) throw new Error("Lit PKP ID must be a 20-byte EVM address");
+  const response = await executeAction(config, { pkpId });
+  const ciphertext = response && typeof response === "object" ? (response as { ciphertext?: unknown }).ciphertext : undefined;
+  if (typeof ciphertext !== "string" || !ciphertext) throw new Error("Lit generate Action returned invalid ciphertext");
+  return ciphertext;
+}
+
+/**
+ * Has Lit decrypt the Fiber key and re-encrypt it to the browser's one-time public key. The result is a
+ * sealed bundle only that browser can open; this server just relays it.
+ */
+export async function wrapFiberKey(
+  ciphertext: string,
+  pkpId: string,
+  recipientPublicKey: string,
+  deviceIdHash: string,
+  config: LitRuntimeConfig,
+): Promise<{ v: 1; epk: string; iv: string; ct: string }> {
+  if (!ciphertext) throw new Error("Encrypted Fiber key is required");
+  if (!/^[A-Za-z0-9_-]{87}$/.test(recipientPublicKey)) throw new Error("A raw P-256 recipient key is required");
+  if (!/^[0-9a-f]{64}$/.test(deviceIdHash)) throw new Error("Device ID hash is invalid");
+  const response = await executeAction(config, { pkpId, ciphertext, recipientPublicKey, deviceIdHash }) as Record<string, unknown> | undefined;
+  const parts = ["epk", "iv", "ct"].map((key) => response?.[key]);
+  if (response?.v !== 1 || !parts.every((part) => typeof part === "string" && /^[A-Za-z0-9_-]+$/.test(part))) {
+    throw new Error("Lit wrap Action returned an invalid bundle");
+  }
+  const [epk, iv, ct] = parts as string[];
+  return { v: 1, epk, iv, ct };
+}
+
 /** A Lit failure that is worth retrying: rate limiting, a dependency outage, a network error, or a grant that hasn't propagated yet. */
 export class LitTransientError extends Error {
   constructor(message: string, readonly reason: "unavailable" | "not-granted") { super(message); }

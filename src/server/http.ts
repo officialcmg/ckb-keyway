@@ -16,7 +16,7 @@ import {
 } from "./auth.ts";
 import { acquireLease, heartbeatLease, releaseLease, requireLease } from "./device-lease.ts";
 import { loadLitAction } from "./lit-actions.ts";
-import { decryptFiberKey } from "./lit.ts";
+import { decryptFiberKey, wrapFiberKey } from "./lit.ts";
 import {
   previewFundingTransaction,
   serializeTransaction,
@@ -168,24 +168,38 @@ async function logoutRequest(request: Request): Promise<Response> {
 async function bootstrapRequest(request: Request): Promise<Response> {
   const user = await authenticateUser(request);
   const body = await objectBody(request, "Invalid bootstrap request");
-  const { deviceIdHash, fiberKey, nodeMode } = body;
+  const { deviceIdHash, fiberKey, nodeMode, keyCustody } = body;
   if (typeof deviceIdHash !== "string") throw new Error("Device ID hash is required");
   if (fiberKey !== undefined && typeof fiberKey !== "string") throw new Error("Fiber key is invalid");
+  if (keyCustody !== undefined && keyCustody !== "lit") throw new Error("Key custody is invalid");
+  if (keyCustody === "lit" && fiberKey !== undefined) throw new Error("Current SDKs don't send a Fiber key");
   if (nodeMode !== undefined && nodeMode !== "browser" && nodeMode !== "managed") throw new Error("Node mode is invalid");
   return Response.json(await versionedMutation(request, user.id, "bootstrap", body, () =>
-    bootstrap(user, deviceIdHash, fiberKey, nodeMode),
+    bootstrap(user, deviceIdHash, fiberKey, nodeMode, keyCustody === "lit"),
   ));
 }
 
 async function fiberKeyRequest(request: Request): Promise<Response> {
   const user = await authenticateUser(request);
-  const { deviceIdHash, leaseId } = await objectBody(request, "Invalid Fiber key request");
+  const { deviceIdHash, leaseId, recipientPublicKey } = await objectBody(request, "Invalid Fiber key request");
   if (typeof deviceIdHash !== "string") throw new Error("Device ID hash is required");
   if (typeof leaseId !== "string") throw new Error("Device lease is required");
   const wallet = await readWallet(user);
   if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
   if (wallet.primaryDeviceIdHash !== deviceIdHash) throw new Error("Fiber wallet is bound to another device");
   await requireLease(user, deviceIdHash, leaseId);
+
+  // Current SDKs: Lit seals the key to the browser's one-time key, and this server only relays ciphertext.
+  if (recipientPublicKey !== undefined) {
+    if (typeof recipientPublicKey !== "string") throw new Error("Recipient key is invalid");
+    const bundle = await wrapFiberKey(wallet.encryptedFiberKey, wallet.litPkpId, recipientPublicKey, deviceIdHash, {
+      apiKey: requiredEnv("LIT_USAGE_API_KEY"),
+      actionCid: requiredEnv("LIT_WRAP_ACTION_CID"),
+      actionCode: await loadLitAction("wrap-fiber-key"),
+    });
+    return Response.json(bundle, { headers: { "Cache-Control": "no-store" } });
+  }
+  // SDK 0.2.3 and earlier receive the plain key. Removed once 0.2.4 is out (open item 19).
 
   const fiberKey = await decryptFiberKey(wallet.encryptedFiberKey, wallet.litPkpId, {
     apiKey: requiredEnv("LIT_USAGE_API_KEY"),

@@ -62,7 +62,7 @@ export async function connectKeyWay(options: {
     approveFiberChannelOpen: options.approveFiberChannelOpen,
     approveFiberPayment: options.approveFiberPayment,
     approvals: options.approvals,
-    loadFiberKey: (leaseId) => loadFiberKey(options.authToken, leaseId, apiClient),
+    loadFiberKey: (leaseId) => loadFiberKey(options.authToken, leaseId, wallet.litPkpId, apiClient),
     apiClient,
     restoreRequired,
     onLeaseLost: options.onLeaseLost,

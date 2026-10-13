@@ -1,3 +1,6 @@
+import { KeyWayApiClient } from "./api-client";
+import { createFiberKeyRecipient } from "./fiber-key-wrap";
+
 export type PublicWallet = {
   version: 1;
   status: "ready";
@@ -24,19 +27,10 @@ export async function bootstrapKeyWay(
   if (!authToken) throw new Error("Authenticated KeyWay session is required");
   return navigator.locks.request("ckb-keyway:bootstrap", async () => {
     const deviceIdHash = await getDeviceIdHash();
-    const existing = await requestBootstrap(api, authToken, { deviceIdHash, nodeMode });
-    if (!existing.needsFiberKey) return existing;
-
-    const fiberKey = crypto.getRandomValues(new Uint8Array(32));
-    let encodedFiberKey = bytesToBase64(fiberKey);
-    try {
-      const provisioned = await requestBootstrap(api, authToken, { deviceIdHash, fiberKey: encodedFiberKey, nodeMode });
-      if (provisioned.needsFiberKey) throw new Error("Fiber key provisioning did not complete");
-      return provisioned;
-    } finally {
-      fiberKey.fill(0);
-      encodedFiberKey = "";
-    }
+    // Lit creates the Fiber key inside its secure enclave; neither this browser nor KeyWay's server sends one.
+    const result = await requestBootstrap(api, authToken, { deviceIdHash, nodeMode, keyCustody: "lit" });
+    if (result.needsFiberKey) throw new Error("KeyWay couldn't create this account's Fiber key");
+    return result;
   });
 }
 
@@ -50,18 +44,21 @@ export async function getDeviceIdHash(): Promise<string> {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+/**
+ * Unlocks the Fiber key for this device's lease. Lit seals it to a one-time key made here, so KeyWay's
+ * server only relays ciphertext; the bundle opens only for this wallet, this device and this request.
+ */
 export async function loadFiberKey(
   authToken: string,
   leaseId: string,
+  pkpId: string,
   api = new KeyWayApiClient(),
 ): Promise<Uint8Array> {
   if (!authToken) throw new Error("Authenticated KeyWay session is required");
-  const fiberKey = await api.loadFiberKey(authToken, { deviceIdHash: await getDeviceIdHash(), leaseId });
-  if (fiberKey.length !== 32) {
-    fiberKey.fill(0);
-    throw new Error("Backend returned an invalid Fiber key");
-  }
-  return fiberKey;
+  const deviceIdHash = await getDeviceIdHash();
+  const recipient = await createFiberKeyRecipient();
+  const bundle = await api.loadFiberKey(authToken, { deviceIdHash, leaseId, recipientPublicKey: recipient.publicKey });
+  return recipient.unwrap(bundle, { pkpId, deviceIdHash });
 }
 
 export async function markChannelOpened(authToken: string, api = new KeyWayApiClient()): Promise<void> {
@@ -71,7 +68,7 @@ export async function markChannelOpened(authToken: string, api = new KeyWayApiCl
 async function requestBootstrap(
   api: KeyWayApiClient,
   authToken: string,
-  body: { deviceIdHash: string; fiberKey?: string; nodeMode?: "browser" | "managed" },
+  body: { deviceIdHash: string; nodeMode?: "browser" | "managed"; keyCustody: "lit" },
 ): Promise<BootstrapResponse> {
   return await api.bootstrap(authToken, body) as BootstrapResponse;
 }
@@ -81,4 +78,3 @@ function bytesToBase64(value: Uint8Array): string {
   for (const byte of value) binary += String.fromCharCode(byte);
   return btoa(binary);
 }
-import { KeyWayApiClient } from "./api-client";

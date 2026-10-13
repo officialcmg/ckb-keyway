@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 
-export type LitActionName = "sign-ckb-digest" | "encrypt-fiber-key" | "decrypt-fiber-key";
+export type LitActionName = "sign-ckb-digest" | "encrypt-fiber-key" | "decrypt-fiber-key" | "generate-fiber-key" | "wrap-fiber-key";
 
 const cache = new Map<LitActionName, Promise<string>>();
 

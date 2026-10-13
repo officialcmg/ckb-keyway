@@ -61,10 +61,11 @@ export class KeyWayApiClient {
     return this.idempotentJson(`${KEYWAY_API_PATH}/bootstrap`, authToken, body);
   }
 
-  async loadFiberKey(authToken: string, body: { deviceIdHash: string; leaseId: string }): Promise<Uint8Array> {
+  /** Returns the sealed Fiber key bundle; only the browser holding the matching one-time key can open it. */
+  async loadFiberKey(authToken: string, body: { deviceIdHash: string; leaseId: string; recipientPublicKey: string }): Promise<unknown> {
     const response = await this.request(`${KEYWAY_API_PATH}/fiber-key`, authToken, body);
     if (!response.ok) throw new Error(await responseError(response, "Could not unlock Fiber credentials"));
-    return new Uint8Array(await response.arrayBuffer());
+    return response.json();
   }
 
   async markChannelOpened(authToken: string, body: { deviceIdHash: string }): Promise<void> {
