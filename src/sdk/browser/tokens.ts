@@ -6,6 +6,18 @@ export const KNOWN_TOKENS: Record<string, { symbol: string; decimals: number }> 
   "0x45b32a2bc4285d0a09678eb11960ddc8707bc2779887a09d482e9bfe9a2cdf52": { symbol: "RUSD", decimals: 8 },
 };
 
+/**
+ * Token contracts that behave like xUDT but aren't CCC's standard deployment, by code hash. Stable++
+ * deployed its own copy for RUSD, the token Fiber's testnet nodes accept.
+ */
+export const XUDT_COMPATIBLE: ReadonlyArray<{ codeHash: string; hashType: "type" | "data" | "data1" | "data2" }> = [
+  { codeHash: "0x1142755a044bf2ee358cba9f2da187ce928c91cd4dc8692ded0337efa677d21a", hashType: "type" },
+];
+
+export function isXudtCompatible(script: { codeHash: string; hashType: string }): boolean {
+  return XUDT_COMPATIBLE.some((known) => known.codeHash === script.codeHash.toLowerCase() && known.hashType === script.hashType);
+}
+
 /** A token's ID: the hash of its type script, given in Fiber's RPC shape or as molecule bytes from an invoice. */
 export function tokenAsset(script: { code_hash: string; hash_type: string; args: string } | string): string {
   if (typeof script === "string") return ccc.hashCkb(script);

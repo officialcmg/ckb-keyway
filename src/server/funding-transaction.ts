@@ -1,5 +1,6 @@
 import * as ccc from "@ckb-ccc/core";
 import type { User } from "./auth-user.ts";
+import { isXudtCompatible } from "../sdk/browser/tokens.ts";
 import { loadLitAction } from "./lit-actions.ts";
 import { signCkbDigest } from "./lit.ts";
 import { recoverPkpPublicKey } from "./pkp-identity.ts";
@@ -96,7 +97,7 @@ export async function checkTokenFunding(
   const type = fundingOutput.type;
   if (!type) throw new Error("Only the channel output and your own change may carry a token");
   const [xudt, sudt] = await Promise.all([client.getKnownScript(ccc.KnownScript.XUdt), client.getKnownScript(ccc.KnownScript.SUdt)]);
-  const standard = [xudt, sudt].some((known) => known.codeHash === type.codeHash && known.hashType === type.hashType);
+  const standard = [xudt, sudt].some((known) => known.codeHash === type.codeHash && known.hashType === type.hashType) || isXudtCompatible(type);
   if (!standard) throw new Error("Only standard xUDT or sUDT tokens can fund a channel");
   for (const { cellOutput, outputData } of typed) {
     if (!cellOutput.type!.eq(type)) throw new Error("A channel can hold only one token");

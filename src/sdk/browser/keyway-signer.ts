@@ -13,7 +13,8 @@ export type TransactionPreview = {
   /** Plain CKB arriving in the account. */
   receivingCkb: string;
   feeCkb: string;
-  tokens: Array<{ id: string; standard: "xUDT" | "sUDT"; amount: string }>;
+  /** Net change per token: `amount` in raw units with a sign, `amountText` for people, such as "-25 RUSD". */
+  tokens: Array<{ id: string; standard: "xUDT" | "sUDT"; amount: string; amountText?: string }>;
   nfts: Array<{ kind: "Spore" | "Cluster"; id: string; change: "sent" | "received" | "minted" | "burned" }>;
   dao: Array<{ action: "deposit" | "withdrawal request" | "withdrawal"; amountCkb: string }>;
   recipients: Array<{

@@ -36,7 +36,8 @@ import {
   type PaymentEstimate,
 } from "./create-keyway";
 import { createFiberNode } from "./fiber-node";
-import type { PaymentFiberMethod } from "./fiber-methods";
+import { approveFiberParams, type PaymentFiberMethod } from "./fiber-methods";
+import { createFiberActions, type FiberActionApprovals } from "./fiber-actions";
 import type { ApproveFiberPayment, FiberPaymentPreview } from "./fiber-payment";
 import { withEmailCode, type RequestEmailCode } from "./email-code";
 import { normalizeFiberPubkey } from "./fiber-pubkey";
@@ -60,13 +61,15 @@ export function createManagedKeyWay(options: {
   /** The app's own payment confirmation, if any. KeyWay draws no payment dialog. */
   approveFiberPayment?: ApproveFiberPayment;
   requestEmailCode?: RequestEmailCode;
+  approvals?: () => FiberActionApprovals;
   apiClient?: KeyWayApiClient;
 }) {
+  let openingPeer: string | undefined;
   const api = options.apiClient ?? new KeyWayApiClient();
   const fundingSigner = new RemoteCkbSigner(
     options.authToken,
     options.ckbPublicKey,
-    options.approveFiberChannelOpen,
+    (preview) => options.approveFiberChannelOpen({ ...preview, ...(openingPeer ? { peer: openingPeer } : {}) }),
     undefined,
     api,
   );
@@ -121,6 +124,7 @@ export function createManagedKeyWay(options: {
   }
 
   async function openFundedChannel(params: KeyWayFundingParams) {
+    openingPeer = params.pubkey;
     const funding = await resolveExternalFunding(undefined);
     return openChannelWithExternalFundingFlow({
       node: { openChannelWithExternalFunding, submitSignedFundingTx },
@@ -169,23 +173,23 @@ export function createManagedKeyWay(options: {
     return api.managedNode(options.authToken, { operation: "wait-channel-ready", channelId });
   }
 
-  async function closeChannel(channelId: ChannelId, closeOptions?: { force?: boolean }): Promise<void> {
-    const prepared = await api.managedNode<{ confirmationNonce: string }>(options.authToken, {
-      operation: "prepare-close-channel",
-      channelId,
-      force: closeOptions?.force,
+  async function closeChannel(channelId: ChannelId, closeOptions?: { force?: boolean; feeRate?: bigint }): Promise<void> {
+    await fiberNode.shutdownChannel({
+      channel_id: channelId,
+      ...(closeOptions?.force ? { force: true } : {}),
+      ...(closeOptions?.feeRate === undefined ? {} : { fee_rate: toHex(closeOptions.feeRate) }),
     });
-    await api.managedNode(options.authToken, {
-      operation: "close-channel",
-      channelId,
-      force: closeOptions?.force,
-      confirmationNonce: prepared.confirmationNonce,
-    }, crypto.randomUUID());
   }
 
   // Free methods go through the backend's copy of the shared method table; payments through its payment flow.
   const call = (method: string, params?: unknown) => api.managedNode(options.authToken, { operation: "call", method, params });
-  const fiberNode = createFiberNode(call, pay);
+  const fiberNode = createFiberNode(call, pay, createFiberActions({
+    listChannels,
+    act: (method, params) => api.managedNode(options.authToken, { operation: "act", method, params }, crypto.randomUUID()),
+  }, () => options.approvals?.() ?? {}), (input) => {
+    const params = approveFiberParams("openChannelWithExternalFunding", input) as unknown as KeyWayFundingParams;
+    return openFundedChannel(params).then(({ channelId, fundingTxHash }) => ({ channelId, fundingTxHash }));
+  });
 
   async function pay(method: PaymentFiberMethod, params: unknown): Promise<unknown> {
     if ((params as { dry_run?: unknown } | undefined)?.dry_run === true) return call(method, params);
@@ -250,7 +254,6 @@ export function createManagedKeyWay(options: {
     nodeInfo: async () => status?.node ?? start(),
     listChannels,
     getChannels,
-    shutdownChannel: ({ channel_id, force }: { channel_id: ChannelId; force?: boolean }) => closeChannel(channel_id, { force }),
     closeChannel,
     waitForChannelReady,
     newInvoice,

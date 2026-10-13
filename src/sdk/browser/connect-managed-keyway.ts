@@ -4,6 +4,7 @@ import { createManagedKeyWay, type ManagedKeyWay } from "./create-managed-keyway
 import type { ApproveFiberChannelOpen } from "./remote-ckb-signer";
 import type { ApproveFiberPayment } from "./fiber-payment";
 import type { RequestEmailCode } from "./email-code";
+import type { FiberActionApprovals } from "./fiber-actions";
 import type { FiberStartupEvent, FiberStartupStage } from "./connect-keyway";
 
 export type ConnectedManagedKeyWay = {
@@ -20,6 +21,7 @@ export async function connectManagedKeyWay(options: {
   approveFiberChannelOpen: ApproveFiberChannelOpen;
   approveFiberPayment?: ApproveFiberPayment;
   requestEmailCode?: RequestEmailCode;
+  approvals?: () => FiberActionApprovals;
   apiClient?: KeyWayApiClient;
   onWalletReady?: (wallet: PublicWallet) => void;
   onFiberStartup?: (event: FiberStartupEvent) => void;
@@ -39,6 +41,7 @@ export async function connectManagedKeyWay(options: {
     ckbPublicKey: wallet.litPublicKey,
     approveFiberChannelOpen: options.approveFiberChannelOpen,
     approveFiberPayment: options.approveFiberPayment,
+    approvals: options.approvals,
     requestEmailCode: options.requestEmailCode,
     apiClient: api,
   });

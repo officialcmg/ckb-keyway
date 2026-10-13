@@ -107,8 +107,20 @@ test("managed beta exposes only bounded authenticated node operations", async ()
         shutdown_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" },
         funding_lock_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" },
       },
-    }, node as never, ownLock),
-    /approved testnet channel peers/,
+    }, { ...node, call: async () => ({ nodes: [], last_cursor: "0x" }) } as never, ownLock),
+    /isn't in the Fiber network graph/,
+  );
+  // Any public peer works, but one announcing only private addresses is refused.
+  await assert.rejects(
+    managedNodeRequest("user-1", {
+      operation: "open-channel",
+      params: {
+        pubkey: `0x02${"55".repeat(32)}`,
+        funding_amount: "0x1",
+        funding_lock_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" },
+      },
+    }, { ...node, call: async () => ({ nodes: [{ pubkey: `02${"55".repeat(32)}`, addresses: ["/ip4/10.1.2.3/tcp/8228/p2p/Qm1"] }], last_cursor: "0x" }) } as never, ownLock),
+    /must be public/,
   );
 });
 

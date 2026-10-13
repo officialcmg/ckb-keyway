@@ -4,6 +4,7 @@ import { createKeyWay, type KeyWay } from "./create-keyway";
 import type { ApproveFiberChannelOpen } from "./remote-ckb-signer";
 import type { ApproveFiberPayment } from "./fiber-payment";
 import type { RequestEmailCode } from "./email-code";
+import type { FiberActionApprovals } from "./fiber-actions";
 import { connectTestnetPeers } from "./testnet-peers";
 import { KeyWayApiClient } from "./api-client";
 
@@ -38,6 +39,7 @@ export async function connectKeyWay(options: {
   approveFiberChannelOpen: ApproveFiberChannelOpen;
   approveFiberPayment?: ApproveFiberPayment;
   requestEmailCode?: RequestEmailCode;
+  approvals?: () => FiberActionApprovals;
   apiClient?: KeyWayApiClient;
   onLeaseLost?: (error: Error) => void;
   onWalletReady?: (wallet: PublicWallet) => void;
@@ -59,6 +61,7 @@ export async function connectKeyWay(options: {
     ckbPublicKey: wallet.litPublicKey,
     approveFiberChannelOpen: options.approveFiberChannelOpen,
     approveFiberPayment: options.approveFiberPayment,
+    approvals: options.approvals,
     loadFiberKey: (leaseId) => loadFiberKey(options.authToken, leaseId, apiClient),
     apiClient,
     restoreRequired,

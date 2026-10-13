@@ -27,6 +27,8 @@ import { backUpBeforeLogout, restoreBeforeStart } from "./node-migration";
 import { toKeyWayError, type KeyWayError } from "./keyway-error";
 import { freeFiberParams, paymentFiberParams } from "./fiber-methods";
 import { describePayment, type ApproveFiberPayment } from "./fiber-payment";
+import { createFiberActions, type FiberActionApprovals } from "./fiber-actions";
+import { approveFiberParams } from "./fiber-methods";
 import { createFiberNode, listLoggedPayments, type ListPaymentsParams } from "./fiber-node";
 import { createPaymentLog } from "./payment-log";
 
@@ -42,6 +44,7 @@ export type CreateKeyWayOptions = {
   approveFiberChannelOpen: ApproveFiberChannelOpen;
   /** The app's own payment confirmation, if any. KeyWay draws no payment dialog. */
   approveFiberPayment?: ApproveFiberPayment;
+  approvals?: () => FiberActionApprovals;
   loadFiberKey: (leaseId: string) => ReturnType<FiberKeyLoader>;
   network?: "testnet" | "mainnet";
   apiClient?: KeyWayApiClient;
@@ -99,11 +102,12 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   let deviceLock: DeviceLock | undefined;
   const api = options.apiClient ?? new KeyWayApiClient();
   let activationProgress: ChannelOpenProgress | undefined;
+  let openingPeer: string | undefined;
   let preparedPeers: Promise<ChannelPeer[]> | undefined;
   let preparedFundingAmount: bigint | undefined;
   const fundingSigner = new RemoteCkbSigner(options.authToken, options.ckbPublicKey, async (preview) => {
     activationProgress?.("confirming");
-    const approved = await options.approveFiberChannelOpen(preview);
+    const approved = await options.approveFiberChannelOpen({ ...preview, ...(openingPeer ? { peer: openingPeer } : {}) });
     if (approved) activationProgress?.("signing");
     return approved;
   }, undefined, api);
@@ -200,6 +204,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
 
   async function openFundedChannel(params: KeyWayFundingParams) {
     if (!node.isRunning) throw new Error("Start the Fiber node before opening a channel");
+    openingPeer = params.pubkey;
     const funding = await resolveExternalFunding(undefined);
     const result = await openChannelWithExternalFundingFlow({
       node,
@@ -278,12 +283,12 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     return channels.map(normalizeChannel);
   }
 
-  async function closeChannel(channelId: ChannelId, options?: { force?: boolean; feeRate?: bigint }): Promise<void> {
+  async function closeChannel(channelId: ChannelId, closeOptions?: { force?: boolean; feeRate?: bigint }): Promise<void> {
     try {
-      await node.shutdownChannel({
+      await fiberNode.shutdownChannel({
         channel_id: channelId,
-        force: options?.force,
-        fee_rate: options?.feeRate === undefined ? undefined : toHex(options.feeRate),
+        ...(closeOptions?.force ? { force: true } : {}),
+        ...(closeOptions?.feeRate === undefined ? {} : { fee_rate: toHex(closeOptions.feeRate) }),
       });
     } catch (error) {
       throw toKeyWayError(error, "CHANNEL_FAILED");
@@ -332,6 +337,15 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     // Browser nodes have no payment history of their own; failing to log never fails the payment.
     await paymentLog.record(payment.payment_hash).catch(() => undefined);
     return payment;
+  }, createFiberActions({
+    listChannels: (params) => node.listChannels(params),
+    act: (method, params) => {
+      if (!node.isRunning) throw new Error("Start Fiber before using the node");
+      return (node[method] as (params: unknown) => Promise<unknown>).call(node, params);
+    },
+  }, () => options.approvals?.() ?? {}), (input) => {
+    const params = approveFiberParams("openChannelWithExternalFunding", input) as unknown as KeyWayFundingParams;
+    return openFundedChannel(params).then(({ channelId, fundingTxHash }) => ({ channelId, fundingTxHash }));
   });
 
   return {

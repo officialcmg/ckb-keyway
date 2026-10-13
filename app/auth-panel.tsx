@@ -33,13 +33,16 @@ export function AuthPanel({ nodeMode = "hosted", devScreen }: { nodeMode?: NodeM
   return <LiveDemo key={nodeMode} nodeMode={nodeMode} setMode={setMode} />;
 }
 
+// The demo asks "Confirm close" in its own channel card, so it replaces KeyWay's close dialog.
+const confirmedByDemo = () => true;
+
 function LiveDemo({ nodeMode, setMode }: { nodeMode: NodeMode; setMode: (mode: NodeMode) => void }) {
   const [events, setEvents] = useState<LifecycleEvent[]>([]);
   const onFiberStartup = useCallback((event: FiberStartupEvent) => {
     setEvents((current) => event.stage === "loading_account" ? [event] : [...current, event]);
   }, []);
   return (
-    <KeyWayProvider appId={process.env.NEXT_PUBLIC_KEYWAY_APP_ID} fiberNode={nodeMode} theme="light" onFiberStartup={onFiberStartup}>
+    <KeyWayProvider appId={process.env.NEXT_PUBLIC_KEYWAY_APP_ID} fiberNode={nodeMode} theme="light" onFiberStartup={onFiberStartup} approveFiberChannelClose={confirmedByDemo}>
       <LiveWallet nodeMode={nodeMode} events={events} resetEvents={() => setEvents([])} setMode={setMode} />
     </KeyWayProvider>
   );

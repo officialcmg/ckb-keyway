@@ -27,6 +27,7 @@ import type {
   SettleInvoiceParams,
 } from "@fiber-pay/sdk/browser";
 import type { FreeFiberMethod, PaymentFiberMethod } from "./fiber-methods";
+import type { createFiberActions } from "./fiber-actions";
 
 export type ListPaymentsParams = {
   status?: "Created" | "Inflight" | "Success" | "Failed";
@@ -61,12 +62,44 @@ export type KeyWayFiberNode = {
   sendPayment(params: SendPaymentParams): Promise<SendPaymentResult>;
   /** Pays over an explicit route from `buildRouter`. */
   sendPaymentWithRouter(params: SendPaymentWithRouterParams): Promise<SendPaymentResult>;
+  /**
+   * Opens a channel funded from the user's account, after the channel-open dialog. KeyWay sets the funding
+   * and close scripts, so the channel always closes back to the user.
+   */
+  openChannelWithExternalFunding(params: OpenChannelParams): Promise<{ channelId: string; fundingTxHash?: string }>;
+  /** Closes a channel back to the user's account, after the close dialog. `force` settles without the peer. */
+  shutdownChannel(params: { channel_id: string; force?: boolean; fee_rate?: HexString }): Promise<void>;
+  /** Connects to a peer by pubkey or multiaddr, after the peer dialog. */
+  connectPeer(params: { pubkey?: string; address?: string; addr_type?: "tcp" | "ws" | "wss" }): Promise<void>;
+  disconnectPeer(params: { pubkey: string }): Promise<void>;
+  /** Changes a channel's forwarding settings, after the settings dialog. */
+  updateChannel(params: { channel_id: string; enabled?: boolean; tlc_expiry_delta?: HexString; tlc_minimum_value?: HexString; tlc_fee_proportional_millionths?: HexString }): Promise<void>;
+};
+
+/** `openChannelWithExternalFunding` parameters; the funding and close scripts are KeyWay's to set. */
+export type OpenChannelParams = {
+  pubkey: string;
+  funding_amount: HexString;
+  public?: boolean;
+  funding_udt_type_script?: { code_hash: string; hash_type: string; args: string };
+  funding_fee_rate?: HexString;
+  commitment_fee_rate?: HexString;
+  tlc_expiry_delta?: HexString;
+  tlc_min_value?: HexString;
+  tlc_fee_proportional_millionths?: HexString;
+  max_tlc_value_in_flight?: HexString;
+  max_tlc_number_in_flight?: HexString;
 };
 
 export type FiberCall = (method: FreeFiberMethod, params?: unknown) => Promise<unknown>;
 export type FiberPay = (method: PaymentFiberMethod, params: unknown) => Promise<unknown>;
 
-export function createFiberNode(call: FiberCall, pay: FiberPay): KeyWayFiberNode {
+export function createFiberNode(
+  call: FiberCall,
+  pay: FiberPay,
+  actions: ReturnType<typeof createFiberActions>,
+  openChannel: (params: OpenChannelParams) => Promise<{ channelId: string; fundingTxHash?: string }>,
+): KeyWayFiberNode {
   const invoke = <T>(method: FreeFiberMethod) => (params?: unknown) => call(method, params) as Promise<T>;
   return {
     nodeInfo: () => call("nodeInfo") as Promise<NodeInfoResult>,
@@ -84,6 +117,11 @@ export function createFiberNode(call: FiberCall, pay: FiberPay): KeyWayFiberNode
     cancelInvoice: invoke<CancelInvoiceResult>("cancelInvoice"),
     sendPayment: (params) => pay("sendPayment", params) as Promise<SendPaymentResult>,
     sendPaymentWithRouter: (params) => pay("sendPaymentWithRouter", params) as Promise<SendPaymentResult>,
+    openChannelWithExternalFunding: openChannel,
+    shutdownChannel: actions.shutdownChannel,
+    connectPeer: actions.connectPeer,
+    disconnectPeer: actions.disconnectPeer,
+    updateChannel: actions.updateChannel,
   };
 }
 

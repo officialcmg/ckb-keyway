@@ -101,6 +101,10 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
     const limit = await consumeRateLimit(`fiber-call:${user.id}`, { max: 120, window: 60 });
     if (!limit.allowed) throw new Error(`Too many Fiber node requests. Try again in ${limit.retryAfter ?? 60} seconds`);
   }
+  if (operation === "act") {
+    const limit = await consumeRateLimit(`fiber-act:${user.id}`, { max: 30, window: 60 });
+    if (!limit.allowed) throw new Error(`Too many Fiber node changes. Try again in ${limit.retryAfter ?? 60} seconds`);
+  }
   if (operation === "pay") {
     const scope = await resolveAuthScope(request);
     const context = { user, appName: scope.name, email: () => sessionEmail(request), sendEmail: sendTransactionalEmail, rateLimit: consumeRateLimit };

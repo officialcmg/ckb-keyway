@@ -16,7 +16,8 @@ import { connectCandidates, TESTNET_CHANNEL_PEERS } from "../sdk/browser/channel
 import { normalizeCkbTransactionForCcc } from "@fiber-pay/sdk/browser";
 import { serializeCccTransactionForRpc } from "../sdk/browser/ccc-transaction.ts";
 import { DEFAULT_INVOICE_EXPIRY } from "../sdk/browser/invoice-expiry.ts";
-import { FIBER_METHODS, freeFiberParams, paymentFiberParams, type FiberMethod } from "../sdk/browser/fiber-methods.ts";
+import { approveFiberParams, FIBER_METHODS, freeFiberParams, paymentFiberParams, type FiberMethod } from "../sdk/browser/fiber-methods.ts";
+import { assertPublicPeerAddress } from "./peer-address.ts";
 
 type ManagedNodeClient = Pick<
   FiberRpcClient,
@@ -62,6 +63,21 @@ export async function managedNodeRequest(
     const rpc = FIBER_METHODS[method as FiberMethod].rpc;
     const run = () => node.call(rpc, method === "listPeers" ? [] : [params]);
     return ["newInvoice", "settleInvoice", "cancelInvoice"].includes(method) ? serializeMutation(userId, run) : run();
+  }
+  if (body.operation === "act") {
+    // Closes, peers and channel settings, after the user approved them in the page.
+    const method = typeof body.method === "string" ? body.method : "";
+    if (!["shutdownChannel", "connectPeer", "disconnectPeer", "updateChannel"].includes(method)) {
+      throw new Error(`${method} isn't available through KeyWay`);
+    }
+    const params = approveFiberParams(method, body.params);
+    if (method === "connectPeer") {
+      if (typeof params.address === "string") await assertPublicPeerAddress(params.address);
+      else await assertKnownPublicPeer(node, String(params.pubkey));
+      if ((await node.listPeers()).peers.length >= MAX_PEERS) throw new Error(`A hosted node can connect to at most ${MAX_PEERS} peers`);
+    }
+    await serializeMutation(userId, () => node.call(FIBER_METHODS[method as FiberMethod].rpc, [params]));
+    return { done: true };
   }
   if (body.operation === "status") {
     return {
@@ -286,9 +302,43 @@ function submitFundingParams(value: unknown): SubmitSignedFundingTxParams {
   };
 }
 
+const MAX_PEERS = 32;
+
+/**
+ * Connecting by pubkey makes the node dial the addresses the peer announced to the network, so those must
+ * be public too. A peer that is already connected, or one of the official peers, needs no check.
+ */
+async function assertKnownPublicPeer(node: ManagedNodeClient, peer: string): Promise<string[]> {
+  const bare = peer.toLowerCase().replace(/^0x/, "");
+  if (TESTNET_CHANNEL_PEERS.some(({ pubkey }) => pubkey.slice(2) === bare)) return [];
+  if ((await node.listPeers()).peers.some(({ pubkey }) => pubkey.toLowerCase().replace(/^0x/, "") === bare)) return [];
+  let after: string | undefined;
+  for (let page = 0; page < 8; page++) {
+    const result = await node.call<{ nodes: Array<{ pubkey: string; addresses: string[] }>; last_cursor: string }>("graph_nodes", [{ limit: "0x100", ...(after ? { after } : {}) }]);
+    const found = result.nodes.find((item) => item.pubkey.toLowerCase().replace(/^0x/, "") === bare);
+    if (found) {
+      const tcp = found.addresses.filter((address) => /\/tcp\/\d+(\/p2p\/|$)/.test(address) && !/\/(ws|wss)(\/|$)/.test(address));
+      if (tcp.length === 0) throw new Error("This peer announces no address a hosted node can reach; pass one with connectPeer");
+      for (const address of tcp) await assertPublicPeerAddress(address);
+      return tcp;
+    }
+    if (result.nodes.length < 256) break;
+    after = result.last_cursor;
+  }
+  throw new Error("This peer isn't in the Fiber network graph yet; connect to it first with connectPeer and its address");
+}
+
 async function connectManagedPeer(node: ManagedNodeClient, peer: Pubkey): Promise<void> {
   const candidate = TESTNET_CHANNEL_PEERS.find(({ pubkey }) => pubkey === peer.toLowerCase());
-  if (!candidate) throw new Error("Managed beta only supports approved testnet channel peers");
+  if (!candidate) {
+    // Any public peer: its announced addresses must be public, and the handshake must match its key.
+    const addresses = await assertKnownPublicPeer(node, peer);
+    if (addresses.length === 0) return;
+    if ((await connectCandidates(node, [{ pubkey: peer as `0x${string}`, nodeName: "selected peer", addresses, minimumFunding: 0n }], 10_000, 250)).length === 0) {
+      throw new Error("Could not connect to the selected Fiber channel peer");
+    }
+    return;
+  }
   // Native nodes resolve current TCP addresses from gossip, not browser WSS seeds.
   let addresses: string[] = [];
   try {

@@ -1,4 +1,5 @@
 import * as ccc from "@ckb-ccc/core";
+import { formatAsset, isXudtCompatible } from "../sdk/browser/tokens.ts";
 import type { ReadyWallet } from "./user-wallet.ts";
 
 const SHANNONS_PER_CKB = 100_000_000n;
@@ -16,7 +17,8 @@ const CLUSTER_CODE_HASHES = new Set([
   "0x598d793defef36e2eeba54a9b45130e4ca92822e1d193671f490950c3b856080",
 ]);
 
-export type TokenEffect = { id: string; standard: "xUDT" | "sUDT"; amount: string };
+/** A token's net change for the account: `amount` is signed raw units, `amountText` is for people ("-25 RUSD"). */
+export type TokenEffect = { id: string; standard: "xUDT" | "sUDT"; amount: string; amountText: string };
 export type NftEffect = { kind: "Spore" | "Cluster"; id: string; change: "sent" | "received" | "minted" | "burned" };
 export type DaoEffect = { action: "deposit" | "withdrawal request" | "withdrawal"; amountCkb: string };
 export type Recipient = {
@@ -147,7 +149,7 @@ export function describeTransaction(
   const matches = (script: ccc.Script | undefined, info: ccc.ScriptInfo) => Boolean(script && script.codeHash === info.codeHash && script.hashType === info.hashType);
   const typeKind = (type: ccc.Script | undefined): "none" | "xUDT" | "sUDT" | "dao" | "Spore" | "Cluster" | "quiet" | "unknown" => {
     if (!type) return "none";
-    if (matches(type, known.xudt)) return "xUDT";
+    if (matches(type, known.xudt) || isXudtCompatible(type)) return "xUDT";
     if (matches(type, known.sudt)) return "sUDT";
     if (matches(type, known.dao)) return "dao";
     if (SPORE_CODE_HASHES.has(type.codeHash)) return "Spore";
@@ -177,7 +179,10 @@ export function describeTransaction(
   ownInputs.forEach((cell) => addToken(cell, -1n));
   ownOutputs.forEach((cell) => addToken(cell, 1n));
   const tokens = [...tokenTotals].filter(([, { delta }]) => delta !== 0n)
-    .map(([id, { standard, delta }]) => ({ id: shortHash(id), standard, amount: `${delta > 0n ? "+" : ""}${delta}` }));
+    .map(([id, { standard, delta }]) => ({
+      id: shortHash(id), standard, amount: `${delta > 0n ? "+" : ""}${delta}`,
+      amountText: `${delta > 0n ? "+" : "-"}${formatAsset(delta > 0n ? delta : -delta, id)}`,
+    }));
 
   // NFTs: Spore and Cluster cells identified by their type args.
   const nftKey = (cell: { cellOutput: ccc.CellOutput }) => {
@@ -259,8 +264,13 @@ export function describeTransaction(
 
   return {
     outflowShannons: outflow,
-    tokensLeaving: [...tokenTotals.values()].some(({ delta }) => delta < 0n),
-    tokenOutflows: [...tokenTotals].filter(([, { delta }]) => delta < 0n).map(([asset, { delta }]) => ({ asset, amount: -delta })),
+    tokensLeaving: [...tokenTotals.values()].some(({ delta }) => delta < 0n) || unrecognizedLeaving(ownInputs, ownOutputs, typeKind).length > 0,
+    // Cells with a type script KeyWay can't read leave as "tokens" with no daily amount, counted per cell,
+    // so they always need the email code once confirmation is on.
+    tokenOutflows: [
+      ...[...tokenTotals].filter(([, { delta }]) => delta < 0n).map(([asset, { delta }]) => ({ asset, amount: -delta })),
+      ...unrecognizedLeaving(ownInputs, ownOutputs, typeKind),
+    ],
     preview: {
       network: "CKB testnet",
       sendingCkb: formatCkb(sending),
@@ -326,4 +336,19 @@ function sum(values: readonly bigint[]): bigint {
 
 function maxBig(a: bigint, b: bigint): bigint {
   return a > b ? a : b;
+}
+
+function unrecognizedLeaving(
+  ownInputs: Array<{ cellOutput: ccc.CellOutput }>,
+  ownOutputs: Array<{ cellOutput: ccc.CellOutput }>,
+  typeKind: (type: ccc.Script | undefined) => string,
+): TokenOutflow[] {
+  const counts = new Map<string, bigint>();
+  for (const { cellOutput } of ownInputs) {
+    if (typeKind(cellOutput.type) === "unknown") counts.set(cellOutput.type!.hash(), (counts.get(cellOutput.type!.hash()) ?? 0n) + 1n);
+  }
+  for (const { cellOutput } of ownOutputs) {
+    if (typeKind(cellOutput.type) === "unknown" && counts.has(cellOutput.type!.hash())) counts.set(cellOutput.type!.hash(), counts.get(cellOutput.type!.hash())! - 1n);
+  }
+  return [...counts].filter(([, left]) => left > 0n).map(([asset, amount]) => ({ asset, amount }));
 }

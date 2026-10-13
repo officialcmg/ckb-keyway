@@ -184,6 +184,74 @@ function customRecords(value: unknown): Record<string, string> {
   return records as Record<string, string>;
 }
 
+export type ApproveFiberMethod = "openChannelWithExternalFunding" | "shutdownChannel" | "connectPeer" | "disconnectPeer" | "updateChannel";
+
+/** Closing fees: at most 100 times Fiber's default of 1,000 shannons per KB. */
+export const MAX_CLOSE_FEE_RATE = 100_000n;
+/** Forwarding fees: at most 10% of what a channel forwards. */
+export const MAX_FORWARDING_FEE_MILLIONTHS = 100_000n;
+/** TLC expiry: at most 14 days, in milliseconds. */
+const MAX_TLC_EXPIRY_DELTA = 14n * 24n * 60n * 60n * 1000n;
+
+/**
+ * Checks the parameters of methods that show a dialog. KeyWay sets the funding and close scripts itself, so
+ * channels always fund from and close back to the user's own account; a custom close address is refused.
+ */
+export function approveFiberParams(method: string, input: unknown): Record<string, unknown> {
+  const params = record(input, "Parameters must be an object");
+  switch (method) {
+    case "openChannelWithExternalFunding":
+      if (params.shutdown_script !== undefined || params.funding_lock_script !== undefined || params.funding_lock_script_cell_deps !== undefined) {
+        throw new Error("KeyWay sets the channel's funding and close scripts to the user's own account");
+      }
+      return required(pick(params, {
+        pubkey,
+        funding_amount: hex,
+        public: bool,
+        funding_udt_type_script: script,
+        funding_fee_rate: hex,
+        commitment_fee_rate: hex,
+        tlc_expiry_delta: (value) => cappedHex(value, MAX_TLC_EXPIRY_DELTA, "tlc_expiry_delta"),
+        tlc_min_value: hex,
+        tlc_fee_proportional_millionths: (value) => cappedHex(value, MAX_FORWARDING_FEE_MILLIONTHS, "tlc_fee_proportional_millionths"),
+        max_tlc_value_in_flight: hex,
+        max_tlc_number_in_flight: hex,
+      }), ["pubkey", "funding_amount"]);
+    case "shutdownChannel":
+      if (params.close_script !== undefined) throw new Error("Channels close back to the user's own account; a close_script isn't accepted");
+      return required(pick(params, {
+        channel_id: hash256,
+        force: bool,
+        fee_rate: (value) => cappedHex(value, MAX_CLOSE_FEE_RATE, "fee_rate"),
+      }), ["channel_id"]);
+    case "connectPeer": {
+      const peer = pick(params, { pubkey, address: multiaddr, addr_type: (value) => oneOf(value, ["tcp", "ws", "wss"], "addr_type") });
+      if (peer.pubkey === undefined && peer.address === undefined) throw new Error("Pass a peer pubkey or address");
+      // Peers are never saved to the node's permanent peer store on an app's say-so.
+      return { ...peer, save: false };
+    }
+    case "disconnectPeer":
+      return required(pick(params, { pubkey }), ["pubkey"]);
+    case "updateChannel":
+      return required(pick(params, {
+        channel_id: hash256,
+        enabled: bool,
+        tlc_expiry_delta: (value) => cappedHex(value, MAX_TLC_EXPIRY_DELTA, "tlc_expiry_delta"),
+        tlc_minimum_value: hex,
+        tlc_fee_proportional_millionths: (value) => cappedHex(value, MAX_FORWARDING_FEE_MILLIONTHS, "tlc_fee_proportional_millionths"),
+      }), ["channel_id"]);
+    default:
+      throw new KeyWayError("UNSUPPORTED_METHOD", `${method} isn't available through KeyWay`, false);
+  }
+}
+
+function multiaddr(value: unknown): string {
+  if (typeof value !== "string" || value.length > 512 || !/^\/(ip4|ip6|dns|dns4|dns6)\/[^/]+\/tcp\/\d+(\/(ws|wss|tls\/ws))?(\/p2p\/\w+)?$/.test(value)) {
+    throw new Error("Expected a peer multiaddr such as /dns4/host/tcp/443/wss/p2p/Qm…");
+  }
+  return value;
+}
+
 export function isFiberMethod(method: string): method is FiberMethod {
   return Object.prototype.hasOwnProperty.call(FIBER_METHODS, method);
 }

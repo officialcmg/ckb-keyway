@@ -1,4 +1,5 @@
 import { createRoot } from "react-dom/client";
+import * as ccc from "@ckb-ccc/core";
 import { KeyWayProvider, useKeyWay, useCkbWallet, useFiber } from "../../src/sdk/react/index";
 
 function Probe() {
@@ -10,7 +11,7 @@ function Probe() {
 }
 const params = new URLSearchParams(location.search);
 const root = createRoot(document.getElementById("root")!);
-Object.assign(window, { unmount: () => root.unmount() });
+Object.assign(window, { unmount: () => root.unmount(), ccc });
 // `?approve` adds an app-side payment confirmation that tests control through window.allowPayments.
 const approvals: unknown[] = [];
 Object.assign(window, { paymentApprovals: approvals, allowPayments: true });

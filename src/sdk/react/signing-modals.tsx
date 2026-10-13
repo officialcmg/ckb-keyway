@@ -2,6 +2,7 @@
 
 import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import type { MessagePreview, TransactionPreview } from "../browser/keyway-signer";
+import type { FiberChannelClosePreview, FiberChannelSettingsPreview, FiberPeerPreview } from "../browser/fiber-actions";
 import {
   fundingDetails,
   modalActions,
@@ -52,7 +53,9 @@ function shortAddress(value: string): string {
 export function KeyWayTransactionModal({ theme, appName, preview, answer }: { theme: Theme; appName: string; preview: TransactionPreview; answer: (approved: boolean) => void }) {
   useEscape(() => answer(false));
   const sending = preview.sendingCkb !== "0";
-  const title = sending ? `Send ${preview.sendingCkb} CKB?` : "Approve this transaction?";
+  // A token leaving is the point of the transaction; the CKB that travels inside its cell is secondary.
+  const tokenOut = preview.tokens.find((token) => token.amount.startsWith("-") && token.amountText);
+  const title = tokenOut ? `Send ${tokenOut.amountText!.slice(1)}?` : sending ? `Send ${preview.sendingCkb} CKB?` : "Approve this transaction?";
   return (
     <Shell theme={theme} labelId="keyway-transaction-title">
       {(palette) => (
@@ -67,7 +70,7 @@ export function KeyWayTransactionModal({ theme, appName, preview, answer }: { th
           <dl style={{ ...fundingDetails, margin: "16px 0" }}>
             {sending && <><dt>You send</dt><dd style={rowValue}>{preview.sendingCkb} CKB</dd></>}
             {preview.receivingCkb !== "0" && <><dt>You receive</dt><dd style={rowValue}>{preview.receivingCkb} CKB</dd></>}
-            {preview.tokens.map((token) => <Row key={`t-${token.id}`} label={`Token ${token.id} (${token.standard})`} value={token.amount} />)}
+            {preview.tokens.map((token) => <Row key={`t-${token.id}`} label={`Token ${token.id} (${token.standard})`} value={token.amountText ?? token.amount} />)}
             {preview.nfts.map((nft) => <Row key={`n-${nft.id}`} label={`${nft.kind} ${nft.id}`} value={nft.change} />)}
             {preview.dao.map((action, index) => <Row key={`d-${index}`} label={`Nervos DAO ${action.action}`} value={`${action.amountCkb} CKB`} />)}
             {preview.recipients.map((recipient) => (
@@ -176,6 +179,98 @@ export function KeyWayEmailCodeModal({ theme, reason, error, resend, answer }: {
             <button type="submit" disabled={code.length !== 6} style={{ ...modalButton, ...modalPrimaryButton, background: palette.primary, color: palette.primaryText, opacity: code.length === 6 ? 1 : 0.6 }}>Confirm</button>
           </div>
         </form>
+      )}
+    </Shell>
+  );
+}
+
+function Actions({ palette, confirm, answer }: { palette: ModalPalette; confirm: string; answer: (approved: boolean) => void }) {
+  return (
+    <div style={modalActions}>
+      <button type="button" autoFocus style={{ ...modalButton, borderColor: palette.border, color: palette.text }} onClick={() => answer(false)}>Cancel</button>
+      <button type="button" style={{ ...modalButton, ...modalPrimaryButton, background: palette.primary, color: palette.primaryText }} onClick={() => answer(true)}>{confirm}</button>
+    </div>
+  );
+}
+
+/** The built-in dialog for closing a channel. */
+export function KeyWayChannelCloseModal({ theme, appName, preview, answer }: { theme: Theme; appName: string; preview: FiberChannelClosePreview; answer: (approved: boolean) => void }) {
+  useEscape(() => answer(false));
+  return (
+    <Shell theme={theme} labelId="keyway-close-title">
+      {(palette) => (
+        <>
+          <p style={{ ...modalEyebrow, color: palette.muted }}>{appName} · CLOSE CHANNEL</p>
+          <h2 id="keyway-close-title" style={modalTitle}>{preview.force ? "Force-close this channel?" : "Close this channel?"}</h2>
+          <dl style={{ ...fundingDetails, margin: "16px 0" }}>
+            <Row label="Returns to you" value={preview.returningText} />
+            <Row label="Peer" value={shortAddress(preview.peer)} />
+            <Row label="Network" value={preview.network} />
+          </dl>
+          <p style={note(palette)}>
+            {preview.force
+              ? "A force close settles on-chain without the peer. Your funds are locked for about 4 hours first, and the closing fee comes out of your side."
+              : "Your side of the channel, minus the closing fee, goes back to your own account."}
+          </p>
+          <Actions palette={palette} confirm={preview.force ? "Force close" : "Close channel"} answer={answer} />
+        </>
+      )}
+    </Shell>
+  );
+}
+
+/** The built-in dialog for connecting to or disconnecting from a Fiber peer. */
+export function KeyWayPeerModal({ theme, appName, preview, answer }: { theme: Theme; appName: string; preview: FiberPeerPreview; answer: (approved: boolean) => void }) {
+  useEscape(() => answer(false));
+  const connect = preview.action === "connect";
+  return (
+    <Shell theme={theme} labelId="keyway-peer-title">
+      {(palette) => (
+        <>
+          <p style={{ ...modalEyebrow, color: palette.muted }}>{appName} · FIBER PEER</p>
+          <h2 id="keyway-peer-title" style={modalTitle}>{connect ? "Connect to this peer?" : "Disconnect this peer?"}</h2>
+          <dl style={{ ...fundingDetails, margin: "16px 0" }}>
+            {preview.pubkey && <Row label="Node ID" value={shortAddress(preview.pubkey)} />}
+            {preview.address && <Row label="Address" value={preview.address} />}
+          </dl>
+          <p style={note(palette)}>
+            {connect
+              ? "Your Fiber node will talk to this node. No funds move."
+              : preview.openChannels > 0
+                ? `You have ${preview.openChannels} open channel${preview.openChannels === 1 ? "" : "s"} with this peer. ${preview.openChannels === 1 ? "It goes" : "They go"} offline until the peer reconnects.`
+                : "No funds move."}
+          </p>
+          <Actions palette={palette} confirm={connect ? "Connect" : "Disconnect"} answer={answer} />
+        </>
+      )}
+    </Shell>
+  );
+}
+
+const SETTING_LABELS: Record<FiberChannelSettingsPreview["changes"][number]["setting"], string> = {
+  enabled: "Forwarding payments",
+  tlc_expiry_delta: "Payment expiry (ms)",
+  tlc_minimum_value: "Smallest payment",
+  tlc_fee_proportional_millionths: "Forwarding fee (per million)",
+};
+
+/** The built-in dialog for changing a channel's forwarding settings. */
+export function KeyWayChannelSettingsModal({ theme, appName, preview, answer }: { theme: Theme; appName: string; preview: FiberChannelSettingsPreview; answer: (approved: boolean) => void }) {
+  useEscape(() => answer(false));
+  const show = (value?: string) => value === undefined ? "—" : value === "true" ? "on" : value === "false" ? "off" : /^0x/.test(value) ? BigInt(value).toString() : value;
+  return (
+    <Shell theme={theme} labelId="keyway-settings-title">
+      {(palette) => (
+        <>
+          <p style={{ ...modalEyebrow, color: palette.muted }}>{appName} · CHANNEL SETTINGS</p>
+          <h2 id="keyway-settings-title" style={modalTitle}>Change this channel&apos;s settings?</h2>
+          <dl style={{ ...fundingDetails, margin: "16px 0" }}>
+            {preview.changes.map((change) => <Row key={change.setting} label={SETTING_LABELS[change.setting]} value={`${show(change.from)} → ${show(change.to)}`} />)}
+            <Row label="Peer" value={shortAddress(preview.peer)} />
+          </dl>
+          <p style={note(palette)}>These settings apply to payments other people route through this channel. No funds move.</p>
+          <Actions palette={palette} confirm="Save settings" answer={answer} />
+        </>
       )}
     </Shell>
   );

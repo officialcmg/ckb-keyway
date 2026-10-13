@@ -28,7 +28,8 @@ import type { ApproveFiberChannelOpen, FiberChannelOpenPreview } from "../browse
 import type { ApproveFiberPayment } from "../browser/fiber-payment";
 import type { RequestEmailCode } from "../browser/email-code";
 import { KeyWaySigner, type ApproveCkbMessage, type ApproveCkbTransaction, type MessagePreview, type TransactionPreview } from "../browser/keyway-signer";
-import { KeyWayEmailCodeModal, KeyWayMessageModal, KeyWayTransactionModal } from "./signing-modals";
+import { KeyWayChannelCloseModal, KeyWayChannelSettingsModal, KeyWayEmailCodeModal, KeyWayMessageModal, KeyWayPeerModal, KeyWayTransactionModal } from "./signing-modals";
+import type { ApproveFiberChannelClose, ApproveFiberChannelSettings, ApproveFiberPeer, FiberChannelClosePreview, FiberChannelSettingsPreview, FiberPeerPreview } from "../browser/fiber-actions";
 import {
   modalBackdrop,
   modalPanel,
@@ -73,6 +74,12 @@ export type KeyWayProviderProps = {
    * payment dialog. Payments still count toward the user's daily email-confirmation amount.
    */
   approveFiberPayment?: ApproveFiberPayment;
+  /** Replaces the built-in dialog for closing a Fiber channel. Return false to cancel. */
+  approveFiberChannelClose?: ApproveFiberChannelClose;
+  /** Replaces the built-in dialog for connecting to or disconnecting from a Fiber peer. Return false to cancel. */
+  approveFiberPeerConnect?: ApproveFiberPeer;
+  /** Replaces the built-in dialog for changing a channel's forwarding settings. Return false to cancel. */
+  approveFiberChannelSettings?: ApproveFiberChannelSettings;
   /** Replaces the built-in dialog for signing a CKB transaction. Return false to cancel. */
   approveCkbTransaction?: ApproveCkbTransaction;
   /** Replaces the built-in dialog for signing a message. Return false to cancel. */
@@ -123,6 +130,9 @@ export function KeyWayProvider({
   theme = "light",
   approveFiberChannelOpen,
   approveFiberPayment,
+  approveFiberChannelClose,
+  approveFiberPeerConnect,
+  approveFiberChannelSettings,
   approveCkbTransaction,
   approveCkbMessage,
   autoStartFiber = false,
@@ -135,8 +145,8 @@ export function KeyWayProvider({
   const connectionRef = useRef<KeyWayConnection | undefined>(undefined);
   const operationRef = useRef<Promise<void>>(Promise.resolve());
   const runRef = useRef(0);
-  const callbacksRef = useRef({ approveFiberChannelOpen, approveFiberPayment, approveCkbTransaction, approveCkbMessage, onError, onFiberStartup });
-  callbacksRef.current = { approveFiberChannelOpen, approveFiberPayment, approveCkbTransaction, approveCkbMessage, onError, onFiberStartup };
+  const callbacksRef = useRef({ approveFiberChannelOpen, approveFiberPayment, approveFiberChannelClose, approveFiberPeerConnect, approveFiberChannelSettings, approveCkbTransaction, approveCkbMessage, onError, onFiberStartup });
+  callbacksRef.current = { approveFiberChannelOpen, approveFiberPayment, approveFiberChannelClose, approveFiberPeerConnect, approveFiberChannelSettings, approveCkbTransaction, approveCkbMessage, onError, onFiberStartup };
   const [connection, setConnection] = useState<KeyWayConnection>();
   const [wallet, setWallet] = useState<PublicWallet>();
   const [status, setStatus] = useState<KeyWayStatus>("idle");
@@ -157,6 +167,11 @@ export function KeyWayProvider({
     resend: () => Promise<void>;
     resolve: (code: string | undefined) => void;
   }>();
+  const [actionRequest, setActionRequest] = useState<
+    | { kind: "close"; preview: FiberChannelClosePreview; resolve: (approved: boolean) => void }
+    | { kind: "peer"; preview: FiberPeerPreview; resolve: (approved: boolean) => void }
+    | { kind: "settings"; preview: FiberChannelSettingsPreview; resolve: (approved: boolean) => void }
+  >();
   const [fundingRequest, setFundingRequest] = useState<{
     preview: FiberChannelOpenPreview;
     resolve: (approved: boolean) => void;
@@ -195,6 +210,15 @@ export function KeyWayProvider({
           // Read at payment time, so an app can add or drop its own confirmation without restarting Fiber.
           approveFiberPayment: (preview) => callbacksRef.current.approveFiberPayment?.(preview) ?? true,
           requestEmailCode,
+          // Each reads the app's prop at the time of the action, falling back to the built-in dialog.
+          approvals: () => ({
+            approveFiberChannelClose: (preview) => callbacksRef.current.approveFiberChannelClose?.(preview) ??
+              new Promise<boolean>((resolve) => setActionRequest({ kind: "close", preview, resolve })),
+            approveFiberPeerConnect: (preview) => callbacksRef.current.approveFiberPeerConnect?.(preview) ??
+              new Promise<boolean>((resolve) => setActionRequest({ kind: "peer", preview, resolve })),
+            approveFiberChannelSettings: (preview) => callbacksRef.current.approveFiberChannelSettings?.(preview) ??
+              new Promise<boolean>((resolve) => setActionRequest({ kind: "settings", preview, resolve })),
+          }),
           ...(fiberNode === "browser" ? { onLeaseLost: (leaseError: Error) => {
             if (run !== runRef.current) return;
             connectionRef.current = undefined;
@@ -241,6 +265,8 @@ export function KeyWayProvider({
     ++runRef.current;
     fundingRequest?.resolve(false);
     setFundingRequest(undefined);
+    actionRequest?.resolve(false);
+    setActionRequest(undefined);
     const current = connectionRef.current;
     connectionRef.current = undefined;
     setConnection(undefined);
@@ -479,6 +505,12 @@ export function KeyWayProvider({
           answer={(code) => { codeRequest.resolve(code); setCodeRequest(undefined); }}
         />
       ) : null}
+      {actionRequest ? (() => {
+        const answer = (approved: boolean) => { actionRequest.resolve(approved); setActionRequest(undefined); };
+        if (actionRequest.kind === "close") return <KeyWayChannelCloseModal theme={theme} appName={resolvedAppName} preview={actionRequest.preview} answer={answer} />;
+        if (actionRequest.kind === "peer") return <KeyWayPeerModal theme={theme} appName={resolvedAppName} preview={actionRequest.preview} answer={answer} />;
+        return <KeyWayChannelSettingsModal theme={theme} appName={resolvedAppName} preview={actionRequest.preview} answer={answer} />;
+      })() : null}
       {fundingRequest ? (
         <KeyWayFundingModal
           theme={theme}
@@ -801,10 +833,11 @@ function KeyWayFundingModal({
         <dl style={fundingDetails}>
           {preview.token && <><dt>Channel funding</dt><dd>{preview.token.amountText}</dd></>}
           <dt>{preview.token ? "CKB reserve" : "Channel funding"}</dt><dd>{preview.amountCkb} CKB</dd>
+          {preview.peer && <><dt>Peer</dt><dd style={{ overflowWrap: "anywhere" }}>{preview.peer.slice(0, 12)}…{preview.peer.slice(-6)}</dd></>}
           <dt>Network fee</dt><dd>{preview.feeCkb} CKB</dd>
           <dt>Network</dt><dd>CKB testnet</dd>
         </dl>
-        <p style={{ ...modalCopy, color: palette.muted }}>{preview.token ? "This locks the token, and some CKB as a reserve," : "This locks testnet CKB"} into a payment channel. It does not send funds to another wallet.</p>
+        <p style={{ ...modalCopy, color: palette.muted }}>{preview.token ? "This locks the token, and some CKB as a reserve," : "This locks testnet CKB"} into a payment channel. It does not send funds to another wallet, and closing the channel returns your side to your own account.</p>
         <div style={modalActions}>
           <button type="button" autoFocus style={{ ...modalButton, borderColor: palette.border, color: palette.text }} onClick={() => answer(false)}>Cancel</button>
           <button type="button" style={{ ...modalButton, ...modalPrimaryButton, background: palette.primary, color: palette.primaryText }} onClick={() => answer(true)}>Confirm activation</button>

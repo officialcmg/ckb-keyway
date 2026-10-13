@@ -135,3 +135,23 @@ test("validates email-confirmation thresholds", () => {
   assert.throws(() => parseThreshold("0"), /greater than zero/);
   assert.throws(() => parseThreshold(5), /whole number/);
 });
+
+test("RUSD's own token contract is read as a token, and shown in RUSD", () => {
+  const rusd = ccc.Script.from({ codeHash: "0x1142755a044bf2ee358cba9f2da187ce928c91cd4dc8692ded0337efa677d21a", hashType: "type", args: "0x878fcc6f1f08d48e87bb1c3b3d5083f23f8a39c5d5c764f253b55b998526439b" });
+  const { preview, tokenOutflows } = build(
+    [{ lock: own, capacity: 142n * CKB, type: rusd, data: u128(60n * CKB) }, { lock: own, capacity: 1_000n * CKB }],
+    [{ lock: alice, capacity: 142n * CKB, type: rusd, data: u128(25n * CKB) }, { lock: own, capacity: 142n * CKB, type: rusd, data: u128(35n * CKB) }, { lock: own, capacity: 858n * CKB - 1_000n }],
+  );
+  assert.equal(preview.unrecognized.length, 0);
+  assert.equal(preview.tokens[0].amountText, "-25 RUSD");
+  assert.deepEqual(tokenOutflows, [{ asset: rusd.hash(), amount: 25n * CKB }]);
+});
+
+test("cells with a type script KeyWay can't read count as tokens leaving, per cell", () => {
+  const { tokensLeaving, tokenOutflows } = build(
+    [{ lock: own, capacity: 200n * CKB, type: mystery }, { lock: own, capacity: 1_000n * CKB }],
+    [{ lock: alice, capacity: 200n * CKB, type: mystery }, { lock: own, capacity: 1_000n * CKB - 1_000n }],
+  );
+  assert.equal(tokensLeaving, true);
+  assert.deepEqual(tokenOutflows, [{ asset: mystery.hash(), amount: 1n }]);
+});

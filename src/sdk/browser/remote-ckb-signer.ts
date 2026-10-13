@@ -12,6 +12,8 @@ export type FiberChannelOpenPreview = {
   transactionHash: string;
   /** For a token channel: the token's type script hash, the amount in its smallest unit, and the amount for people. */
   token?: { asset: string; amount: string; amountText: string };
+  /** The peer's Fiber node ID. The channel always closes back to the user's own account. */
+  peer?: string;
 };
 
 export type ApproveFiberChannelOpen = (preview: FiberChannelOpenPreview) => boolean | Promise<boolean>;

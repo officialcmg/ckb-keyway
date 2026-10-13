@@ -19,7 +19,8 @@ export {
   type TransactionPreview,
 } from "./keyway-signer";
 export type { ApproveFiberPayment, FiberPaymentPreview } from "./fiber-payment";
-export type { KeyWayFiberNode, KeyWayNewInvoiceParams, ListPaymentsParams, ListPaymentsResult } from "./fiber-node";
+export type { ApproveFiberChannelClose, ApproveFiberChannelSettings, ApproveFiberPeer, FiberChannelClosePreview, FiberChannelSettingsPreview, FiberPeerPreview } from "./fiber-actions";
+export type { KeyWayFiberNode, KeyWayNewInvoiceParams, ListPaymentsParams, ListPaymentsResult, OpenChannelParams } from "./fiber-node";
 export { FIBER_METHODS, type FiberMethod, type FiberMethodKind } from "./fiber-methods";
 export { friendlyKeyWayError } from "./friendly-error";
 export { KeyWayError, toKeyWayError, type KeyWayErrorCode } from "./keyway-error";
