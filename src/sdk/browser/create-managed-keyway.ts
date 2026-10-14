@@ -44,6 +44,7 @@ import { normalizeFiberPubkey } from "./fiber-pubkey";
 import { RemoteCkbSigner, type ApproveFiberChannelOpen } from "./remote-ckb-signer";
 import { serializeCccTransactionForRpc } from "./ccc-transaction";
 import { toKeyWayError } from "./keyway-error";
+import { createFeeReserve, FEE_RESERVE } from "./fee-reserve";
 
 type ManagedStatus = {
   node: NodeInfoResult;
@@ -65,14 +66,31 @@ export function createManagedKeyWay(options: {
   apiClient?: KeyWayApiClient;
 }) {
   let openingPeer: string | undefined;
+  let openingWithReserve = false;
   const api = options.apiClient ?? new KeyWayApiClient();
   const fundingSigner = new RemoteCkbSigner(
     options.authToken,
     options.ckbPublicKey,
-    (preview) => options.approveFiberChannelOpen({ ...preview, ...(openingPeer ? { peer: openingPeer } : {}) }),
+    (preview) => options.approveFiberChannelOpen({
+      ...preview,
+      ...(openingPeer ? { peer: openingPeer } : {}),
+      ...(openingWithReserve ? { feeReserveCkb: ccc.fixedPointToString(FEE_RESERVE) } : {}),
+    }),
     undefined,
     api,
   );
+  // The hosted node settles force-closed channels with its own key, so the reserve goes there.
+  const feeReserve = createFeeReserve({
+    authToken: options.authToken,
+    ckbPublicKey: options.ckbPublicKey,
+    api,
+    requestEmailCode: options.requestEmailCode,
+    client: fundingSigner.client,
+    lock: async () => {
+      const { lockScript } = await api.managedNode<{ lockScript: { code_hash: string; hash_type: ccc.HashTypeLike; args: string } }>(options.authToken, { operation: "fee-reserve" });
+      return { codeHash: lockScript.code_hash, hashType: lockScript.hash_type, args: lockScript.args };
+    },
+  });
   const resolveExternalFunding = createCccExternalFundingResolver({
     signer: fundingSigner,
     knownScripts: [ccc.KnownScript.Secp256k1Blake160],
@@ -125,8 +143,9 @@ export function createManagedKeyWay(options: {
 
   async function openFundedChannel(params: KeyWayFundingParams) {
     openingPeer = params.pubkey;
+    openingWithReserve = await feeReserve.needed();
     const funding = await resolveExternalFunding(undefined);
-    return openChannelWithExternalFundingFlow({
+    const result = await openChannelWithExternalFundingFlow({
       node: { openChannelWithExternalFunding, submitSignedFundingTx },
       params: {
         ...params,
@@ -136,6 +155,8 @@ export function createManagedKeyWay(options: {
       },
       signFundingTx: funding.signFundingTx,
     });
+    const feeReserveTxHash = openingWithReserve ? await feeReserve.send(result.fundingTxHash) : undefined;
+    return { ...result, ...(feeReserveTxHash ? { feeReserveTxHash } : {}) };
   }
 
   async function prepareCkbChannel(fundingAmount: bigint) {

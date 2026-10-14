@@ -130,6 +130,8 @@ A force close (`shutdownChannel({ channel_id, force: true })`) settles on-chain 
 - **Browser node:** the node settles to a key derived from its Fiber key, and the SDK sweeps that key to the user's address when the node starts and every 10 minutes while it runs. A browser node only settles while it runs, so after the delay the channel settles the next time the user starts Fiber in that browser, and the sweep follows. The channel state needed to settle lives in that browser's IndexedDB until the user signs out, which backs it up to KeyWay encrypted.
 - **Hosted node:** the node settles to its own key on KeyWay's servers, and KeyWay sweeps it to the user's address the next time the user uses Fiber.
 
+Fiber's watchtower also needs a little CKB on the node's own key to pay the fee for claiming those funds. So the first channel a user opens also sends a one-time **fee reserve** of 62 CKB from their account to their node's key, after the channel's funding transaction confirms. The channel-open dialog shows it (`FiberChannelOpenPreview.feeReserveCkb`). The sweep leaves the reserve in place while any channel is open or still settling, and returns it to the user once every channel is fully closed. The reserve is an ordinary send from the user's account, so it counts toward their daily email-confirmation amount.
+
 The sweep moves CKB and standard tokens. Prefer cooperative closes; use `force` only when the peer is unreachable.
 
 ## Errors

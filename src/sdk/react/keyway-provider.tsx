@@ -834,10 +834,12 @@ function KeyWayFundingModal({
           {preview.token && <><dt>Channel funding</dt><dd>{preview.token.amountText}</dd></>}
           <dt>{preview.token ? "CKB reserve" : "Channel funding"}</dt><dd>{preview.amountCkb} CKB</dd>
           {preview.peer && <><dt>Peer</dt><dd style={{ overflowWrap: "anywhere" }}>{preview.peer.slice(0, 12)}…{preview.peer.slice(-6)}</dd></>}
+          {preview.feeReserveCkb && <><dt>Fee reserve</dt><dd>{preview.feeReserveCkb} CKB</dd></>}
           <dt>Network fee</dt><dd>{preview.feeCkb} CKB</dd>
           <dt>Network</dt><dd>CKB testnet</dd>
         </dl>
         <p style={{ ...modalCopy, color: palette.muted }}>{preview.token ? "This locks the token, and some CKB as a reserve," : "This locks testnet CKB"} into a payment channel. It does not send funds to another wallet, and a normal close returns your side to your own account.</p>
+        {preview.feeReserveCkb && <p style={{ ...modalCopy, color: palette.muted }}>The fee reserve stays on your own Fiber node so it can claim your funds if a channel is ever force-closed. You get it back once all your channels are closed.</p>}
         <div style={modalActions}>
           <button type="button" autoFocus style={{ ...modalButton, borderColor: palette.border, color: palette.text }} onClick={() => answer(false)}>Cancel</button>
           <button type="button" style={{ ...modalButton, ...modalPrimaryButton, background: palette.primary, color: palette.primaryText }} onClick={() => answer(true)}>Confirm activation</button>

@@ -33,6 +33,8 @@ import { createFiberNode, listLoggedPayments, type ListPaymentsParams } from "./
 import { createPaymentLog } from "./payment-log";
 import { sweepSettlement } from "./settlement-sweep";
 import { fiberWasmFactory } from "./fiber-wasm";
+import { createFeeReserve, FEE_RESERVE, needsFeeReserve } from "./fee-reserve";
+import type { RequestEmailCode } from "./email-code";
 
 export type KeyWayFundingParams = Omit<
   OpenChannelWithExternalFundingParams,
@@ -47,6 +49,7 @@ export type CreateKeyWayOptions = {
   /** The app's own payment confirmation, if any. KeyWay draws no payment dialog. */
   approveFiberPayment?: ApproveFiberPayment;
   approvals?: () => FiberActionApprovals;
+  requestEmailCode?: RequestEmailCode;
   loadFiberKey: (leaseId: string) => ReturnType<FiberKeyLoader>;
   network?: "testnet" | "mainnet";
   apiClient?: KeyWayApiClient;
@@ -107,11 +110,16 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   const api = options.apiClient ?? new KeyWayApiClient();
   let activationProgress: ChannelOpenProgress | undefined;
   let openingPeer: string | undefined;
+  let openingWithReserve = false;
   let preparedPeers: Promise<ChannelPeer[]> | undefined;
   let preparedFundingAmount: bigint | undefined;
   const fundingSigner = new RemoteCkbSigner(options.authToken, options.ckbPublicKey, async (preview) => {
     activationProgress?.("confirming");
-    const approved = await options.approveFiberChannelOpen({ ...preview, ...(openingPeer ? { peer: openingPeer } : {}) });
+    const approved = await options.approveFiberChannelOpen({
+      ...preview,
+      ...(openingPeer ? { peer: openingPeer } : {}),
+      ...(openingWithReserve ? { feeReserveCkb: ccc.fixedPointToString(FEE_RESERVE) } : {}),
+    });
     if (approved) activationProgress?.("signing");
     return approved;
   }, undefined, api);
@@ -123,6 +131,22 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     signFundingTxOptions: { toRpcTransaction: serializeCccTransactionForRpc },
   });
   const ckbRpcUrl = "https://testnet.ckbapp.dev/";
+  // The node settles force-closed channels with the key derived from the Fiber key, so the reserve goes there.
+  const feeReserve = createFeeReserve({
+    authToken: options.authToken,
+    ckbPublicKey: options.ckbPublicKey,
+    api,
+    requestEmailCode: options.requestEmailCode,
+    client: fundingSigner.client,
+    lock: async () => {
+      const key = await credential.getCkbSecretKey();
+      try {
+        return (await new ccc.SignerCkbPrivateKey(fundingSigner.client, ccc.hexFrom(key)).getRecommendedAddressObj()).script;
+      } finally {
+        key.fill(0);
+      }
+    },
+  });
   const databasePrefix = `/wasm-${options.identifier}`;
   const paymentLog = createPaymentLog(databasePrefix);
   let restoreRequired = options.restoreRequired ?? false;
@@ -163,7 +187,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     const key = await credential.getCkbSecretKey();
     try {
       const destination = (await fundingSigner.getRecommendedAddressObj()).script;
-      await sweepSettlement(fundingSigner.client, ccc.hexFrom(key), destination);
+      const { channels } = await node.listChannels({ include_closed: true });
+      await sweepSettlement(fundingSigner.client, ccc.hexFrom(key), destination, needsFeeReserve(channels) ? FEE_RESERVE : 0n);
     } finally {
       key.fill(0);
     }
@@ -235,6 +260,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   async function openFundedChannel(params: KeyWayFundingParams) {
     if (!node.isRunning) throw new Error("Start the Fiber node before opening a channel");
     openingPeer = params.pubkey;
+    openingWithReserve = await feeReserve.needed();
     const funding = await resolveExternalFunding(undefined);
     const result = await openChannelWithExternalFundingFlow({
       node,
@@ -247,7 +273,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       signFundingTx: funding.signFundingTx,
     });
     await markChannelOpened(options.authToken, api);
-    return result;
+    const feeReserveTxHash = openingWithReserve ? await feeReserve.send(result.fundingTxHash) : undefined;
+    return { ...result, ...(feeReserveTxHash ? { feeReserveTxHash } : {}) };
   }
 
   function prepareCkbChannel(fundingAmount: bigint): Promise<ChannelPeer[]> {

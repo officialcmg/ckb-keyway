@@ -14,6 +14,11 @@ export type FiberChannelOpenPreview = {
   token?: { asset: string; amount: string; amountText: string };
   /** The peer's Fiber node ID. The channel always closes back to the user's own account. */
   peer?: string;
+  /**
+   * Set when this open also sends the one-time fee reserve: CKB from the user's account kept on their own
+   * Fiber node so it can claim their funds after a force close. It returns once every channel is closed.
+   */
+  feeReserveCkb?: string;
 };
 
 export type ApproveFiberChannelOpen = (preview: FiberChannelOpenPreview) => boolean | Promise<boolean>;

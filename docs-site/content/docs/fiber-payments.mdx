@@ -65,6 +65,8 @@ KeyWay shows a built-in dialog before it signs the funding transaction, with the
 
 The callback runs after KeyWay has built and checked the exact funding transaction, and before it is signed. Return `true` to sign or `false` to cancel.
 
+On the user's first channel, `preview.feeReserveCkb` is set too: approving also sends a one-time 62 CKB fee reserve to the user's own Fiber node, so it can claim their funds after a force close. Show it in your dialog. See [Closing channels](/fiber-node#closing-channels).
+
 ## Read channels and balances
 
 ```ts

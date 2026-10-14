@@ -19,7 +19,7 @@ import { DEFAULT_INVOICE_EXPIRY } from "../sdk/browser/invoice-expiry.ts";
 import { approveFiberParams, FIBER_METHODS, freeFiberParams, paymentFiberParams, type FiberMethod } from "../sdk/browser/fiber-methods.ts";
 import { assertPublicPeerAddress } from "./peer-address.ts";
 import * as ccc from "@ckb-ccc/core";
-import { sweepSettlement } from "../sdk/browser/settlement-sweep.ts";
+import { FEE_RESERVE, needsFeeReserve, sweepSettlement } from "../sdk/browser/settlement-sweep.ts";
 
 type ManagedNodeClient = Pick<
   FiberRpcClient,
@@ -88,6 +88,12 @@ export async function managedNodeRequest(
       network: "testnet",
       custody: "keyway-managed",
     };
+  }
+  // Where the user's fee reserve goes: the hosted node's own CKB lock, which Fiber's watchtower pays fees from.
+  if (body.operation === "fee-reserve") {
+    const info = await node.nodeInfo() as { default_funding_lock_script?: unknown };
+    if (!info.default_funding_lock_script) throw new Error("The hosted node didn't report its CKB lock");
+    return { lockScript: info.default_funding_lock_script };
   }
   if (body.operation === "list-channels") {
     return node.listChannels({ include_closed: body.includeClosed === true });
@@ -164,7 +170,8 @@ const SWEEP_INTERVAL_MS = 10 * 60_000;
 /**
  * Stopgap until Fiber pays force-closed channels to their close address: Fiber settles them to the hosted
  * node's own CKB key, so while the user's node is in use KeyWay moves anything there to the user's own
- * address. Runs at most every 10 minutes per user and never fails the request that triggered it.
+ * address, leaving the user's fee reserve while any channel may still need settling. Runs at most every
+ * 10 minutes per user and never fails the request that triggered it.
  */
 export function sweepHostedSettlement(userId: string, destination: () => Promise<ccc.ScriptLike>): void {
   if (!process.env.KEYWAY_MANAGED_FIBER_HOST_URL || managedNodeAssignments(false).has(userId)) return;
@@ -180,7 +187,9 @@ export function sweepHostedSettlement(userId: string, destination: () => Promise
     if (!response.ok) return;
     const { key } = await response.json() as { key?: string };
     if (typeof key !== "string" || !/^[0-9a-f]{64}$/.test(key)) return;
-    const hash = await sweepSettlement(new ccc.ClientPublicTestnet(), `0x${key}`, await destination());
+    const { channels } = await managedNodeClient(userId).listChannels({ include_closed: true });
+    const keep = needsFeeReserve(channels as never) ? FEE_RESERVE : 0n;
+    const hash = await sweepSettlement(new ccc.ClientPublicTestnet(), `0x${key}`, await destination(), keep);
     if (hash) console.info("[keyway] swept a hosted node's settlement funds to the user", { tx: hash });
   })().catch(() => console.error("[keyway] settlement sweep failed", { cause: "sweep" }));
 }
