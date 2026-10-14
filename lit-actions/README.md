@@ -15,6 +15,6 @@ Any source change creates a different CID and must be reviewed and registered ag
 
 ## Fiber key protection
 
-`encrypt-fiber-key.js` encrypts a browser-generated 32-byte Fiber identity key using the permitted PKP. `decrypt-fiber-key.js` recovers it only inside the permitted Lit Action so the authenticated backend can start the same browser identity again.
+`generate-fiber-key.js` creates a browser node's 32-byte Fiber identity key inside Lit and returns only its ciphertext, encrypted to the permitted PKP. `wrap-fiber-key.js` decrypts it inside Lit and re-encrypts it to a one-time key the signed-in browser made, so KeyWay's backend only ever relays ciphertext.
 
 Both Actions must be published immutably and added to the same Lit group as the intended PKP before use.

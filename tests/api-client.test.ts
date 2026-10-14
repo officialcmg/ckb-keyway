@@ -7,11 +7,11 @@ test("sends SDK requests to the managed KeyWay backend", async () => {
   const api = new KeyWayApiClient({
     fetch: async (input) => {
       requestedUrl = String(input);
-      return Response.json({ needsFiberKey: true });
+      return Response.json({ provisioned: false, restoreRequired: false, wallet: {} });
     },
   });
 
-  await api.bootstrap("session", { deviceIdHash: "00".repeat(32) });
+  await api.bootstrap("session", { deviceIdHash: "00".repeat(32), keyCustody: "lit" });
   assert.equal(requestedUrl, "https://keyway-api-production.up.railway.app/api/v1/keyway/bootstrap");
 });
 
@@ -88,8 +88,8 @@ test("sends idempotency keys for managed mutations", async () => {
       return Response.json({ status: "Success" });
     },
   });
-  await api.managedNode("session", { operation: "send-payment" }, "payment-request-1234");
-  assert.equal(headers.get("idempotency-key"), "payment-request-1234");
+  await api.managedNode("session", { operation: "open-channel" }, "channel-request-1234");
+  assert.equal(headers.get("idempotency-key"), "channel-request-1234");
 });
 
 test("retries versioned mutations with the same idempotency key", async () => {
@@ -100,11 +100,11 @@ test("retries versioned mutations with the same idempotency key", async () => {
       keys.push(new Headers(init?.headers).get("idempotency-key") ?? "");
       attempts += 1;
       if (attempts === 1) throw new TypeError("network interrupted");
-      return Response.json({ needsFiberKey: true });
+      return Response.json({ provisioned: false, restoreRequired: false, wallet: {} });
     },
   });
 
-  await api.bootstrap("session", { deviceIdHash: "00".repeat(32) });
+  await api.bootstrap("session", { deviceIdHash: "00".repeat(32), keyCustody: "lit" });
   assert.equal(attempts, 2);
   assert.match(keys[0], /^[0-9a-f-]{36}$/);
   assert.equal(keys[1], keys[0]);
@@ -117,10 +117,10 @@ test("retries transient server failures only for idempotent requests", async () 
       attempts += 1;
       return attempts === 1
         ? Response.json({ error: "temporarily unavailable" }, { status: 503 })
-        : Response.json({ needsFiberKey: true });
+        : Response.json({ provisioned: false, restoreRequired: false, wallet: {} });
     },
   });
 
-  await api.bootstrap("session", { deviceIdHash: "00".repeat(32) });
+  await api.bootstrap("session", { deviceIdHash: "00".repeat(32), keyCustody: "lit" });
   assert.equal(attempts, 2);
 });

@@ -4,8 +4,6 @@ import { managedNodeRequest, parseManagedNodeAssignments } from "../src/server/m
 
 const ownLock = async () => ({ code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" }) as never;
 
-let lastInvoiceParams: Record<string, unknown> | undefined;
-
 const node = {
   nodeInfo: async () => ({ pubkey: `0x02${"11".repeat(32)}` }),
   connectPeer: async () => undefined,
@@ -20,39 +18,11 @@ const node = {
     funding_tx_hash: `0x${"44".repeat(32)}`,
   }),
   waitForChannelReady: async () => ({ channel_id: `0x${"33".repeat(32)}` }),
-  newInvoice: async (params: { amount: string }) => {
-    lastInvoiceParams = params;
-    return { invoice_address: `fibt-${params.amount}` };
-  },
   getInvoice: async () => ({ status: "Open" }),
   parseInvoice: async ({ invoice }: { invoice: string }) => ({ invoice: { currency: invoice.slice(0, 4) } }),
-  sendPayment: async () => ({ payment_hash: `0x${"22".repeat(32)}`, fee: "0x1" }),
   getPayment: async () => ({ status: "Created" }),
   waitForPayment: async () => ({ status: "Success" }),
-  shutdownChannel: async () => undefined,
 };
-
-test("managed invoices honor a bounded caller expiry and default to 24 hours", async () => {
-  const request = (expiry?: unknown) => managedNodeRequest("user-1", {
-    operation: "new-invoice",
-    amount: "0x5f5e100",
-    ...(expiry === undefined ? {} : { expiry }),
-  }, node as never);
-
-  await request("0xe10");
-  assert.equal(lastInvoiceParams?.expiry, "0xe10");
-  assert.equal(lastInvoiceParams?.currency, "Fibt");
-  await request("0x3c");
-  assert.equal(lastInvoiceParams?.expiry, "0x3c");
-  await request("0x15180");
-  assert.equal(lastInvoiceParams?.expiry, "0x15180");
-  await request();
-  assert.equal(lastInvoiceParams?.expiry, "0x15180");
-
-  for (const expiry of ["0x3b", "0x15181", "3600", "0xzz", 3600]) {
-    await assert.rejects(request(expiry), /Invoice expiry must be between 60 seconds and 24 hours/);
-  }
-});
 
 test("managed beta exposes only bounded authenticated node operations", async () => {
   const status = await managedNodeRequest("user-1", { operation: "status" }, node as never) as {
@@ -63,13 +33,10 @@ test("managed beta exposes only bounded authenticated node operations", async ()
   assert.equal(status.custody, "keyway-managed");
 
   const invoice = await managedNodeRequest("user-1", {
-    operation: "new-invoice",
-    amount: "0x5f5e100",
-    description: "test",
-  }, node as never) as { invoice_address: string };
-  assert.equal(invoice.invoice_address, "fibt-0x5f5e100");
-  // Fiber invoice expiry is in seconds: 0x15180 = 86,400 s = 24 hours.
-  assert.equal(lastInvoiceParams?.expiry, "0x15180");
+    operation: "get-invoice",
+    paymentHash: `0x${"22".repeat(32)}`,
+  }, node as never) as { status: string };
+  assert.equal(invoice.status, "Open");
 
   const parsed = await managedNodeRequest("user-1", {
     operation: "parse-invoice",
@@ -91,13 +58,13 @@ test("managed beta exposes only bounded authenticated node operations", async ()
   assert.equal(channel.channel_id, `0x${"33".repeat(32)}`);
 
   await assert.rejects(
-    managedNodeRequest("user-1", { operation: "new-invoice", amount: "100" }, node as never),
-    /hexadecimal/,
+    managedNodeRequest("user-1", { operation: "get-payment", paymentHash: "bad" }, node as never),
+    /valid payment hash/,
   );
-  await assert.rejects(
-    managedNodeRequest("user-1", { operation: "close-channel", channelId: "bad" }, node as never),
-    /valid channel ID/,
-  );
+  // Invoices, payments and closes go through call, pay and act; the old dedicated operations are gone.
+  for (const operation of ["new-invoice", "preflight-payment", "send-payment", "prepare-close-channel", "close-channel"]) {
+    await assert.rejects(managedNodeRequest("user-1", { operation }, node as never), /Unsupported managed-node operation/);
+  }
   await assert.rejects(
     managedNodeRequest("user-1", {
       operation: "open-channel",

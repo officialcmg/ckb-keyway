@@ -31,14 +31,14 @@ try {
         else if (url.endsWith("/bootstrap")) {
           if (scenario === "logout-race") await barrier;
           if (scenario === "recovery-failure") { status = 400; result = { error: "Recovery rejected" }; }
-          else result = { needsFiberKey: false, provisioned: false, restoreRequired: false, wallet };
+          else result = { provisioned: false, restoreRequired: false, wallet };
         } else if (url.endsWith("/managed-node")) {
           if (body.operation === "status") result = { node: { node_id: "test" }, peers: [] };
           else if (body.operation === "list-channels") {
             if (paid) { status = 400; result = { error: "Refresh unavailable" }; }
             else result = { channels: [] };
-          } else if (body.operation === "preflight-payment") result = { routable: true, fee: "0x0", confirmationNonce: "test-nonce" };
-          else if (body.operation === "send-payment") { paid = true; result = { payment_hash: "0x123", status: "Success" }; }
+          } else if (body.operation === "pay" && body.stage === "preview") result = { preview: {}, confirmationNonce: "test-nonce", requiresEmailCode: false };
+          else if (body.operation === "pay" && body.stage === "send") { paid = true; result = { payment_hash: "0x123", status: "Created" }; }
           else if (body.operation === "get-payment" || body.operation === "wait-for-payment") result = { payment_hash: "0x123", status: "Success" };
           else throw new Error(`Unexpected operation: ${body.operation}`);
         }

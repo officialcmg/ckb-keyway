@@ -195,7 +195,7 @@ The production deployment also sends `Cross-Origin-Opener-Policy: same-origin` a
 - Testnet only (Fiber currency `Fibt`). CKB and tokens (xUDT, including RUSD) are supported; swaps, merchant checkout, and mainnet are out of scope.
 - Cross-device Fiber state migration currently requires explicit logout. A crash, lost device, force-closed tab, or interrupted browser cannot create a fresh checkpoint, so background snapshots still need an upstream-safe database flush boundary.
 - Channel balances and channel shutdown are available through `useFiber()`. The reference wallet renders both sides of each channel and can close one after an explicit confirmation; a cooperative close settles the latest balance back on CKB.
-- The backend is trusted to authorize Lit operations. It holds hosted nodes' keys; it doesn't receive browser nodes' Fiber keys in normal operation.
+- The backend is trusted to authorize Lit operations, including Lit releasing a browser node's Fiber key to the signed-in user. It never sees that key: Lit creates it and seals it to a one-time browser key, and the backend only relays ciphertext. It holds hosted nodes' keys.
 - Browser-node Fiber payments don't pass through KeyWay's backend, so they aren't counted toward the daily email-confirmation amount, and the method rules are enforced only in the SDK.
 - The reference wallet uses fixed activation and maximum-payment-fee limits for a predictable demo; SDK consumers can configure channel funding and estimate payment fees.
 - CKB balance is an indexer-derived sum of live cells, not an account field. The reference wallet polls it every ten seconds, so a newly mined or faucet-created cell can still appear after indexer delay.

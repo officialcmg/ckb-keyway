@@ -182,20 +182,16 @@ export async function messageSigning(context: SigningContext, body: Record<strin
 /**
  * The user's daily email-confirmation amounts, one per asset. Strengthening (a lower amount, or protecting
  * something that wasn't) applies at once; weakening (a higher amount, removing one, or turning email
- * confirmation off) needs a code from the user's inbox. `emailThresholdShannons` is the CKB amount, kept
- * for SDK 0.2.3 and earlier.
+ * confirmation off) needs a code from the user's inbox.
  */
 export async function signingSettings(context: SigningContext, body: Record<string, unknown>): Promise<unknown> {
   const current = await readDailyAmounts(context.user);
   const view = (amounts: DailyAmounts) => ({
-    emailThresholdShannons: amounts.get("ckb")?.toString() ?? null,
     dailyAmounts: Object.fromEntries([...amounts].map(([asset, amount]) => [asset, amount.toString()])),
   });
   if (body.operation === "get") return view(current);
-  const change = body.operation === "set" ? { asset: "ckb", amount: parseThreshold(body.emailThresholdShannons) }
-    : body.operation === "set-daily-amount" ? { asset: parseAsset(body.asset), amount: parseThreshold(body.amount) }
-    : undefined;
-  if (!change) throw new Error("A valid settings operation is required");
+  if (body.operation !== "set-daily-amount") throw new Error("A valid settings operation is required");
+  const change = { asset: parseAsset(body.asset), amount: parseThreshold(body.amount) };
   const next = new Map(current);
   if (change.amount === null) next.delete(change.asset); else next.set(change.asset, change.amount);
   if (!weakens(current, next)) {

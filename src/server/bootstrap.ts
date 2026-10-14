@@ -1,7 +1,7 @@
 import type { User } from "./auth-user.ts";
 import { addPkpToGroup, createPkp, findGroupId } from "./chipotle";
 import { loadLitAction } from "./lit-actions";
-import { encryptFiberKey, generateFiberKey } from "./lit";
+import { generateFiberKey } from "./lit";
 import { derivePkpIdentity } from "./pkp-identity";
 import { readActiveLease } from "./device-lease";
 import { prepareBackupForDevice } from "./node-backup";
@@ -15,36 +15,28 @@ import {
   type ReadyWallet,
 } from "./user-wallet";
 
-const BASE64_KEY = /^[A-Za-z0-9+/]{43}=$/;
 const DEVICE_ID_HASH = /^[0-9a-f]{64}$/;
 
-export type BootstrapResult =
-  | { needsFiberKey: true }
-  | {
-      needsFiberKey: false;
-      provisioned: boolean;
-      restoreRequired: boolean;
-      wallet: Omit<ReadyWallet, "encryptedFiberKey">;
-    };
+export type BootstrapResult = {
+  provisioned: boolean;
+  restoreRequired: boolean;
+  wallet: Omit<ReadyWallet, "encryptedFiberKey">;
+};
 
 export async function bootstrap(
   user: User,
   deviceIdHash: string,
-  encodedFiberKey?: string,
   nodeMode: "browser" | "managed" = "browser",
-  litGeneratesKey = false,
 ): Promise<BootstrapResult> {
   if (!DEVICE_ID_HASH.test(deviceIdHash)) throw new Error("Device ID hash must be 32-byte lowercase hex");
-  return withUserLock(user.id, (sql) => bootstrapLocked(user, deviceIdHash, encodedFiberKey, nodeMode, sql, litGeneratesKey));
+  return withUserLock(user.id, (sql) => bootstrapLocked(user, deviceIdHash, nodeMode, sql));
 }
 
 async function bootstrapLocked(
   user: User,
   deviceIdHash: string,
-  encodedFiberKey: string | undefined,
   nodeMode: "browser" | "managed",
   sql: DatabaseSql,
-  litGeneratesKey: boolean,
 ): Promise<BootstrapResult> {
   let wallet = await readWallet(user, sql);
   if (wallet?.status === "ready") {
@@ -63,10 +55,6 @@ async function bootstrapLocked(
     if (rebound !== wallet) await saveWallet(user, rebound, sql);
     return publicResult(rebound, false, migration.restoreRequired);
   }
-  // Current SDKs let Lit create the Fiber key; SDK 0.2.3 and earlier send one (removed once 0.2.4 is out).
-  if (!wallet && !encodedFiberKey && !litGeneratesKey) return { needsFiberKey: true };
-  if (encodedFiberKey && !BASE64_KEY.test(encodedFiberKey)) throw new Error("Fiber key must be base64-encoded 32 bytes");
-
   const runtimeApiKey = requiredEnv("LIT_USAGE_API_KEY");
   const provisioningApiKey = requiredEnv("LIT_PROVISIONING_API_KEY");
   if (!wallet) {
@@ -85,7 +73,6 @@ async function bootstrapLocked(
     await saveWallet(user, rebound, sql);
     wallet = rebound;
   }
-  if (!encodedFiberKey && !litGeneratesKey) return { needsFiberKey: true };
 
   await addPkpToGroup(
     provisioningApiKey,
@@ -94,39 +81,28 @@ async function bootstrapLocked(
   );
   const signing = { apiKey: runtimeApiKey, actionCid: requiredEnv("LIT_SIGN_ACTION_CID") };
   const identity = await derivePkpIdentity(wallet.litPkpId, signing);
-  const fiberKey = new Uint8Array(encodedFiberKey ? Buffer.from(encodedFiberKey, "base64") : []);
-  try {
-    const encryptedFiberKey = encodedFiberKey
-      ? await encryptFiberKey(fiberKey, wallet.litPkpId, {
-        apiKey: runtimeApiKey,
-        actionCid: requiredEnv("LIT_ENCRYPT_ACTION_CID"),
-        actionCode: await loadLitAction("encrypt-fiber-key"),
-      })
-      : await generateFiberKey(wallet.litPkpId, {
-        apiKey: runtimeApiKey,
-        actionCid: requiredEnv("LIT_GENERATE_ACTION_CID"),
-        actionCode: await loadLitAction("generate-fiber-key"),
-      });
-    const now = new Date().toISOString();
-    const ready: ReadyWallet = {
-      ...wallet,
-      status: "ready",
-      litPublicKey: identity.publicKey,
-      ckbAddress: identity.ckbAddress,
-      encryptedFiberKey,
-      hasOpenedChannel: false,
-      updatedAt: now,
-    };
-    await saveWallet(user, ready, sql);
-    return publicResult(ready, true, false);
-  } finally {
-    fiberKey.fill(0);
-  }
+  // Lit creates the Fiber key and returns it encrypted to the PKP; this server never sees it.
+  const encryptedFiberKey = await generateFiberKey(wallet.litPkpId, {
+    apiKey: runtimeApiKey,
+    actionCid: requiredEnv("LIT_GENERATE_ACTION_CID"),
+    actionCode: await loadLitAction("generate-fiber-key"),
+  });
+  const ready: ReadyWallet = {
+    ...wallet,
+    status: "ready",
+    litPublicKey: identity.publicKey,
+    ckbAddress: identity.ckbAddress,
+    encryptedFiberKey,
+    hasOpenedChannel: false,
+    updatedAt: new Date().toISOString(),
+  };
+  await saveWallet(user, ready, sql);
+  return publicResult(ready, true, false);
 }
 
 function publicResult(wallet: ReadyWallet, provisioned: boolean, restoreRequired: boolean): BootstrapResult {
   const { encryptedFiberKey: _encrypted, ...publicWallet } = wallet;
-  return { needsFiberKey: false, provisioned, restoreRequired, wallet: publicWallet };
+  return { provisioned, restoreRequired, wallet: publicWallet };
 }
 
 function requiredEnv(name: string): string {

@@ -30,7 +30,7 @@ function harness(amount: bigint, options: { failSend?: boolean } = {}) {
       throw new Error(`unexpected ${method}`);
     },
   };
-  const settings = (threshold: bigint | null) => signingSettings({ ...context, wallet: {} } as unknown as SigningContext, { operation: "set", emailThresholdShannons: threshold?.toString() ?? null });
+  const settings = (threshold: bigint | null) => signingSettings({ ...context, wallet: {} } as unknown as SigningContext, { operation: "set-daily-amount", asset: "ckb", amount: threshold?.toString() ?? null });
   return { context, node, emails, sent, settings, codeFrom: () => /code is (\d{6})/.exec(emails.at(-1)!.plaintext)![1] };
 }
 

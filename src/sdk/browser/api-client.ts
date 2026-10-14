@@ -55,8 +55,8 @@ export class KeyWayApiClient {
 
   bootstrap(authToken: string, body: {
     deviceIdHash: string;
-    fiberKey?: string;
     nodeMode?: "browser" | "managed";
+    keyCustody: "lit";
   }) {
     return this.idempotentJson(`${KEYWAY_API_PATH}/bootstrap`, authToken, body);
   }
@@ -97,9 +97,7 @@ export class KeyWayApiClient {
   }
 
   signingSettings(authToken: string, body: Record<string, unknown>) {
-    return body.operation === "set"
-      ? this.idempotentJson(`${KEYWAY_API_PATH}/signing-settings`, authToken, body)
-      : this.json(`${KEYWAY_API_PATH}/signing-settings`, authToken, body);
+    return this.json(`${KEYWAY_API_PATH}/signing-settings`, authToken, body);
   }
 
   managedNode<T>(

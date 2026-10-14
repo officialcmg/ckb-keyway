@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { decryptFiberKey, encryptFiberKey, signCkbDigest } from "../src/server/lit.ts";
+import { generateFiberKey, signCkbDigest, wrapFiberKey } from "../src/server/lit.ts";
 import { litActionCid } from "../src/server/lit-cid.ts";
 
 const config = { apiKey: "test", actionCid: "QmTest" };
@@ -39,31 +39,28 @@ test("executes only the configured CID with the supplied PKP and digest", async 
   }
 });
 
-test("round-trips Fiber key transport through pinned Lit Actions", async () => {
+test("relays only Fiber key ciphertext through pinned Lit Actions", async () => {
   const originalFetch = globalThis.fetch;
-  const fiberKey = new Uint8Array(32).fill(7);
-  const encryptedConfig = { apiKey: "test", actionCid: "QmEncrypt" };
-  const decryptedConfig = { apiKey: "test", actionCid: "QmDecrypt" };
+  const generateConfig = { apiKey: "test", actionCid: "QmGenerate" };
+  const wrapConfig = { apiKey: "test", actionCid: "QmWrap" };
+  const recipientPublicKey = "A".repeat(87);
+  const deviceIdHash = "ab".repeat(32);
 
   globalThis.fetch = async (_input, init) => {
     const request = JSON.parse(String(init?.body));
-    if (request.ipfs_id === encryptedConfig.actionCid) {
-      assert.equal(request.js_params.fiberKey, Buffer.from(fiberKey).toString("base64"));
+    if (request.ipfs_id === generateConfig.actionCid) {
+      assert.deepEqual(request.js_params, { pkpId });
       return Response.json({ has_error: false, logs: "", response: { ciphertext: "encrypted" } });
     }
-    assert.equal(request.ipfs_id, decryptedConfig.actionCid);
-    assert.equal(request.js_params.ciphertext, "encrypted");
-    return Response.json({
-      has_error: false,
-      logs: "",
-      response: { fiberKey: Buffer.from(fiberKey).toString("base64") },
-    });
+    assert.equal(request.ipfs_id, wrapConfig.actionCid);
+    assert.deepEqual(request.js_params, { pkpId, ciphertext: "encrypted", recipientPublicKey, deviceIdHash });
+    return Response.json({ has_error: false, logs: "", response: { v: 1, epk: "epk", iv: "iv", ct: "ct" } });
   };
 
   try {
-    const ciphertext = await encryptFiberKey(fiberKey, pkpId, encryptedConfig);
+    const ciphertext = await generateFiberKey(pkpId, generateConfig);
     assert.equal(ciphertext, "encrypted");
-    assert.deepEqual(await decryptFiberKey(ciphertext, pkpId, decryptedConfig), fiberKey);
+    assert.deepEqual(await wrapFiberKey(ciphertext, pkpId, recipientPublicKey, deviceIdHash, wrapConfig), { v: 1, epk: "epk", iv: "iv", ct: "ct" });
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -75,7 +72,7 @@ test("preserves Chipotle string errors", async () => {
 
   try {
     await assert.rejects(
-      () => encryptFiberKey(new Uint8Array(32), pkpId, { apiKey: "test", actionCid: "QmEncrypt" }),
+      () => generateFiberKey(pkpId, { apiKey: "test", actionCid: "QmGenerate" }),
       /cache miss/,
     );
   } finally {
@@ -93,7 +90,7 @@ test("submits inline Action source when provided", async () => {
   };
 
   try {
-    await encryptFiberKey(new Uint8Array(32), pkpId, {
+    await generateFiberKey(pkpId, {
       apiKey: "test",
       actionCid: litActionCid("async function main() {}"),
       actionCode: "async function main() {}",

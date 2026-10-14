@@ -13,9 +13,7 @@ export type PublicWallet = {
   updatedAt: string;
 };
 
-type BootstrapResponse =
-  | { needsFiberKey: true }
-  | { needsFiberKey: false; provisioned: boolean; restoreRequired: boolean; wallet: PublicWallet };
+type BootstrapResponse = { provisioned: boolean; restoreRequired: boolean; wallet: PublicWallet };
 
 const DEVICE_STORAGE_KEY = "ckb-keyway:device-id";
 
@@ -28,9 +26,7 @@ export async function bootstrapKeyWay(
   return navigator.locks.request("ckb-keyway:bootstrap", async () => {
     const deviceIdHash = await getDeviceIdHash();
     // Lit creates the Fiber key inside its secure enclave; neither this browser nor KeyWay's server sends one.
-    const result = await requestBootstrap(api, authToken, { deviceIdHash, nodeMode, keyCustody: "lit" });
-    if (result.needsFiberKey) throw new Error("KeyWay couldn't create this account's Fiber key");
-    return result;
+    return requestBootstrap(api, authToken, { deviceIdHash, nodeMode, keyCustody: "lit" });
   });
 }
 

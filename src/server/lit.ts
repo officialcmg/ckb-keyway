@@ -35,35 +35,6 @@ export async function signCkbDigest(
   return signature;
 }
 
-export async function encryptFiberKey(
-  fiberKey: Uint8Array,
-  pkpId: string,
-  config: LitRuntimeConfig,
-): Promise<string> {
-  if (fiberKey.length !== 32) throw new Error("Fiber key must be exactly 32 bytes");
-  const response = await executeAction(config, { pkpId, fiberKey: Buffer.from(fiberKey).toString("base64") });
-  if (!response || typeof response !== "object" || typeof (response as { ciphertext?: unknown }).ciphertext !== "string") {
-    throw new Error("Lit encrypt Action returned invalid ciphertext");
-  }
-  return (response as { ciphertext: string }).ciphertext;
-}
-
-export async function decryptFiberKey(
-  ciphertext: string,
-  pkpId: string,
-  config: LitRuntimeConfig,
-): Promise<Uint8Array> {
-  if (!ciphertext) throw new Error("Encrypted Fiber key is required");
-  const response = await executeAction(config, { pkpId, ciphertext });
-  const encoded = response && typeof response === "object" ? (response as { fiberKey?: unknown }).fiberKey : undefined;
-  if (typeof encoded !== "string" || !/^[A-Za-z0-9+/]{43}=$/.test(encoded)) {
-    throw new Error("Lit decrypt Action returned an invalid Fiber key");
-  }
-  const fiberKey = new Uint8Array(Buffer.from(encoded, "base64"));
-  if (fiberKey.length !== 32) throw new Error("Lit decrypt Action returned an invalid Fiber key");
-  return fiberKey;
-}
-
 /** Creates a Fiber key inside Lit and returns only its ciphertext; no server ever holds the key. */
 export async function generateFiberKey(pkpId: string, config: LitRuntimeConfig): Promise<string> {
   if (!EVM_ADDRESS.test(pkpId)) throw new Error("Lit PKP ID must be a 20-byte EVM address");
