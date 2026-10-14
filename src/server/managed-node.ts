@@ -165,6 +165,8 @@ export async function managedNodeRequest(
 }
 
 const lastSweep = new Map<string, number>();
+/** A script in Fiber's RPC shape, as the user's lock is passed around on the server. */
+type FiberScript = { code_hash: string; hash_type: ccc.HashTypeLike; args: string };
 const SWEEP_INTERVAL_MS = 10 * 60_000;
 
 /**
@@ -173,7 +175,7 @@ const SWEEP_INTERVAL_MS = 10 * 60_000;
  * address, leaving the user's fee reserve while any channel may still need settling. Runs at most every
  * 10 minutes per user and never fails the request that triggered it.
  */
-export function sweepHostedSettlement(userId: string, destination: () => Promise<ccc.ScriptLike>): void {
+export function sweepHostedSettlement(userId: string, destination: () => Promise<FiberScript>): void {
   if (!process.env.KEYWAY_MANAGED_FIBER_HOST_URL || managedNodeAssignments(false).has(userId)) return;
   const now = Date.now();
   if (now - (lastSweep.get(userId) ?? 0) < SWEEP_INTERVAL_MS) return;
@@ -189,9 +191,10 @@ export function sweepHostedSettlement(userId: string, destination: () => Promise
     if (typeof key !== "string" || !/^[0-9a-f]{64}$/.test(key)) return;
     const { channels } = await managedNodeClient(userId).listChannels({ include_closed: true });
     const keep = needsFeeReserve(channels as never) ? FEE_RESERVE : 0n;
-    const hash = await sweepSettlement(new ccc.ClientPublicTestnet(), `0x${key}`, await destination(), keep);
+    const to = await destination();
+    const hash = await sweepSettlement(new ccc.ClientPublicTestnet(), `0x${key}`, { codeHash: to.code_hash, hashType: to.hash_type, args: to.args }, keep);
     if (hash) console.info("[keyway] swept a hosted node's settlement funds to the user", { tx: hash });
-  })().catch(() => console.error("[keyway] settlement sweep failed", { cause: "sweep" }));
+  })().catch((error) => console.error("[keyway] settlement sweep failed", { cause: error instanceof Error ? error.message.slice(0, 200) : "sweep" }));
 }
 
 /** The user's hosted node, for the payment flow. */
