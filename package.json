@@ -27,7 +27,7 @@
   },
   "dependencies": {
     "@ckb-ccc/core": "^1.16.1",
-    "@ckb-keyway/react": "0.2.3",
+    "@ckb-keyway/react": "0.2.4",
     "@fiber-pay/sdk": "^0.2.7",
     "@nervosnetwork/fiber-js": "0.9.1",
     "@noble/curves": "^2.0.1",
