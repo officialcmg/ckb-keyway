@@ -1,0 +1,7 @@
+- step1: `0x20347d6b23628eaa485ab1203ef1094f0a787a0c2361b63349705077167aab5d` enable recovery (AdminList + Omnilock)
+- step2: `0x6aeb4ddb970b5a35016e56296fc615ab230134c41b0935a0f5515f108783b326` owner spend (K, 85-byte lock)
+- step3: `0x1c24c8af49d55f3b82937ae869ab175c45d5e56a7a26950074014bda94028186` backup B1 admin-path spend
+- step4a: `0x8826e6ea56a2505e01b7a6e2ad4a4de5616d14772490c0b0949e3f7ec90e89db` AdminList rotate {B1} -> {B1,B2}, same Type ID
+- step4b: `0x8d1652c59ee4f7c91587e10c190fb444ef96f8ecc510bd4bf2f890352c24a821` backup B2 admin-path spend
+- step5a: `0x6358edd00f9a050d3334228111d729d58ed0fc3b7bde51b1e0b97c42683eba76` deposit 500 CKB to K's old secp address
+- step5b: `0xd768a68bac9bb11819f9ef2e1ac72df49f9b3d479dca3d462b4c50fd38c33562` sweep 1 cell(s) old secp -> Omnilock

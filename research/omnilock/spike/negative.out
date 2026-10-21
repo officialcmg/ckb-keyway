@@ -1,0 +1,11 @@
+rejected as expected: B1 with stale single-member proof
+   Client request error TransactionFailedToVerify: Verification failed Script(TransactionScriptError { source: Inputs[0].Lock, cause: ValidationFailure: see error code 59 on page https://nervosnetwork.github.io/ckb-script-e
+rejected as expected: outsider signing with B1's identity+proof
+   Client request error TransactionFailedToVerify: Verification failed Script(TransactionScriptError { source: Inputs[0].Lock, cause: ValidationFailure: see error code -31 on page https://nervosnetwork.github.io/ckb-script-
+rejected as expected: B1 admin path without AdminList dep
+   Client request error TransactionFailedToVerify: Verification failed Script(TransactionScriptError { source: Inputs[0].Lock, cause: ValidationFailure: see error code 1 on page https://nervosnetwork.github.io/ckb-script-er
+rejected as expected: owner sig over 65-byte placeholder
+   Client request error TransactionFailedToVerify: Verification failed Script(TransactionScriptError { source: Inputs[0].Lock, cause: ValidationFailure: see error code -31 on page https://nervosnetwork.github.io/ckb-script-
+rejected as expected: bare 65-byte secp signature as Omnilock witness lock
+   Client request error TransactionFailedToVerify: Verification failed Script(TransactionScriptError { source: Inputs[0].Lock, cause: ValidationFailure: see error code 5 on page https://nervosnetwork.github.io/ckb-script-er
+control owner tx dry-run cycles: 1403887n
