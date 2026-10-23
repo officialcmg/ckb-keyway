@@ -1,9 +1,7 @@
 import * as ccc from "@ckb-ccc/core";
 import {
   createCccExternalFundingResolver,
-  cccScriptToFiberScript,
   FiberBrowserNode,
-  getLockBalanceShannons,
   openChannelWithExternalFundingFlow,
   shouldDiagnoseFundingAbortError,
   type Channel,
@@ -17,6 +15,8 @@ import { KeyWayCredentialProvider, type FiberKeyLoader } from "./credential-prov
 import { acquireDeviceLock, type DeviceLock } from "./device-lock";
 import { acquireDeviceLease, type DeviceLease } from "./device-lease";
 import { serializeCccTransactionForRpc } from "./ccc-transaction";
+import { FUNDING_LOCK_KNOWN_SCRIPTS, type KeyWayRecovery } from "./account-lock";
+import { getLockBalance } from "./ckb-balance";
 import { RemoteCkbSigner, type ApproveFiberChannelOpen } from "./remote-ckb-signer";
 import { getDeviceIdHash, markChannelOpened } from "./bootstrap";
 import { ANY_FUNDING, connectChannelPeers, type ChannelPeer } from "./channel-peers";
@@ -25,7 +25,7 @@ import { KeyWayApiClient } from "./api-client";
 import { createEncryptedNodeBackup, restoreEncryptedNodeBackup } from "./node-backup";
 import { backUpBeforeLogout, restoreBeforeStart } from "./node-migration";
 import { toKeyWayError, type KeyWayError } from "./keyway-error";
-import { freeFiberParams, paymentFiberParams } from "./fiber-methods";
+import { DEFAULT_FUNDING_FEE_RATE, freeFiberParams, paymentFiberParams } from "./fiber-methods";
 import { describePayment, type ApproveFiberPayment } from "./fiber-payment";
 import { createFiberActions, type FiberActionApprovals } from "./fiber-actions";
 import { approveFiberParams } from "./fiber-methods";
@@ -45,6 +45,8 @@ export type CreateKeyWayOptions = {
   identifier: string;
   authToken: string;
   ckbPublicKey: string;
+  /** The wallet's recovery settings, when it has them: the account then lives at its Omnilock address. */
+  recovery?: KeyWayRecovery;
   approveFiberChannelOpen: ApproveFiberChannelOpen;
   /** The app's own payment confirmation, if any. KeyWay draws no payment dialog. */
   approveFiberPayment?: ApproveFiberPayment;
@@ -122,19 +124,19 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     });
     if (approved) activationProgress?.("signing");
     return approved;
-  }, undefined, api);
+  }, undefined, api, options.recovery);
   const resolveExternalFunding = createCccExternalFundingResolver({
     signer: fundingSigner,
-    knownScripts: [ccc.KnownScript.Secp256k1Blake160],
+    knownScripts: FUNDING_LOCK_KNOWN_SCRIPTS,
     ckbRpcUrl: "https://testnet.ckb.dev/",
     // fiber-pay normalizes field names, but CCC must first serialize bigint fields to CKB RPC hex.
     signFundingTxOptions: { toRpcTransaction: serializeCccTransactionForRpc },
   });
-  const ckbRpcUrl = "https://testnet.ckbapp.dev/";
   // The node settles force-closed channels with the key derived from the Fiber key, so the reserve goes there.
   const feeReserve = createFeeReserve({
     authToken: options.authToken,
     ckbPublicKey: options.ckbPublicKey,
+    recovery: options.recovery,
     api,
     requestEmailCode: options.requestEmailCode,
     client: fundingSigner.client,
@@ -266,6 +268,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       node,
       params: {
         ...params,
+        funding_fee_rate: params.funding_fee_rate ?? DEFAULT_FUNDING_FEE_RATE,
         shutdown_script: funding.shutdownScript,
         funding_lock_script: funding.fundingLockScript,
         funding_lock_script_cell_deps: funding.fundingLockScriptCellDeps,
@@ -332,7 +335,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
 
   async function getCkbBalance(): Promise<bigint> {
     const address = await fundingSigner.getRecommendedAddressObj();
-    return getLockBalanceShannons(ckbRpcUrl, cccScriptToFiberScript(address.script));
+    return getLockBalance(fundingSigner.client, address.script, options.recovery);
   }
 
   async function getChannels(options?: { includeClosed?: boolean }): Promise<KeyWayChannel[]> {

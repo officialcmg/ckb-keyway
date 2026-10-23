@@ -1,5 +1,6 @@
 import * as ccc from "@ckb-ccc/core";
 import { serializeCccTransaction } from "./ccc-transaction";
+import { KeyWayAccountSigner, type KeyWayRecovery } from "./account-lock";
 import { KeyWayApiClient } from "./api-client";
 import { formatAsset } from "./tokens";
 
@@ -23,15 +24,22 @@ export type FiberChannelOpenPreview = {
 
 export type ApproveFiberChannelOpen = (preview: FiberChannelOpenPreview) => boolean | Promise<boolean>;
 
-export class RemoteCkbSigner extends ccc.SignerCkbPublicKey {
+/**
+ * Signs Fiber's channel funding transaction through KeyWay. Fiber has fixed everything but the witnesses by
+ * then, so preparing it only writes the account's placeholders and never adds cell deps.
+ */
+export class RemoteCkbSigner extends KeyWayAccountSigner {
+  protected addsCellDeps = false;
+
   constructor(
     public readonly authToken: string,
     publicKey: ccc.HexLike,
     private readonly approveChannelOpen: ApproveFiberChannelOpen,
     client: ccc.Client = new ccc.ClientPublicTestnet(),
     private readonly api = new KeyWayApiClient(),
+    recovery?: KeyWayRecovery,
   ) {
-    super(client, publicKey);
+    super(client, publicKey, recovery);
   }
 
   async signOnlyTransaction(transactionLike: ccc.TransactionLike): Promise<ccc.Transaction> {

@@ -17,7 +17,7 @@ export function useCkbWallet() {
     const run = generation.current;
     setRefreshing(true);
     try {
-      const next = await getCkbAccountBalance(wallet.litPublicKey);
+      const next = await getCkbAccountBalance(wallet.litPublicKey, wallet.recovery);
       if (run === generation.current) { setBalance(next); setBalanceError(undefined); }
       return next;
     } catch (cause) {
@@ -36,13 +36,15 @@ export function useCkbWallet() {
     setRefreshing(false);
     if (wallet) void refreshBalance().catch(() => undefined);
     return () => { ++generation.current; };
-  }, [wallet?.litPublicKey]);
+  }, [wallet?.litPublicKey, wallet?.recovery?.omnilockArgs]);
 
   return {
     status: !authenticated ? "disconnected" as const : !wallet ? recoveryError ? "error" as const : "loading" as const : "ready" as const,
     /** A CCC signer for this account. Every transaction and message is shown to the user before signing. */
     signer,
     address: wallet?.ckbAddress,
+    /** The account's address from before it turned recovery on, if it has. */
+    legacyAddress: wallet?.recovery?.legacyAddress,
     /** The account's compressed secp256k1 public key. */
     publicKey: wallet?.litPublicKey,
     balance,

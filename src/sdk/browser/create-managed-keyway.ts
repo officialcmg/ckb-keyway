@@ -1,8 +1,6 @@
 import * as ccc from "@ckb-ccc/core";
 import {
-  cccScriptToFiberScript,
   createCccExternalFundingResolver,
-  getLockBalanceShannons,
   openChannelWithExternalFundingFlow,
   type Channel,
   type ChannelId,
@@ -36,13 +34,15 @@ import {
   type PaymentEstimate,
 } from "./create-keyway";
 import { createFiberNode } from "./fiber-node";
-import { approveFiberParams, type PaymentFiberMethod } from "./fiber-methods";
+import { approveFiberParams, DEFAULT_FUNDING_FEE_RATE, type PaymentFiberMethod } from "./fiber-methods";
 import { createFiberActions, type FiberActionApprovals } from "./fiber-actions";
 import type { ApproveFiberPayment, FiberPaymentPreview } from "./fiber-payment";
 import { withEmailCode, type RequestEmailCode } from "./email-code";
 import { normalizeFiberPubkey } from "./fiber-pubkey";
 import { RemoteCkbSigner, type ApproveFiberChannelOpen } from "./remote-ckb-signer";
 import { serializeCccTransactionForRpc } from "./ccc-transaction";
+import { FUNDING_LOCK_KNOWN_SCRIPTS, type KeyWayRecovery } from "./account-lock";
+import { getLockBalance } from "./ckb-balance";
 import { toKeyWayError } from "./keyway-error";
 import { createFeeReserve, FEE_RESERVE } from "./fee-reserve";
 
@@ -58,6 +58,8 @@ const DEFAULT_CHANNEL_FUNDING = 1_000n * 100_000_000n;
 export function createManagedKeyWay(options: {
   authToken: string;
   ckbPublicKey: string;
+  /** The wallet's recovery settings, when it has them: the account then lives at its Omnilock address. */
+  recovery?: KeyWayRecovery;
   approveFiberChannelOpen: ApproveFiberChannelOpen;
   /** The app's own payment confirmation, if any. KeyWay draws no payment dialog. */
   approveFiberPayment?: ApproveFiberPayment;
@@ -78,11 +80,13 @@ export function createManagedKeyWay(options: {
     }),
     undefined,
     api,
+    options.recovery,
   );
   // The hosted node settles force-closed channels with its own key, so the reserve goes there.
   const feeReserve = createFeeReserve({
     authToken: options.authToken,
     ckbPublicKey: options.ckbPublicKey,
+    recovery: options.recovery,
     api,
     requestEmailCode: options.requestEmailCode,
     client: fundingSigner.client,
@@ -93,7 +97,7 @@ export function createManagedKeyWay(options: {
   });
   const resolveExternalFunding = createCccExternalFundingResolver({
     signer: fundingSigner,
-    knownScripts: [ccc.KnownScript.Secp256k1Blake160],
+    knownScripts: FUNDING_LOCK_KNOWN_SCRIPTS,
     ckbRpcUrl: "https://testnet.ckb.dev/",
     signFundingTxOptions: { toRpcTransaction: serializeCccTransactionForRpc },
   });
@@ -149,6 +153,7 @@ export function createManagedKeyWay(options: {
       node: { openChannelWithExternalFunding, submitSignedFundingTx },
       params: {
         ...params,
+        funding_fee_rate: params.funding_fee_rate ?? DEFAULT_FUNDING_FEE_RATE,
         shutdown_script: funding.shutdownScript,
         funding_lock_script: funding.fundingLockScript,
         funding_lock_script_cell_deps: funding.fundingLockScriptCellDeps,
@@ -264,7 +269,7 @@ export function createManagedKeyWay(options: {
 
   async function getCkbBalance(): Promise<bigint> {
     const address = await fundingSigner.getRecommendedAddressObj();
-    return getLockBalanceShannons("https://testnet.ckbapp.dev/", cccScriptToFiberScript(address.script));
+    return getLockBalance(fundingSigner.client, address.script, options.recovery);
   }
 
   return {

@@ -1,4 +1,5 @@
 import * as ccc from "@ckb-ccc/core";
+import { KeyWayAccountSigner, type KeyWayRecovery } from "./account-lock";
 import { KeyWayApiClient } from "./api-client";
 import { serializeCccTransaction } from "./ccc-transaction";
 import { withEmailCode, type RequestEmailCode } from "./email-code";
@@ -49,17 +50,19 @@ export type KeyWaySignerHandlers = {
 
 /**
  * A CCC signer for the signed-in KeyWay account. Every transaction and message is shown to the user
- * before the KeyWay backend signs it, and only the user's own account is ever signed.
+ * before the KeyWay backend signs it, and only the user's own account is ever signed. Pass the wallet's
+ * `recovery` when it has one, so addresses and placeholders follow its Omnilock.
  */
-export class KeyWaySigner extends ccc.SignerCkbPublicKey {
+export class KeyWaySigner extends KeyWayAccountSigner {
   constructor(
     private readonly authToken: string,
     publicKey: ccc.HexLike,
     private readonly handlers: KeyWaySignerHandlers,
     client: ccc.Client = new ccc.ClientPublicTestnet(),
     private readonly api = new KeyWayApiClient(),
+    recovery?: KeyWayRecovery,
   ) {
-    super(client, publicKey);
+    super(client, publicKey, recovery);
   }
 
   async signOnlyTransaction(transactionLike: ccc.TransactionLike): Promise<ccc.Transaction> {
