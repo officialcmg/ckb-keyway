@@ -204,3 +204,16 @@ test("a fresh managed node uses a TCP bootstrap hint when gossip has no address"
   assert.equal(calls.length, 2);
   assert.equal(calls[0].addr_type, "tcp");
 });
+
+test("hosted channels fund at 1500 shannons/KB unless the caller sets a rate", async () => {
+  const rates: unknown[] = [];
+  const recording = { ...node, openChannelWithExternalFunding: async (params: { funding_fee_rate?: string }) => { rates.push(params.funding_fee_rate); return node.openChannelWithExternalFunding(); } };
+  const params = {
+    pubkey: "0x02b6d4e3ab86a2ca2fad6fae0ecb2e1e559e0b911939872a90abdda6d20302be71",
+    funding_amount: "0x5f5e100",
+    funding_lock_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" },
+  };
+  await managedNodeRequest("fee-rate-test", { operation: "open-channel", params }, recording as never, ownLock);
+  await managedNodeRequest("fee-rate-test", { operation: "open-channel", params: { ...params, funding_fee_rate: "0x7d0" } }, recording as never, ownLock);
+  assert.deepEqual(rates, ["0x5dc", "0x7d0"]);
+});

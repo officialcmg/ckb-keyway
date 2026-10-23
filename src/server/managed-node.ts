@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
 import { connectCandidates, TESTNET_CHANNEL_PEERS } from "../sdk/browser/channel-peers.ts";
 import { normalizeCkbTransactionForCcc } from "@fiber-pay/sdk/browser";
 import { serializeCccTransactionForRpc } from "../sdk/browser/ccc-transaction.ts";
-import { approveFiberParams, FIBER_METHODS, freeFiberParams, paymentFiberParams, type FiberMethod } from "../sdk/browser/fiber-methods.ts";
+import { approveFiberParams, DEFAULT_FUNDING_FEE_RATE, FIBER_METHODS, freeFiberParams, paymentFiberParams, type FiberMethod } from "../sdk/browser/fiber-methods.ts";
 import { assertPublicPeerAddress } from "./peer-address.ts";
 import * as ccc from "@ckb-ccc/core";
 import { FEE_RESERVE, needsFeeReserve, sweepSettlement } from "../sdk/browser/settlement-sweep.ts";
@@ -262,7 +262,7 @@ function openChannelParams(value: unknown): OpenChannelWithExternalFundingParams
     shutdown_script: params.shutdown_script === undefined ? undefined as never : script(params.shutdown_script),
     funding_lock_script: script(params.funding_lock_script),
     funding_lock_script_cell_deps: cellDeps(params.funding_lock_script_cell_deps),
-    funding_fee_rate: optionalHex(params.funding_fee_rate, "Funding fee rate"),
+    funding_fee_rate: optionalHex(params.funding_fee_rate, "Funding fee rate") ?? DEFAULT_FUNDING_FEE_RATE,
     commitment_fee_rate: optionalHex(params.commitment_fee_rate, "Commitment fee rate"),
   };
 }
