@@ -1,9 +1,13 @@
 import * as ccc from "@ckb-ccc/core";
 import { formatAsset, isXudtCompatible } from "../sdk/browser/tokens.ts";
+import { accountLocks, refuseAdminListSpend, type KeyWayRecovery } from "../sdk/browser/account-lock.ts";
+import { signingGroups, type SigningGroup } from "./funding-transaction.ts";
 import type { ReadyWallet } from "./user-wallet.ts";
 
 const SHANNONS_PER_CKB = 100_000_000n;
 const MIN_FEE_CAP = SHANNONS_PER_CKB / 100n; // 0.01 CKB
+/** How the details label the account's AdminList cell. */
+const RECOVERY_LIST = "recovery list";
 const FIBER_FUNDING_LOCK_CODE_HASH = "0x6c67887fe201ee0c7853f1682c0b77c0e6214044c156c7558269390a8afa6d7c";
 
 // Spore protocol testnet scripts (sporeprotocol/spore-sdk predefined config).
@@ -60,6 +64,8 @@ export type ValidatedTransaction = {
   transaction: ccc.Transaction;
   signer: ccc.SignerCkbPublicKey;
   script: ccc.Script;
+  /** Every lock group of the account in the transaction, the current lock first. */
+  groups: SigningGroup[];
   preview: TransactionPreview;
   /** All CKB leaving the user's account including any fee they pay; compared with the email threshold. */
   outflowShannons: bigint;
@@ -105,33 +111,38 @@ export async function previewGeneralTransaction(
   if (transaction.headerDeps.length > 8) throw new Error("Transaction has too many header dependencies");
 
   const signer = new ccc.SignerCkbPublicKey(client, wallet.litPublicKey);
-  const own = (await signer.getRecommendedAddressObj()).script;
+  const locks = await accountLocks(client, wallet.litPublicKey, wallet.recovery);
+  const own = locks.map(({ script }) => script);
   const inputCells = await Promise.all(transaction.inputs.map((cellInput) => cellInput.getCell(client)));
-  if (!inputCells.some(({ cellOutput }) => cellOutput.lock.eq(own))) {
-    throw new Error("Transaction has no input owned by this KeyWay account");
-  }
+  const groups = signingGroups(locks, inputCells);
+  if (groups.length === 0) throw new Error("Transaction has no input owned by this KeyWay account");
+  refuseAdminListSpend(transaction, inputCells, wallet.recovery);
+  // CCC's own groups for this key are its secp256k1 lock and anyone-can-pay locks; only the first is signed.
+  const secp = locks.find(({ kind }) => kind === "secp256k1")!.script;
   const related = await signer.getRelatedScripts(transaction);
-  if (related.length !== 1 || !related[0].script.eq(own)) throw new Error("Transaction has an unexpected signing group");
+  if (related.some(({ script }) => !script.eq(secp))) throw new Error("Transaction has an unexpected signing group");
 
   const known = await loadKnownScripts(client);
-  const described = describeTransaction(transaction, inputCells, own, known, client);
+  const described = describeTransaction(transaction, inputCells, own, known, client, feeRateCap(), wallet.recovery);
   return {
-    transaction, signer, script: related[0].script, preview: described.preview,
+    transaction, signer, script: groups[0].script, groups, preview: described.preview,
     outflowShannons: described.outflowShannons, tokensLeaving: described.tokensLeaving, tokenOutflows: described.tokenOutflows,
   };
 }
 
 /**
- * Pure decoding of a transaction's effects on one account. Anything it can't explain becomes a visible
+ * Pure decoding of a transaction's effects on one account, which may have more than one lock (its Omnilock
+ * and its old secp256k1 lock once recovery is on). Anything it can't explain becomes a visible
  * "unrecognized" entry rather than being left out.
  */
 export function describeTransaction(
   transaction: ccc.Transaction,
   inputCells: Array<{ cellOutput: ccc.CellOutput; outputData: ccc.Hex }>,
-  own: ccc.Script,
+  own: ccc.Script | ccc.Script[],
   known: KnownScripts,
   client: ccc.Client,
   maxFeeRate = feeRateCap(),
+  recovery?: KeyWayRecovery,
 ): { preview: TransactionPreview; outflowShannons: bigint; tokensLeaving: boolean; tokenOutflows: TokenOutflow[] } {
   const outputs = transaction.outputs.map((cellOutput, index) => ({ cellOutput, outputData: ccc.hexFrom(transaction.outputsData[index] ?? "0x") }));
   const totalIn = sum(inputCells.map(({ cellOutput }) => cellOutput.capacity));
@@ -142,7 +153,9 @@ export function describeTransaction(
   const feeCap = maxBig(MIN_FEE_CAP, size * maxFeeRate);
   if (fee > feeCap) throw new Error(`Transaction fee ${formatCkb(fee)} CKB is above the KeyWay limit of ${formatCkb(feeCap)} CKB for this transaction size`);
 
-  const isOwn = (cell: { cellOutput: ccc.CellOutput }) => cell.cellOutput.lock.eq(own);
+  const ownLocks = [own].flat();
+  const isOwn = (cell: { cellOutput: ccc.CellOutput }) => ownLocks.some((lock) => lock.eq(cell.cellOutput.lock));
+  const isRecoveryList = (type: ccc.Script | undefined) => Boolean(recovery && type?.hash() === recovery.adminListTypeHash.toLowerCase());
   const ownInputs = inputCells.filter(isOwn);
   const ownOutputs = outputs.filter(isOwn);
   const otherSigners = inputCells.length - ownInputs.length;
@@ -256,7 +269,10 @@ export function describeTransaction(
     const kind = typeKind(cell.cellOutput.type);
     return {
       lock: isOwn(cell) ? "you" : shortHash(cell.cellOutput.lock.hash()),
-      ...(cell.cellOutput.type ? { type: kind === "unknown" || kind === "quiet" ? shortHash(cell.cellOutput.type.codeHash) : kind === "dao" ? "Nervos DAO" : kind } : {}),
+      ...(cell.cellOutput.type ? {
+        type: isRecoveryList(cell.cellOutput.type) ? RECOVERY_LIST
+          : kind === "unknown" || kind === "quiet" ? shortHash(cell.cellOutput.type.codeHash) : kind === "dao" ? "Nervos DAO" : kind,
+      } : {}),
       capacityCkb: formatCkb(cell.cellOutput.capacity),
       dataBytes: (cell.outputData.length - 2) / 2,
     };
@@ -296,6 +312,7 @@ export function previewSummaryLines(preview: TransactionPreview): string[] {
   for (const nft of preview.nfts) lines.push(`${nft.kind} ${nft.id}: ${nft.change}`);
   for (const action of preview.dao) lines.push(`Nervos DAO ${action.action}: ${action.amountCkb} CKB`);
   for (const script of preview.unrecognized) lines.push(`Unrecognized script ${script.codeHash} (${script.cells} cells)`);
+  if (preview.details.outputs.some(({ type }) => type === RECOVERY_LIST)) lines.push("Writes the account's recovery list");
   lines.push(`Network ${preview.network}`);
   return lines;
 }
