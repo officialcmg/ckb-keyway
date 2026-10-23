@@ -59,6 +59,7 @@ export async function connectKeyWay(options: {
     identifier: wallet.litPkpId,
     authToken: options.authToken,
     ckbPublicKey: wallet.litPublicKey,
+    recovery: wallet.recovery,
     approveFiberChannelOpen: options.approveFiberChannelOpen,
     approveFiberPayment: options.approveFiberPayment,
     approvals: options.approvals,

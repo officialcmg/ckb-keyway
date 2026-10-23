@@ -435,8 +435,8 @@ export function KeyWayProvider({
       approveCkbMessage: (preview) => callbacksRef.current.approveCkbMessage?.(preview) ??
         new Promise<boolean>((resolve) => setMessageRequest({ preview, resolve })),
       requestEmailCode,
-    }, undefined, new KeyWayApiClient({ appId }));
-  }, [wallet?.litPublicKey, authToken, appId]);
+    }, undefined, new KeyWayApiClient({ appId }), wallet.recovery);
+  }, [wallet?.litPublicKey, wallet?.recovery?.omnilockArgs, authToken, appId]);
 
   return (
     <KeyWayContext.Provider value={{

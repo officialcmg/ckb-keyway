@@ -1,4 +1,5 @@
 import * as ccc from "@ckb-ccc/core";
+import type { KeyWayRecovery } from "./account-lock";
 import type { KeyWayApiClient } from "./api-client";
 import type { RequestEmailCode } from "./email-code";
 import { KeyWaySigner } from "./keyway-signer";
@@ -22,6 +23,7 @@ export async function hasFeeReserve(client: ccc.Client, lock: ccc.ScriptLike): P
 export async function sendFeeReserve(options: {
   authToken: string;
   ckbPublicKey: string;
+  recovery?: KeyWayRecovery;
   api: KeyWayApiClient;
   requestEmailCode?: RequestEmailCode;
   client: ccc.Client;
@@ -32,7 +34,7 @@ export async function sendFeeReserve(options: {
     approveCkbTransaction: (preview) => expected !== undefined && preview.transactionHash === expected,
     approveCkbMessage: () => false,
     requestEmailCode: options.requestEmailCode ?? (() => Promise.resolve(undefined)),
-  }, options.client, options.api);
+  }, options.client, options.api, options.recovery);
   const transaction = ccc.Transaction.from({ outputs: [{ lock: options.lock, capacity: FEE_RESERVE }] });
   await transaction.completeInputsByCapacity(signer);
   await transaction.completeFeeBy(signer);
