@@ -187,6 +187,13 @@ function customRecords(value: unknown): Record<string, string> {
 export type ApproveFiberMethod = "openChannelWithExternalFunding" | "shutdownChannel" | "connectPeer" | "disconnectPeer" | "updateChannel";
 
 /** Closing fees: at most 100 times Fiber's default of 1,000 shannons per KB. */
+/**
+ * Funding fee rate KeyWay opens channels at unless the caller sets one, in shannons/KB. Fiber sizes the
+ * funding fee with a 65-byte secp256k1 placeholder and adds the second Omnilock cell dep after balancing, so
+ * an Omnilock-funded transaction falls under the node minimum at Fiber's default of 1000; 1500 clears it.
+ */
+export const DEFAULT_FUNDING_FEE_RATE = "0x5dc";
+
 export const MAX_CLOSE_FEE_RATE = 100_000n;
 /** Forwarding fees: at most 10% of what a channel forwards. */
 export const MAX_FORWARDING_FEE_MILLIONTHS = 100_000n;
