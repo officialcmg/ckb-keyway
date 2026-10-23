@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { adminListTypeScript, omnilockArgsFor } from "../src/sdk/browser/account-lock.ts";
 import {
   parseWallet,
   rebindProvisioningWallet,
@@ -75,4 +76,34 @@ test("rebinds an incomplete provisioning wallet without creating another PKP", (
   const rebound = rebindProvisioningWallet(wallet, "b".repeat(64));
   assert.equal(rebound.litPkpId, wallet.litPkpId);
   assert.equal(rebound.primaryDeviceIdHash, "b".repeat(64));
+});
+
+test("reads a wallet with recovery on, and refuses recovery settings that don't fit its key", () => {
+  const publicKey = `0x02${"22".repeat(32)}`;
+  const adminListTypeArgs = `0x${"3e".repeat(32)}`;
+  const adminListTypeHash = adminListTypeScript({ adminListTypeArgs }).hash();
+  const wallet = {
+    version: 1,
+    status: "ready",
+    litPkpId: "0x1111111111111111111111111111111111111111",
+    litPublicKey: publicKey,
+    ckbAddress: "ckt1omnilock",
+    encryptedFiberKey: "ciphertext",
+    primaryDeviceIdHash: "a".repeat(64),
+    hasOpenedChannel: false,
+    createdAt: "2026-07-12T00:00:00.000Z",
+    updatedAt: "2026-07-12T00:00:00.000Z",
+    recovery: {
+      omnilockArgs: omnilockArgsFor(publicKey, adminListTypeHash),
+      adminListTypeArgs,
+      adminListTypeHash,
+      adminListOutPoint: { txHash: `0x${"ad".repeat(32)}`, index: 0 },
+      legacyAddress: "ckt1legacy",
+      enabledAt: "2026-10-23T00:00:00.000Z",
+    },
+  } as const;
+  assert.deepEqual(parseWallet(wallet), wallet);
+  // A broken record must not read as "no wallet", which would provision a new one.
+  assert.throws(() => parseWallet({ ...wallet, litPublicKey: `0x03${"33".repeat(32)}` }), /recovery settings are invalid/);
+  assert.throws(() => parseWallet({ ...wallet, recovery: { ...wallet.recovery, omnilockArgs: "0x00" } }), /recovery settings are invalid/);
 });

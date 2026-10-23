@@ -1,3 +1,4 @@
+import type { KeyWayRecovery } from "./account-lock";
 import { KeyWayApiClient } from "./api-client";
 import { createFiberKeyRecipient } from "./fiber-key-wrap";
 
@@ -6,11 +7,14 @@ export type PublicWallet = {
   status: "ready";
   litPkpId: string;
   litPublicKey: string;
+  /** The account's current address: its Omnilock address once recovery is on. */
   ckbAddress: string;
   primaryDeviceIdHash: string;
   hasOpenedChannel: boolean;
   createdAt: string;
   updatedAt: string;
+  /** Present once the user has turned account recovery on. */
+  recovery?: KeyWayRecovery;
 };
 
 type BootstrapResponse = { provisioned: boolean; restoreRequired: boolean; wallet: PublicWallet };

@@ -1,3 +1,4 @@
+import { parseRecovery, type KeyWayRecovery } from "../sdk/browser/account-lock.ts";
 import type { User } from "./auth-user.ts";
 import { database, withUserLock, type DatabaseSql } from "./database.ts";
 
@@ -12,10 +13,13 @@ export type ProvisioningWallet = {
 export type ReadyWallet = Omit<ProvisioningWallet, "status"> & {
   status: "ready";
   litPublicKey: string;
+  /** The account's current address: the Omnilock one once recovery is on, else the secp256k1 one. */
   ckbAddress: string;
   encryptedFiberKey: string;
   hasOpenedChannel: boolean;
   updatedAt: string;
+  /** Set once the user turns account recovery on; `legacyAddress` then holds the old secp256k1 address. */
+  recovery?: KeyWayRecovery;
 };
 
 export type KeyWayWallet = ProvisioningWallet | ReadyWallet;
@@ -30,6 +34,8 @@ export function parseWallet(value: unknown): KeyWayWallet | undefined {
     typeof candidate.ckbAddress !== "string" ||
     typeof candidate.encryptedFiberKey !== "string"
   )) return undefined;
+  // Malformed recovery settings throw rather than read as no wallet, which would provision a new one.
+  if (candidate.status === "ready") parseRecovery(candidate.recovery, candidate.litPublicKey as string);
   return candidate as KeyWayWallet;
 }
 
