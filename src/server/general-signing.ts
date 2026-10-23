@@ -5,7 +5,7 @@ import type { User } from "./auth-user.ts";
 import type { TransactionSql } from "postgres";
 import { database, type DatabaseSql } from "./database.ts";
 import { createConfirmationEmailTemplate } from "./email-template.ts";
-import { formatCkbSignature, serializeTransaction } from "./funding-transaction.ts";
+import { formatCkbSignature, serializeTransaction, signAccountGroups } from "./funding-transaction.ts";
 import { loadLitAction } from "./lit-actions.ts";
 import { signCkbDigest } from "./lit.ts";
 import { recoverPkpPublicKey } from "./pkp-identity.ts";
@@ -253,13 +253,7 @@ function parseAsset(value: unknown): string {
 }
 
 async function signTransaction(context: SigningContext, validated: ValidatedTransaction): Promise<ccc.Transaction> {
-  const info = await validated.transaction.getSignHashInfo(validated.script, validated.signer.client);
-  if (!info) throw new Error("Transaction has no KeyWay signing group");
-  const signature = await sign(context, info.message);
-  const witness = validated.transaction.getWitnessArgsAt(info.position) ?? ccc.WitnessArgs.from({});
-  witness.lock = signature;
-  validated.transaction.setWitnessArgsAt(info.position, witness);
-  return validated.transaction;
+  return signAccountGroups(validated.transaction, validated.groups, validated.signer.client, (digest) => sign(context, digest));
 }
 
 /** Signs a digest the backend computed itself, then checks the recovered key before releasing it. */

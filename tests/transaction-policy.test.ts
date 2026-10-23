@@ -155,3 +155,20 @@ test("cells with a type script KeyWay can't read count as tokens leaving, per ce
   assert.equal(tokensLeaving, true);
   assert.deepEqual(tokenOutflows, [{ asset: mystery.hash(), amount: 1n }]);
 });
+
+test("with recovery on, the Omnilock and the old secp256k1 lock are both the user's", () => {
+  const omni = ccc.Script.from({ codeHash: `0x${"f3".repeat(32)}`, hashType: "type", args: `0x00${"11".repeat(20)}01${"aa".repeat(32)}` });
+  const transaction = ccc.Transaction.from({
+    inputs: [0, 1].map((index) => ({ previousOutput: { txHash: `0x${index.toString(16).padStart(64, "0")}`, index: 0 } })),
+    outputs: [{ lock: alice, capacity: 100n * CKB }, { lock: omni, capacity: 600n * CKB - 2_000n }],
+    outputsData: ["0x", "0x"],
+    witnesses: [ccc.hexFrom(ccc.WitnessArgs.from({ lock: `0x${"00".repeat(85)}` }).toBytes()), "0x"],
+  });
+  const inputCells = [[omni, 300n], [own, 400n]].map(([lock, ckb]) => ({ cellOutput: ccc.CellOutput.from({ lock: lock as ccc.Script, capacity: (ckb as bigint) * CKB }), outputData: "0x" as ccc.Hex }));
+  const { preview, outflowShannons } = describeTransaction(transaction, inputCells, [omni, own], known, client);
+  assert.equal(preview.sendingCkb, "100");
+  assert.equal(outflowShannons, 100n * CKB + 2_000n);
+  assert.equal(preview.otherSigners, 0);
+  assert.deepEqual(preview.details.inputs.map(({ lock }) => lock), ["you", "you"]);
+  assert.equal(preview.recipients.length, 1);
+});

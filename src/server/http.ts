@@ -1,4 +1,5 @@
 import * as ccc from "@ckb-ccc/core";
+import { currentLock } from "../sdk/browser/account-lock.ts";
 import type { User } from "./auth-user.ts";
 import { bootstrap } from "./bootstrap.ts";
 import { markChannelOpened, readWallet } from "./user-wallet.ts";
@@ -133,7 +134,7 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
 async function ownLockScript(user: User) {
   const wallet = await readWallet(user);
   if (wallet?.status !== "ready") throw new Error("KeyWay wallet is not ready");
-  const { script } = await ccc.Address.fromString(wallet.ckbAddress, new ccc.ClientPublicTestnet());
+  const script = await currentLock(new ccc.ClientPublicTestnet(), wallet.litPublicKey, wallet.recovery);
   return { code_hash: script.codeHash, hash_type: script.hashType, args: script.args } as never;
 }
 

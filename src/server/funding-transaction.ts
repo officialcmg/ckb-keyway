@@ -1,5 +1,6 @@
 import * as ccc from "@ckb-ccc/core";
 import type { User } from "./auth-user.ts";
+import { accountLocks, omnilockOwnerWitnessLock, refuseAdminListSpend, witnessLockLength, type KeyWayLockKind } from "../sdk/browser/account-lock.ts";
 import { isXudtCompatible } from "../sdk/browser/tokens.ts";
 import { loadLitAction } from "./lit-actions.ts";
 import { signCkbDigest } from "./lit.ts";
@@ -20,14 +21,23 @@ export type FundingPreview = {
   token?: { asset: string; amount: string };
 };
 
+/** One of the account's lock groups in a transaction, signed with the witness its lock expects. */
+export type SigningGroup = { script: ccc.Script; kind: KeyWayLockKind };
+
 type ValidatedFunding = {
   transaction: ccc.Transaction;
   signer: ccc.SignerCkbPublicKey;
   script: ccc.Script;
+  /** Every lock group of the account in the transaction, the current lock first. */
+  groups: SigningGroup[];
   preview: FundingPreview;
 };
 
-export async function previewFundingTransaction(wallet: ReadyWallet, input: unknown): Promise<ValidatedFunding> {
+export async function previewFundingTransaction(
+  wallet: ReadyWallet,
+  input: unknown,
+  client: ccc.Client = new ccc.ClientPublicTestnet(),
+): Promise<ValidatedFunding> {
   if (!input || typeof input !== "object") throw new Error("A complete CKB transaction is required");
   const transaction = ccc.Transaction.from(input as ccc.TransactionLike);
   if (transaction.version !== 0n) throw new Error("Only CKB transaction version 0 is allowed");
@@ -35,11 +45,13 @@ export async function previewFundingTransaction(wallet: ReadyWallet, input: unkn
   if (transaction.outputs.length < 1 || transaction.outputs.length > 64) throw new Error("Funding output count is invalid");
   if (transaction.headerDeps.length !== 0) throw new Error("Funding transactions cannot include header dependencies");
 
-  const client = new ccc.ClientPublicTestnet();
   const signer = new ccc.SignerCkbPublicKey(client, wallet.litPublicKey);
-  const signerScript = (await signer.getRecommendedAddressObj()).script;
+  const locks = await accountLocks(client, wallet.litPublicKey, wallet.recovery);
+  const own = locks.map(({ script }) => script);
+  const isOwn = (lock: ccc.Script) => own.some((script) => script.eq(lock));
   const inputCells = await Promise.all(transaction.inputs.map((input) => input.getCell(client)));
-  const ownedInputs = inputCells.filter(({ cellOutput }) => cellOutput.lock.eq(signerScript));
+  refuseAdminListSpend(transaction, inputCells, wallet.recovery);
+  const ownedInputs = inputCells.filter(({ cellOutput }) => isOwn(cellOutput.lock));
   if (ownedInputs.length === 0) {
     throw new Error("Funding transaction has no input controlled by this KeyWay wallet");
   }
@@ -49,23 +61,27 @@ export async function previewFundingTransaction(wallet: ReadyWallet, input: unkn
   ));
   if (fundingOutputs.length !== 1) throw new Error("Funding transaction must contain exactly one channel output");
   const fundingOutput = fundingOutputs[0];
-  const token = await checkTokenFunding(client, transaction, inputCells, signerScript, fundingOutput);
+  const token = await checkTokenFunding(client, transaction, inputCells, own, fundingOutput);
   const spend = calculateFundingSpend({
     ownedInputCapacity: sumCapacities(ownedInputs.map(({ cellOutput }) => cellOutput.capacity)),
-    ownedChangeCapacity: sumCapacities(transaction.outputs.filter(({ lock }) => lock.eq(signerScript)).map(({ capacity }) => capacity)),
+    ownedChangeCapacity: sumCapacities(transaction.outputs.filter(({ lock }) => isOwn(lock)).map(({ capacity }) => capacity)),
     totalInputCapacity: sumCapacities(inputCells.map(({ cellOutput }) => cellOutput.capacity)),
     totalOutputCapacity: transaction.getOutputsCapacity(),
   });
 
+  const groups = signingGroups(locks, inputCells);
   const related = await signer.getRelatedScripts(transaction);
-  if (related.length !== 1 || !related[0].script.eq(signerScript)) {
+  // CCC's own groups for this key are its secp256k1 lock and anyone-can-pay locks; only the first is signed.
+  const secp = locks.find(({ kind }) => kind === "secp256k1")!.script;
+  if (related.some(({ script }) => !script.eq(secp))) {
     throw new Error("Funding transaction has an unexpected signing group");
   }
 
   return {
     transaction,
     signer,
-    script: related[0].script,
+    script: groups[0].script,
+    groups,
     preview: {
       amountCkb: formatCkb(spend.fundingAmount),
       feeCkb: formatCkb(spend.fee),
@@ -85,9 +101,10 @@ export async function checkTokenFunding(
   client: ccc.Client,
   transaction: ccc.Transaction,
   inputCells: Array<{ cellOutput: ccc.CellOutput; outputData: ccc.Hex }>,
-  own: ccc.Script,
+  own: ccc.Script | ccc.Script[],
   fundingOutput: ccc.CellOutput,
 ): Promise<{ asset: string; amount: bigint } | undefined> {
+  const owns = (lock: ccc.Script) => [own].flat().some((script) => script.eq(lock));
   const outputs = transaction.outputs.map((cellOutput, index) => ({ cellOutput, outputData: ccc.hexFrom(transaction.outputsData[index] ?? "0x") }));
   for (const { cellOutput, outputData } of outputs) {
     if (!cellOutput.type && outputData !== "0x") throw new Error("Unexpected funding output data");
@@ -104,11 +121,11 @@ export async function checkTokenFunding(
     if ((outputData.length - 2) / 2 < 16) throw new Error("Token cells must hold a 16-byte amount");
   }
   for (const { cellOutput } of outputs.filter(({ cellOutput }) => cellOutput.type)) {
-    if (cellOutput !== fundingOutput && !cellOutput.lock.eq(own)) throw new Error("Only the channel output and your own change may carry a token");
+    if (cellOutput !== fundingOutput && !owns(cellOutput.lock)) throw new Error("Only the channel output and your own change may carry a token");
   }
   const tokenAmount = (cells: typeof typed) => cells.reduce((sum, { outputData }) => sum + ccc.numLeFromBytes(ccc.bytesFrom(outputData).slice(0, 16)), 0n);
-  const amount = tokenAmount(inputCells.filter((cell) => cell.cellOutput.type && cell.cellOutput.lock.eq(own)))
-    - tokenAmount(outputs.filter((cell) => cell.cellOutput.type && cell.cellOutput !== fundingOutput && cell.cellOutput.lock.eq(own)));
+  const amount = tokenAmount(inputCells.filter((cell) => cell.cellOutput.type && owns(cell.cellOutput.lock)))
+    - tokenAmount(outputs.filter((cell) => cell.cellOutput.type && cell.cellOutput !== fundingOutput && owns(cell.cellOutput.lock)));
   if (amount <= 0n) throw new Error("A token channel must take the token from the KeyWay wallet");
   return { asset: type.hash(), amount };
 }
@@ -133,23 +150,51 @@ export async function signFundingTransaction(
   wallet: ReadyWallet,
   validated: ValidatedFunding,
 ): Promise<ccc.Transaction> {
-  const info = await validated.transaction.getSignHashInfo(validated.script, validated.signer.client);
-  if (!info) throw new Error("Funding transaction has no KeyWay signing group");
+  return signAccountGroups(validated.transaction, validated.groups, validated.signer.client, async (digest) => {
+    const signature = await signCkbDigest(digest, wallet.litPkpId, {
+      apiKey: requiredEnv("LIT_USAGE_API_KEY"),
+      actionCid: requiredEnv("LIT_SIGN_ACTION_CID"),
+      actionCode: await loadLitAction("sign-ckb-digest"),
+    });
+    const recovered = ccc.hexFrom(recoverPkpPublicKey(ccc.bytesFrom(digest), signature));
+    if (recovered.toLowerCase() !== wallet.litPublicKey.toLowerCase()) {
+      throw new Error("Lit signature does not match the KeyWay wallet");
+    }
+    return formatCkbSignature(signature);
+  }, "Funding transaction has no KeyWay signing group");
+}
 
-  const signature = await signCkbDigest(info.message, wallet.litPkpId, {
-    apiKey: requiredEnv("LIT_USAGE_API_KEY"),
-    actionCid: requiredEnv("LIT_SIGN_ACTION_CID"),
-    actionCode: await loadLitAction("sign-ckb-digest"),
-  });
-  const recovered = ccc.hexFrom(recoverPkpPublicKey(ccc.bytesFrom(info.message), signature));
-  if (recovered.toLowerCase() !== wallet.litPublicKey.toLowerCase()) {
-    throw new Error("Lit signature does not match the KeyWay wallet");
+/** The account's lock groups that have inputs in the transaction, in the order of `locks`. */
+export function signingGroups(
+  locks: SigningGroup[],
+  inputCells: Array<{ cellOutput: ccc.CellOutput }>,
+): SigningGroup[] {
+  return locks.filter(({ script }) => inputCells.some(({ cellOutput }) => cellOutput.lock.eq(script)));
+}
+
+/**
+ * Signs each of the account's lock groups over its own digest. The group's first witness lock is reset to
+ * zeros at its final length (65 bytes secp256k1, 85 bytes Omnilock) before hashing, then replaced with the
+ * signature, bare for secp256k1 or wrapped in OmniLockWitnessLock for Omnilock.
+ */
+export async function signAccountGroups(
+  transaction: ccc.Transaction,
+  groups: SigningGroup[],
+  client: ccc.Client,
+  signDigest: (digest: ccc.Hex) => Promise<ccc.Hex>,
+  missingGroup = "Transaction has no KeyWay signing group",
+): Promise<ccc.Transaction> {
+  if (groups.length === 0) throw new Error(missingGroup);
+  for (const { script, kind } of groups) {
+    await transaction.prepareSighashAllWitness(script, witnessLockLength(kind), client);
+    const info = await transaction.getSignHashInfo(script, client);
+    if (!info) throw new Error(missingGroup);
+    const signature = await signDigest(info.message);
+    const witness = transaction.getWitnessArgsAt(info.position) ?? ccc.WitnessArgs.from({});
+    witness.lock = kind === "omnilock" ? omnilockOwnerWitnessLock(signature) : signature;
+    transaction.setWitnessArgsAt(info.position, witness);
   }
-
-  const witness = validated.transaction.getWitnessArgsAt(info.position) ?? ccc.WitnessArgs.from({});
-  witness.lock = formatCkbSignature(signature);
-  validated.transaction.setWitnessArgsAt(info.position, witness);
-  return validated.transaction;
+  return transaction;
 }
 
 export function serializeTransaction(transaction: ccc.Transaction): Record<string, unknown> {

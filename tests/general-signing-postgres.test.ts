@@ -25,10 +25,12 @@ function harness(outflow: bigint, tokenOutflows: Array<{ asset: string; amount: 
   const preview = async (_wallet: ReadyWallet, input: unknown): Promise<ValidatedTransaction> => {
     const transaction = ccc.Transaction.from(input as ccc.TransactionLike);
     Object.assign(transaction, { getSignHashInfo: async () => ({ message: ccc.hexFrom(`0x${"ab".repeat(32)}`), position: 0 }) });
+    const script = ccc.Script.from({ codeHash: `0x${"9b".repeat(32)}`, hashType: "type", args: "0x" });
     return {
       transaction,
       signer: { client: new ccc.ClientPublicTestnet() } as unknown as ccc.SignerCkbPublicKey,
-      script: ccc.Script.from({ codeHash: `0x${"9b".repeat(32)}`, hashType: "type", args: "0x" }),
+      script,
+      groups: [{ script, kind: "secp256k1" }],
       preview: {
         network: "CKB testnet", sendingCkb: "100", receivingCkb: "0", feeCkb: "0.00001", tokens: [], nfts: [], dao: [],
         recipients: [{ address: "ckt1qtest", kind: "wallet", walletType: "standard", ckb: "100", tokens: [], nfts: [] }],
