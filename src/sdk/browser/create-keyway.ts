@@ -25,7 +25,7 @@ import { KeyWayApiClient } from "./api-client";
 import { createEncryptedNodeBackup, restoreEncryptedNodeBackup } from "./node-backup";
 import { backUpBeforeLogout, restoreBeforeStart } from "./node-migration";
 import { toKeyWayError, type KeyWayError } from "./keyway-error";
-import { DEFAULT_FUNDING_FEE_RATE, freeFiberParams, paymentFiberParams } from "./fiber-methods";
+import { freeFiberParams, fundingFeeRate, paymentFiberParams } from "./fiber-methods";
 import { describePayment, type ApproveFiberPayment } from "./fiber-payment";
 import { createFiberActions, type FiberActionApprovals } from "./fiber-actions";
 import { approveFiberParams } from "./fiber-methods";
@@ -268,7 +268,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       node,
       params: {
         ...params,
-        funding_fee_rate: params.funding_fee_rate ?? DEFAULT_FUNDING_FEE_RATE,
+        funding_fee_rate: fundingFeeRate(params.funding_fee_rate, funding.fundingLockScript),
         shutdown_script: funding.shutdownScript,
         funding_lock_script: funding.fundingLockScript,
         funding_lock_script_cell_deps: funding.fundingLockScriptCellDeps,

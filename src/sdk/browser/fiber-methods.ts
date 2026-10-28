@@ -188,11 +188,22 @@ export type ApproveFiberMethod = "openChannelWithExternalFunding" | "shutdownCha
 
 /** Closing fees: at most 100 times Fiber's default of 1,000 shannons per KB. */
 /**
- * Funding fee rate KeyWay opens channels at unless the caller sets one, in shannons/KB. Fiber sizes the
- * funding fee with a 65-byte secp256k1 placeholder and adds the second Omnilock cell dep after balancing, so
- * an Omnilock-funded transaction falls under the node minimum at Fiber's default of 1000; 1500 clears it.
+ * Funding fee rate for channels funded from an Omnilock account (recovery on), in shannons/KB. Fiber sizes the
+ * funding fee with a 65-byte secp256k1 placeholder, so an Omnilock-funded transaction falls under the node
+ * minimum at Fiber's default of 1000; 1500 clears it. secp256k1 accounts keep Fiber's default.
  */
-export const DEFAULT_FUNDING_FEE_RATE = "0x5dc";
+export const OMNILOCK_FUNDING_FEE_RATE: `0x${string}` = "0x5dc";
+const OMNILOCK_CODE_HASHES = [
+  "0xf329effd1c475a2978453c8600e1eaf0bc2087ee093c3ee64cc96ec6847752cb", // testnet
+  "0x9b819793a64463aed77c615d6cb226eea5487ccfc0783043a587254cda2b6f26", // mainnet
+];
+
+/** The caller's funding fee rate, or 1500 when the channel is funded from an Omnilock lock (else Fiber's default). */
+export function fundingFeeRate(requested: `0x${string}` | undefined, fundingLock: { code_hash?: string; codeHash?: string }): `0x${string}` | undefined {
+  if (requested !== undefined) return requested;
+  const codeHash = (fundingLock.code_hash ?? fundingLock.codeHash ?? "").toLowerCase();
+  return OMNILOCK_CODE_HASHES.includes(codeHash) ? OMNILOCK_FUNDING_FEE_RATE : undefined;
+}
 
 export const MAX_CLOSE_FEE_RATE = 100_000n;
 /** Forwarding fees: at most 10% of what a channel forwards. */
