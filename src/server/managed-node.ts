@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
 import { connectCandidates, TESTNET_CHANNEL_PEERS } from "../sdk/browser/channel-peers.ts";
 import { normalizeCkbTransactionForCcc } from "@fiber-pay/sdk/browser";
 import { serializeCccTransactionForRpc } from "../sdk/browser/ccc-transaction.ts";
-import { approveFiberParams, DEFAULT_FUNDING_FEE_RATE, FIBER_METHODS, freeFiberParams, paymentFiberParams, type FiberMethod } from "../sdk/browser/fiber-methods.ts";
+import { approveFiberParams, FIBER_METHODS, fundingFeeRate, freeFiberParams, paymentFiberParams, type FiberMethod } from "../sdk/browser/fiber-methods.ts";
 import { assertPublicPeerAddress } from "./peer-address.ts";
 import * as ccc from "@ckb-ccc/core";
 import { FEE_RESERVE, needsFeeReserve, sweepSettlement } from "../sdk/browser/settlement-sweep.ts";
@@ -253,6 +253,7 @@ function channelId(value: unknown): ChannelId {
 
 function openChannelParams(value: unknown): OpenChannelWithExternalFundingParams {
   const params = object(value, "Channel parameters are required");
+  const fundingLock = script(params.funding_lock_script);
   return {
     pubkey: pubkey(params.pubkey),
     funding_amount: positiveHex(params.funding_amount, "Funding amount"),
@@ -260,9 +261,9 @@ function openChannelParams(value: unknown): OpenChannelWithExternalFundingParams
     // The node accepts only tokens on its whitelist; funding signing accepts only standard tokens.
     ...(params.funding_udt_type_script === undefined ? {} : { funding_udt_type_script: script(params.funding_udt_type_script) }),
     shutdown_script: params.shutdown_script === undefined ? undefined as never : script(params.shutdown_script),
-    funding_lock_script: script(params.funding_lock_script),
+    funding_lock_script: fundingLock,
     funding_lock_script_cell_deps: cellDeps(params.funding_lock_script_cell_deps),
-    funding_fee_rate: optionalHex(params.funding_fee_rate, "Funding fee rate") ?? DEFAULT_FUNDING_FEE_RATE,
+    funding_fee_rate: fundingFeeRate(optionalHex(params.funding_fee_rate, "Funding fee rate"), fundingLock),
     commitment_fee_rate: optionalHex(params.commitment_fee_rate, "Commitment fee rate"),
   };
 }

@@ -205,7 +205,7 @@ test("a fresh managed node uses a TCP bootstrap hint when gossip has no address"
   assert.equal(calls[0].addr_type, "tcp");
 });
 
-test("hosted channels fund at 1500 shannons/KB unless the caller sets a rate", async () => {
+test("hosted channels from an Omnilock account fund at 1500 shannons/KB; others keep Fiber's default", async () => {
   const rates: unknown[] = [];
   const recording = { ...node, openChannelWithExternalFunding: async (params: { funding_fee_rate?: string }) => { rates.push(params.funding_fee_rate); return node.openChannelWithExternalFunding(); } };
   const params = {
@@ -215,5 +215,7 @@ test("hosted channels fund at 1500 shannons/KB unless the caller sets a rate", a
   };
   await managedNodeRequest("fee-rate-test", { operation: "open-channel", params }, recording as never, ownLock);
   await managedNodeRequest("fee-rate-test", { operation: "open-channel", params: { ...params, funding_fee_rate: "0x7d0" } }, recording as never, ownLock);
-  assert.deepEqual(rates, ["0x5dc", "0x7d0"]);
+  const omnilock = { code_hash: "0xf329effd1c475a2978453c8600e1eaf0bc2087ee093c3ee64cc96ec6847752cb", hash_type: "type", args: `0x00${"11".repeat(20)}01${"22".repeat(32)}` };
+  await managedNodeRequest("fee-rate-test", { operation: "open-channel", params: { ...params, funding_lock_script: omnilock } }, recording as never, ownLock);
+  assert.deepEqual(rates, [undefined, "0x7d0", "0x5dc"]);
 });

@@ -34,7 +34,7 @@ import {
   type PaymentEstimate,
 } from "./create-keyway";
 import { createFiberNode } from "./fiber-node";
-import { approveFiberParams, DEFAULT_FUNDING_FEE_RATE, type PaymentFiberMethod } from "./fiber-methods";
+import { approveFiberParams, fundingFeeRate, type PaymentFiberMethod } from "./fiber-methods";
 import { createFiberActions, type FiberActionApprovals } from "./fiber-actions";
 import type { ApproveFiberPayment, FiberPaymentPreview } from "./fiber-payment";
 import { withEmailCode, type RequestEmailCode } from "./email-code";
@@ -153,7 +153,7 @@ export function createManagedKeyWay(options: {
       node: { openChannelWithExternalFunding, submitSignedFundingTx },
       params: {
         ...params,
-        funding_fee_rate: params.funding_fee_rate ?? DEFAULT_FUNDING_FEE_RATE,
+        funding_fee_rate: fundingFeeRate(params.funding_fee_rate, funding.fundingLockScript),
         shutdown_script: funding.shutdownScript,
         funding_lock_script: funding.fundingLockScript,
         funding_lock_script_cell_deps: funding.fundingLockScriptCellDeps,
