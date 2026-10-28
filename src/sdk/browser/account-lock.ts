@@ -1,4 +1,5 @@
 import * as ccc from "@ckb-ccc/core";
+import { parseBackup, type RecoveryBackup } from "./recovery-backups.ts";
 
 /**
  * Opt-in account recovery: the account lives at an Omnilock address in administrator mode, owned by the same
@@ -17,6 +18,8 @@ export type KeyWayRecovery = {
   /** The account's secp256k1 address from before recovery was turned on. */
   legacyAddress: string;
   enabledAt: string;
+  /** The backups in the AdminList's whitelist, in order. Its root alone can't rebuild their proofs. */
+  backups?: RecoveryBackup[];
 };
 
 export type KeyWayLockKind = "secp256k1" | "omnilock";
@@ -54,8 +57,10 @@ export function parseRecovery(value: unknown, publicKey: ccc.HexLike): KeyWayRec
     typeof candidate.adminListTypeHash !== "string" || !HASH.test(candidate.adminListTypeHash) ||
     !outPoint || typeof outPoint.txHash !== "string" || !HASH.test(outPoint.txHash) ||
     !Number.isSafeInteger(outPoint.index) || outPoint.index < 0 ||
-    typeof candidate.legacyAddress !== "string" || typeof candidate.enabledAt !== "string"
+    typeof candidate.legacyAddress !== "string" || typeof candidate.enabledAt !== "string" ||
+    (candidate.backups !== undefined && !Array.isArray(candidate.backups))
   ) throw invalid();
+  try { candidate.backups?.forEach(parseBackup); } catch { throw invalid(); }
   const typeHash = candidate.adminListTypeHash.toLowerCase();
   if (adminListTypeScript(candidate as KeyWayRecovery).hash() !== typeHash) throw invalid();
   if (candidate.omnilockArgs.toLowerCase() !== omnilockArgsFor(publicKey, typeHash)) throw invalid();
@@ -113,6 +118,25 @@ export function refuseAdminListSpend(
 ): void {
   if (transaction.inputs.some((input, index) => isAdminListCell({ outPoint: input.previousOutput, cellOutput: inputCells[index].cellOutput }, recovery))) {
     throw new Error("This transaction would spend the account's recovery list, which KeyWay never signs here");
+  }
+}
+
+/**
+ * Funds may only reach an Omnilock of this key when it is the account's own current lock. Any other Omnilock
+ * with this key's auth, such as one pointing at an AdminList someone else made, would let that list's
+ * members spend what it receives, so a recovery list can only be set up by the recovery flow.
+ */
+export function refuseForeignOmnilockOutputs(
+  transaction: ccc.Transaction,
+  omnilock: Pick<ccc.ScriptInfo, "codeHash" | "hashType">,
+  publicKey: ccc.HexLike,
+  recovery: KeyWayRecovery | undefined,
+): void {
+  const auth = ccc.hexFrom(ccc.bytesConcat([0x00], ccc.hashCkbShort(publicKey)));
+  for (const { lock } of transaction.outputs) {
+    if (lock.codeHash !== omnilock.codeHash || lock.hashType !== omnilock.hashType || !lock.args.toLowerCase().startsWith(auth)) continue;
+    if (recovery && lock.args.toLowerCase() === recovery.omnilockArgs.toLowerCase()) continue;
+    throw new Error("This transaction would send funds to an Omnilock address of this account that isn't its own");
   }
 }
 

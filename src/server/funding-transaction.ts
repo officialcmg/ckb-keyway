@@ -1,6 +1,6 @@
 import * as ccc from "@ckb-ccc/core";
 import type { User } from "./auth-user.ts";
-import { accountLocks, omnilockOwnerWitnessLock, refuseAdminListSpend, witnessLockLength, type KeyWayLockKind } from "../sdk/browser/account-lock.ts";
+import { accountLocks, omnilockOwnerWitnessLock, refuseAdminListSpend, refuseForeignOmnilockOutputs, witnessLockLength, type KeyWayLockKind } from "../sdk/browser/account-lock.ts";
 import { isXudtCompatible } from "../sdk/browser/tokens.ts";
 import { loadLitAction } from "./lit-actions.ts";
 import { signCkbDigest } from "./lit.ts";
@@ -55,6 +55,7 @@ export async function previewFundingTransaction(
   if (ownedInputs.length === 0) {
     throw new Error("Funding transaction has no input controlled by this KeyWay wallet");
   }
+  refuseForeignOmnilockOutputs(transaction, await client.getKnownScript(ccc.KnownScript.OmniLock), wallet.litPublicKey, wallet.recovery);
 
   const fundingOutputs = transaction.outputs.filter(({ lock }) => (
     lock.codeHash.toLowerCase() === TESTNET_FUNDING_LOCK_CODE_HASH && lock.hashType === "type"
