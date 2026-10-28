@@ -7,9 +7,10 @@ import { keccak_256 } from "@noble/hashes/sha3.js";
  * id, and the AdminList's whitelist holds one SMT key per backup. A backup is accepted only with a signature
  * over `recoveryBackupChallenge`, proving the user controls it.
  *
- * - EVM wallet, flag 0x01 (Ethereum): id = the 20-byte address. Omnilock recovers the signer from a 65-byte
- *   r ‖ s ‖ recid signature over keccak256("\x19Ethereum Signed Message:\n32" ‖ sighash), i.e. personal_sign of
- *   the raw 32-byte sighash, with recid 0 or 1 (a wallet's v of 27 or 28, minus 27).
+ * - EVM wallet, flag 0x12 (EthereumDisplaying): id = the 20-byte address. The wallet personal_signs the text
+ *   "CKB transaction: 0x" followed by the sighash in 64 lowercase hex digits (83 bytes, `evmOmnilockMessage`), so
+ *   Omnilock recovers the signer from a 65-byte r ‖ s ‖ recid signature over
+ *   keccak256("\x19Ethereum Signed Message:\n83" ‖ that text), with recid 0 or 1 (a wallet's v of 27 or 28, minus 27).
  * - JoyID, flag 0xFC (owner lock): id = the first 20 bytes of the JoyID lock script hash. Omnilock needs no
  *   signature then; it only checks that an input of the same transaction has that lock, which JoyID unlocks
  *   with its own passkey signature.
@@ -24,7 +25,8 @@ export type RecoveryBackupProof =
   | { kind: "joyid"; address: string; signature: string; identity: string };
 
 export const OMNILOCK_AUTH_CKB = 0x00;
-export const OMNILOCK_AUTH_ETHEREUM = 0x01;
+/** Omnilock's IdentityFlagsEthereumDisplaying: personal_sign of "CKB transaction: 0x…". */
+export const OMNILOCK_AUTH_ETHEREUM_DISPLAYING = 0x12;
 export const OMNILOCK_AUTH_OWNER_LOCK = 0xfc;
 export const MAX_RECOVERY_BACKUPS = 8;
 /** JoyID lock args for a secp256r1 main key: 0x0001 ‖ blake160(64-byte public key). */
@@ -38,7 +40,7 @@ const auth = (flag: number, id: ccc.BytesLike): ccc.Hex => {
 };
 
 export function evmBackupAuth(address: string): ccc.Hex {
-  return auth(OMNILOCK_AUTH_ETHEREUM, normalizeEvmAddress(address));
+  return auth(OMNILOCK_AUTH_ETHEREUM_DISPLAYING, normalizeEvmAddress(address));
 }
 
 export function joyIdBackupAuth(lock: ccc.ScriptLike): ccc.Hex {
@@ -114,8 +116,7 @@ export function recoveryBackupChallenge(account: string, backup: RecoveryBackup)
 /** The address an EIP-191 personal_sign signature (r ‖ s ‖ v) recovers to. */
 export function evmPersonalSignAddress(message: string | Uint8Array, signature: ccc.HexLike): ccc.Hex {
   const bytes = typeof message === "string" ? new TextEncoder().encode(message) : message;
-  const digest = keccak_256(ccc.bytesConcat(new TextEncoder().encode(`\x19Ethereum Signed Message:\n${bytes.length}`), bytes));
-  return evmAddressFrom(digest, evmOmnilockSignature(signature));
+  return evmAddressFrom(evmPersonalSignDigest(bytes), evmOmnilockSignature(signature));
 }
 
 /** A wallet's 65-byte r ‖ s ‖ v signature with v reduced to the 0/1 recovery id Omnilock expects. */
@@ -134,10 +135,23 @@ function evmAddressFrom(digest: Uint8Array, signature: ccc.Hex): ccc.Hex {
   return ccc.hexFrom(keccak_256(uncompressed.slice(1)).slice(12));
 }
 
-/** The digest an Ethereum-flag (0x01) Omnilock identity signs for a transaction's sighash. */
-export function evmOmnilockDigest(sighash: ccc.HexLike): Uint8Array {
-  return keccak_256(ccc.bytesConcat(new TextEncoder().encode("\x19Ethereum Signed Message:\n32"), ccc.bytesFrom(sighash)));
+/**
+ * The text an EVM backup (flag 0x12) personal_signs to approve a transaction: "CKB transaction: 0x" and the
+ * 32-byte sighash in lowercase hex, as Omnilock's `convert_eth_message_displaying` rebuilds it.
+ */
+export function evmOmnilockMessage(sighash: ccc.HexLike): string {
+  const bytes = ccc.bytesFrom(sighash);
+  if (bytes.length !== 32) throw new Error("A sighash must be 32 bytes");
+  return `CKB transaction: ${ccc.hexFrom(bytes)}`;
 }
+
+/** The digest Omnilock checks a flag-0x12 signature against: personal_sign's hash of `evmOmnilockMessage`. */
+export function evmOmnilockDigest(sighash: ccc.HexLike): Uint8Array {
+  return evmPersonalSignDigest(new TextEncoder().encode(evmOmnilockMessage(sighash)));
+}
+
+const evmPersonalSignDigest = (bytes: Uint8Array) =>
+  keccak_256(ccc.bytesConcat(new TextEncoder().encode(`\x19Ethereum Signed Message:\n${bytes.length}`), bytes));
 
 /**
  * Checks a backup's signature over the recovery challenge for this account and returns the backup. EVM:

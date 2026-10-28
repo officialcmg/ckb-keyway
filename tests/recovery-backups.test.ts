@@ -11,6 +11,7 @@ import {
   describeBackup,
   evmBackupAuth,
   evmOmnilockDigest,
+  evmOmnilockMessage,
   evmOmnilockSignature,
   evmPersonalSignAddress,
   joyIdBackupAuth,
@@ -61,7 +62,7 @@ async function joyIdWallet() {
 
 test("encodes each backup as its 21-byte Omnilock auth", async () => {
   const evm = evmWallet();
-  assert.equal(evmBackupAuth(evm.address.toUpperCase().replace("0X", "0x")), `0x01${evm.address.slice(2)}`);
+  assert.equal(evmBackupAuth(evm.address.toUpperCase().replace("0X", "0x")), `0x12${evm.address.slice(2)}`);
   const joy = await joyIdWallet();
   assert.equal(joyIdBackupAuth(joy.lock), `0xfc${joy.lock.hash().slice(2, 42)}`);
   assert.equal(await backupAuth(client, { kind: "joyid", address: joy.address }), joyIdBackupAuth(joy.lock));
@@ -132,12 +133,48 @@ test("builds the admin witness lock the spike used on chain", () => {
   assert.equal(owner.length, 146 - 65 - 4);
 });
 
-test("signs an Omnilock sighash the way flag 0x01 verifies it", () => {
+test("signs an Omnilock sighash the way flag 0x12 verifies it", () => {
   const evm = evmWallet();
-  const sighash = ccc.hexFrom(new Uint8Array(32).fill(9));
-  const signature = evmOmnilockSignature(evm.signDigest(evmOmnilockDigest(sighash)));
+  const sighash = `0x${"0a".repeat(16)}${"FF".repeat(16)}`;
+  // Omnilock's convert_eth_message_displaying: "CKB transaction: 0x" and 64 lowercase hex digits, 83 bytes.
+  const message = evmOmnilockMessage(sighash);
+  assert.equal(message, `CKB transaction: 0x${"0a".repeat(16)}${"ff".repeat(16)}`);
+  assert.equal(new TextEncoder().encode(message).length, 83);
+  assert.deepEqual(evmOmnilockDigest(sighash), keccak_256(new TextEncoder().encode(`\x19Ethereum Signed Message:\n83${message}`)));
+  // A wallet's personal_sign of that text is the signature Omnilock recovers E's address from.
+  const signature = evmOmnilockSignature(evm.personalSign(message));
   assert.ok(ccc.bytesFrom(signature)[64] <= 1);
-  // The same digest is personal_sign of the raw 32 bytes, as CCC's EVM signer does for flag 0x01.
-  assert.equal(evmPersonalSignAddress(ccc.bytesFrom(sighash), signature), evm.address);
+  assert.equal(evmPersonalSignAddress(message, signature), evm.address);
+  // A personal_sign of the raw 32 bytes (the flag 0x01 rule) recovers someone else under 0x12.
+  const raw = evmOmnilockSignature(evm.signDigest(keccak_256(ccc.bytesConcat(new TextEncoder().encode("\x19Ethereum Signed Message:\n32"), ccc.bytesFrom(sighash)))));
+  assert.notEqual(evmPersonalSignAddress(message, raw), evm.address);
+  assert.throws(() => evmOmnilockMessage("0x00"), /32 bytes/);
   assert.throws(() => evmOmnilockSignature("0x00"), /65 bytes/);
+});
+
+test("signs the same text as CCC's EVM signer does for its 0x12 Omnilock address", async () => {
+  const evm = evmWallet();
+  const signed: string[] = [];
+  class Wallet extends ccc.SignerEvm {
+    async connect() {}
+    async isConnected() { return true; }
+    async getEvmAccount() { return evm.address; }
+    async signMessageRaw(message: string | ccc.BytesLike) {
+      if (typeof message !== "string") throw new Error("expected text");
+      signed.push(message);
+      return evm.personalSign(message);
+    }
+  }
+  const signer = new Wallet(client);
+  const lock = await ccc.Script.fromKnownScript(client, ccc.KnownScript.OmniLock, ccc.hexFrom(ccc.bytesConcat(evmBackupAuth(evm.address), [0x00])));
+  const input = { outPoint: { txHash: `0x${"31".repeat(32)}`, index: 0 }, cellOutput: { lock, capacity: 1000n * 100_000_000n }, outputData: "0x" };
+  await client.cache.recordCells([input]);
+  const tx = ccc.Transaction.from({ inputs: [{ previousOutput: input.outPoint }], outputs: [{ lock, capacity: 999n * 100_000_000n }], outputsData: ["0x"] });
+  tx.setWitnessArgsAt(0, ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(85)) }));
+  const sighash = (await tx.getSignHashInfo(lock, client))!.message;
+  const signedTx = await signer.signOnlyTransaction(tx);
+  assert.deepEqual(signed, [evmOmnilockMessage(sighash)]);
+  // CCC writes the same 0/1 recovery id signature Omnilock checks.
+  const witness = ccc.bytesFrom(signedTx.getWitnessArgsAt(0)!.lock!);
+  assert.equal(ccc.hexFrom(witness.slice(20)), evmOmnilockSignature(evm.personalSign(evmOmnilockMessage(sighash))));
 });
