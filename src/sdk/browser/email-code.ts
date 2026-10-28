@@ -1,6 +1,6 @@
 /** Asks the user for the code KeyWay emailed them. Resolve undefined if they cancel. */
 export type RequestEmailCode = (request: {
-  reason: "transaction" | "settings" | "payment";
+  reason: "transaction" | "settings" | "payment" | "recovery";
   error?: string;
   resend: () => Promise<void>;
 }) => Promise<string | undefined>;
@@ -13,7 +13,7 @@ const WRONG_CODE = /isn't right|six-digit code/i;
  */
 export async function withEmailCode<T>(
   requestEmailCode: RequestEmailCode,
-  reason: "transaction" | "settings" | "payment",
+  reason: "transaction" | "settings" | "payment" | "recovery",
   send: () => Promise<void>,
   complete: (code: string) => Promise<T>,
 ): Promise<T> {

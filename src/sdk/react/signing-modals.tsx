@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
+import type { RecoveryPreview } from "../browser/account-recovery";
 import type { MessagePreview, TransactionPreview } from "../browser/keyway-signer";
 import type { FiberChannelClosePreview, FiberChannelSettingsPreview, FiberPeerPreview } from "../browser/fiber-actions";
 import {
@@ -140,7 +141,7 @@ export function KeyWayMessageModal({ theme, appName, preview, answer }: { theme:
 /** Asks for the code KeyWay emailed the user. Always drawn by the SDK, even when an app brings its own approval UI. */
 export function KeyWayEmailCodeModal({ theme, reason, error, resend, answer }: {
   theme: Theme;
-  reason: "transaction" | "settings" | "payment";
+  reason: "transaction" | "settings" | "payment" | "recovery";
   error?: string;
   resend: () => Promise<void>;
   answer: (code: string | undefined) => void;
@@ -155,7 +156,10 @@ export function KeyWayEmailCodeModal({ theme, reason, error, resend, answer }: {
           <p style={{ ...modalEyebrow, color: palette.muted }}>EMAIL CONFIRMATION</p>
           <h2 id="keyway-code-title" style={modalTitle}>Check your email</h2>
           <p style={{ ...modalCopy, color: palette.muted }}>
-            {reason === "transaction" ? "We emailed you a code to confirm this transaction." : reason === "payment" ? "We emailed you a code to confirm this payment." : "We emailed you a code to confirm this security change."} It expires in 10 minutes.
+            {reason === "transaction" ? "We emailed you a code to confirm this transaction."
+              : reason === "payment" ? "We emailed you a code to confirm this payment."
+              : reason === "recovery" ? "We emailed you a code to confirm turning on recovery."
+              : "We emailed you a code to confirm this security change."} It expires in 10 minutes.
           </p>
           <label style={modalLabel}>Confirmation code
             <input
@@ -270,6 +274,43 @@ export function KeyWayChannelSettingsModal({ theme, appName, preview, answer }: 
           </dl>
           <p style={note(palette)}>These settings apply to payments other people route through this channel. No funds move.</p>
           <Actions palette={palette} confirm="Save settings" answer={answer} />
+        </>
+      )}
+    </Shell>
+  );
+}
+
+/** The built-in dialog for turning account recovery on, drawn from the backend's own plan. */
+export function KeyWayRecoveryModal({ theme, appName, preview, answer }: { theme: Theme; appName: string; preview: RecoveryPreview; answer: (approved: boolean) => void }) {
+  useEscape(() => answer(false));
+  return (
+    <Shell theme={theme} labelId="keyway-recovery-title">
+      {(palette) => (
+        <>
+          <p style={{ ...modalEyebrow, color: palette.muted }}>{appName} · ACCOUNT RECOVERY</p>
+          <h2 id="keyway-recovery-title" style={modalTitle}>Turn on recovery?</h2>
+          <p style={{ ...modalCopy, color: palette.muted }}>
+            {preview.backups.length === 1 ? "This backup" : "These backups"} can recover your account if you lose access to your email.
+          </p>
+          <dl style={{ ...fundingDetails, margin: "16px 0" }}>
+            {preview.backups.map((backup) => <Row key={`${backup.kind}:${backup.address}`} label="Backup" value={backup.label} />)}
+            <Row label="Locked for the recovery list" value={`${preview.adminListCkb} CKB`} />
+            {preview.tokenCellsExtraCkb !== "0" && <Row label="Locked in token cells" value={`${preview.tokenCellsExtraCkb} CKB`} />}
+            <Row label="Network fee" value={`${preview.feeCkb} CKB`} />
+            <Row label="New address" value={shortAddress(preview.newAddress)} />
+            <Row label="Network" value={preview.network} />
+          </dl>
+          <p role="note" style={warning(palette)}>Your address will change because you&apos;re turning on recovery.</p>
+          <p style={note(palette)}>
+            Your CKB{preview.tokens.length > 0 ? " and tokens" : ""} move to the new address in one transaction. The old address stays yours.
+            {preview.cellsLeft > 0 ? ` ${preview.cellsLeft} cell${preview.cellsLeft === 1 ? "" : "s"} that can't be moved stay${preview.cellsLeft === 1 ? "s" : ""} there.` : ""} We&apos;ll email you a code next.
+          </p>
+          <details style={{ textAlign: "left", fontSize: 12, color: palette.muted, margin: "8px 0 0" }}>
+            <summary style={{ cursor: "pointer" }}>Details</summary>
+            <p style={{ margin: "8px 0 0", fontFamily: "ui-monospace, monospace", overflowWrap: "anywhere" }}>New address {preview.newAddress}</p>
+            <p style={{ margin: "8px 0 0", fontFamily: "ui-monospace, monospace", overflowWrap: "anywhere" }}>Transaction {preview.transactionHash}</p>
+          </details>
+          <Actions palette={palette} confirm="Turn on recovery" answer={answer} />
         </>
       )}
     </Shell>
