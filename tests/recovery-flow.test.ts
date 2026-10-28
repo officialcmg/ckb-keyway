@@ -5,7 +5,7 @@ import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { adminListTypeScript, omnilockArgsFor, secp256k1Lock, type KeyWayRecovery } from "../src/sdk/browser/account-lock.ts";
-import { evmBackupAuth, evmPersonalSignAddress, omnilockAdminWitnessLock, recoveryBackupChallenge, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
+import { evmBackupAuth, evmOmnilockMessage, evmPersonalSignAddress, omnilockAdminWitnessLock, recoveryBackupChallenge, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
 import { adminListData, whitelistTree } from "../src/sdk/browser/recovery-smt.ts";
 import { formatCkbSignature, previewFundingTransaction, signAccountGroups } from "../src/server/funding-transaction.ts";
 import { checkRecoveryTransaction, planRecovery, recoveryLines, recoverySetup, type RecoveryContext } from "../src/server/recovery.ts";
@@ -115,12 +115,12 @@ test("refuses when the balance can't cover it or there is no plain CKB", async (
 });
 
 test("reproduces the testnet enable transaction and its EVM backup spend from the recorded cells", async () => {
-  // research/omnilock/phase2-results.md: 0x250e0b50…1af4 turned recovery on; 0x7597ed3d…ac66 is the EVM spend.
+  // research/omnilock/phase2-results.md: 0xe1536bd6…b4c1 turned recovery on; 0x5ec745a9…c70c is the EVM spend (flag 0x12).
   const fixture = JSON.parse(await readFile(new URL("./fixtures/recovery-enable.json", import.meta.url), "utf8"));
   const client = await offlineClient(fixture.inputCells);
   const plan = await planRecovery(client, walletFor(fixture.publicKey), [{ kind: "evm", address: fixture.evmBackup }]);
   const onChain = ccc.Transaction.from(fixture.transaction);
-  assert.equal(plan.transaction.hash(), "0x250e0b50785082de4819b618251aa4c1d6148c36fb5bb1379488edfaa0911af4");
+  assert.equal(plan.transaction.hash(), "0xe1536bd605120ed82d8fd811e9607f71e2622a77b6ebd154cfb2222c4599b4c1");
   assert.equal(plan.transaction.hash(), onChain.hash());
   // Its secp256k1 signature is over the digest KeyWay signs.
   const digest = (await plan.transaction.getSignHashInfo(plan.secp, client))!.message;
@@ -128,7 +128,7 @@ test("reproduces the testnet enable transaction and its EVM backup spend from th
   const recovered = secp256k1.recoverPublicKey(Uint8Array.from([signature[64], ...signature.slice(0, 64)]), ccc.bytesFrom(digest), { prehash: false });
   assert.equal(ccc.hexFrom(recovered), fixture.publicKey);
 
-  // The backup spend: an admin witness whose signature is the EVM backup's personal_sign of the raw sighash.
+  // The backup spend: an admin witness whose signature is the EVM backup's personal_sign of "CKB transaction: 0x<sighash>".
   const spend = ccc.Transaction.from(fixture.evmSpend.transaction);
   const spendClient = await offlineClient([fixture.evmSpend.inputCell]);
   const auth = evmBackupAuth(fixture.evmBackup);
@@ -138,7 +138,7 @@ test("reproduces the testnet enable transaction and its EVM backup spend from th
   const unsigned = spend.clone();
   unsigned.setWitnessArgsAt(0, ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(ccc.bytesFrom(lock).length)) }));
   const sighash = (await unsigned.getSignHashInfo(plan.omnilock, spendClient))!.message;
-  assert.equal(evmPersonalSignAddress(ccc.bytesFrom(sighash), spendSignature), fixture.evmBackup);
+  assert.equal(evmPersonalSignAddress(evmOmnilockMessage(sighash), spendSignature), fixture.evmBackup);
 });
 
 test("refuses a recovery transaction that doesn't match what KeyWay computed", async () => {
