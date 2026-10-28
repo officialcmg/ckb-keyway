@@ -1,0 +1,3 @@
+control: E signs as E: accepted
+outsider signs with E's identity and proof: rejected, error code -31
+outsider with its own identity, proof from its own tree: rejected, error code 59

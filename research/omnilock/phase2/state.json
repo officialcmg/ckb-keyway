@@ -1,0 +1,24 @@
+{
+  "enable": "0x250e0b50785082de4819b618251aa4c1d6148c36fb5bb1379488edfaa0911af4",
+  "recovery": {
+    "omnilockArgs": "0x005fba3041cbae104865a9fe5f5abce2b05519403a0177ac64e754e4222c58512bcd48c9b9c5f1504ee38e2e174b0fee041450477ef7",
+    "adminListTypeArgs": "0x322bb9f6d79d1b17a0430202d1a70014ff07728cc1302720d60b5868730f2d49",
+    "adminListTypeHash": "0x77ac64e754e4222c58512bcd48c9b9c5f1504ee38e2e174b0fee041450477ef7",
+    "adminListOutPoint": {
+      "txHash": "0x250e0b50785082de4819b618251aa4c1d6148c36fb5bb1379488edfaa0911af4",
+      "index": 0
+    },
+    "legacyAddress": "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq2lhgcyrjawzpyxt207tadtec4s25v5qws2m4yxa",
+    "enabledAt": "2026-10-28T00:43:40.853Z",
+    "backups": [
+      {
+        "kind": "evm",
+        "address": "0x2918d5553eec5967e4fcc79a07577f96ee23d3b3"
+      }
+    ]
+  },
+  "newAddress": "ckt1qrejnmlar3r452tcg57gvq8patctcgy8acync0hxfnyka35ywafvkqgqt7arqswt4cgysedfle04408zkp23jsp6q9m6ce882njzytzc2y4u6jxfh8zlz5zwuw8zu96tplhqg9zsgal0w0dq5n9",
+  "legacyAddress": "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq2lhgcyrjawzpyxt207tadtec4s25v5qws2m4yxa",
+  "evmBackup": "0x2918d5553eec5967e4fcc79a07577f96ee23d3b3",
+  "evmSpend": "0x7597ed3d13d4e1a0f7293e67fb02fc16b479d265e634e3d6625fb14b5737ac66"
+}
