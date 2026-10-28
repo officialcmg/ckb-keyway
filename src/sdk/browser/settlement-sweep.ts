@@ -80,14 +80,7 @@ export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.Hex
     outputsData: [...tokens.map((cell) => cell.outputData), ...plainOutputs.map(() => "0x")],
   });
   await tx.addCellDepsOfKnownScripts(client, ccc.KnownScript.Secp256k1Blake160);
-  if (cells.some((cell) => cell.cellOutput.type && !isXudtCompatible(cell.cellOutput.type))) {
-    await tx.addCellDepsOfKnownScripts(client, ccc.KnownScript.XUdt);
-  }
-  if (cells.some((cell) => cell.cellOutput.type && isXudtCompatible(cell.cellOutput.type))) {
-    const contract = await client.findSingletonCellByType({ codeHash: TYPE_ID_CODE_HASH, hashType: "type", args: RUSD_CONTRACT_TYPE_ID_ARGS }, true);
-    if (!contract) throw new Error("Could not find the token contract to move token cells");
-    tx.addCellDeps({ outPoint: contract.outPoint, depType: "code" });
-  }
+  await addTokenCellDeps(client, tx, cells);
 
   // The fee comes out of the user's CKB, else the reserve, else a token cell's spare capacity.
   const indexed = tx.outputs.map((output, index) => ({ output, index }));
@@ -98,3 +91,15 @@ export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.Hex
 }
 
 const TYPE_ID_CODE_HASH = "0x00000000000000000000000000000000000000000000000000545950455f4944";
+
+/** Cell deps for moving xUDT cells: CCC's xUDT deployment, and the RUSD contract for xUDT-compatible ones. */
+export async function addTokenCellDeps(client: ccc.Client, tx: ccc.Transaction, cells: Array<{ cellOutput: { type?: ccc.Script } }>): Promise<void> {
+  if (cells.some((cell) => cell.cellOutput.type && !isXudtCompatible(cell.cellOutput.type))) {
+    await tx.addCellDepsOfKnownScripts(client, ccc.KnownScript.XUdt);
+  }
+  if (cells.some((cell) => cell.cellOutput.type && isXudtCompatible(cell.cellOutput.type))) {
+    const contract = await client.findSingletonCellByType({ codeHash: TYPE_ID_CODE_HASH, hashType: "type", args: RUSD_CONTRACT_TYPE_ID_ARGS }, true);
+    if (!contract) throw new Error("Could not find the token contract to move token cells");
+    tx.addCellDeps({ outPoint: contract.outPoint, depType: "code" });
+  }
+}

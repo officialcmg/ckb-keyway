@@ -12,7 +12,7 @@ import { recoverPkpPublicKey } from "./pkp-identity.ts";
 import { formatCkb, previewGeneralTransaction, previewSummaryLines, type ValidatedTransaction } from "./transaction-policy.ts";
 import type { ReadyWallet } from "./user-wallet.ts";
 
-export type Purpose = "transaction" | "message" | "settings" | "payment";
+export type Purpose = "transaction" | "message" | "settings" | "payment" | "recovery";
 
 /** Everything the signing service needs from the HTTP layer, so it can be tested without it. */
 export type SigningContext = {
@@ -257,7 +257,7 @@ async function signTransaction(context: SigningContext, validated: ValidatedTran
 }
 
 /** Signs a digest the backend computed itself, then checks the recovered key before releasing it. */
-async function sign(context: SigningContext, digest: ccc.Hex): Promise<ccc.Hex> {
+export async function sign(context: SigningContext, digest: ccc.Hex): Promise<ccc.Hex> {
   if (context.signDigest) return context.signDigest(digest, context.wallet);
   const signature = await signCkbDigest(digest, context.wallet.litPkpId, {
     apiKey: requiredEnv("LIT_USAGE_API_KEY"),

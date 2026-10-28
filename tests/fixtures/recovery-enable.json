@@ -1,0 +1,177 @@
+{
+  "note": "CKB testnet phase 2 proof (research/omnilock/phase2-results.md): recovery turned on with one EVM backup, then that backup's admin-path spend",
+  "publicKey": "0x03abc93bb365d44fc442fef31ee4fabf3d46f8f0f328e6ec303adf6d160c1356f2",
+  "evmBackup": "0x2918d5553eec5967e4fcc79a07577f96ee23d3b3",
+  "transaction": {
+    "version": "0x0",
+    "cellDeps": [
+      {
+        "outPoint": {
+          "txHash": "0xf8de3bb47d055cdf460d93a2a6e1b05f7432f9777c8c474abf4eec1d4aee5d37",
+          "index": "0x0"
+        },
+        "depType": "depGroup"
+      }
+    ],
+    "headerDeps": [],
+    "inputs": [
+      {
+        "previousOutput": {
+          "txHash": "0x8cbde12caaa302087c6f0e759172ece3d3cd50e7096d2cc8b20f543fc5f32175",
+          "index": "0x0"
+        },
+        "since": "0x0",
+        "cellOutput": {
+          "capacity": "0xe8d4a51000",
+          "lock": {
+            "codeHash": "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8",
+            "hashType": "type",
+            "args": "0x5fba3041cbae104865a9fe5f5abce2b05519403a"
+          }
+        },
+        "outputData": "0x"
+      }
+    ],
+    "outputs": [
+      {
+        "capacity": "0x496362500",
+        "lock": {
+          "codeHash": "0xf329effd1c475a2978453c8600e1eaf0bc2087ee093c3ee64cc96ec6847752cb",
+          "hashType": "type",
+          "args": "0x005fba3041cbae104865a9fe5f5abce2b05519403a0177ac64e754e4222c58512bcd48c9b9c5f1504ee38e2e174b0fee041450477ef7"
+        },
+        "type": {
+          "codeHash": "0x00000000000000000000000000000000000000000000000000545950455f4944",
+          "hashType": "type",
+          "args": "0x322bb9f6d79d1b17a0430202d1a70014ff07728cc1302720d60b5868730f2d49"
+        }
+      },
+      {
+        "capacity": "0xe43e6ee72b",
+        "lock": {
+          "codeHash": "0xf329effd1c475a2978453c8600e1eaf0bc2087ee093c3ee64cc96ec6847752cb",
+          "hashType": "type",
+          "args": "0x005fba3041cbae104865a9fe5f5abce2b05519403a0177ac64e754e4222c58512bcd48c9b9c5f1504ee38e2e174b0fee041450477ef7"
+        }
+      }
+    ],
+    "outputsData": [
+      "0x0000000094f6e5394cb1eef1ada6e0cd6a17bcd0667008b9ddfc8ce38318bc731199518302",
+      "0x"
+    ],
+    "witnesses": [
+      "0x55000000100000005500000055000000410000005490376218209bd422c43836d659703bb9f6c4ec1f12978faca8b802e3755ff827e8e4b61547b92e987c5aff1fa28b36ba3e983207e3f19e4e6eaa89b48082d501"
+    ]
+  },
+  "inputCells": [
+    {
+      "outPoint": {
+        "txHash": "0x8cbde12caaa302087c6f0e759172ece3d3cd50e7096d2cc8b20f543fc5f32175",
+        "index": "0x0"
+      },
+      "cellOutput": {
+        "capacity": "0xe8d4a51000",
+        "lock": {
+          "codeHash": "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8",
+          "hashType": "type",
+          "args": "0x5fba3041cbae104865a9fe5f5abce2b05519403a"
+        }
+      },
+      "outputData": "0x"
+    }
+  ],
+  "evmSpend": {
+    "transaction": {
+      "version": "0x0",
+      "cellDeps": [
+        {
+          "outPoint": {
+            "txHash": "0x250e0b50785082de4819b618251aa4c1d6148c36fb5bb1379488edfaa0911af4",
+            "index": "0x0"
+          },
+          "depType": "code"
+        },
+        {
+          "outPoint": {
+            "txHash": "0xf8de3bb47d055cdf460d93a2a6e1b05f7432f9777c8c474abf4eec1d4aee5d37",
+            "index": "0x0"
+          },
+          "depType": "depGroup"
+        },
+        {
+          "outPoint": {
+            "txHash": "0xec18bf0d857c981c3d1f4e17999b9b90c484b303378e94de1a57b0872f5d4602",
+            "index": "0x0"
+          },
+          "depType": "code"
+        }
+      ],
+      "headerDeps": [],
+      "inputs": [
+        {
+          "previousOutput": {
+            "txHash": "0x250e0b50785082de4819b618251aa4c1d6148c36fb5bb1379488edfaa0911af4",
+            "index": "0x1"
+          },
+          "since": "0x0",
+          "cellOutput": {
+            "capacity": "0xe43e6ee72b",
+            "lock": {
+              "codeHash": "0xf329effd1c475a2978453c8600e1eaf0bc2087ee093c3ee64cc96ec6847752cb",
+              "hashType": "type",
+              "args": "0x005fba3041cbae104865a9fe5f5abce2b05519403a0177ac64e754e4222c58512bcd48c9b9c5f1504ee38e2e174b0fee041450477ef7"
+            }
+          },
+          "outputData": "0x"
+        }
+      ],
+      "outputs": [
+        {
+          "capacity": "0x174876e800",
+          "lock": {
+            "codeHash": "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8",
+            "hashType": "type",
+            "args": "0x5fba3041cbae104865a9fe5f5abce2b05519403a"
+          }
+        },
+        {
+          "capacity": "0xccf5f7fb57",
+          "lock": {
+            "codeHash": "0xf329effd1c475a2978453c8600e1eaf0bc2087ee093c3ee64cc96ec6847752cb",
+            "hashType": "type",
+            "args": "0x005fba3041cbae104865a9fe5f5abce2b05519403a0177ac64e754e4222c58512bcd48c9b9c5f1504ee38e2e174b0fee041450477ef7"
+          }
+        }
+      ],
+      "outputsData": [
+        "0x",
+        "0x"
+      ],
+      "witnesses": [
+        "0xa600000010000000a6000000a6000000920000009200000010000000550000009200000041000000552a77ff3f1a1c199cb7bbbe8a81b3ae2affebb848d0c0e90eeb30d512c3d65f455693b784ffae2452c9abdc30e8df29b70414e1abb4da6410709b41666b8fbc013d0000000c00000021000000012918d5553eec5967e4fcc79a07577f96ee23d3b31c00000008000000140000000c0000000d00000003030000004c4f00"
+      ]
+    },
+    "inputCell": {
+      "cellOutput": {
+        "capacity": "0xe43e6ee72b",
+        "lock": {
+          "codeHash": "0xf329effd1c475a2978453c8600e1eaf0bc2087ee093c3ee64cc96ec6847752cb",
+          "hashType": "type",
+          "args": "0x005fba3041cbae104865a9fe5f5abce2b05519403a0177ac64e754e4222c58512bcd48c9b9c5f1504ee38e2e174b0fee041450477ef7"
+        }
+      },
+      "outputData": "0x",
+      "outPoint": {
+        "txHash": "0x250e0b50785082de4819b618251aa4c1d6148c36fb5bb1379488edfaa0911af4",
+        "index": "0x1"
+      }
+    },
+    "adminListCellDep": {
+      "outPoint": {
+        "txHash": "0x250e0b50785082de4819b618251aa4c1d6148c36fb5bb1379488edfaa0911af4",
+        "index": "0x0"
+      },
+      "depType": "code"
+    }
+  }
+}

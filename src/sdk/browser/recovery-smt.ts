@@ -238,3 +238,8 @@ export function whitelistTree(auths: ccc.HexLike[]): { root: ccc.Hex; proofs: Re
   for (const key of keys) tree.update(key);
   return { root: tree.root, proofs: Object.fromEntries(auths.map((auth, index) => [ccc.hexFrom(auth), tree.proof([keys[index]])])) };
 }
+
+/** AdminList cell data: RCData union item 0, RCRule { smt_root, flags: 0x02 (whitelist) }. 37 bytes. */
+export function adminListData(root: ccc.HexLike): ccc.Hex {
+  return ccc.hexFrom(ccc.bytesConcat(ccc.numLeToBytes(0, 4), h256(root, "An SMT root"), [0x02]));
+}
