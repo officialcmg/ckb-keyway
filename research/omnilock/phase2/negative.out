@@ -1,3 +1,4 @@
 control: E signs as E: accepted
+E personal_signs the raw 32-byte sighash (0x01 style): rejected, error code -31
 outsider signs with E's identity and proof: rejected, error code -31
 outsider with its own identity, proof from its own tree: rejected, error code 59

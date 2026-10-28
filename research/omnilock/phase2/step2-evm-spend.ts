@@ -1,9 +1,9 @@
 // Phase 2, step 2: spend from the account's Omnilock address through the administrator path, signed only by
-// the EVM backup E (Omnilock auth flag 0x01): identity = 0x01 ‖ E's address, one SMT proof (mask 3), the
-// AdminList as a cell dep, and E's personal_sign of the raw 32-byte sighash.
+// the EVM backup E (Omnilock auth flag 0x12, EthereumDisplaying): identity = 0x12 ‖ E's address, one SMT proof
+// (mask 3), the AdminList as a cell dep, and E's personal_sign of "CKB transaction: 0x<sighash>".
 import * as ccc from "@ckb-ccc/core";
 import { adminListTypeScript, parseRecovery } from "../../../src/sdk/browser/account-lock.ts";
-import { evmBackupAuth, evmOmnilockSignature, omnilockAdminWitnessLock } from "../../../src/sdk/browser/recovery-backups.ts";
+import { evmBackupAuth, evmOmnilockMessage, evmOmnilockSignature, omnilockAdminWitnessLock } from "../../../src/sdk/browser/recovery-backups.ts";
 import { adminListData, whitelistTree } from "../../../src/sdk/browser/recovery-smt.ts";
 import { client, evmPersonalSign, loadKeys, loadState, publicKeyOf, saveState, waitCommitted } from "./lib.ts";
 
@@ -40,8 +40,10 @@ const fee = (BigInt(tx.toBytes().length + 4) * 1500n + 999n) / 1000n;
 tx.outputs[1].capacity = funds.cellOutput.capacity - tx.outputs[0].capacity - fee;
 const info = await tx.getSignHashInfo(omnilock, client);
 if (!info) throw new Error("no sign hash info");
-// What a wallet's personal_sign does with the 32 raw bytes of the sighash.
-const signature = evmOmnilockSignature(evmPersonalSign(keys.E, ccc.bytesFrom(info.message)));
+// What a wallet shows and personal_signs: "CKB transaction: 0x" and the sighash in lowercase hex.
+const message = evmOmnilockMessage(info.message);
+console.log("E signs:", message);
+const signature = evmOmnilockSignature(evmPersonalSign(keys.E, new TextEncoder().encode(message)));
 tx.setWitnessArgsAt(0, ccc.WitnessArgs.from({ lock: omnilockAdminWitnessLock({ signature, auth, proof }) }));
 
 const cycles = await client.sendTransactionDry(tx, "passthrough");
