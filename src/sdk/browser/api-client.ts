@@ -96,6 +96,12 @@ export class KeyWayApiClient {
       : this.json(`${KEYWAY_API_PATH}/sign-message`, authToken, body);
   }
 
+  recovery(authToken: string, body: Record<string, unknown>) {
+    return body.operation === "enable"
+      ? this.idempotentJson(`${KEYWAY_API_PATH}/recovery`, authToken, body)
+      : this.json(`${KEYWAY_API_PATH}/recovery`, authToken, body);
+  }
+
   signingSettings(authToken: string, body: Record<string, unknown>) {
     return this.json(`${KEYWAY_API_PATH}/signing-settings`, authToken, body);
   }

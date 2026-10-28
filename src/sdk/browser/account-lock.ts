@@ -1,5 +1,5 @@
 import * as ccc from "@ckb-ccc/core";
-import { parseBackup, type RecoveryBackup } from "./recovery-backups.ts";
+import { parseBackup, type RecoveryBackup } from "./recovery-backups";
 
 /**
  * Opt-in account recovery: the account lives at an Omnilock address in administrator mode, owned by the same
