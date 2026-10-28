@@ -7,7 +7,7 @@
   "type": "module",
   "scripts": {
     "migrate": "node --import tsx scripts/migrate-auth.ts",
-    "test:auth:postgres": "node --import tsx --test tests/auth-postgres.test.ts tests/general-signing-postgres.test.ts tests/fiber-payments-postgres.test.ts",
+    "test:auth:postgres": "node --import tsx --test tests/auth-postgres.test.ts tests/general-signing-postgres.test.ts tests/fiber-payments-postgres.test.ts tests/recovery-postgres.test.ts",
     "dev": "next dev",
     "build": "next build",
     "build:sdk": "tsup src/sdk/react/index.ts --tsconfig tsconfig.sdk.json --format esm --dts --platform browser --external react --external react/jsx-runtime --env.KEYWAY_API_TARGET production --out-dir dist/react --clean",

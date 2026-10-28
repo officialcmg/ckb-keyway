@@ -38,6 +38,7 @@ import { fiberPayment } from "./fiber-payments.ts";
 import { runIdempotentMutation } from "./idempotency.ts";
 import { recordSigningEvent } from "./security-alerts.ts";
 import { messageSigning, signingSettings, transactionSigning, type SigningContext } from "./general-signing.ts";
+import { recoverySetup } from "./recovery.ts";
 
 export async function handleKeyWayRequest(request: Request): Promise<Response> {
   const cors = await corsHeaders(request);
@@ -78,6 +79,7 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
       : path === "/api/keyway/sign-transaction" ? await signTransactionRequest(request)
       : path === "/api/keyway/sign-message" ? await generalSigningRequest(request, "message")
       : path === "/api/keyway/signing-settings" ? await generalSigningRequest(request, "settings")
+      : path === "/api/keyway/recovery" ? await generalSigningRequest(request, "recovery")
       : path === "/api/keyway/developer/apps" ? await developerAppsRequest(request)
       : path === "/api/keyway/managed-node" ? await managedNodeHttpRequest(request)
       : jsonError("Not found", 404);
@@ -313,7 +315,7 @@ async function signTransactionRequest(request: Request): Promise<Response> {
 
 async function generalSigningRequest(
   request: Request,
-  kind: "transaction" | "message" | "settings",
+  kind: "transaction" | "message" | "settings" | "recovery",
   parsedBody?: Record<string, unknown>,
 ): Promise<Response> {
   const user = await authenticateUser(request);
@@ -330,8 +332,11 @@ async function generalSigningRequest(
     rateLimit: consumeRateLimit,
     recordSigning: recordSigningEvent,
   };
-  const run = () => kind === "transaction" ? transactionSigning(context, body) : kind === "message" ? messageSigning(context, body) : signingSettings(context, body);
-  const result = body.operation === "sign" ? await versionedMutation(request, user.id, `general-${kind}`, body, run) : await run();
+  const run = () => kind === "transaction" ? transactionSigning(context, body)
+    : kind === "message" ? messageSigning(context, body)
+    : kind === "recovery" ? recoverySetup(context, body)
+    : signingSettings(context, body);
+  const result = body.operation === "sign" || body.operation === "enable" ? await versionedMutation(request, user.id, `general-${kind}`, body, run) : await run();
   return Response.json(result, { headers: { "Cache-Control": "no-store" } });
 }
 
