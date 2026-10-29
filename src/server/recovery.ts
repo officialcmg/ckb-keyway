@@ -6,6 +6,7 @@ import { adminListData, whitelistTree } from "../sdk/browser/recovery-smt.ts";
 import { addTokenCellDeps } from "../sdk/browser/settlement-sweep.ts";
 import { formatAsset, isXudtCompatible } from "../sdk/browser/tokens.ts";
 import { withUserLock } from "./database.ts";
+import { createRecoveryNoticeEmailTemplate } from "./email-template.ts";
 import { serializeTransaction, signAccountGroups } from "./funding-transaction.ts";
 import { consumeRequest, hashText, issueRequest, limit, loadRequest, sendCode, sign, verifyCode, type SigningContext } from "./general-signing.ts";
 import { feeRateCap, formatCkb } from "./transaction-policy.ts";
@@ -103,8 +104,23 @@ export async function recoverySetup(context: RecoveryContext, body: Record<strin
     };
     const updated: ReadyWallet = { ...wallet, ckbAddress: plan.preview.newAddress, recovery, updatedAt: new Date().toISOString() };
     await saveWallet(context.user, updated, sql);
+    await sendRecoveryNotice(context, "Account recovery is on", updated.ckbAddress, backups, transactionHash);
     return { transactionHash, recovery, ckbAddress: updated.ckbAddress, transaction: serializeTransaction(signed) };
   });
+}
+
+/**
+ * Emails the account's address, its backups and the rescue page after the change is on chain, so the user can
+ * reach their funds with a backup even if KeyWay is gone. The change already happened, so a failed email is
+ * logged, not thrown.
+ */
+async function sendRecoveryNotice(context: RecoveryContext, heading: string, address: string, backups: RecoveryBackup[], transactionHash: string): Promise<void> {
+  try {
+    const template = createRecoveryNoticeEmailTemplate(context.appName, { heading, address, backups: backups.map(({ kind, address }) => `${kind === "evm" ? "EVM wallet" : "JoyID"} ${address}`), network: "CKB testnet" });
+    await context.sendEmail(await context.email(), template, `keyway-recovery-notice/${transactionHash}`);
+  } catch (error) {
+    console.error("[keyway] recovery notice email failed", { cause: error instanceof Error ? error.message.slice(0, 200) : "email" });
+  }
 }
 
 async function verifyBackups(client: ccc.Client, wallet: ReadyWallet, proofs: unknown[]): Promise<void> {
@@ -336,6 +352,8 @@ export async function recoveryBackupChange(context: RecoveryContext, body: Recor
     const transactionHash = await (context.broadcast ?? ((transaction) => client.sendTransaction(transaction, "passthrough")))(signed);
     const recovery: KeyWayRecovery = { ...wallet.recovery, adminListOutPoint: { txHash: transactionHash, index: 0 }, backups: plan.backups };
     await saveWallet(context.user, { ...wallet, recovery, updatedAt: new Date().toISOString() }, sql);
+    const heading = change.change === "add" ? "A recovery backup was added" : "A recovery backup was removed";
+    await sendRecoveryNotice(context, heading, wallet.ckbAddress, plan.backups, transactionHash);
     return { transactionHash, recovery, transaction: serializeTransaction(signed) };
   });
 }
