@@ -1,0 +1,8 @@
+Control: J1 signs this transaction: accepted (6799126 cycles)
+J1 signs another transaction's sighash: rejected, error code 107 Inputs[0].Lock
+J2 signs with its own key under J1's identity and proof: rejected, error code 101 Inputs[0].Lock
+J2's signature with J1's public key in the blob: rejected, error code 109 Inputs[0].Lock
+J2 with its own identity and a proof from a tree that contains it: rejected, error code 59 Inputs[0].Lock
+J1 signs, but the verifier isn't a cell dep: rejected, error code 1 Inputs[0].Lock
+Owner-lock style (0xFC, J1's JoyID lock hash), J1's JoyID cell as an input, no signature: rejected, error code 59 Inputs[0].Lock
+J1's identity with no signature and a JoyID input: rejected, error code 72 Inputs[0].Lock

@@ -8,5 +8,40 @@
     "hashType": "data1",
     "size": 37024,
     "capacity": "37085"
-  }
+  },
+  "userId": "b225f76f-43a9-43c8-9f71-6c6fa276cee6",
+  "enable": "0x749adad0d67555b18816d419c79c662f5d6bc68655abf6cafcd713329e3861cc",
+  "recovery": {
+    "backups": [
+      {
+        "kind": "joyid",
+        "address": "ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqqy9f7lknjuzw75jjpqy5seak7qqt4xln3uhkpv2y"
+      },
+      {
+        "kind": "joyid",
+        "address": "ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqqy7ux6pgwdffgwyj5vaxh3s279nj5d40ksh9gqla"
+      }
+    ],
+    "enabledAt": "2026-10-29T01:17:35.691Z",
+    "omnilockArgs": "0x004365fdd3dc2315ac0e6feb276fbb8cb12f5246e601b2289cd128a19ca308febfac9dd299c8801650ab3d1802cd231a87c14f8f4425",
+    "legacyAddress": "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq2rvh7a8hprzkkqumltyahmhr939afydesksjnwu",
+    "adminListOutPoint": {
+      "txHash": "0xa8fd196ee0bd09bff0fcba3e0cd3e426c3f8abb477cca9701a4d6a13c18a2c62",
+      "index": 0
+    },
+    "adminListTypeArgs": "0xf23c272a818387efe18fbe9cd37e217d5e24f46fce1cc0774f5dc45b5a1a9cda",
+    "adminListTypeHash": "0xb2289cd128a19ca308febfac9dd299c8801650ab3d1802cd231a87c14f8f4425"
+  },
+  "newAddress": "ckt1qrejnmlar3r452tcg57gvq8patctcgy8acync0hxfnyka35ywafvkqgqgdjlm57uyv26crn0avnklwuvkyh4y3hxqxez38x39zseegcgl6l6e8wjn8ygq9js4v73sqkdyvdg0s203azz27kznm9",
+  "legacyAddress": "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq2rvh7a8hprzkkqumltyahmhr939afydesksjnwu",
+  "joyIdBackup": "ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqqy9f7lknjuzw75jjpqy5seak7qqt4xln3uhkpv2y",
+  "joyIdSpend": "0x7e0bc4816afc6e8fbd3f49961b3330ed798165e7314b5e00d5f65ea59788b445",
+  "addE1": "0x310a9cebc1c06316c458cf5f96982c0e11a2b2a1b10c054166600637d5e56829",
+  "addJ2": "0x6d2d989c457f1c9ad8ea2e9679e93c41ef3af3251a08800fd1b56897cf361d2e",
+  "joyIdBackups": {
+    "J2": "ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqqy7ux6pgwdffgwyj5vaxh3s279nj5d40ksh9gqla"
+  },
+  "spendJ2": "0xfce3fdd7c941deb8cba68815eda4b08fe595221879a951f4bbd069851cf115e2",
+  "spendE1": "0xe835a32ddacfa58d7b94370f1c796ea146c5d0327b28b35f11ca1dabc953b22b",
+  "removeE1": "0xa8fd196ee0bd09bff0fcba3e0cd3e426c3f8abb477cca9701a4d6a13c18a2c62"
 }
