@@ -1,0 +1,19 @@
+84 |     let s = p256::Scalar::from_repr(p256::FieldBytes::clone_from_slice(&high[97..129])).unwrap();
+control: a valid assertion verifies, and only for its own sighash
+clientDataJSON duplicate challenge: Err(ClientDataJson)
+clientDataJSON duplicate via escape: Err(ClientDataJson)
+clientDataJSON challenge only nested: Err(Challenge)
+clientDataJSON challenge in origin: Err(Challenge)
+clientDataJSON trailing data: Err(ClientDataJson)
+clientDataJSON BOM: Err(ClientDataJson)
+clientDataJSON type missing: Err(Type)
+clientDataJSON type not a string: Err(Type)
+clientDataJSON webauthn.create: Err(Type)
+clientDataJSON NUL in key: Err(ClientDataJson)
+clientDataJSON lone surrogate: Err(ClientDataJson)
+clientDataJSON depth 10: Err(ClientDataJson)
+clientDataJSON leading zero: Err(ClientDataJson)
+clientDataJSON escaped challenge: Ok(())
+blob framing: dirty padding, >1024, version, short length refused; high-s accepted (witness malleability only)
+exec argument: extra field refused, uppercase hex accepted (Omnilock emits lowercase)
+220000 random mutations: no panic, no mutated blob accepted
