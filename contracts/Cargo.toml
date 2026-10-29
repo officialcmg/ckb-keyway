@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["joyid-webauthn", "tests"]
+default-members = ["tests"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = true
+overflow-checks = true
