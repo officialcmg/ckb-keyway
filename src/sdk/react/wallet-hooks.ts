@@ -3,13 +3,13 @@
 import { useEffect, useRef, useState } from "react";
 import { createEvmBackup, createJoyIdBackup, recoveryAccountAddress, type EthereumProvider } from "../browser/account-recovery";
 import { getCkbAccountBalance } from "../browser/ckb-balance";
-import type { RecoveryBackupProof } from "../browser/recovery-backups";
+import type { RecoveryBackup, RecoveryBackupProof } from "../browser/recovery-backups";
 import type * as ccc from "@ckb-ccc/core";
 import type { KeyWay, KeyWayChannel, OpenKeyWayChannelOptions, ChannelOpenProgress } from "../browser/create-keyway";
 import { useKeyWayContext } from "./keyway-provider";
 
 export function useCkbWallet() {
-  const { authenticated, wallet, signer, error: recoveryError, enableRecovery } = useKeyWayContext();
+  const { authenticated, wallet, signer, error: recoveryError, enableRecovery, changeRecoveryBackup } = useKeyWayContext();
   const [balance, setBalance] = useState<bigint>();
   const [balanceError, setBalanceError] = useState<Error>();
   const [refreshing, setRefreshing] = useState(false);
@@ -65,6 +65,13 @@ export function useCkbWallet() {
         void refreshBalance().catch(() => undefined);
         return result;
       },
+      /**
+       * Adds a backup from `createEvmBackup` or `createJoyIdBackup`, after the user approves and enters the emailed
+       * code. The address doesn't change.
+       */
+      addBackup: (backup: RecoveryBackupProof) => changeRecoveryBackup("add", backup),
+      /** Removes a backup, after the user approves and enters the emailed code. The last backup can't be removed. */
+      removeBackup: (backup: RecoveryBackup) => changeRecoveryBackup("remove", backup),
       /** Asks an injected EVM wallet (`window.ethereum` by default) to sign up as a backup. */
       createEvmBackup: async (ethereum?: EthereumProvider) => {
         if (!wallet) throw new Error("Recover the CKB account before adding a backup");

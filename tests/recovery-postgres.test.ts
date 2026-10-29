@@ -8,7 +8,7 @@ import { recoveryBackupChallenge } from "../src/sdk/browser/recovery-backups.ts"
 import { database } from "../src/server/database.ts";
 import { formatCkbSignature } from "../src/server/funding-transaction.ts";
 import { signingSettings } from "../src/server/general-signing.ts";
-import { recoverySetup, type RecoveryContext } from "../src/server/recovery.ts";
+import { recoveryBackupChange, recoverySetup, type RecoveryContext } from "../src/server/recovery.ts";
 import { readWallet, saveWallet, type ReadyWallet } from "../src/server/user-wallet.ts";
 
 const enabled = Boolean(process.env.KEYWAY_AUTH_TEST_DATABASE_URL);
@@ -69,7 +69,7 @@ async function harness() {
   const evm = evmWallet();
   const backup = { kind: "evm" as const, address: evm.address };
   const proof = { ...backup, signature: evm.personalSign(recoveryBackupChallenge(legacyAddress, backup)) };
-  return { user, wallet, legacyAddress, publicKey, context, emails, broadcasts, proof, addCell, codeFrom: () => /code is (\d{6})/.exec(emails.at(-1)!.plaintext)![1] };
+  return { user, wallet, legacyAddress, publicKey, client, context, emails, broadcasts, proof, addCell, codeFrom: () => /code is (\d{6})/.exec(emails.at(-1)!.plaintext)![1] };
 }
 
 type Preview = { preview: { newAddress: string; adminListCkb: string; transactionHash: string }; confirmationNonce: string; requiresEmailCode: boolean };
@@ -148,5 +148,95 @@ test("turning recovery on: preview, emailed code, enable", { skip: !enabled }, a
     await assert.rejects(enable([{ ...h.proof, signature: otherProof.signature }]), /didn't sign/);
     await assert.rejects(enable([h.proof, otherProof]), /changed since the preview/);
     assert.equal(h.broadcasts.length, 0);
+  });
+});
+
+test("adding and removing backups: preview, emailed code, apply", { skip: !enabled }, async (t) => {
+  process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
+
+  /** Recovery turned on through the real flow, with the client then answering from the enable transaction's outputs. */
+  async function enabledHarness() {
+    const h = await harness();
+    const preview = await recoverySetup(h.context(h.wallet), { operation: "preview", backups: [h.proof] }) as Preview;
+    await recoverySetup(h.context(h.wallet), { operation: "request-email-code", backups: [h.proof], confirmationNonce: preview.confirmationNonce });
+    await recoverySetup(h.context(h.wallet), { operation: "enable", backups: [h.proof], confirmationNonce: preview.confirmationNonce, emailCode: h.codeFrom() });
+    const transactions = [...h.broadcasts];
+    const live = () => {
+      const spent = new Set(transactions.flatMap((tx) => tx.inputs.map((input) => input.previousOutput.toBytes().toString())));
+      return transactions.flatMap((tx) => tx.outputs.map((cellOutput, index) => ccc.Cell.from({ outPoint: { txHash: tx.hash(), index }, cellOutput, outputData: tx.outputsData[index] })))
+        .filter((cell) => !spent.has(cell.outPoint.toBytes().toString()));
+    };
+    Object.assign(h.client, {
+      findSingletonCellByType: async (type: ccc.ScriptLike) => live().find((cell) => cell.cellOutput.type?.eq(ccc.Script.from(type))),
+      findCellsByLock: async function* (lock: ccc.ScriptLike) { for (const cell of live()) if (cell.cellOutput.lock.eq(ccc.Script.from(lock))) yield cell; },
+      getTransaction: async (hash: ccc.HexLike) => {
+        const transaction = transactions.find((tx) => tx.hash() === ccc.hexFrom(hash));
+        return transaction ? { transaction, status: "committed" } : undefined;
+      },
+    });
+    await h.client.cache.recordCells(transactions.flatMap((tx) => tx.outputs.map((cellOutput, index) => ({ outPoint: { txHash: tx.hash(), index }, cellOutput, outputData: tx.outputsData[index] }))));
+    h.emails.length = 0;
+    const apply = async (body: Record<string, unknown>) => {
+      const wallet = await readWallet(h.user) as ReadyWallet;
+      const shown = await recoveryBackupChange(h.context(wallet), { ...body, operation: "preview" }) as { preview: { feeCkb: string; backups: unknown[] }; confirmationNonce: string; requiresEmailCode: boolean };
+      await recoveryBackupChange(h.context(wallet), { ...body, operation: "request-email-code", confirmationNonce: shown.confirmationNonce });
+      const result = await recoveryBackupChange(h.context(wallet), { ...body, operation: "apply", confirmationNonce: shown.confirmationNonce, emailCode: h.codeFrom() }) as { transactionHash: string };
+      transactions.push(h.broadcasts.at(-1)!);
+      return { shown, result };
+    };
+    return { ...h, apply, transactions };
+  }
+
+  await t.test("adds a backup with its signature and the emailed code, keeping the address", async () => {
+    const h = await enabledHarness();
+    const enabledWallet = await readWallet(h.user) as ReadyWallet;
+    const second = evmWallet();
+    const backup = { kind: "evm" as const, address: second.address };
+    const proof = { ...backup, signature: second.personalSign(recoveryBackupChallenge(h.legacyAddress, backup)) };
+    const preview = await recoveryBackupChange(h.context(enabledWallet), { operation: "preview", change: "add", backup: proof }) as { preview: { backups: unknown[] }; confirmationNonce: string; requiresEmailCode: boolean };
+    assert.equal(preview.requiresEmailCode, true);
+    assert.equal(preview.preview.backups.length, 2);
+    await assert.rejects(recoveryBackupChange(h.context(enabledWallet), { operation: "apply", change: "add", backup: proof, confirmationNonce: preview.confirmationNonce, emailCode: "123456" }), /expired/);
+    await recoveryBackupChange(h.context(enabledWallet), { operation: "request-email-code", change: "add", backup: proof, confirmationNonce: preview.confirmationNonce });
+    assert.match(h.emails.at(-1)!.subject, /Add a recovery backup/);
+    assert.match(h.emails.at(-1)!.plaintext, new RegExp(`Adding: EVM wallet ${second.address.slice(0, 10)}`));
+    assert.match(h.emails.at(-1)!.plaintext, /move everything in your account without KeyWay/);
+    // Without the backup's own signature, or with another one, nothing is applied.
+    await assert.rejects(recoveryBackupChange(h.context(enabledWallet), { operation: "apply", change: "add", backup, confirmationNonce: preview.confirmationNonce, emailCode: h.codeFrom() }), /didn't sign/);
+    const before = h.broadcasts.length;
+    const result = await recoveryBackupChange(h.context(enabledWallet), { operation: "apply", change: "add", backup: proof, confirmationNonce: preview.confirmationNonce, emailCode: h.codeFrom() }) as { transactionHash: string };
+    assert.equal(h.broadcasts.length, before + 1);
+    const stored = await readWallet(h.user) as ReadyWallet;
+    assert.equal(stored.ckbAddress, enabledWallet.ckbAddress, "the address doesn't change");
+    assert.deepEqual(stored.recovery?.backups, [{ kind: "evm", address: h.proof.address }, backup]);
+    assert.deepEqual(stored.recovery?.adminListOutPoint, { txHash: result.transactionHash, index: 0 });
+    assert.equal(stored.recovery?.omnilockArgs, enabledWallet.recovery?.omnilockArgs);
+    // The owner path: one 85-byte Omnilock witness signed by the account key.
+    assert.equal(ccc.bytesFrom(h.broadcasts.at(-1)!.getWitnessArgsAt(0)!.lock!).length, 85);
+  });
+
+  await t.test("removes a backup with the emailed code and refuses removing the last one", async () => {
+    const h = await enabledHarness();
+    await assert.rejects(recoveryBackupChange(h.context(await readWallet(h.user) as ReadyWallet), { operation: "preview", change: "remove", backup: { kind: "evm", address: h.proof.address } }), /Keep at least one backup/);
+    const second = evmWallet();
+    const backup = { kind: "evm" as const, address: second.address };
+    await h.apply({ change: "add", backup: { ...backup, signature: second.personalSign(recoveryBackupChallenge(h.legacyAddress, backup)) } });
+    const { shown } = await h.apply({ change: "remove", backup: { kind: "evm", address: h.proof.address } });
+    assert.equal(shown.requiresEmailCode, true);
+    assert.match(h.emails.at(-1)!.subject, /Remove a recovery backup/);
+    assert.match(h.emails.at(-1)!.plaintext, new RegExp(`Removing: EVM wallet ${h.proof.address.slice(0, 10)}`));
+    assert.deepEqual((await readWallet(h.user) as ReadyWallet).recovery?.backups, [backup]);
+  });
+
+  await t.test("needs the code even when a daily amount is set", async () => {
+    const h = await enabledHarness();
+    const wallet = await readWallet(h.user) as ReadyWallet;
+    await signingSettings(h.context(wallet), { operation: "set-daily-amount", asset: "ckb", amount: (1_000_000n * CKB).toString() });
+    const second = evmWallet();
+    const backup = { kind: "evm" as const, address: second.address };
+    const proof = { ...backup, signature: second.personalSign(recoveryBackupChallenge(h.legacyAddress, backup)) };
+    const preview = await recoveryBackupChange(h.context(wallet), { operation: "preview", change: "add", backup: proof }) as { confirmationNonce: string; requiresEmailCode: boolean };
+    assert.equal(preview.requiresEmailCode, true);
+    await assert.rejects(recoveryBackupChange(h.context(wallet), { operation: "apply", change: "add", backup: proof, confirmationNonce: preview.confirmationNonce }), /expired|six-digit/);
   });
 });

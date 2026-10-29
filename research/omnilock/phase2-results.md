@@ -125,36 +125,9 @@ on-chain witnesses) and B2's on-chain 71-byte proof. Vectors: `tests/fixtures/re
 
 ## JoyID backups
 
-Encoding: **owner-lock mode, auth flag 0xFC, id = the first 20 bytes of the JoyID lock script hash** (not blake160 of
-it: the lock hash is already a blake2b hash, and `is_lock_script_hash_present` compares its first 20 bytes). Unlock
-rule (`c/omni_lock.c` + `ckb_identity.h`): Omnilock takes the identity from the witness, checks its SMT proof against
-the AdminList, then for flag 0xFC only checks that **some input of the same transaction has that lock script hash**. No
-signature is needed in the Omnilock witness (`signature: None`); the JoyID input's own lock (passkey signature over its
-sighash) is what authorizes. Only JoyID main keys (lock args `0x0001 ‖ blake160(64-byte secp256r1 public key)`,
-confirmed against @joyid/ckb's own test data) are accepted; sub keys need JoyID's CoTA cells to resolve and are
-refused. Ownership proof: CCC's JoyID signer `signMessage(challenge)`; the server checks `ccc.verifyMessageJoyId`, that
-the key type is `main_key` with ES256, and that the signing public key is the one in the address's lock args. Unit
-tests use a P-256 key producing JoyID's WebAuthn assertion shape. A headless on-chain proof isn't possible (it needs a
-passkey), so it was not run.
-
-### What a manual JoyID test must check
-
-1. With a testnet JoyID passkey (testnet.joyid.dev) and CCC's `JoyId.CkbSigner` from `@ckb-ccc/joy-id`,
-   `useCkbWallet().recovery.createJoyIdBackup(signer)` returns a proof the server accepts at preview. Check the
-   identity JSON CCC returns really has `{ keyType: "main_key", publicKey }` with the 64-byte key (with or without
-   0x) and the signature JSON has `alg: -7`; a sub-key session must be refused.
-2. Turning recovery on with that backup puts SMT key `0xfc ‖ lockHash(JoyID lock)[0..20] ‖ 00×11` in the AdminList.
-3. A recovery spend: inputs = the account's Omnilock cell(s) **plus at least one cell locked by the JoyID address**
-   (≥ 63 CKB; fund one first); cell deps = Omnilock deps, the AdminList (`code`), JoyID's deps. Write the Omnilock
-   group's witness lock first, `omnilockAdminWitnessLock({ auth: 0xfc‖id, proof })` (no signature, 77 bytes for a
-   1-member tree), then let the JoyID signer sign its own group. Check the JoyID signer's `prepareTransaction` doesn't
-   overwrite the Omnilock witness or reorder inputs, and that the transaction is accepted.
-4. Negative: the same transaction without the JoyID input is rejected (`ERROR_IDENTITY_LOCK_SCRIPT_HASH_NOT_FOUND`),
-   and a JoyID address that isn't in the list is rejected with error 59.
-5. Threat model note for later phases: because the 0xFC rule only needs the JoyID input to be present, anyone who can
-   get the JoyID holder to sign *any* transaction containing their JoyID cell alongside the account's Omnilock cell can
-   spend the account's cell. The JoyID signing UI shows the whole transaction, but this is weaker than a signature
-   bound to the Omnilock's own sighash.
+Replaced: a JoyID backup now needs a passkey signature made for the recovery transaction itself. It is an
+Omnilock exec identity (flag 0xFD) run by KeyWay's WebAuthn verifier (`contracts/joyid-webauthn`); see
+`joyid-verifier-results.md` for the design, its testnet proof and the manual steps with a real JoyID.
 
 ## Gotchas and open points
 

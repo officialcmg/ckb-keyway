@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
-import type { RecoveryPreview } from "../browser/account-recovery";
+import type { BackupChangePreview, RecoveryPreview } from "../browser/account-recovery";
 import type { MessagePreview, TransactionPreview } from "../browser/keyway-signer";
 import type { FiberChannelClosePreview, FiberChannelSettingsPreview, FiberPeerPreview } from "../browser/fiber-actions";
 import {
@@ -141,7 +141,7 @@ export function KeyWayMessageModal({ theme, appName, preview, answer }: { theme:
 /** Asks for the code KeyWay emailed the user. Always drawn by the SDK, even when an app brings its own approval UI. */
 export function KeyWayEmailCodeModal({ theme, reason, error, resend, answer }: {
   theme: Theme;
-  reason: "transaction" | "settings" | "payment" | "recovery";
+  reason: "transaction" | "settings" | "payment" | "recovery" | "recovery-backup";
   error?: string;
   resend: () => Promise<void>;
   answer: (code: string | undefined) => void;
@@ -159,6 +159,7 @@ export function KeyWayEmailCodeModal({ theme, reason, error, resend, answer }: {
             {reason === "transaction" ? "We emailed you a code to confirm this transaction."
               : reason === "payment" ? "We emailed you a code to confirm this payment."
               : reason === "recovery" ? "We emailed you a code to confirm turning on recovery."
+              : reason === "recovery-backup" ? "We emailed you a code to confirm this backup change."
               : "We emailed you a code to confirm this security change."} It expires in 10 minutes.
           </p>
           <label style={modalLabel}>Confirmation code
@@ -311,6 +312,40 @@ export function KeyWayRecoveryModal({ theme, appName, preview, answer }: { theme
             <p style={{ margin: "8px 0 0", fontFamily: "ui-monospace, monospace", overflowWrap: "anywhere" }}>Transaction {preview.transactionHash}</p>
           </details>
           <Actions palette={palette} confirm="Turn on recovery" answer={answer} />
+        </>
+      )}
+    </Shell>
+  );
+}
+
+/** The built-in dialog for adding or removing a recovery backup, drawn from the backend's own plan. */
+export function KeyWayBackupChangeModal({ theme, appName, preview, answer }: { theme: Theme; appName: string; preview: BackupChangePreview; answer: (approved: boolean) => void }) {
+  useEscape(() => answer(false));
+  const adding = preview.change === "add";
+  return (
+    <Shell theme={theme} labelId="keyway-backup-title">
+      {(palette) => (
+        <>
+          <p style={{ ...modalEyebrow, color: palette.muted }}>{appName} · ACCOUNT RECOVERY</p>
+          <h2 id="keyway-backup-title" style={modalTitle}>{adding ? "Add this backup?" : "Remove this backup?"}</h2>
+          <p style={{ ...modalCopy, color: palette.muted }}>
+            {adding ? "It will be able to move everything in your account without KeyWay." : "It will no longer be able to recover your account."}
+          </p>
+          <dl style={{ ...fundingDetails, margin: "16px 0" }}>
+            <Row label={adding ? "Adding" : "Removing"} value={preview.backup.label} />
+            <Row label="Backups after this" value={String(preview.backups.length)} />
+            <Row label="Network fee" value={`${preview.feeCkb} CKB`} />
+            <Row label="Network" value={preview.network} />
+          </dl>
+          <p style={note(palette)}>Your address doesn&apos;t change. We&apos;ll email you a code next.</p>
+          <details style={{ textAlign: "left", fontSize: 12, color: palette.muted, margin: "8px 0 0" }}>
+            <summary style={{ cursor: "pointer" }}>Details</summary>
+            {preview.backups.map((backup) => (
+              <p key={`${backup.kind}:${backup.address}`} style={{ margin: "8px 0 0", fontFamily: "ui-monospace, monospace", overflowWrap: "anywhere" }}>Backup {backup.address}</p>
+            ))}
+            <p style={{ margin: "8px 0 0", fontFamily: "ui-monospace, monospace", overflowWrap: "anywhere" }}>Transaction {preview.transactionHash}</p>
+          </details>
+          <Actions palette={palette} confirm={adding ? "Add backup" : "Remove backup"} answer={answer} />
         </>
       )}
     </Shell>

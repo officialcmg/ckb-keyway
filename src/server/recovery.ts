@@ -1,6 +1,7 @@
 import * as ccc from "@ckb-ccc/core";
-import { adminListTypeScript, omnilockArgsFor, secp256k1Lock, type KeyWayRecovery } from "../sdk/browser/account-lock.ts";
-import { backupAuth, describeBackup, parseBackups, verifyBackupOwnership, type RecoveryBackup } from "../sdk/browser/recovery-backups.ts";
+import { adminListTypeScript, omnilockArgsFor, omnilockLock, secp256k1Lock, OMNILOCK_OWNER_WITNESS_LOCK_LENGTH, type KeyWayRecovery } from "../sdk/browser/account-lock.ts";
+import { backupAuth, describeBackup, MAX_RECOVERY_BACKUPS, parseBackup, parseBackups, verifyBackupOwnership, type RecoveryBackup } from "../sdk/browser/recovery-backups.ts";
+import { readRecoveryList, recoveryListRecord, recoveryListRecordOf, setRecoveryListRecord } from "../sdk/browser/recovery-list.ts";
 import { adminListData, whitelistTree } from "../sdk/browser/recovery-smt.ts";
 import { addTokenCellDeps } from "../sdk/browser/settlement-sweep.ts";
 import { formatAsset, isXudtCompatible } from "../sdk/browser/tokens.ts";
@@ -129,7 +130,8 @@ const occupied = (output: ccc.CellOutput, data: ccc.HexLike) => ccc.fixedPointFr
  * The one transaction that turns recovery on, built from the account's own secp256k1 cells: input 0 is its
  * largest plain cell, which fixes the AdminList's Type ID and so the new address. Output 0 is the AdminList
  * (Type ID, locked by the new Omnilock, RCRule data with the backups' root, at its exact occupied capacity),
- * then each token cell moves as it is, and the rest of the CKB less the fee goes to the new address.
+ * then each token cell moves as it is, and the rest of the CKB less the fee goes to the new address. Witness 0
+ * records the full backup list (`recoveryListRecord`) in its output_type.
  */
 export async function planRecovery(client: ccc.Client, wallet: ReadyWallet, backups: RecoveryBackup[]): Promise<RecoveryPlan> {
   const secp = await secp256k1Lock(client, wallet.litPublicKey);
@@ -168,6 +170,8 @@ export async function planRecovery(client: ccc.Client, wallet: ReadyWallet, back
   transaction.witnesses = inputCells.map((_, index) => index === 0
     ? ccc.hexFrom(ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(SECP_WITNESS_LOCK_LENGTH)) }).toBytes())
     : "0x");
+  // The full list goes on chain beside the AdminList (output 0), so it can be rebuilt without KeyWay.
+  setRecoveryListRecord(transaction, 0, await recoveryListRecord(client, backups));
 
   const totalIn = inputCells.reduce((sum, cell) => sum + cell.cellOutput.capacity, 0n);
   const fee = (BigInt(transaction.toBytes().length + 4) * FEE_RATE + 999n) / 1000n;
@@ -207,8 +211,8 @@ export async function planRecovery(client: ccc.Client, wallet: ReadyWallet, back
 /**
  * Checks the transaction against the rules of turning recovery on, independently of how it was built: it
  * spends only the account's secp256k1 cells, output 0 is the AdminList for input 0's Type ID with exactly
- * these backups, every other output goes to the Omnilock that AdminList belongs to, tokens are kept whole,
- * and the fee is within the cap.
+ * these backups and their on-chain record, every other output goes to the Omnilock that AdminList belongs to,
+ * tokens are kept whole, and the fee is within the cap.
  */
 export async function checkRecoveryTransaction(client: ccc.Client, transaction: ccc.Transaction, publicKey: ccc.HexLike, backups: RecoveryBackup[]): Promise<void> {
   const refuse = (reason: string) => { throw new Error(`The recovery transaction doesn't match what KeyWay computed: ${reason}`); };
@@ -224,6 +228,7 @@ export async function checkRecoveryTransaction(client: ccc.Client, transaction: 
   const data = ccc.hexFrom(transaction.outputsData[0] ?? "0x");
   if (data !== adminListData(root)) refuse("the recovery list doesn't hold exactly these backups");
   if (adminList.capacity !== occupied(adminList, data)) refuse("the recovery list's capacity is wrong");
+  if (recoveryListRecordOf(transaction, 0) !== await recoveryListRecord(client, backups)) refuse("the recorded backup list isn't exactly these backups");
   if (rest.length === 0) refuse("nothing moves to the new address");
   rest.forEach((output, index) => {
     if (!output.lock.eq(omnilock)) refuse(`output ${index + 1} goes somewhere other than your new address`);
@@ -267,4 +272,196 @@ function outPointKey(cell: ccc.Cell): string {
 function requiredNonce(value: unknown): string {
   if (typeof value !== "string" || !/^[0-9a-f-]{36}$/i.test(value)) throw new Error("A recovery confirmation is required");
   return value;
+}
+
+export type BackupChange = { change: "add" | "remove"; backup: RecoveryBackup };
+
+export type BackupChangePreview = {
+  network: "CKB testnet";
+  change: "add" | "remove";
+  backup: RecoveryBackup & { label: string };
+  /** The list after the change. */
+  backups: Array<RecoveryBackup & { label: string }>;
+  feeCkb: string;
+  transactionHash: string;
+};
+
+export type BackupChangePlan = {
+  transaction: ccc.Transaction;
+  omnilock: ccc.Script;
+  adminList: ccc.Cell;
+  backups: RecoveryBackup[];
+  preview: BackupChangePreview;
+};
+
+const backupKey = (backup: RecoveryBackup) => `${backup.kind}:${backup.address}`;
+
+/**
+ * Adding or removing a backup: preview, request-email-code, apply. The emailed code is always required, and
+ * adding needs the new backup's signature over the recovery challenge. Removing the last backup is refused.
+ */
+export async function recoveryBackupChange(context: RecoveryContext, body: Record<string, unknown>): Promise<unknown> {
+  const client = context.client ?? new ccc.ClientPublicTestnet();
+  if (!context.wallet.recovery) throw new Error("Account recovery is off");
+  const change = parseBackupChange(body);
+  if (body.operation === "preview") {
+    await limit(context, "sign", { max: 10, window: 60 });
+    if (change.change === "add") await verifyBackups(client, context.wallet, [body.backup]);
+    const plan = await planBackupChange(client, context.wallet, change);
+    const confirmationNonce = await issueRequest(context.user, "recovery", changeDigest(plan, change), { lines: backupChangeLines(plan.preview) }, true);
+    return { preview: plan.preview, confirmationNonce, requiresEmailCode: true };
+  }
+  const nonce = requiredNonce(body.confirmationNonce);
+  if (body.operation === "request-email-code") {
+    const plan = await planBackupChange(client, context.wallet, change);
+    const request = await loadRequest(context.user, "recovery", nonce, changeDigest(plan, change));
+    await sendCode(context, "recovery", nonce, change.change === "add" ? "Add a recovery backup" : "Remove a recovery backup", request.summary.lines ?? []);
+    return { sent: true };
+  }
+  if (body.operation !== "apply") throw new Error("A valid backup operation is required");
+  return withUserLock(context.user.id, async (sql) => {
+    const wallet = await readWallet(context.user, sql);
+    if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
+    if (!wallet.recovery) throw new Error("Account recovery is off");
+    if (change.change === "add") await verifyBackups(client, wallet, [body.backup]);
+    const plan = await planBackupChange(client, wallet, change);
+    await loadRequest(context.user, "recovery", nonce, changeDigest(plan, change)).catch(() => {
+      throw new Error("This approval expired or your account changed since the preview. Review the backup change again");
+    });
+    await verifyCode(context.user, "recovery", nonce, body.emailCode);
+    await consumeRequest(context.user, "recovery", nonce);
+    await checkBackupChangeTransaction(client, plan.transaction, wallet.recovery, plan.backups);
+    await context.recordSigning(context.user.id);
+    const signed = await signAccountGroups(plan.transaction, [{ script: plan.omnilock, kind: "omnilock" }], client, (message) => sign({ ...context, wallet }, message));
+    const transactionHash = await (context.broadcast ?? ((transaction) => client.sendTransaction(transaction, "passthrough")))(signed);
+    const recovery: KeyWayRecovery = { ...wallet.recovery, adminListOutPoint: { txHash: transactionHash, index: 0 }, backups: plan.backups };
+    await saveWallet(context.user, { ...wallet, recovery, updatedAt: new Date().toISOString() }, sql);
+    return { transactionHash, recovery, transaction: serializeTransaction(signed) };
+  });
+}
+
+function parseBackupChange(body: Record<string, unknown>): BackupChange {
+  if (body.change !== "add" && body.change !== "remove") throw new Error("Say whether to add or remove the backup");
+  return { change: body.change, backup: parseBackup(body.backup) };
+}
+
+function changeDigest(plan: BackupChangePlan, change: BackupChange): string {
+  return hashText(JSON.stringify({ transaction: serializeTransaction(plan.transaction), change }));
+}
+
+/** The list as it is on chain: its record, or for a list without one, the stored list if it matches the root. */
+async function currentBackups(client: ccc.Client, recovery: KeyWayRecovery): Promise<{ adminList: ccc.Cell; backups: RecoveryBackup[] }> {
+  try {
+    const list = await readRecoveryList(client, recovery);
+    return { adminList: list.cell, backups: list.entries.map(({ backup }) => backup) };
+  } catch (error) {
+    if (!(error instanceof Error) || !/doesn't record its backups/.test(error.message) || !recovery.backups) throw error;
+    const adminList = await client.findSingletonCellByType(adminListTypeScript(recovery), true);
+    const { root } = whitelistTree(await Promise.all(recovery.backups.map((backup) => backupAuth(client, backup))));
+    if (!adminList || ccc.hexFrom(adminList.outputData) !== adminListData(root)) throw new Error("KeyWay's copy of your backups doesn't match the recovery list on chain");
+    return { adminList, backups: recovery.backups };
+  }
+}
+
+/**
+ * The list-update transaction: input 0 is the AdminList cell, then the account's plain Omnilock cells, largest
+ * first, until they cover the fee and a change cell. Output 0 recreates the AdminList (same lock, Type ID and
+ * capacity) with the new root, and witness 0 records the new list; the rest goes back to the account's own
+ * address. Everything is under the account's Omnilock, so the one owner signature covers it.
+ */
+export async function planBackupChange(client: ccc.Client, wallet: ReadyWallet, change: BackupChange): Promise<BackupChangePlan> {
+  const recovery = wallet.recovery;
+  if (!recovery) throw new Error("Account recovery is off");
+  const omnilock = await omnilockLock(client, recovery);
+  const { adminList, backups: current } = await currentBackups(client, recovery);
+  if (!adminList.cellOutput.lock.eq(omnilock)) throw new Error("The recovery list isn't this account's");
+  const listed = current.some((backup) => backupKey(backup) === backupKey(change.backup));
+  let backups: RecoveryBackup[];
+  if (change.change === "add") {
+    if (listed) throw new Error(`${describeBackup(change.backup)} is already a backup`);
+    if (current.length >= MAX_RECOVERY_BACKUPS) throw new Error(`At most ${MAX_RECOVERY_BACKUPS} backups can be added`);
+    backups = [...current, change.backup];
+  } else {
+    if (!listed) throw new Error(`${describeBackup(change.backup)} isn't a backup`);
+    if (current.length === 1) throw new Error("Keep at least one backup. Add another backup before removing this one");
+    backups = current.filter((backup) => backupKey(backup) !== backupKey(change.backup));
+  }
+  const { root } = whitelistTree(await Promise.all(backups.map((backup) => backupAuth(client, backup))));
+  const data = adminListData(root);
+
+  const plain: ccc.Cell[] = [];
+  for await (const cell of client.findCellsByLock(omnilock, null, true)) {
+    if (!cell.cellOutput.type && cell.outputData === "0x") plain.push(cell);
+  }
+  plain.sort((a, b) => a.cellOutput.capacity === b.cellOutput.capacity ? outPointKey(a).localeCompare(outPointKey(b)) : a.cellOutput.capacity > b.cellOutput.capacity ? -1 : 1);
+  const output = ccc.CellOutput.from(adminList.cellOutput);
+  const changeOutput = ccc.CellOutput.from({ lock: omnilock, capacity: 0n });
+  const minimum = occupied(changeOutput, "0x");
+  const transaction = ccc.Transaction.from({ inputs: [{ previousOutput: adminList.outPoint }], outputs: [output, changeOutput], outputsData: [data, "0x"] });
+  await transaction.addCellDepsOfKnownScripts(client, ccc.KnownScript.OmniLock);
+  let funded = 0n;
+  let fee = 0n;
+  for (const cell of plain) {
+    transaction.inputs.push(ccc.CellInput.from({ previousOutput: cell.outPoint }));
+    funded += cell.cellOutput.capacity;
+    transaction.witnesses = [ccc.hexFrom(ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(OMNILOCK_OWNER_WITNESS_LOCK_LENGTH)) }).toBytes())];
+    setRecoveryListRecord(transaction, 0, await recoveryListRecord(client, backups));
+    fee = (BigInt(transaction.toBytes().length + 4) * FEE_RATE + 999n) / 1000n;
+    if (funded >= minimum + fee) break;
+    if (transaction.inputs.length > MAX_CELLS) break;
+  }
+  if (funded < minimum + fee) throw new Error(`Your balance can't cover changing backups: it needs ${formatCkb(minimum + fee - funded)} CKB more`);
+  transaction.outputs[1].capacity = funded - fee;
+  const label = (backup: RecoveryBackup) => ({ ...backup, label: describeBackup(backup) });
+  return {
+    transaction, omnilock, adminList, backups,
+    preview: {
+      network: "CKB testnet",
+      change: change.change,
+      backup: label(change.backup),
+      backups: backups.map(label),
+      feeCkb: formatCkb(fee),
+      transactionHash: transaction.hash(),
+    },
+  };
+}
+
+/**
+ * Checks a list-update transaction independently of how it was built: input 0 is the account's AdminList and
+ * every other input is plain CKB at the account's Omnilock; output 0 recreates the AdminList with the same lock,
+ * Type ID and capacity, the root of exactly `backups` and their record; every other output is plain CKB at the
+ * account's own address; the fee is within the cap.
+ */
+export async function checkBackupChangeTransaction(client: ccc.Client, transaction: ccc.Transaction, recovery: KeyWayRecovery, backups: RecoveryBackup[]): Promise<void> {
+  const refuse = (reason: string) => { throw new Error(`The backup change doesn't match what KeyWay computed: ${reason}`); };
+  const omnilock = await omnilockLock(client, recovery);
+  const type = adminListTypeScript(recovery);
+  const inputCells = await Promise.all(transaction.inputs.map((input) => input.getCell(client)));
+  if (inputCells.length < 2 || inputCells.some(({ cellOutput }) => !cellOutput.lock.eq(omnilock))) refuse("an input isn't this account's");
+  if (!inputCells[0].cellOutput.type?.eq(type)) refuse("input 0 isn't the recovery list");
+  if (inputCells.slice(1).some(({ cellOutput, outputData }) => cellOutput.type || outputData !== "0x")) refuse("an input isn't plain CKB");
+  const [adminList, ...rest] = transaction.outputs;
+  if (!adminList || !adminList.lock.eq(omnilock) || !adminList.type?.eq(type) || adminList.capacity !== inputCells[0].cellOutput.capacity) refuse("output 0 doesn't recreate the recovery list");
+  const { root } = whitelistTree(await Promise.all(backups.map((backup) => backupAuth(client, backup))));
+  if (ccc.hexFrom(transaction.outputsData[0] ?? "0x") !== adminListData(root)) refuse("the recovery list doesn't hold exactly these backups");
+  if (recoveryListRecordOf(transaction, 0) !== await recoveryListRecord(client, backups)) refuse("the recorded backup list isn't exactly these backups");
+  if (rest.length === 0) refuse("nothing returns to your address");
+  rest.forEach((output, index) => {
+    if (!output.lock.eq(omnilock) || output.type || ccc.hexFrom(transaction.outputsData[index + 1] ?? "0x") !== "0x") refuse(`output ${index + 1} isn't plain CKB at your address`);
+  });
+  const fee = inputCells.reduce((sum, { cellOutput }) => sum + cellOutput.capacity, 0n) - transaction.getOutputsCapacity();
+  const cap = BigInt(transaction.toBytes().length + 4) * feeRateCap();
+  if (fee <= 0n || fee > cap) refuse("the fee is outside KeyWay's limit");
+}
+
+/** Lines for the confirmation email, naming the backup being added or removed. */
+export function backupChangeLines(preview: BackupChangePreview): string[] {
+  return [
+    preview.change === "add" ? "Add a recovery backup" : "Remove a recovery backup",
+    `${preview.change === "add" ? "Adding" : "Removing"}: ${preview.backup.label}`,
+    ...(preview.change === "add" ? ["This backup will be able to move everything in your account without KeyWay."] : []),
+    `Backups after this change: ${preview.backups.length}`,
+    `Network fee ${preview.feeCkb} CKB`,
+    `Network ${preview.network}`,
+  ];
 }

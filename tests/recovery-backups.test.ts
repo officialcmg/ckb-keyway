@@ -14,7 +14,10 @@ import {
   evmOmnilockMessage,
   evmOmnilockSignature,
   evmPersonalSignAddress,
+  execAuth,
+  JOYID_WEBAUTHN_VERIFIER,
   joyIdBackupAuth,
+  joyIdPreimage,
   omnilockAdminWitnessLock,
   parseBackups,
   recoveryBackupChallenge,
@@ -57,14 +60,19 @@ async function joyIdWallet() {
       identity: JSON.stringify({ keyType: "main_key", publicKey: publicKey.slice(2) }),
     };
   };
-  return { address, lock, sign };
+  return { address, lock, sign, publicKey };
 }
 
 test("encodes each backup as its 21-byte Omnilock auth", async () => {
   const evm = evmWallet();
   assert.equal(evmBackupAuth(evm.address.toUpperCase().replace("0X", "0x")), `0x12${evm.address.slice(2)}`);
   const joy = await joyIdWallet();
-  assert.equal(joyIdBackupAuth(joy.lock), `0xfc${joy.lock.hash().slice(2, 42)}`);
+  // 0xFD (exec) ‖ blake160 of the 62-byte preimage naming the verifier and the passkey's key hash.
+  const preimage = joyIdPreimage(ccc.hashCkbShort(joy.publicKey));
+  assert.equal(preimage, ccc.hexFrom(ccc.bytesConcat(JOYID_WEBAUTHN_VERIFIER.codeHash, [0x02, 0x00], new Uint8Array(8), ccc.hashCkbShort(joy.publicKey))));
+  assert.equal(ccc.bytesFrom(preimage).length, 62);
+  assert.equal(joyIdBackupAuth(joy.lock), `0xfd${ccc.hashCkbShort(preimage).slice(2)}`);
+  assert.equal(execAuth(preimage), joyIdBackupAuth(joy.lock));
   assert.equal(await backupAuth(client, { kind: "joyid", address: joy.address }), joyIdBackupAuth(joy.lock));
   assert.equal(await backupAuth(client, { kind: "evm", address: evm.address }), evmBackupAuth(evm.address));
   const publicKey = ccc.hexFrom(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true));
@@ -119,8 +127,13 @@ test("accepts a JoyID backup only with its passkey signature and matching lock",
   await assert.rejects(() => verifyBackupOwnership(client, ACCOUNT, { ...backup, ...joy.sign("something else") }), /didn't sign/);
   const other = await joyIdWallet();
   await assert.rejects(() => verifyBackupOwnership(client, ACCOUNT, { ...backup, ...other.sign(challenge) }), /didn't sign/, "another passkey's signature");
+  // Sub keys and session keys are refused with a reason.
   const subKey = { ...signed, identity: JSON.stringify({ ...JSON.parse(signed.identity), keyType: "sub_key" }) };
-  await assert.rejects(() => verifyBackupOwnership(client, ACCOUNT, { ...backup, ...subKey }), /didn't sign/);
+  await assert.rejects(() => verifyBackupOwnership(client, ACCOUNT, { ...backup, ...subKey }), /device added later can't be a backup\. Use the JoyID passkey your account was created with/);
+  const session = { ...signed, identity: JSON.stringify({ ...JSON.parse(signed.identity), keyType: "main_session_key" }) };
+  await assert.rejects(() => verifyBackupOwnership(client, ACCOUNT, { ...backup, ...session }), /session key can't be a backup/);
+  const rsa = { ...signed, signature: JSON.stringify({ ...JSON.parse(signed.signature), alg: -257 }) };
+  await assert.rejects(() => verifyBackupOwnership(client, ACCOUNT, { ...backup, ...rsa }), /session key can't be a backup/);
 });
 
 test("builds the admin witness lock the spike used on chain", () => {
@@ -128,9 +141,11 @@ test("builds the admin witness lock the spike used on chain", () => {
   const signature = "0xd72796f113b21471000cb19cf7345e4d1f8f5f3fd88a9ea81548a35248e4110b33c1f31320a13ca87daa969bc2c2780e0adc4472840ab3a169e55662ebdb39c801";
   const lock = omnilockAdminWitnessLock({ signature, auth: "0x0079af2d8dbb19362ec15a4acc3c026c2386e0ffa2", proof: "0x4c4f00" });
   assert.equal(lock, `0x9200000010000000550000009200000041000000${signature.slice(2)}3d0000000c000000210000000079af2d8dbb19362ec15a4acc3c026c2386e0ffa21c00000008000000140000000c0000000d00000003030000004c4f00`);
-  // An owner-lock backup carries no signature.
-  const owner = ccc.bytesFrom(omnilockAdminWitnessLock({ auth: `0xfc${"11".repeat(20)}`, proof: "0x4c4f00" }));
-  assert.equal(owner.length, 146 - 65 - 4);
+  // An exec (JoyID) backup also carries its 62-byte preimage, as Bytes, in the third field.
+  const preimage = joyIdPreimage(new Uint8Array(20).fill(0x11));
+  const exec = ccc.bytesFrom(omnilockAdminWitnessLock({ signature: new Uint8Array(768), auth: execAuth(preimage), proof: "0x4c4f00", preimage }));
+  assert.equal(exec.length, 146 + 768 - 65 + 4 + 62);
+  assert.equal(ccc.hexFrom(exec.slice(-62)), preimage);
 });
 
 test("signs an Omnilock sighash the way flag 0x12 verifies it", () => {
