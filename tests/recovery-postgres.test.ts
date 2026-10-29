@@ -69,7 +69,7 @@ async function harness() {
   const evm = evmWallet();
   const backup = { kind: "evm" as const, address: evm.address };
   const proof = { ...backup, signature: evm.personalSign(recoveryBackupChallenge(legacyAddress, backup)) };
-  return { user, wallet, legacyAddress, publicKey, client, context, emails, broadcasts, proof, addCell, codeFrom: () => /code is (\d{6})/.exec(emails.at(-1)!.plaintext)![1] };
+  return { user, wallet, legacyAddress, publicKey, client, context, emails, broadcasts, proof, addCell, codeFrom: () => /code is (\d{6})/.exec(emails.findLast(({ plaintext }) => /code is \d{6}/.test(plaintext))!.plaintext)![1] };
 }
 
 type Preview = { preview: { newAddress: string; adminListCkb: string; transactionHash: string }; confirmationNonce: string; requiresEmailCode: boolean };
@@ -97,6 +97,12 @@ test("turning recovery on: preview, emailed code, enable", { skip: !enabled }, a
     assert.equal(h.broadcasts.length, 1);
     assert.equal(result.transactionHash, preview.preview.transactionHash);
     assert.equal(result.ckbAddress, preview.preview.newAddress);
+    // Then a notice with the full new address and the rescue page, for when KeyWay is gone.
+    assert.equal(h.emails.length, 2);
+    assert.match(h.emails[1].subject, /Account recovery is on/);
+    assert.ok(h.emails[1].plaintext.includes(result.ckbAddress));
+    assert.ok(h.emails[1].plaintext.includes(`EVM wallet ${h.proof.address}`));
+    assert.match(h.emails[1].plaintext, /https:\/\/ckbkeyway\.dev\/rescue/);
     const stored = await readWallet(h.user) as ReadyWallet;
     assert.equal(stored.ckbAddress, preview.preview.newAddress);
     assert.equal(stored.recovery?.legacyAddress, h.legacyAddress);
@@ -208,6 +214,8 @@ test("adding and removing backups: preview, emailed code, apply", { skip: !enabl
     assert.equal(h.broadcasts.length, before + 1);
     const stored = await readWallet(h.user) as ReadyWallet;
     assert.equal(stored.ckbAddress, enabledWallet.ckbAddress, "the address doesn't change");
+    assert.match(h.emails.at(-1)!.subject, /A recovery backup was added/);
+    assert.ok(h.emails.at(-1)!.plaintext.includes(stored.ckbAddress));
     assert.deepEqual(stored.recovery?.backups, [{ kind: "evm", address: h.proof.address }, backup]);
     assert.deepEqual(stored.recovery?.adminListOutPoint, { txHash: result.transactionHash, index: 0 });
     assert.equal(stored.recovery?.omnilockArgs, enabledWallet.recovery?.omnilockArgs);
@@ -223,8 +231,11 @@ test("adding and removing backups: preview, emailed code, apply", { skip: !enabl
     await h.apply({ change: "add", backup: { ...backup, signature: second.personalSign(recoveryBackupChallenge(h.legacyAddress, backup)) } });
     const { shown } = await h.apply({ change: "remove", backup: { kind: "evm", address: h.proof.address } });
     assert.equal(shown.requiresEmailCode, true);
-    assert.match(h.emails.at(-1)!.subject, /Remove a recovery backup/);
-    assert.match(h.emails.at(-1)!.plaintext, new RegExp(`Removing: EVM wallet ${h.proof.address.slice(0, 10)}`));
+    assert.match(h.emails.at(-2)!.subject, /Remove a recovery backup/);
+    assert.match(h.emails.at(-2)!.plaintext, new RegExp(`Removing: EVM wallet ${h.proof.address.slice(0, 10)}`));
+    assert.match(h.emails.at(-1)!.subject, /A recovery backup was removed/);
+    assert.ok(h.emails.at(-1)!.plaintext.includes((await readWallet(h.user) as ReadyWallet).ckbAddress));
+    assert.ok(h.emails.at(-1)!.plaintext.includes(`EVM wallet ${second.address}`) && !h.emails.at(-1)!.plaintext.includes(h.proof.address));
     assert.deepEqual((await readWallet(h.user) as ReadyWallet).recovery?.backups, [backup]);
   });
 
