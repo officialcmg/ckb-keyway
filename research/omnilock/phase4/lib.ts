@@ -90,3 +90,61 @@ export async function waitCommitted(hash: ccc.HexLike, timeoutMs = 300_000) {
   }
   throw new Error(`timeout waiting for ${hash}`);
 }
+
+/** J1/J2's JoyID main-key lock: args 0x0001 ‖ blake160(public key). */
+export async function joyIdLockOf(key: string) {
+  const joyId = await client.getKnownScript(ccc.KnownScript.JoyId);
+  return ccc.Script.from({ codeHash: joyId.codeHash, hashType: joyId.hashType, args: ccc.bytesConcat("0x0001", ccc.hashCkbShort(joyIdPasskey(key).publicKey)) });
+}
+
+/** A stand-in for CCC's JoyId.CkbSigner, answering from a local P-256 key as JoyID's pages do. */
+export async function joyIdSigner(key: string): Promise<ccc.Signer> {
+  const passkey = joyIdPasskey(key);
+  const address = ccc.Address.fromScript(await joyIdLockOf(key), client).toString();
+  return {
+    client,
+    signType: ccc.SignerSignType.JoyId,
+    isConnected: async () => true,
+    connect: async () => undefined,
+    getRecommendedAddress: async () => address,
+    getIdentity: async () => passkey.identity,
+    signMessageRaw: async (text: string) => passkey.signMessageRaw(text),
+    signMessage: async (text: string) => ({ signature: passkey.signMessageRaw(text), identity: passkey.identity, signType: ccc.SignerSignType.JoyId }),
+  } as unknown as ccc.Signer;
+}
+
+/** A local Postgres user and wallet record for K, created once and kept in state.json. */
+export async function accountContext(emails: string[]) {
+  const { saveWallet, readWallet } = await import("../../../src/server/user-wallet.ts");
+  const { formatCkbSignature } = await import("../../../src/server/funding-transaction.ts");
+  const keys = loadKeys();
+  const state = loadState();
+  const user = { id: state.userId ?? crypto.randomUUID() };
+  const publicKey = publicKeyOf(keys.K);
+  let wallet = await readWallet(user);
+  if (!wallet) {
+    wallet = {
+      version: 1, status: "ready", litPkpId: "0xphase4-throwaway", litPublicKey: publicKey, ckbAddress: await secpAddress(keys.K),
+      encryptedFiberKey: "unused", primaryDeviceIdHash: "0".repeat(64), hasOpenedChannel: false,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    };
+    await saveWallet(user, wallet);
+    saveState({ userId: user.id });
+  }
+  if (wallet.status !== "ready") throw new Error("wallet isn't ready");
+  return {
+    user, wallet, appName: "KeyWay phase 4 testnet proof", client,
+    email: async () => "phase4@example.invalid",
+    sendEmail: async (_to: string, message: { plaintext: string }) => { emails.push(message.plaintext); },
+    rateLimit: async () => ({ allowed: true, retryAfter: null }),
+    recordSigning: async () => undefined,
+    signDigest: async (digest: ccc.Hex) => formatCkbSignature(localLitSignature(keys.K, digest)),
+    broadcast: async (transaction: ccc.Transaction) => {
+      const cycles = await client.sendTransactionDry(transaction, "passthrough");
+      console.log("test_tx_pool_accept ok, cycles", cycles.toString(), "size", transaction.toBytes().length + 4);
+      return client.sendTransaction(transaction, "passthrough");
+    },
+  };
+}
+
+export const emailCode = (emails: string[]) => /code is (\d{6})/.exec(emails.at(-1)!)![1];

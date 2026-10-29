@@ -14,13 +14,14 @@ Omnilock supports both (`IdentityFlagsExec = 0xFD`, `IdentityFlagsDl = 0xFE`, `c
 ordinary RISC-V program with one argument, so it can be a plain Rust `no_std` binary on ckb-std. Dynamic linking
 needs a position-independent shared object exporting the ckb-auth `ckb_auth_validate` entry and the
 swappable-signature ABI, which Rust doesn't produce without a custom toolchain setup. Exec costs one extra
-program load (about 0.1M cycles here) and Omnilock does nothing after the identity check, so replacing its VM
-loses nothing.
+program load, small next to the P-256 check (a whole JoyID backup spend on testnet took 6.80M cycles, of which
+the verifier is about 6.5M), and Omnilock does nothing after the identity check, so replacing its VM loses
+nothing.
 
 ### Identity
 
 ```
-preimage (74 bytes) = verifier code hash (32) ‖ hash_type 0x02 (data1) ‖ place 0x00 (cell dep)
+preimage (62 bytes) = verifier code hash (32) ‖ hash_type 0x02 (data1) ‖ place 0x00 (cell dep)
                       ‖ length u32 LE 0 ‖ offset u32 LE 0 (the whole cell) ‖ pubkey_hash (20)
 pubkey_hash         = blake160(64-byte uncompressed P-256 public key X ‖ Y)
                     = the JoyID main key's lock args without the 0x0001 prefix
@@ -123,5 +124,6 @@ authenticatorData ‖ sha256(clientDataJSON) without the JSON.
 | Same, in a 640-byte zero-padded blob | 6,502,372 |
 | ckb-auth#31 vector, P-256 core only | 6,346,468 |
 
-Almost all of it is the P-256 verification. Omnilock's own part (sighash, SMT proof, exec) comes on top; see
-`research/omnilock/joyid-verifier-results.md` for whole transactions.
+Almost all of it is the P-256 verification. A whole administrator-path spend through Omnilock (sighash, SMT
+proof, exec, then this binary) took 6,796,168 cycles on testnet; see
+`research/omnilock/joyid-verifier-results.md`.
