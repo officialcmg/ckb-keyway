@@ -10,7 +10,7 @@ These are separate pieces of state:
 
 | Concept | What it is | Where it lives |
 | --- | --- | --- |
-| CKB account | The on-chain identity and cells controlled through the Lit PKP. | Recoverable from the authenticated email identity. |
+| CKB account | The on-chain identity and cells controlled through the Lit PKP, and with [account recovery](/account-recovery) on, also by the user's backups. | Recoverable from the authenticated email identity. |
 | Fiber node | The networking process that creates invoices, finds routes, and updates channels. | A persistent native process on KeyWay's servers (hosted), or WebAssembly in the page (browser). |
 | Channel database | The latest off-chain state for the user's Fiber channels. | The hosted node's durable volume, or IndexedDB for a browser node. |
 

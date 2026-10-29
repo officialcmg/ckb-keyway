@@ -55,6 +55,11 @@ function fixture(screen: string, nodeMode: NodeMode): { model: DemoModel; ui?: D
     case "error": return { model: { ...base, fiber: "error", events: CONNECTED.slice(0, 2), failedAt: at(25_418), fiberError: { code: "PEER_OFFLINE", message: "Your node started, but bottle.fiber.channel didn't answer within 25 seconds." } } };
     case "noChannels": return { model: { ...base, fiber: "running", events: CONNECTED } };
     case "funding": return { model: { ...base, fiber: "running", events: CONNECTED }, ui: { activation: "confirming" } };
+    case "recoveryOff": return { model: { ...base, recovery: { status: "off", backups: [] } } };
+    case "recoveryOn": return { model: { ...base, address: "ckt1qrejnmlar3r452tcg57gvq8patctcgy8acync0hxfnyka35ywafvkqgqqywhsqz6a9nuq7n78x78eqrnwzsj37faqxrn7dq20dqufhj5gwyme9azeu9hjf6c4fyrhs5qhgasjkf2vj44ypl035x", recovery: {
+      status: "on", legacyAddress: ADDRESS,
+      backups: [{ kind: "evm", address: "0x30033cae613a8331b8a7b756ce46cd7999ec1ef8" }, { kind: "joyid", address: "ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq9t2pwvmv7pqxy32jug4p3yd0rgptagcycxsx9hu" }],
+    } } };
     case "pay": return { model: channel, ui: { dialog: "pay", invoice: "fibt100000000001pcsaug0p0exgfw0pnm6vk0rnt4xefskmrz0g2vqhe4l3gr9a7hzkm8a" } };
     case "receive": return { model: channel, ui: { dialog: "receive", created: RECEIVE } };
     default: return { model: channel };
@@ -81,6 +86,9 @@ export function DevScreen({ screen, nodeMode }: { screen: string; nodeMode: Node
     signMessage: async () => ({ signature: "0x00", verified: true }),
     getEmailThreshold: async () => null,
     setEmailThreshold: noop,
+    enableRecovery: noop,
+    addEvmBackup: noop,
+    removeBackup: noop,
   };
   return (
     <>

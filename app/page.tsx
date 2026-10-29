@@ -178,7 +178,7 @@ export default function Home() {
           <div className="lp-split__copy lp-split__copy--stack">
             <p className="eyebrow lp-eyebrow">Under the hood</p>
             <h2 className="lp-h2">Standard CKB, end to end.</h2>
-            <p className="lp-lede lp-lede--narrow">KeyWay accounts are ordinary secp256k1 lock addresses built with CCC. Inspect them in the CKB explorer like any other address, and pay any Fiber invoice on the network.</p>
+            <p className="lp-lede lp-lede--narrow">KeyWay accounts are standard CKB lock scripts built with CCC: secp256k1, or Omnilock once a user turns on recovery. Inspect them in the CKB explorer like any other address, and pay any Fiber invoice on the network.</p>
           </div>
           <ol className="lp-route">
             {STACK.map((stop) => (

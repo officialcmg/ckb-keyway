@@ -28,7 +28,7 @@ function SignIn() {
     A valid application-specific code returns a database-backed bearer session bound to that application and its permanent KeyWay user ID.
   </Step>
   <Step title="Recover the account">
-    The user ID maps to the same Lit PKP and CKB address on future logins.
+    The user ID maps to the same Lit PKP and CKB account on future logins. The address stays the same unless the user turns on [account recovery](/account-recovery), which changes it once.
   </Step>
   <Step title="Start Fiber">
     Login only recovers the CKB identity. Call `start()` from `useFiber()` to start Fiber, or set `autoStartFiber`. A hosted node is already running on KeyWay's servers; a browser node restores device state and starts in the page.

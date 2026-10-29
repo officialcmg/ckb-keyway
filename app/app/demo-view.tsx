@@ -47,7 +47,12 @@ export type DemoModel = {
   clock?: number;
   channels: DemoChannel[];
   activity: DemoActivity[];
+  /** Opt-in account recovery, when the SDK in use has it. */
+  recovery?: DemoRecovery;
 };
+
+export type DemoBackup = { kind: "evm" | "joyid"; address: string };
+export type DemoRecovery = { status: "on" | "off"; backups: DemoBackup[]; legacyAddress?: string };
 
 export type InvoiceCheck = { amount: bigint; unit: Unit; description?: string; fee?: bigint; error?: string };
 export type CreatedInvoice = { address: string; amount: bigint; description?: string; createdAt: number; paymentHash: string };
@@ -68,6 +73,10 @@ export type DemoActions = {
   signMessage: (message: string) => Promise<{ signature: string; verified: boolean }>;
   getEmailThreshold: () => Promise<bigint | null>;
   setEmailThreshold: (shannons: bigint | null) => Promise<void>;
+  /** Turns recovery on with the EVM wallet in this browser as the first backup. */
+  enableRecovery?: () => Promise<void>;
+  addEvmBackup?: () => Promise<void>;
+  removeBackup?: (backup: DemoBackup) => Promise<void>;
 };
 
 /** Initial UI for development screenshots; production always starts closed. */
@@ -159,6 +168,7 @@ export function DemoView({ model, actions, initialUi }: { model: DemoModel; acti
               <>
                 <AccountCard model={model} />
                 {model.balance !== 0n && <SignerCard actions={actions} />}
+                {model.recovery && <RecoveryCard recovery={model.recovery} actions={actions} />}
                 <FiberCard model={model} now={now} actions={actions} activation={activation} setActivation={setActivation} onPay={() => setDialog("pay")} onReceive={() => setDialog("receive")} channels={openChannels} />
                 {hasChannels && model.activity.length > 0 && <ActivityCard activity={model.activity} />}
               </>
@@ -315,6 +325,56 @@ function SignerCard({ actions }: { actions: DemoActions }) {
         )}
       </div>
       <p className="demo-card__muted demo-signer-status">{threshold === undefined ? "Checking your email confirmation setting…" : threshold === null ? "Email confirmation is off." : `Once you send ${formatCkb(threshold)} CKB within 24 hours, you'll need a code from your email.`}</p>
+      {error && <p className="field-error"><AlertIcon />{error}</p>}
+    </section>
+  );
+}
+
+function RecoveryCard({ recovery, actions }: { recovery: DemoRecovery; actions: DemoActions }) {
+  const [busy, setBusy] = useState<string>();
+  const [error, setError] = useState<string>();
+  const on = recovery.status === "on";
+
+  async function run(label: string, task?: () => Promise<void>) {
+    if (!task) return;
+    setBusy(label);
+    setError(undefined);
+    try { await task(); } catch (cause) { setError(cause instanceof Error ? cause.message : "Something went wrong"); } finally { setBusy(undefined); }
+  }
+
+  return (
+    <section className="card demo-card demo-card--16">
+      <CardHead title="Account recovery">
+        {on ? <span className="status status--success"><span className="status__dot" />On</span> : <code className="demo-card__code">useCkbWallet().recovery</code>}
+      </CardHead>
+      {on ? (
+        <>
+          <p className="demo-card__body">These backups can move everything in this account without KeyWay, at the <a className="link" href="/rescue">rescue page</a>. Changing them needs a code from your email; your address stays the same.</p>
+          <ul className="demo-backups">
+            {recovery.backups.map((backup) => (
+              <li key={`${backup.kind}:${backup.address}`}>
+                <span className="demo-backups__kind">{backup.kind === "evm" ? "EVM wallet" : "JoyID"}</span>
+                <span className="demo-backups__address">{backup.address}</span>
+                {recovery.backups.length > 1 && (
+                  <button type="button" className={`text-button${busy === backup.address ? " btn--busy" : ""}`} disabled={Boolean(busy)} onClick={() => void run(backup.address, actions.removeBackup && (() => actions.removeBackup!(backup)))}>Remove</button>
+                )}
+              </li>
+            ))}
+          </ul>
+          <button type="button" className={`btn btn--outline demo-card__action${busy === "add" ? " btn--busy" : ""}`} disabled={Boolean(busy)} onClick={() => void run("add", actions.addEvmBackup)}>
+            {busy === "add" ? "Waiting for approval…" : "Add an EVM wallet"}
+          </button>
+          {recovery.legacyAddress && <p className="demo-card__muted demo-backups__old">Earlier address: <span className="demo-card__code">{shortHash(recovery.legacyAddress)}</span>. Funds sent there move here when you sign in.</p>}
+        </>
+      ) : (
+        <>
+          <p className="demo-card__body">Name an EVM wallet that can move everything in this account if KeyWay is ever gone. Turning this on changes your address once and locks about 197 CKB for the backup list.</p>
+          <button type="button" className={`btn btn--route demo-card__action${busy === "enable" ? " btn--busy" : ""}`} disabled={Boolean(busy)} onClick={() => void run("enable", actions.enableRecovery)}>
+            {busy === "enable" ? "Waiting for approval…" : "Turn on with an EVM wallet"}
+          </button>
+          <p className="demo-card__muted demo-backups__old">Your EVM wallet signs to prove it&apos;s yours, then you approve and enter the code we email you.</p>
+        </>
+      )}
       {error && <p className="field-error"><AlertIcon />{error}</p>}
     </section>
   );

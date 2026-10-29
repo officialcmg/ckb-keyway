@@ -26,6 +26,8 @@ icon: Code
 | `approveFiberPayment` | none | Your own confirmation for Fiber payments, which have no built-in dialog. Receives `FiberPaymentPreview`. |
 | `approveCkbTransaction` | built-in dialog | Your own approval for signer transactions. Receives the decoded `TransactionPreview`. |
 | `approveCkbMessage` | built-in dialog | Your own approval for message signing. Receives `MessagePreview`. |
+| `approveRecovery` | built-in dialog | Your own approval for turning account recovery on. Receives `RecoveryPreview`. |
+| `approveBackupChange` | built-in dialog | Your own approval for adding or removing a recovery backup. Receives `BackupChangePreview`. |
 | `onError` | none | Account recovery, Fiber startup and device lease errors. |
 | `onFiberStartup` | none | Each step of starting the Fiber node, with elapsed time. |
 
@@ -44,18 +46,20 @@ const { ready, authenticated, user, login, logout } = useKeyWay();
 ## Account: `useCkbWallet()`
 
 ```ts
-const { status, signer, address, publicKey, balance, refreshing, refreshBalance, error } = useCkbWallet();
+const { status, signer, address, legacyAddress, publicKey, balance, refreshing, refreshBalance, error, recovery } = useCkbWallet();
 ```
 
 | Member | Behavior |
 | --- | --- |
 | `status` | `disconnected` (signed out), `loading`, `ready` or `error`. |
 | `signer` | A CCC signer for the account once it's ready. See [Signing transactions](/ccc-signer). |
-| `address` | The account's CKB testnet address. |
+| `address` | The account's CKB testnet address. It changes once if the user turns on account recovery. |
+| `legacyAddress` | The address from before recovery was turned on, if it was. |
 | `publicKey` | The account's compressed secp256k1 public key. |
 | `balance` | On-chain CKB in shannons, as a bigint. Undefined until the first read completes. |
 | `refreshBalance()` | Reads the balance again. Doesn't need Fiber. |
-| `error` | An account recovery error, or a balance error once the account is ready. A balance error doesn't invalidate the account. |
+| `error` | An account loading error, or a balance error once the account is ready. A balance error doesn't invalidate the account. |
+| `recovery` | Opt-in account recovery: `status`, `backups`, `enable()`, `addBackup()`, `removeBackup()`, `createEvmBackup()`, `createJoyIdBackup()`. See [Account address & recovery](/account-recovery). |
 
 ## Fiber: `useFiber()`
 

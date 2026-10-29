@@ -14,7 +14,7 @@ import {
   type KeyWayChannel,
   type FiberStartupEvent,
 } from "@ckb-keyway/react";
-import { DemoView, type DemoActions, type DemoActivity, type DemoChannel, type DemoModel, type LifecycleEvent, type NodeMode } from "./app/demo-view";
+import { DemoView, type DemoBackup, type DemoActions, type DemoActivity, type DemoChannel, type DemoModel, type LifecycleEvent, type NodeMode } from "./app/demo-view";
 import { CKB, parseCkb, toHex, type Unit } from "./app/format";
 
 // Tokens the demo names, by type script hash. Stable++ RUSD is the token Fiber's testnet nodes accept.
@@ -53,6 +53,17 @@ function LiveDemo({ nodeMode, setMode }: { nodeMode: NodeMode; setMode: (mode: N
   );
 }
 
+/** `useCkbWallet().recovery`, from @ckb-keyway/react 0.2.5. With an SDK without it the demo hides the card. */
+type RecoveryApi = {
+  status: "on" | "off";
+  backups: DemoBackup[];
+  legacyAddress?: string;
+  createEvmBackup: () => Promise<unknown>;
+  enable: (backups: unknown[]) => Promise<unknown>;
+  addBackup: (backup: unknown) => Promise<unknown>;
+  removeBackup: (backup: DemoBackup) => Promise<unknown>;
+};
+
 function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
   nodeMode: NodeMode;
   events: LifecycleEvent[];
@@ -74,6 +85,9 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
   refreshBalanceRef.current = account.refreshBalance;
   const signerRef = useRef(account.signer);
   signerRef.current = account.signer;
+  const recovery = (account as { recovery?: RecoveryApi }).recovery;
+  const recoveryRef = useRef(recovery);
+  recoveryRef.current = recovery;
 
   // Time the wallet recovery that follows sign-in, so the log has something real to show before Fiber starts.
   useEffect(() => {
@@ -180,6 +194,16 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
       const signature = await signer.signMessage(message);
       return { signature: signature.signature, verified: await signer.verifyMessage(message, signature) };
     },
+    enableRecovery: async () => {
+      const current = requireRecovery(recoveryRef.current);
+      await current.enable([await current.createEvmBackup()]);
+      await refreshBalanceRef.current().catch(() => undefined);
+    },
+    addEvmBackup: async () => {
+      const current = requireRecovery(recoveryRef.current);
+      await current.addBackup(await current.createEvmBackup());
+    },
+    removeBackup: async (backup) => { await requireRecovery(recoveryRef.current).removeBackup(backup); },
     getEmailThreshold: async () => (await requireSigner(signerRef.current).getDailyConfirmationAmounts()).ckb ?? null,
     setEmailThreshold: (shannons) => requireSigner(signerRef.current).setDailyConfirmationAmount("ckb", shannons),
     invoiceStatus: async (paymentHash) => {
@@ -220,6 +244,7 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
     failedAt,
     channels,
     activity: [...activity, ...payments],
+    recovery: recovery && { status: recovery.status, backups: recovery.backups, legacyAddress: recovery.legacyAddress },
   };
   return <DemoView model={model} actions={actions} />;
 }
@@ -300,4 +325,9 @@ function useChannelReserves(channels: KeyWayChannel[]): Record<string, bigint> {
 function requireSigner<T>(signer: T | undefined): T {
   if (!signer) throw new Error("Your account is still being prepared. Try again in a moment.");
   return signer;
+}
+
+function requireRecovery(recovery: RecoveryApi | undefined): RecoveryApi {
+  if (!recovery) throw new Error("This KeyWay SDK doesn't support account recovery yet");
+  return recovery;
 }
