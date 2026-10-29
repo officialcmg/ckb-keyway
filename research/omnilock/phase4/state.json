@@ -1,0 +1,12 @@
+{
+  "verifier": {
+    "outPoint": {
+      "txHash": "0x333fa2abd90d32133cd3aca9be68a2042f0bdf3d191c384d6bc77b3cd6ae387b",
+      "index": 0
+    },
+    "codeHash": "0x24306cbe18769a05ca453722a53628ebb2453b72d1d6e6ed7a12b878b1ce9720",
+    "hashType": "data1",
+    "size": 37024,
+    "capacity": "37085"
+  }
+}
