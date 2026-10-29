@@ -2,7 +2,7 @@ import * as ccc from "@ckb-ccc/core";
 import type { KeyWayRecovery } from "./account-lock";
 import { KeyWayApiClient } from "./api-client";
 import { withEmailCode, type RequestEmailCode } from "./email-code";
-import { recoveryBackupChallenge, type RecoveryBackup, type RecoveryBackupProof } from "./recovery-backups";
+import { parseBackup, recoveryBackupChallenge, type RecoveryBackup, type RecoveryBackupProof } from "./recovery-backups";
 
 /** What turning recovery on does, as the backend computed it. */
 export type RecoveryPreview = {
@@ -82,5 +82,47 @@ export async function enableRecovery(options: {
     "recovery",
     () => api.recovery(options.authToken, { ...base, operation: "request-email-code", confirmationNonce }).then(() => undefined),
     (emailCode) => api.recovery(options.authToken, { ...base, operation: "enable", confirmationNonce, emailCode }) as Promise<RecoveryEnabled>,
+  );
+}
+
+/** What adding or removing a backup does, as the backend computed it. */
+export type BackupChangePreview = {
+  network: "CKB testnet";
+  change: "add" | "remove";
+  backup: RecoveryBackup & { label: string };
+  /** The backups after the change. */
+  backups: Array<RecoveryBackup & { label: string }>;
+  feeCkb: string;
+  transactionHash: string;
+};
+
+/** Your own confirmation for adding or removing a backup. Return false to cancel. The emailed code follows. */
+export type ApproveBackupChange = (preview: BackupChangePreview) => boolean | Promise<boolean>;
+
+export type BackupChanged = { transactionHash: string; recovery: KeyWayRecovery };
+
+/**
+ * Adds a backup (with its signature over the recovery challenge, from `createEvmBackup` or
+ * `createJoyIdBackup`) or removes one: preview, the user's approval, then the emailed code, which a backup
+ * change always needs. The address doesn't change.
+ */
+export async function changeRecoveryBackup(options: {
+  authToken: string;
+  change: "add" | "remove";
+  backup: RecoveryBackupProof | RecoveryBackup;
+  approve: ApproveBackupChange;
+  requestEmailCode: RequestEmailCode;
+  api?: KeyWayApiClient;
+}): Promise<BackupChanged> {
+  const api = options.api ?? new KeyWayApiClient();
+  const backup = options.change === "add" ? options.backup : parseBackup(options.backup);
+  const base = { change: options.change, backup };
+  const { preview, confirmationNonce } = await api.recoveryBackups(options.authToken, { ...base, operation: "preview" }) as { preview: BackupChangePreview; confirmationNonce: string };
+  if (!await options.approve(preview)) throw new Error(options.change === "add" ? "Adding the backup was cancelled" : "Removing the backup was cancelled");
+  return withEmailCode(
+    options.requestEmailCode,
+    "recovery-backup",
+    () => api.recoveryBackups(options.authToken, { ...base, operation: "request-email-code", confirmationNonce }).then(() => undefined),
+    (emailCode) => api.recoveryBackups(options.authToken, { ...base, operation: "apply", confirmationNonce, emailCode }) as Promise<BackupChanged>,
   );
 }

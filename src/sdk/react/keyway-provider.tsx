@@ -27,10 +27,10 @@ import { bootstrapKeyWay, type PublicWallet } from "../browser/bootstrap";
 import type { ApproveFiberChannelOpen, FiberChannelOpenPreview } from "../browser/remote-ckb-signer";
 import type { ApproveFiberPayment } from "../browser/fiber-payment";
 import type { RequestEmailCode } from "../browser/email-code";
-import { enableRecovery, type ApproveRecovery, type RecoveryEnabled, type RecoveryPreview } from "../browser/account-recovery";
-import type { RecoveryBackupProof } from "../browser/recovery-backups";
+import { changeRecoveryBackup, enableRecovery, type ApproveBackupChange, type ApproveRecovery, type BackupChanged, type BackupChangePreview, type RecoveryEnabled, type RecoveryPreview } from "../browser/account-recovery";
+import type { RecoveryBackup, RecoveryBackupProof } from "../browser/recovery-backups";
 import { KeyWaySigner, type ApproveCkbMessage, type ApproveCkbTransaction, type MessagePreview, type TransactionPreview } from "../browser/keyway-signer";
-import { KeyWayChannelCloseModal, KeyWayChannelSettingsModal, KeyWayEmailCodeModal, KeyWayMessageModal, KeyWayPeerModal, KeyWayRecoveryModal, KeyWayTransactionModal } from "./signing-modals";
+import { KeyWayChannelCloseModal, KeyWayChannelSettingsModal, KeyWayEmailCodeModal, KeyWayMessageModal, KeyWayBackupChangeModal, KeyWayPeerModal, KeyWayRecoveryModal, KeyWayTransactionModal } from "./signing-modals";
 import type { ApproveFiberChannelClose, ApproveFiberChannelSettings, ApproveFiberPeer, FiberChannelClosePreview, FiberChannelSettingsPreview, FiberPeerPreview } from "../browser/fiber-actions";
 import {
   modalBackdrop,
@@ -88,6 +88,8 @@ export type KeyWayProviderProps = {
   approveCkbMessage?: ApproveCkbMessage;
   /** Replaces the built-in dialog for turning account recovery on. Return false to cancel. The emailed code follows. */
   approveRecovery?: ApproveRecovery;
+  /** Replaces the built-in dialog for adding or removing a recovery backup. Return false to cancel. The emailed code follows. */
+  approveBackupChange?: ApproveBackupChange;
   /** Starts Fiber as soon as the user signs in. Off by default; call `useFiber().start()` instead. */
   autoStartFiber?: boolean;
   /** Where the user's Fiber node runs: on KeyWay's servers (default) or in this page. */
@@ -125,6 +127,8 @@ export type KeyWayContextValue = {
   stopFiber: () => Promise<void>;
   /** Turns account recovery on with these backups, after the user's approval and the emailed code. */
   enableRecovery: (backups: RecoveryBackupProof[]) => Promise<RecoveryEnabled>;
+  /** Adds or removes a recovery backup, after the user's approval and the emailed code. */
+  changeRecoveryBackup: (change: "add" | "remove", backup: RecoveryBackupProof | RecoveryBackup) => Promise<BackupChanged>;
 };
 
 const KeyWayContext = createContext<KeyWayContextValue | undefined>(undefined);
@@ -142,6 +146,7 @@ export function KeyWayProvider({
   approveCkbTransaction,
   approveCkbMessage,
   approveRecovery,
+  approveBackupChange,
   autoStartFiber = false,
   fiberNode = "hosted",
   onError,
@@ -152,8 +157,8 @@ export function KeyWayProvider({
   const connectionRef = useRef<KeyWayConnection | undefined>(undefined);
   const operationRef = useRef<Promise<void>>(Promise.resolve());
   const runRef = useRef(0);
-  const callbacksRef = useRef({ approveFiberChannelOpen, approveFiberPayment, approveFiberChannelClose, approveFiberPeerConnect, approveFiberChannelSettings, approveCkbTransaction, approveCkbMessage, approveRecovery, onError, onFiberStartup });
-  callbacksRef.current = { approveFiberChannelOpen, approveFiberPayment, approveFiberChannelClose, approveFiberPeerConnect, approveFiberChannelSettings, approveCkbTransaction, approveCkbMessage, approveRecovery, onError, onFiberStartup };
+  const callbacksRef = useRef({ approveFiberChannelOpen, approveFiberPayment, approveFiberChannelClose, approveFiberPeerConnect, approveFiberChannelSettings, approveCkbTransaction, approveCkbMessage, approveRecovery, approveBackupChange, onError, onFiberStartup });
+  callbacksRef.current = { approveFiberChannelOpen, approveFiberPayment, approveFiberChannelClose, approveFiberPeerConnect, approveFiberChannelSettings, approveCkbTransaction, approveCkbMessage, approveRecovery, approveBackupChange, onError, onFiberStartup };
   const [connection, setConnection] = useState<KeyWayConnection>();
   const [wallet, setWallet] = useState<PublicWallet>();
   const [status, setStatus] = useState<KeyWayStatus>("idle");
@@ -169,8 +174,9 @@ export function KeyWayProvider({
   const [transactionRequest, setTransactionRequest] = useState<{ preview: TransactionPreview; resolve: (approved: boolean) => void }>();
   const [messageRequest, setMessageRequest] = useState<{ preview: MessagePreview; resolve: (approved: boolean) => void }>();
   const [recoveryRequest, setRecoveryRequest] = useState<{ preview: RecoveryPreview; resolve: (approved: boolean) => void }>();
+  const [backupChangeRequest, setBackupChangeRequest] = useState<{ preview: BackupChangePreview; resolve: (approved: boolean) => void }>();
   const [codeRequest, setCodeRequest] = useState<{
-    reason: "transaction" | "settings" | "payment" | "recovery";
+    reason: "transaction" | "settings" | "payment" | "recovery" | "recovery-backup";
     error?: string;
     resend: () => Promise<void>;
     resolve: (code: string | undefined) => void;
@@ -460,6 +466,21 @@ export function KeyWayProvider({
     return result;
   }
 
+  async function changeBackup(change: "add" | "remove", backup: RecoveryBackupProof | RecoveryBackup): Promise<BackupChanged> {
+    if (!authToken || !wallet) throw new Error("Sign in before changing backups");
+    const result = await changeRecoveryBackup({
+      authToken,
+      change,
+      backup,
+      api: new KeyWayApiClient({ appId }),
+      approve: (preview) => callbacksRef.current.approveBackupChange?.(preview) ??
+        new Promise<boolean>((resolve) => setBackupChangeRequest({ preview, resolve })),
+      requestEmailCode,
+    });
+    setWallet((current) => current && current.litPublicKey === wallet.litPublicKey ? { ...current, recovery: result.recovery } : current);
+    return result;
+  }
+
   return (
     <KeyWayContext.Provider value={{
       ready,
@@ -482,6 +503,7 @@ export function KeyWayProvider({
       startFiber: connect,
       stopFiber: disconnect,
       enableRecovery: turnOnRecovery,
+      changeRecoveryBackup: changeBackup,
     }}>
       {children}
       {loginOpen && !authenticated ? (
@@ -524,6 +546,14 @@ export function KeyWayProvider({
           appName={resolvedAppName}
           preview={recoveryRequest.preview}
           answer={(approved) => { recoveryRequest.resolve(approved); setRecoveryRequest(undefined); }}
+        />
+      ) : null}
+      {backupChangeRequest ? (
+        <KeyWayBackupChangeModal
+          theme={theme}
+          appName={resolvedAppName}
+          preview={backupChangeRequest.preview}
+          answer={(approved) => { backupChangeRequest.resolve(approved); setBackupChangeRequest(undefined); }}
         />
       ) : null}
       {codeRequest ? (

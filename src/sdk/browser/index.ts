@@ -10,8 +10,10 @@ export type {
 } from "./create-keyway";
 export type { FiberStartupEvent, FiberStartupStage } from "./connect-keyway";
 export type { KeyWayRecovery } from "./account-lock";
-export type { ApproveRecovery, EthereumProvider, RecoveryEnabled, RecoveryPreview } from "./account-recovery";
+export type { ApproveBackupChange, ApproveRecovery, BackupChanged, BackupChangePreview, EthereumProvider, RecoveryEnabled, RecoveryPreview } from "./account-recovery";
 export type { RecoveryBackup, RecoveryBackupProof } from "./recovery-backups";
+export type { OnChainRecoveryList, RecoveryListEntry } from "./recovery-list";
+export type { RecoverySpend } from "./recovery-spend";
 export type { ApproveFiberChannelOpen, FiberChannelOpenPreview } from "./remote-ckb-signer";
 export {
   KeyWaySigner,
