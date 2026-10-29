@@ -313,4 +313,16 @@ export const migrations: Array<{
         check (purpose in ('transaction', 'message', 'settings', 'payment', 'recovery'))`;
     },
   },
+  {
+    version: 17, name: "legacy-address-sweeps",
+    up: async (sql) => {
+      // The last sweep from a recovery account's old address, kept until it is committed or gone, so a sweep
+      // still in the mempool is never rebuilt.
+      await sql`create table keyway_v2_legacy_sweeps (
+        user_id uuid primary key,
+        transaction_hash text not null check (transaction_hash ~ '^0x[0-9a-f]{64}$'),
+        sent_at timestamptz not null default now()
+      )`;
+    },
+  },
 ];
