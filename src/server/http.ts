@@ -39,6 +39,7 @@ import { runIdempotentMutation } from "./idempotency.ts";
 import { recordSigningEvent } from "./security-alerts.ts";
 import { messageSigning, signingSettings, transactionSigning, type SigningContext } from "./general-signing.ts";
 import { recoverySetup } from "./recovery.ts";
+import { sweepLegacyAfterSignIn } from "./legacy-sweep.ts";
 
 export async function handleKeyWayRequest(request: Request): Promise<Response> {
   const cors = await corsHeaders(request);
@@ -180,9 +181,13 @@ async function bootstrapRequest(request: Request): Promise<Response> {
   // Lit creates the Fiber key; SDKs that send their own key are no longer accepted.
   if (keyCustody !== "lit") throw new Error("Update @ckb-keyway/react to 0.2.4 or later");
   if (nodeMode !== undefined && nodeMode !== "browser" && nodeMode !== "managed") throw new Error("Node mode is invalid");
-  return Response.json(await versionedMutation(request, user.id, "bootstrap", body, () =>
+  const result = await versionedMutation(request, user.id, "bootstrap", body, () =>
     bootstrap(user, deviceIdHash, nodeMode),
-  ));
+  );
+  // Every sign-in bootstraps, in both node modes. With recovery on, anything at the old address moves to
+  // the new one after this response.
+  if (result.wallet.recovery) sweepLegacyAfterSignIn(user);
+  return Response.json(result);
 }
 
 async function fiberKeyRequest(request: Request): Promise<Response> {

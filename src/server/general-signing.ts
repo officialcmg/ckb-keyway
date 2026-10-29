@@ -257,7 +257,7 @@ async function signTransaction(context: SigningContext, validated: ValidatedTran
 }
 
 /** Signs a digest the backend computed itself, then checks the recovered key before releasing it. */
-export async function sign(context: SigningContext, digest: ccc.Hex): Promise<ccc.Hex> {
+export async function sign(context: Pick<SigningContext, "wallet" | "signDigest">, digest: ccc.Hex): Promise<ccc.Hex> {
   if (context.signDigest) return context.signDigest(digest, context.wallet);
   const signature = await signCkbDigest(digest, context.wallet.litPkpId, {
     apiKey: requiredEnv("LIT_USAGE_API_KEY"),
