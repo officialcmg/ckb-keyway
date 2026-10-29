@@ -1,0 +1,116 @@
+{
+  "userId": "4dac3837-17df-431b-a971-e45044c1a8f5",
+  "enable": "0xbe07c168bc4dfcf5189492c5815afda17e7fc30038a795d1bd0d1d389f08cb5c",
+  "recovery": {
+    "omnilockArgs": "0x00c9b90be88844e0f14117bf69ee19962c1cb834ea012bc63cfd1d5392e380be6c5c115b3f2fdb4b5d4ad70a396e60f9a654bdcc80ca",
+    "adminListTypeArgs": "0x7aa54829c5a56be796c4ae46b17012be2a3049ee450ebdd082e408262c6dadc3",
+    "adminListTypeHash": "0x2bc63cfd1d5392e380be6c5c115b3f2fdb4b5d4ad70a396e60f9a654bdcc80ca",
+    "adminListOutPoint": {
+      "txHash": "0xbe07c168bc4dfcf5189492c5815afda17e7fc30038a795d1bd0d1d389f08cb5c",
+      "index": 0
+    },
+    "legacyAddress": "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqwfhy973zzyurc5z9ald8hpn93vrjurf6sqfpcmg",
+    "enabledAt": "2026-10-29T01:05:14.380Z",
+    "backups": [
+      {
+        "kind": "evm",
+        "address": "0xfdb83636df65d69c286166599ddf20cf41df20d3"
+      }
+    ]
+  },
+  "newAddress": "ckt1qrejnmlar3r452tcg57gvq8patctcgy8acync0hxfnyka35ywafvkqgqexush6yggns0zsghha57uxvk9swtsd82qy4uv08ar4fe9cuqhek9cy2m8uhakj6aftts5wtwvru6v49aejqv5p46du5",
+  "legacyAddress": "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqwfhy973zzyurc5z9ald8hpn93vrjurf6sqfpcmg",
+  "evmBackup": "0xfdb83636df65d69c286166599ddf20cf41df20d3",
+  "send-mixed": "0x4056acb3f6f0a8f3b55c48486d23cae6241645e671871e097f24494ae015c114",
+  "tokenTypeHash": "0x58675e8fe9a3380d135482e200b795f3ff7a3951523d4a2c56e6f17281366b15",
+  "tokenArgs": "0x6571202c16606cdbf05baa94ca5b9d8f3b7d1df6d0c5aaf04c7637a6bde2d909",
+  "sweep-mixed": {
+    "status": "swept",
+    "transactionHash": "0x3e2684ef105a19ae452336b58429be91c2a79de7cf18f5dcd6031eff70a2f288",
+    "movedCkb": "512",
+    "tokenCells": 1,
+    "topUp": false,
+    "again": {
+      "status": "pending",
+      "transactionHash": "0x3e2684ef105a19ae452336b58429be91c2a79de7cf18f5dcd6031eff70a2f288"
+    },
+    "after": {
+      "status": "empty"
+    },
+    "negatives": [
+      {
+        "destination": "I's address",
+        "policy": "The old address sweep doesn't match what KeyWay allows: output 0 goes somewhere other than the account's recovery address",
+        "chain": "accepted"
+      },
+      {
+        "destination": "K's old address",
+        "policy": "The old address sweep doesn't match what KeyWay allows: output 0 goes somewhere other than the account's recovery address",
+        "chain": "accepted"
+      },
+      {
+        "destination": "an Omnilock of K's key with another AdminList",
+        "policy": "The old address sweep doesn't match what KeyWay allows: output 0 goes somewhere other than the account's recovery address",
+        "chain": "accepted"
+      }
+    ],
+    "inputs": 3,
+    "outputs": [
+      {
+        "ckb": "176",
+        "token": true,
+        "data": "0x40420f00000000000000000000000000"
+      },
+      {
+        "ckb": "335.99998863",
+        "token": false,
+        "data": "0x"
+      }
+    ]
+  },
+  "send-lone-token": "0xc6c70101ba1d2be34610fefada860f7afbeba32d73b6992d83450c3109d52cb9",
+  "sweep-lone-token": {
+    "status": "swept",
+    "transactionHash": "0xe993508811cfea891534f06e21e49907a71455c1a5a29099d3c8c34dd3e7f76d",
+    "movedCkb": "142",
+    "tokenCells": 1,
+    "topUp": true,
+    "again": {
+      "status": "pending",
+      "transactionHash": "0xe993508811cfea891534f06e21e49907a71455c1a5a29099d3c8c34dd3e7f76d"
+    },
+    "after": {
+      "status": "empty"
+    },
+    "negatives": [
+      {
+        "destination": "I's address",
+        "policy": "The old address sweep doesn't match what KeyWay allows: output 0 goes somewhere other than the account's recovery address",
+        "chain": "accepted"
+      },
+      {
+        "destination": "K's old address",
+        "policy": "The old address sweep doesn't match what KeyWay allows: output 0 goes somewhere other than the account's recovery address",
+        "chain": "accepted"
+      },
+      {
+        "destination": "an Omnilock of K's key with another AdminList",
+        "policy": "The old address sweep doesn't match what KeyWay allows: output 0 goes somewhere other than the account's recovery address",
+        "chain": "accepted"
+      }
+    ],
+    "inputs": 2,
+    "outputs": [
+      {
+        "ckb": "176",
+        "token": true,
+        "data": "0x20a10700000000000000000000000000"
+      },
+      {
+        "ckb": "9768.99997723",
+        "token": false,
+        "data": "0x"
+      }
+    ]
+  }
+}
