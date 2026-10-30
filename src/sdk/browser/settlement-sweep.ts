@@ -1,5 +1,5 @@
 import * as ccc from "@ckb-ccc/core";
-import { isXudtCompatible } from "./tokens";
+import { hasPlainTokenArgs, isXudtCompatible } from "./tokens";
 
 const RUSD_CONTRACT_TYPE_ID_ARGS = "0x97d30b723c0b2c66e9cb8d4d0df4ab5d7222cbb00d4a9a2055ce2e5d7f0d8b0f";
 
@@ -45,7 +45,8 @@ const SWEEP_FEE_MARGIN = 1_000_000n;
  * settlement key to the user's own address, keeping tokens as they are, with the fee taken from the CKB.
  * `keepReserve` CKB stays on the key as the watchtower's fee reserve (see FEE_RESERVE); pass 0n once
  * every channel is settled to return it too. Cells with a type script it can't move safely are left where
- * they are. Returns the transaction hash, or undefined when there is nothing to sweep.
+ * they are, and so are token cells the plain CKB can't bring up to the destination lock's minimum. Returns the
+ * transaction hash, or undefined when there is nothing to sweep.
  */
 export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.HexLike, destination: ccc.ScriptLike, keepReserve = 0n): Promise<string | undefined> {
   const signer = new ccc.SignerCkbPrivateKey(client, settlementKey);
@@ -55,8 +56,7 @@ export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.Hex
 
   const xudt = await client.getKnownScript(ccc.KnownScript.XUdt);
   const movable = (type: ccc.Script | undefined) => !type
-    || (type.codeHash === xudt.codeHash && type.hashType === xudt.hashType)
-    || isXudtCompatible(type);
+    || (((type.codeHash === xudt.codeHash && type.hashType === xudt.hashType) || isXudtCompatible(type)) && hasPlainTokenArgs(type));
   const cells: ccc.Cell[] = [];
   for await (const cell of client.findCellsByLock(from, undefined, true)) {
     if (movable(cell.cellOutput.type)) cells.push(cell);
@@ -64,23 +64,43 @@ export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.Hex
   }
   if (cells.length === 0) return undefined;
 
-  // Token cells move as they are. Plain CKB is pooled: the reserve stays on the key, the rest goes to the user.
-  const tokens = cells.filter((cell) => cell.cellOutput.type);
-  const plainTotal = cells.filter((cell) => !cell.cellOutput.type).reduce((total, cell) => total + cell.cellOutput.capacity, 0n);
-  const plan = planSweep(plainTotal, tokens.length, keepReserve);
+  // Token cells move as they are, each at least at what it occupies under the destination's lock (an Omnilock
+  // needs 176 CKB for a standard xUDT cell where secp256k1 needs 142); the difference comes out of the plain CKB.
+  // Token cells the plain CKB can't top up stay on the key for a later sweep. Plain CKB is pooled: the reserve
+  // stays on the key, the rest goes to the user.
+  const plainCells = cells.filter((cell) => !cell.cellOutput.type);
+  const plainTotal = plainCells.reduce((total, cell) => total + cell.cellOutput.capacity, 0n);
+  const sized = cells.filter((cell) => cell.cellOutput.type).map((cell) => {
+    const output = ccc.CellOutput.from({ lock: to, type: cell.cellOutput.type, capacity: 0n });
+    output.capacity = ccc.numMax(cell.cellOutput.capacity, ccc.fixedPointFrom(output.occupiedSize + ccc.bytesFrom(cell.outputData).length));
+    return { cell, output, extra: output.capacity - cell.cellOutput.capacity };
+  }).sort((a, b) => a.extra < b.extra ? -1 : a.extra > b.extra ? 1 : 0);
+  let extra = 0n;
+  const tokens = sized.filter(({ extra: needed }) => {
+    if (extra + needed > plainTotal) return false;
+    extra += needed;
+    return true;
+  });
+  const plan = planSweep(plainTotal - extra, tokens.length, keepReserve);
   if (!plan) return undefined;
-  const { toUser, reserve } = plan;
+  let { toUser } = plan;
+  const { reserve } = plan;
+  // Too little for a plain cell of its own and no reserve to join: it rides in the first token cell.
+  if (reserve === 0n && toUser > 0n && toUser < MIN_PLAIN_CELL + SWEEP_FEE_MARGIN && tokens.length > 0) {
+    tokens[0].output.capacity += toUser;
+    toUser = 0n;
+  }
   const plainOutputs = [
     ...(toUser > 0n ? [{ lock: to, capacity: toUser }] : []),
     ...(reserve > 0n ? [{ lock: from, capacity: reserve }] : []),
   ];
   const tx = ccc.Transaction.from({
-    inputs: cells.map((cell) => ({ previousOutput: cell.outPoint })),
-    outputs: [...tokens.map((cell) => ({ lock: to, type: cell.cellOutput.type, capacity: cell.cellOutput.capacity })), ...plainOutputs],
-    outputsData: [...tokens.map((cell) => cell.outputData), ...plainOutputs.map(() => "0x")],
+    inputs: [...plainCells, ...tokens.map(({ cell }) => cell)].map((cell) => ({ previousOutput: cell.outPoint })),
+    outputs: [...tokens.map(({ output }) => output), ...plainOutputs],
+    outputsData: [...tokens.map(({ cell }) => cell.outputData), ...plainOutputs.map(() => "0x")],
   });
   await tx.addCellDepsOfKnownScripts(client, ccc.KnownScript.Secp256k1Blake160);
-  await addTokenCellDeps(client, tx, cells);
+  await addTokenCellDeps(client, tx, tokens.map(({ cell }) => cell));
 
   // The fee comes out of the user's CKB, else the reserve, else a token cell's spare capacity.
   const indexed = tx.outputs.map((output, index) => ({ output, index }));

@@ -20,6 +20,18 @@ export type ReadyWallet = Omit<ProvisioningWallet, "status"> & {
   updatedAt: string;
   /** Set once the user turns account recovery on; `legacyAddress` then holds the old secp256k1 address. */
   recovery?: KeyWayRecovery;
+  /** A recovery change that was sent and isn't committed yet; it takes effect once it is. */
+  recoveryPending?: PendingRecoveryChange;
+};
+
+export type PendingRecoveryChange = {
+  kind: "enable" | "add" | "remove";
+  transactionHash: string;
+  /** The settings once the transaction commits. */
+  recovery: KeyWayRecovery;
+  /** The account's address once the transaction commits. */
+  ckbAddress: string;
+  sentAt: string;
 };
 
 export type KeyWayWallet = ProvisioningWallet | ReadyWallet;
@@ -35,7 +47,14 @@ export function parseWallet(value: unknown): KeyWayWallet | undefined {
     typeof candidate.encryptedFiberKey !== "string"
   )) return undefined;
   // Malformed recovery settings throw rather than read as no wallet, which would provision a new one.
-  if (candidate.status === "ready") parseRecovery(candidate.recovery, candidate.litPublicKey as string);
+  if (candidate.status === "ready") {
+    parseRecovery(candidate.recovery, candidate.litPublicKey as string);
+    const pending = candidate.recoveryPending;
+    if (pending !== undefined && (
+      !pending || !["enable", "add", "remove"].includes(pending.kind) || typeof pending.transactionHash !== "string" ||
+      typeof pending.ckbAddress !== "string" || typeof pending.sentAt !== "string" || !parseRecovery(pending.recovery, candidate.litPublicKey as string)
+    )) throw new Error("KeyWay account recovery settings are invalid");
+  }
   return candidate as KeyWayWallet;
 }
 

@@ -9,7 +9,7 @@ import type { KeyWay, KeyWayChannel, OpenKeyWayChannelOptions, ChannelOpenProgre
 import { useKeyWayContext } from "./keyway-provider";
 
 export function useCkbWallet() {
-  const { authenticated, wallet, signer, error: recoveryError, enableRecovery, changeRecoveryBackup } = useKeyWayContext();
+  const { authenticated, wallet, signer, error: recoveryError, enableRecovery, changeRecoveryBackup, requestBackupChallenge } = useKeyWayContext();
   const [balance, setBalance] = useState<bigint>();
   const [balanceError, setBalanceError] = useState<Error>();
   const [refreshing, setRefreshing] = useState(false);
@@ -75,12 +75,12 @@ export function useCkbWallet() {
       /** Asks an injected EVM wallet (`window.ethereum` by default) to sign up as a backup. */
       createEvmBackup: async (ethereum?: EthereumProvider) => {
         if (!wallet) throw new Error("Recover the CKB account before adding a backup");
-        return createEvmBackup(await recoveryAccountAddress(wallet.litPublicKey), ethereum);
+        return createEvmBackup(await recoveryAccountAddress(wallet.litPublicKey), await requestBackupChallenge(), ethereum);
       },
       /** Asks a CCC JoyID signer (from @ckb-ccc/joy-id) to sign up as a backup with its passkey. */
       createJoyIdBackup: async (joyIdSigner: ccc.Signer) => {
         if (!wallet) throw new Error("Recover the CKB account before adding a backup");
-        return createJoyIdBackup(await recoveryAccountAddress(wallet.litPublicKey, joyIdSigner.client), joyIdSigner);
+        return createJoyIdBackup(await recoveryAccountAddress(wallet.litPublicKey, joyIdSigner.client), await requestBackupChallenge(), joyIdSigner);
       },
     },
   };

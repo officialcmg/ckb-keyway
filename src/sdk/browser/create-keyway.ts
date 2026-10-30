@@ -15,7 +15,7 @@ import { KeyWayCredentialProvider, type FiberKeyLoader } from "./credential-prov
 import { acquireDeviceLock, type DeviceLock } from "./device-lock";
 import { acquireDeviceLease, type DeviceLease } from "./device-lease";
 import { serializeCccTransactionForRpc } from "./ccc-transaction";
-import { FUNDING_LOCK_KNOWN_SCRIPTS, type KeyWayRecovery } from "./account-lock";
+import { fundingLockCellDeps, FUNDING_LOCK_KNOWN_SCRIPTS, type KeyWayRecovery } from "./account-lock";
 import { getLockBalance } from "./ckb-balance";
 import { RemoteCkbSigner, type ApproveFiberChannelOpen } from "./remote-ckb-signer";
 import { getDeviceIdHash, markChannelOpened } from "./bootstrap";
@@ -125,13 +125,18 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     if (approved) activationProgress?.("signing");
     return approved;
   }, undefined, api, options.recovery);
-  const resolveExternalFunding = createCccExternalFundingResolver({
+  const resolveCccFunding = createCccExternalFundingResolver({
     signer: fundingSigner,
     knownScripts: FUNDING_LOCK_KNOWN_SCRIPTS,
     ckbRpcUrl: "https://testnet.ckb.dev/",
     // fiber-pay normalizes field names, but CCC must first serialize bigint fields to CKB RPC hex.
     signFundingTxOptions: { toRpcTransaction: serializeCccTransactionForRpc },
   });
+  // KeyWay's pinned Omnilock isn't a CCC known script, so its deps come from the account's recovery settings.
+  const resolveExternalFunding: typeof resolveCccFunding = async (context) => {
+    const resolved = await resolveCccFunding(context);
+    return options.recovery ? { ...resolved, fundingLockScriptCellDeps: fundingLockCellDeps(options.recovery) } : resolved;
+  };
   // The node settles force-closed channels with the key derived from the Fiber key, so the reserve goes there.
   const feeReserve = createFeeReserve({
     authToken: options.authToken,
@@ -335,7 +340,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
 
   async function getCkbBalance(): Promise<bigint> {
     const address = await fundingSigner.getRecommendedAddressObj();
-    return getLockBalance(fundingSigner.client, address.script, options.recovery);
+    return getLockBalance(address.script);
   }
 
   async function getChannels(options?: { includeClosed?: boolean }): Promise<KeyWayChannel[]> {

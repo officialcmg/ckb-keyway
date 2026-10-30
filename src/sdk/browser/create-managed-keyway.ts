@@ -41,7 +41,7 @@ import { withEmailCode, type RequestEmailCode } from "./email-code";
 import { normalizeFiberPubkey } from "./fiber-pubkey";
 import { RemoteCkbSigner, type ApproveFiberChannelOpen } from "./remote-ckb-signer";
 import { serializeCccTransactionForRpc } from "./ccc-transaction";
-import { FUNDING_LOCK_KNOWN_SCRIPTS, type KeyWayRecovery } from "./account-lock";
+import { fundingLockCellDeps, FUNDING_LOCK_KNOWN_SCRIPTS, type KeyWayRecovery } from "./account-lock";
 import { getLockBalance } from "./ckb-balance";
 import { toKeyWayError } from "./keyway-error";
 import { createFeeReserve, FEE_RESERVE } from "./fee-reserve";
@@ -95,12 +95,17 @@ export function createManagedKeyWay(options: {
       return { codeHash: lockScript.code_hash, hashType: lockScript.hash_type, args: lockScript.args };
     },
   });
-  const resolveExternalFunding = createCccExternalFundingResolver({
+  const resolveCccFunding = createCccExternalFundingResolver({
     signer: fundingSigner,
     knownScripts: FUNDING_LOCK_KNOWN_SCRIPTS,
     ckbRpcUrl: "https://testnet.ckb.dev/",
     signFundingTxOptions: { toRpcTransaction: serializeCccTransactionForRpc },
   });
+  // KeyWay's pinned Omnilock isn't a CCC known script, so its deps come from the account's recovery settings.
+  const resolveExternalFunding: typeof resolveCccFunding = async (context) => {
+    const resolved = await resolveCccFunding(context);
+    return options.recovery ? { ...resolved, fundingLockScriptCellDeps: fundingLockCellDeps(options.recovery) } : resolved;
+  };
   let running = false;
   let status: ManagedStatus | undefined;
 
@@ -269,7 +274,7 @@ export function createManagedKeyWay(options: {
 
   async function getCkbBalance(): Promise<bigint> {
     const address = await fundingSigner.getRecommendedAddressObj();
-    return getLockBalance(fundingSigner.client, address.script, options.recovery);
+    return getLockBalance(address.script);
   }
 
   return {

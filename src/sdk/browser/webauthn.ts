@@ -25,7 +25,7 @@ const MAX_DEPTH = 8;
 const MAX_KEY = 256;
 /** Omnilock reads at most 1024 signature bytes. */
 export const MAX_WEBAUTHN_SIGNATURE = 1024;
-const BLOB_VERSION = 1;
+const BLOB_VERSION = 2;
 
 const base64url = (bytes: Uint8Array) => {
   let binary = "";
@@ -77,12 +77,13 @@ export function verifyWebAuthn(assertion: WebAuthnAssertion, challengeText: stri
 }
 
 /**
- * The verifier's signature blob: version ‖ public key ‖ r ‖ s ‖ u16 LE length ‖ authenticatorData ‖ u16 LE length ‖
+ * The verifier's signature blob: version 2 ‖ network byte (0 testnet, 1 mainnet: the address prefix the verifier
+ * writes into the approval text) ‖ public key ‖ r ‖ s ‖ u16 LE length ‖ authenticatorData ‖ u16 LE length ‖
  * clientDataJSON, zero-padded to `slot` bytes.
  */
-export function webAuthnSignatureBlob(assertion: WebAuthnAssertion, slot: number): Uint8Array {
+export function webAuthnSignatureBlob(assertion: WebAuthnAssertion, slot: number, networkByte: 0 | 1): Uint8Array {
   const { publicKey, rs, authData, clientDataJson } = assertion;
-  const blob = ccc.bytesConcat([BLOB_VERSION], publicKey, rs, ccc.numLeToBytes(authData.length, 2), authData, ccc.numLeToBytes(clientDataJson.length, 2), clientDataJson);
+  const blob = ccc.bytesConcat([BLOB_VERSION, networkByte], publicKey, rs, ccc.numLeToBytes(authData.length, 2), authData, ccc.numLeToBytes(clientDataJson.length, 2), clientDataJson);
   if (slot > MAX_WEBAUTHN_SIGNATURE) throw new Error(`A passkey signature can't exceed ${MAX_WEBAUTHN_SIGNATURE} bytes`);
   if (blob.length > slot) throw new Error("The passkey signature doesn't fit");
   return ccc.bytesConcat(blob, new Uint8Array(slot - blob.length));
@@ -90,7 +91,7 @@ export function webAuthnSignatureBlob(assertion: WebAuthnAssertion, slot: number
 
 /** The blob's length before padding. */
 export function webAuthnSignatureLength(assertion: WebAuthnAssertion): number {
-  return 1 + 64 + 64 + 2 + assertion.authData.length + 2 + assertion.clientDataJson.length;
+  return 2 + 64 + 64 + 2 + assertion.authData.length + 2 + assertion.clientDataJson.length;
 }
 
 /** The strict clientDataJSON rules of the on-chain verifier. */

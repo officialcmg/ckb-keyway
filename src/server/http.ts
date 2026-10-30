@@ -1,5 +1,5 @@
 import * as ccc from "@ckb-ccc/core";
-import { currentLock } from "../sdk/browser/account-lock.ts";
+import { currentLock, verifyRecoveryAnchor } from "../sdk/browser/account-lock.ts";
 import type { User } from "./auth-user.ts";
 import { bootstrap } from "./bootstrap.ts";
 import { markChannelOpened, readWallet } from "./user-wallet.ts";
@@ -38,7 +38,7 @@ import { fiberPayment } from "./fiber-payments.ts";
 import { runIdempotentMutation } from "./idempotency.ts";
 import { recordSigningEvent } from "./security-alerts.ts";
 import { messageSigning, signingSettings, transactionSigning, type SigningContext } from "./general-signing.ts";
-import { recoveryBackupChange, recoverySetup } from "./recovery.ts";
+import { recoveryBackupChange, recoverySetup, settleRecoveryChange } from "./recovery.ts";
 import { sweepLegacyAfterSignIn } from "./legacy-sweep.ts";
 
 export async function handleKeyWayRequest(request: Request): Promise<Response> {
@@ -138,7 +138,9 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
 async function ownLockScript(user: User) {
   const wallet = await readWallet(user);
   if (wallet?.status !== "ready") throw new Error("KeyWay wallet is not ready");
-  const script = await currentLock(new ccc.ClientPublicTestnet(), wallet.litPublicKey, wallet.recovery);
+  const client = new ccc.ClientPublicTestnet();
+  if (wallet.recovery) await verifyRecoveryAnchor(client, wallet.litPublicKey, wallet.recovery);
+  const script = await currentLock(client, wallet.litPublicKey, wallet.recovery);
   return { code_hash: script.codeHash, hash_type: script.hashType, args: script.args } as never;
 }
 
@@ -185,10 +187,20 @@ async function bootstrapRequest(request: Request): Promise<Response> {
   const result = await versionedMutation(request, user.id, "bootstrap", body, () =>
     bootstrap(user, deviceIdHash, nodeMode),
   );
-  // Every sign-in bootstraps, in both node modes. With recovery on, anything at the old address moves to
-  // the new one after this response.
-  if (result.wallet.recovery) sweepLegacyAfterSignIn(user);
-  return Response.json(result);
+  // A recovery change sent earlier takes effect here once its transaction is committed.
+  let wallet = result.wallet;
+  if (wallet.recoveryPending) {
+    const scope = await resolveAuthScope(request);
+    const { encryptedFiberKey: _encrypted, ...settled } = await settleRecoveryChange({ user, appName: scope.name, email: () => sessionEmail(request), sendEmail: sendTransactionalEmail });
+    wallet = settled;
+  }
+  // Every sign-in bootstraps, in both node modes. With recovery on, the record must be one the chain backs, and
+  // anything at the old address moves to the new one after this response.
+  if (wallet.recovery) {
+    await verifyRecoveryAnchor(new ccc.ClientPublicTestnet(), wallet.litPublicKey, wallet.recovery);
+    sweepLegacyAfterSignIn(user);
+  }
+  return Response.json({ ...result, wallet });
 }
 
 async function fiberKeyRequest(request: Request): Promise<Response> {
