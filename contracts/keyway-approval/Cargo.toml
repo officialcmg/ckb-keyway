@@ -1,0 +1,14 @@
+[package]
+name = "keyway-approval"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The readable text a KeyWay recovery backup signs, rebuilt from the transaction it approves"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+ckb-std = { version = "1.1.0", default-features = false, features = ["dummy-atomic"] }

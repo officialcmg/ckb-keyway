@@ -33,9 +33,10 @@ export const cases: Case[] = [
   text("array at top", `[{${ok}}]`, false),
   text("trailing garbage", `{${ok}} `, false),
   text("trailing garbage 2", `{${ok}}{}`, false),
-  // Finding: TextDecoder strips a leading BOM (ignoreBOM defaults to false), Rust's from_utf8 keeps it, so the
-  // server accepts a clientDataJSON the chain refuses. No browser emits one, so this is a parity note, not a loss.
-  text("leading BOM", `\ufeff{${ok}}`, false, true),
+  // Finding (fixed): TextDecoder stripped a leading BOM (ignoreBOM defaulted to false) while Rust's from_utf8
+  // keeps it, so the server accepted a clientDataJSON the chain refuses. The server now decodes with
+  // ignoreBOM: true and refuses it too.
+  text("leading BOM", `\ufeff{${ok}}`, false),
   text("duplicate type", `{"type":"webauthn.create",${ok}}`, false),
   text("duplicate challenge, second right", `{"challenge":"AAAA",${ok}}`, false),
   text("escaped key equals type", `{"ty\\u0070e":"webauthn.get","challenge":"${C}"}`, true),
@@ -100,6 +101,10 @@ export const cases: Case[] = [
   bytes("utf-8 encoded surrogate", Buffer.concat([Buffer.from(`{${ok},"v":"`), Buffer.from([0xed, 0xa0, 0x80]), Buffer.from(`"}`)]), false),
   bytes("nul byte raw", Buffer.concat([Buffer.from(`{${ok},"v":"`), Buffer.from([0x00]), Buffer.from(`"}`)]), false),
 ];
+
+test("no case records a divergence between the TypeScript and Rust rules", () => {
+  assert.deepEqual(cases.filter(({ expectedTs }) => expectedTs !== undefined).map(({ name }) => name), []);
+});
 
 test("the TypeScript clientDataJSON rules give the expected verdict for every case", () => {
   const failures = cases.filter(({ clientData, expected, expectedTs }) => clientDataMatches(Buffer.from(clientData, "base64"), C) !== (expectedTs ?? expected)).map(({ name }) => name);

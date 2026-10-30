@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["joyid-webauthn", "tests"]
+members = ["keyway-approval", "evm-personal-sign", "joyid-webauthn", "tests"]
 default-members = ["tests"]
 
 [profile.release]
