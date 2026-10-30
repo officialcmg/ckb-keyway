@@ -368,7 +368,7 @@ function RecoveryCard({ recovery, actions }: { recovery: DemoRecovery; actions: 
         </>
       ) : (
         <>
-          <p className="demo-card__body">Name an EVM wallet that can move everything in this account if KeyWay is ever gone. Turning this on changes your address once and locks about 197 CKB for the backup list.</p>
+          <p className="demo-card__body">Name an EVM wallet that can move everything in this account if KeyWay is ever gone. Turning this on changes your address once and locks 165 CKB for the backup list.</p>
           <button type="button" className={`btn btn--route demo-card__action${busy === "enable" ? " btn--busy" : ""}`} disabled={Boolean(busy)} onClick={() => void run("enable", actions.enableRecovery)}>
             {busy === "enable" ? "Waiting for approval…" : "Turn on with an EVM wallet"}
           </button>
