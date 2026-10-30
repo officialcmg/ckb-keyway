@@ -212,8 +212,16 @@ dependencies = [
  "blake2b-ref",
  "ckb-std",
  "ecdsa",
+ "keyway-approval",
  "p256",
  "sha2",
+]
+
+[[package]]
+name = "keyway-approval"
+version = "0.1.0"
+dependencies = [
+ "ckb-std",
 ]
 
 [[package]]
