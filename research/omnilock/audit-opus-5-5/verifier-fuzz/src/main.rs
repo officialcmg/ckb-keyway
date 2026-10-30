@@ -1,5 +1,7 @@
 //! Host-side adversarial checks of contracts/joyid-webauthn (the same library the deployed binary is built from).
-//! Run: cargo run --release. Prints each check and panics on the first property that fails.
+//! Run: cargo run --release. Prints each check and panics on the first property that fails. Updated for the
+//! version 2 blob (a network byte after the version) and the readable approval text as the challenge; on chain the
+//! binary rebuilds that text from the transaction, here it is given.
 use joyid_webauthn::*;
 use p256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
 use sha2::{Digest, Sha256};
@@ -21,7 +23,7 @@ fn blob(key: &SigningKey, auth: &[u8], client: &[u8], pad: usize) -> Vec<u8> {
     let digest = Sha256::new().chain_update(auth).chain_update(Sha256::digest(client)).finalize();
     let sig: Signature = key.sign_prehash(&digest).unwrap();
     let point = key.verifying_key().to_encoded_point(false);
-    let mut out = vec![SIGNATURE_VERSION];
+    let mut out = vec![SIGNATURE_VERSION, 0];
     out.extend_from_slice(&point.as_bytes()[1..]);
     out.extend_from_slice(&sig.to_bytes());
     out.extend_from_slice(&(auth.len() as u16).to_le_bytes());
@@ -36,9 +38,10 @@ fn main() {
     let key = SigningKey::from_slice(&[7u8; 32]).unwrap();
     let pubkey = &key.verifying_key().to_encoded_point(false).as_bytes()[1..].to_vec();
     let pkh = blake160(pubkey);
-    let msg = [0x5au8; 32];
-    let other = [0xa5u8; 32];
-    let challenge = b64(&challenge_text(&msg));
+    let approval = |sighash: &[u8; 32]| format!("KeyWay recovery\nMove everything to ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygfhutwy\nCKB: 100\nTokens: none\nFee: 0.00000765 CKB\nTransaction: 0x{}", sighash.iter().map(|x| format!("{x:02x}")).collect::<String>()).into_bytes();
+    let msg = approval(&[0x5au8; 32]);
+    let other = approval(&[0xa5u8; 32]);
+    let challenge = b64(&msg);
     let auth = { let mut a = vec![0x11u8; 32]; a.extend_from_slice(&[0x05, 0, 0, 0, 0]); a };
     let good = format!(r#"{{"type":"webauthn.get","challenge":"{challenge}","origin":"https://testnet.joyid.dev","crossOrigin":false}}"#);
     assert_eq!(verify(&pkh, &msg, &blob(&key, &auth, good.as_bytes(), 0)), Ok(()));
@@ -74,24 +77,25 @@ fn main() {
     assert_eq!(verify(&pkh, &msg, &dirty), Err(Error::Encoding));
     let mut long = base.clone(); long.resize(1025, 0);
     assert_eq!(verify(&pkh, &msg, &long), Err(Error::Encoding));
-    let mut v2 = base.clone(); v2[0] = 2;
-    assert_eq!(verify(&pkh, &msg, &v2), Err(Error::Encoding));
+    let mut v1 = base.clone(); v1[0] = 1;
+    assert_eq!(verify(&pkh, &msg, &v1), Err(Error::Encoding));
     // A shorter clientDataJSON length leaves non-zero bytes in the padding.
-    let mut shorter = base.clone(); let at = 1 + 64 + 64 + 2 + auth.len(); shorter[at] -= 1;
+    let mut shorter = base.clone(); let at = 2 + 64 + 64 + 2 + auth.len(); shorter[at] -= 1;
     assert_eq!(verify(&pkh, &msg, &shorter), Err(Error::Encoding));
     // High s is accepted (malleable witness, same transaction hash); s = n - s.
     let mut high = base.clone();
-    let s = p256::Scalar::from_repr(p256::FieldBytes::clone_from_slice(&high[97..129])).unwrap();
-    high[97..129].copy_from_slice(&(-s).to_bytes());
+    let s = p256::Scalar::from_repr(p256::FieldBytes::clone_from_slice(&high[98..130])).unwrap();
+    high[98..130].copy_from_slice(&(-s).to_bytes());
     assert_eq!(verify(&pkh, &msg, &high), Ok(()));
     println!("blob framing: dirty padding, >1024, version, short length refused; high-s accepted (witness malleability only)");
 
     // The exec argument: hex case, field count, lengths.
     let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-    let arg = format!("{}:02:{}:{}:{}", hex(&[0x24; 32]), hex(&pkh), hex(&msg), hex(&base));
-    assert_eq!(verify_exec_argument(arg.as_bytes()), Ok(()));
-    assert_eq!(verify_exec_argument(format!("{arg}:00").as_bytes()), Err(Error::Args));
-    assert_eq!(verify_exec_argument(arg.to_uppercase().as_bytes()), Ok(()));
+    let run = |arg: &[u8]| parse_argument(arg).and_then(|parsed| verify(&parsed.pubkey_hash, &msg, parsed.signature()));
+    let arg = format!("{}:02:{}:{}:{}", hex(&[0x24; 32]), hex(&pkh), hex(&[0x5au8; 32]), hex(&base));
+    assert_eq!(run(arg.as_bytes()), Ok(()));
+    assert!(matches!(run(format!("{arg}:00").as_bytes()), Err(Error::Args)));
+    assert_eq!(run(arg.to_uppercase().as_bytes()), Ok(()));
     println!("exec argument: extra field refused, uppercase hex accepted (Omnilock emits lowercase)");
 
     // Random mutations of a valid blob: none may verify unless the bytes that are signed are unchanged.
@@ -106,7 +110,9 @@ fn main() {
         }
         if m.len() > 10 && rng.below(4) == 0 { let n = rng.below(m.len()); m.truncate(n); }
         runs += 1;
-        if verify(&pkh, &msg, &m).is_ok() && m != base && m != high {
+        // The network byte only picks the prefix the chain writes into the text, which is given here.
+        let network_only = m.len() == base.len() && m[1] <= 1 && m[0] == base[0] && m[2..] == base[2..];
+        if verify(&pkh, &msg, &m).is_ok() && m != base && m != high && !network_only {
             // Dropping trailing zero padding keeps the same assertion; on chain the witness length (and so the
             // sighash) would change, so it can't be reused. Anything else accepted would be a forgery.
             let unpadded = base.len() - 100;
