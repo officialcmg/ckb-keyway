@@ -1,0 +1,6 @@
+control (honest node): page shows balance 9802.99998972 CKB, fee 0.00000765 CKB, arriving 9802.99998207 CKB
+  wallet was asked to sign: CKB transaction: 0xc0e8ebdb20aba1a7fb11a56dd253798c7aa5b90fe6a5d89802117c94574d6a10
+  real network: test_tx_pool_accept OK, cycles 1576414, real inputs 9802.99998972 CKB, real fee 0.00000765 CKB (not sent)
+malicious node: page shows balance 490.14999948 CKB, fee 0.00000765 CKB, arriving 490.14999183 CKB
+  wallet was asked to sign: CKB transaction: 0xac426dc31c118d4933dbfd0c46b1b4250c37bd3bd6bac76ceb2cebe643389c1d
+  real network: test_tx_pool_accept OK, cycles 1560566, real inputs 9802.99998972 CKB, real fee 9312.84999789 CKB (not sent)
