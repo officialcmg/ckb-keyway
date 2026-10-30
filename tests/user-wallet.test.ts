@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { adminListTypeScript, omnilockArgsFor } from "../src/sdk/browser/account-lock.ts";
+import { adminListTypeScript, KEYWAY_OMNILOCK, omnilockArgsFor } from "../src/sdk/browser/account-lock.ts";
 import {
   parseWallet,
   rebindProvisioningWallet,
@@ -95,9 +95,11 @@ test("reads a wallet with recovery on, and refuses recovery settings that don't 
     updatedAt: "2026-07-12T00:00:00.000Z",
     recovery: {
       omnilockArgs: omnilockArgsFor(publicKey, adminListTypeHash),
+      omnilock: KEYWAY_OMNILOCK.testnet,
       adminListTypeArgs,
       adminListTypeHash,
       adminListOutPoint: { txHash: `0x${"ad".repeat(32)}`, index: 0 },
+      enableTransactionHash: `0x${"ad".repeat(32)}`,
       legacyAddress: "ckt1legacy",
       enabledAt: "2026-10-23T00:00:00.000Z",
     },
@@ -106,4 +108,9 @@ test("reads a wallet with recovery on, and refuses recovery settings that don't 
   // A broken record must not read as "no wallet", which would provision a new one.
   assert.throws(() => parseWallet({ ...wallet, litPublicKey: `0x03${"33".repeat(32)}` }), /recovery settings are invalid/);
   assert.throws(() => parseWallet({ ...wallet, recovery: { ...wallet.recovery, omnilockArgs: "0x00" } }), /recovery settings are invalid/);
+  // A change waiting for its transaction is kept beside the settings, and checked the same way.
+  const pending = { kind: "add", transactionHash: `0x${"be".repeat(32)}`, recovery: wallet.recovery, ckbAddress: "ckt1omnilock", sentAt: "2026-10-30T00:00:00.000Z" } as const;
+  assert.deepEqual(parseWallet({ ...wallet, recoveryPending: pending }), { ...wallet, recoveryPending: pending });
+  assert.throws(() => parseWallet({ ...wallet, recoveryPending: { ...pending, kind: "swap" } }), /recovery settings are invalid/);
+  assert.throws(() => parseWallet({ ...wallet, recoveryPending: { ...pending, recovery: { ...wallet.recovery, omnilockArgs: "0x00" } } }), /recovery settings are invalid/);
 });

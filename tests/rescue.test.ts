@@ -5,7 +5,7 @@ import { p256 } from "@noble/curves/nist.js";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
-import { omnilockArgsFor, secp256k1Lock } from "../src/sdk/browser/account-lock.ts";
+import { adminListLock, KEYWAY_OMNILOCK, omnilockArgsFor, omnilockScript, secp256k1Lock } from "../src/sdk/browser/account-lock.ts";
 import { backupAuth, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
 import { recoveryListRecord, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
 import { adminListData, whitelistTree } from "../src/sdk/browser/recovery-smt.ts";
@@ -19,6 +19,7 @@ import {
   rescueClient,
   rescueEntryForEvm,
   rescueEntryForJoyId,
+  sendRescue,
   signRescueWithEvm,
   signRescueWithJoyId,
 } from "../src/rescue/rescue.ts";
@@ -61,30 +62,40 @@ async function joyIdAddress(client: ccc.Client): Promise<string> {
   return ccc.Address.fromScript(lock, client).toString();
 }
 
-/** A recovery account on chain: its AdminList, the transaction that recorded the list, and some funds. */
-async function rescueChain(options: { plainCkb?: bigint[]; token?: boolean } = {}) {
+/**
+ * A recovery account on chain: its AdminList under the key's owner-only lock, the transaction that recorded the
+ * list, and some funds, every cell an output of a transaction the client returns.
+ */
+async function rescueChain(options: { plainCkb?: bigint[]; token?: boolean; listData?: ccc.Hex } = {}) {
   const base = await offlineClient();
   const backups: RecoveryBackup[] = [{ kind: "evm", address: evmAddress }, { kind: "joyid", address: await joyIdAddress(base) }];
   const typeArgs = ccc.hexFrom(new Uint8Array(32).fill(0x42));
   const adminType = ccc.Script.from({ codeHash: TYPE_ID, hashType: "type", args: typeArgs });
-  const lock = await ccc.Script.fromKnownScript(base, ccc.KnownScript.OmniLock, omnilockArgsFor(publicKey, adminType.hash()));
+  const lock = omnilockScript({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: omnilockArgsFor(publicKey, adminType.hash()) });
+  const listLock = adminListLock({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: lock.args });
   const { root } = whitelistTree(await Promise.all(backups.map((backup) => backupAuth(base, backup))));
-  const created = ccc.Transaction.from({ outputs: [{ lock, type: adminType, capacity: 197n * CKB }], outputsData: [adminListData(root)] });
+  const created = ccc.Transaction.from({ outputs: [{ lock: listLock, type: adminType, capacity: 165n * CKB }], outputsData: [options.listData ?? adminListData(root)] });
   setRecoveryListRecord(created, 0, await recoveryListRecord(base, backups));
   const adminList = ccc.Cell.from({ outPoint: { txHash: created.hash(), index: 0 }, cellOutput: created.outputs[0], outputData: created.outputsData[0] });
   const xudt = await base.getKnownScript(ccc.KnownScript.XUdt);
   const token = ccc.Script.from({ codeHash: xudt.codeHash, hashType: xudt.hashType, args: `0x${"77".repeat(32)}` });
   const dao = await base.getKnownScript(ccc.KnownScript.NervosDao);
-  const cells = [
-    adminList,
-    ...(options.plainCkb ?? [1_000n * CKB, 300n * CKB]).map((capacity) => cell(lock, capacity)),
-    ...(options.token === false ? [] : [cell(lock, 176n * CKB, token, amount(2_500n))]),
-    cell(lock, 102n * CKB, ccc.Script.from({ codeHash: dao.codeHash, hashType: dao.hashType, args: "0x" }), ccc.hexFrom(new Uint8Array(8))),
+  const outputs = [
+    ...(options.plainCkb ?? [1_000n * CKB, 300n * CKB]).map((capacity) => ({ cellOutput: { lock, capacity }, outputData: "0x" })),
+    ...(options.token === false ? [] : [{ cellOutput: { lock, capacity: 176n * CKB, type: token }, outputData: amount(2_500n) }]),
+    { cellOutput: { lock, capacity: 102n * CKB, type: ccc.Script.from({ codeHash: dao.codeHash, hashType: dao.hashType, args: "0x" }) }, outputData: ccc.hexFrom(new Uint8Array(8)) },
   ];
-  const client = await offlineClient(cells, [created]);
+  const funding = ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: `0x${(nextCell++).toString(16).padStart(64, "0")}`, index: 0 } }],
+    outputs: outputs.map(({ cellOutput }) => cellOutput),
+    outputsData: outputs.map(({ outputData }) => outputData),
+  });
+  const funds = funding.outputs.map((cellOutput, index) => ccc.Cell.from({ outPoint: { txHash: funding.hash(), index }, cellOutput, outputData: funding.outputsData[index] }));
+  const cells = [adminList, ...funds];
+  const client = await offlineClient(cells, [created, funding]);
   const address = ccc.Address.fromScript(lock, client).toString();
   const destination = ccc.Address.fromScript(await secp256k1Lock(client, ccc.hexFrom(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true))), client).toString();
-  return { client, lock, address, adminList, token, destination, backups };
+  return { client, lock, listLock, address, adminList, token, destination, backups, cells, created, funding };
 }
 
 const evmWallet = (accounts = [evmAddress]) => ({
@@ -123,8 +134,12 @@ test("reads a KeyWay recovery address and refuses other addresses with a reason"
 
   const secp = ccc.Address.fromScript(await secp256k1Lock(client, publicKey), client).toString();
   await rejects(parseKeyWayAddress(client, secp), "recovery-off");
+  assert.ok(parsed.adminListLock.eq(adminListLock({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: lock.args })));
   const ownerOnly = ccc.Script.from({ ...lock, args: ccc.hexFrom(ccc.bytesFrom(lock.args).slice(0, 22).map((byte, index) => index === 21 ? 0 : byte)) });
   await rejects(parseKeyWayAddress(client, ccc.Address.fromScript(ownerOnly, client).toString()), "recovery-off");
+  // The same args under CCC's upgradable Omnilock aren't a KeyWay account.
+  const upgradable = await ccc.Script.fromKnownScript(client, ccc.KnownScript.OmniLock, lock.args);
+  await rejects(parseKeyWayAddress(client, ccc.Address.fromScript(upgradable, client).toString()), "not-keyway");
   await rejects(parseKeyWayAddress(client, "hello"), "not-keyway");
   await rejects(parseKeyWayAddress(client, `ckb1${address.slice(4)}`), "network");
   const joyId = await client.getKnownScript(ccc.KnownScript.JoyId);
@@ -153,8 +168,7 @@ test("rebuilds the backup list and balance from the chain alone, leaving the Adm
 });
 
 test("refuses a list whose record doesn't match the AdminList's root", async () => {
-  const { client, address, adminList } = await rescueChain();
-  adminList.outputData = adminListData(ccc.hexFrom(new Uint8Array(32).fill(9)));
+  const { client, address } = await rescueChain({ listData: adminListData(ccc.hexFrom(new Uint8Array(32).fill(9))) });
   await rejects(openRescueAccount(client, address), "list-missing");
 });
 
@@ -182,10 +196,15 @@ test("moves every movable cell to the destination, signed once by an EVM backup"
   assert.equal(plan.ckb + plan.tokens[0].capacity + plan.fee, 1_476n * CKB);
   assert.ok(plan.fee > 0n && plan.fee < CKB / 100n);
 
-  let prompts = 0;
+  // The wallet is asked once, to sign exactly the readable text the page showed.
+  assert.match(plan.approvalText, new RegExp(`^KeyWay recovery\nMove everything to ${destination}\nCKB: 1,475\\.\\d+\nTokens: 1 token cell\nFee: 0\\.\\d+ CKB\nTransaction: 0x[0-9a-f]{64}$`));
+  const prompts: string[] = [];
   const wallet = evmWallet();
-  const signed = await signRescueWithEvm(client, account, plan, { request: async (args) => { if (args.method === "personal_sign") prompts++; return wallet.request(args); } });
-  assert.equal(prompts, 1);
+  const signed = await signRescueWithEvm(client, account, plan, { request: async (args) => {
+    if (args.method === "personal_sign") prompts.push(new TextDecoder().decode(ccc.bytesFrom(args.params![0] as string)));
+    return wallet.request(args);
+  } });
+  assert.deepEqual(prompts, [plan.approvalText]);
   assert.equal(signed.hash(), plan.transaction.hash());
   // The fee was sized with the final witness.
   assert.equal(signed.toBytes().length, plan.transaction.toBytes().length);
@@ -212,6 +231,32 @@ test("refuses a bad destination", async () => {
   await rejects(planRescue(client, account, entry, address), "destination");
   await rejects(planRescue(client, account, entry, `ckb1${destination.slice(4)}`), "destination");
   await rejects(planRescue(client, account, entry, "nowhere"), "destination");
+  // A lock the page can't vouch for: funds sent there might never be spendable.
+  const unknown = ccc.Address.fromScript(ccc.Script.from({ codeHash: `0x${"ee".repeat(32)}`, hashType: "data1", args: `0x${"11".repeat(20)}` }), client).toString();
+  await assert.rejects(planRescue(client, account, entry, unknown), (error: unknown) =>
+    error instanceof RescueError && error.code === "destination" && /lock this page doesn't recognise/.test(error.message));
+  // CCC's known locks and KeyWay's own Omnilock are fine.
+  const joyId = ccc.Address.fromScript(ccc.Script.from({ ...(await client.getKnownScript(ccc.KnownScript.JoyId)), args: `0x0001${"22".repeat(20)}` }), client).toString();
+  assert.ok(await planRescue(client, account, entry, joyId));
+});
+
+test("leaves out a token cell the node blames and asks for a new signature", async () => {
+  const { client, address, destination } = await rescueChain();
+  const account = await openRescueAccount(client, address);
+  const plan = await planRescue(client, account, rescueEntryForEvm(account, [evmAddress]), destination);
+  const signed = await signRescueWithEvm(client, account, plan, evmWallet());
+  const blamed = plan.transaction.inputs.findIndex(({ previousOutput }) => account.movable.find((cell) => cell.outPoint.eq(previousOutput))?.cellOutput.type);
+  let sent = false;
+  Object.assign(client, {
+    sendTransactionDry: async () => { throw new Error(`Verification failed Script(TransactionScriptError { source: Inputs[${blamed}].Type, cause: ValidationFailure: see error code -52 })`); },
+    sendTransaction: async () => { sent = true; return "0x"; },
+  });
+  await assert.rejects(sendRescue(client, signed), (error: unknown) =>
+    error instanceof RescueError && error.code === "blocked" && error.cell!.eq(plan.transaction.inputs[blamed].previousOutput));
+  assert.equal(sent, false);
+  const without = await openRescueAccount(client, address, [plan.transaction.inputs[blamed].previousOutput]);
+  assert.equal(without.movable.length, account.movable.length - 1);
+  assert.equal(without.tokens.length, 0);
 });
 
 test("puts a small remainder into the token cell, and says how much is missing when even that can't work", async () => {
@@ -251,6 +296,11 @@ test("the transaction check refuses anything but the rescue's own shape", async 
   assert.doesNotThrow(tamper(() => undefined));
   assert.throws(tamper((tx) => { tx.outputs[1].lock = account.lock; }), /goes somewhere else/);
   assert.throws(tamper((tx) => { tx.inputs.push(ccc.CellInput.from({ previousOutput: adminList.outPoint })); }), /isn't one of the account's movable cells/);
+  // The AdminList, even if a node listed it as one of the account's movable cells.
+  const listed = { ...account, movable: [...account.movable, adminList] };
+  const withList = plan.transaction.clone();
+  withList.inputs.push(ccc.CellInput.from({ previousOutput: adminList.outPoint }));
+  assert.throws(() => checkRescueTransaction(withList, listed, to), /spends the recovery list/);
   assert.throws(tamper((tx) => { tx.outputsData[0] = amount(9_999n); }), /tokens don't move one to one/);
   assert.throws(tamper((tx) => { tx.outputs[1].capacity -= 10n * CKB; }), /fee is outside the limit/);
 });

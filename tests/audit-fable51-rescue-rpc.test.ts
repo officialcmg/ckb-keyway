@@ -1,17 +1,18 @@
-// Audit PoC (audit/omnilock-fable-5-1): the rescue page trusts the CKB node it is pointed at for the capacity,
-// data and identity of the cells it spends. A malicious or compromised node can make a backup sign a rescue that
-// burns most of the balance as fee, burns tokens, or destroys the AdminList. The signature covers only the
-// transaction (out points, outputs, witness layout), never the input cells' contents, so the chain accepts it.
+// Regression tests for the audit's M1 (audit/omnilock-fable-5-1): the rescue page trusted the CKB node for the
+// capacity, data and identity of the cells it spends, so a lying node could make a backup sign a rescue that burns
+// the balance as fee, burns tokens, or destroys the AdminList. These began as the audit's proof of concept; the page
+// now reads every cell from the transaction that created it, after checking that transaction's hash against the
+// out point, takes the AdminList from one place (under its owner-only lock) and never spends it.
 import assert from "node:assert/strict";
 import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
-import { omnilockArgsFor, secp256k1Lock } from "../src/sdk/browser/account-lock.ts";
+import { adminListLock, KEYWAY_OMNILOCK, omnilockArgsFor, omnilockScript, secp256k1Lock } from "../src/sdk/browser/account-lock.ts";
 import { backupAuth, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
 import { recoveryListRecord, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
 import { adminListData, whitelistTree } from "../src/sdk/browser/recovery-smt.ts";
-import { connectEvmBackup, openRescueAccount, planRescue, signRescueWithEvm } from "../src/rescue/rescue.ts";
+import { checkRescueTransaction, connectEvmBackup, openRescueAccount, planRescue, signRescueWithEvm } from "../src/rescue/rescue.ts";
 
 const CKB = 100_000_000n;
 const TYPE_ID = "0x00000000000000000000000000000000000000000000000000545950455f4944";
@@ -60,75 +61,86 @@ async function realChain() {
   const base = await offlineClient([]);
   const backups: RecoveryBackup[] = [{ kind: "evm", address: evmAddress }];
   const adminType = ccc.Script.from({ codeHash: TYPE_ID, hashType: "type", args: ccc.hexFrom(new Uint8Array(32).fill(0x42)) });
-  const lock = await ccc.Script.fromKnownScript(base, ccc.KnownScript.OmniLock, omnilockArgsFor(publicKey, adminType.hash()));
+  const lock = omnilockScript({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: omnilockArgsFor(publicKey, adminType.hash()) });
+  const listLock = adminListLock({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: lock.args });
   const { root } = whitelistTree(await Promise.all(backups.map((backup) => backupAuth(base, backup))));
-  const created = ccc.Transaction.from({ outputs: [{ lock, type: adminType, capacity: 197n * CKB }], outputsData: [adminListData(root)] });
+  const created = ccc.Transaction.from({ outputs: [{ lock: listLock, type: adminType, capacity: 165n * CKB }], outputsData: [adminListData(root)] });
   setRecoveryListRecord(created, 0, await recoveryListRecord(base, backups));
   const adminList = ccc.Cell.from({ outPoint: { txHash: created.hash(), index: 0 }, cellOutput: created.outputs[0], outputData: created.outputsData[0] });
   const xudt = await base.getKnownScript(ccc.KnownScript.XUdt);
   const token = ccc.Script.from({ codeHash: xudt.codeHash, hashType: xudt.hashType, args: `0x${"77".repeat(32)}` });
-  const plain = cell(lock, 10_000n * CKB);
-  const tokenCell = cell(lock, 176n * CKB, token, amount(2_500n));
+  const funding = ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: `0x${"0f".repeat(32)}`, index: 0 } }],
+    outputs: [{ lock, capacity: 10_000n * CKB }, { lock, capacity: 176n * CKB, type: token }],
+    outputsData: ["0x", amount(2_500n)],
+  });
+  const [plain, tokenCell] = funding.outputs.map((cellOutput, index) => ccc.Cell.from({ outPoint: { txHash: funding.hash(), index }, cellOutput, outputData: funding.outputsData[index] }));
   const destination = ccc.Address.fromScript(await secp256k1Lock(base, ccc.hexFrom(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true))), base).toString();
   const address = ccc.Address.fromScript(lock, base).toString();
-  return { lock, address, adminList, created, plain, tokenCell, token, destination };
+  return { lock, listLock, address, adminList, created, funding, plain, tokenCell, token, destination };
 }
 
 const sumReal = (real: ccc.Cell[], transaction: ccc.Transaction) =>
   transaction.inputs.reduce((sum, input) => sum + real.find((cell) => cell.outPoint.eq(input.previousOutput))!.cellOutput.capacity, 0n);
 
-test("PoC: a node that under-reports a cell's capacity makes the backup sign a rescue that burns the difference as fee", async () => {
+test("M1 fixed: a node that under-reports a cell's capacity can't make the backup burn the difference as fee", async () => {
   const chain = await realChain();
   const real = [chain.adminList, chain.plain];
   // The node says the 10,000 CKB cell holds 200 CKB. Same out point, same lock, same (empty) data.
   const lying = [chain.adminList, cell(chain.lock, 200n * CKB, undefined, "0x", chain.plain.outPoint)];
-  const node = await offlineClient(lying, [chain.created]);
+  const node = await offlineClient(lying, [chain.created, chain.funding]);
 
   const account = await openRescueAccount(node, chain.address);
-  assert.equal(account.ckb, 200n * CKB, "the page shows the balance the node reports");
+  assert.equal(account.ckb, 10_000n * CKB, "the page reads the cell from the transaction that created it");
   const entry = await connectEvmBackup(account, evmWallet());
   const plan = await planRescue(node, account, entry, chain.destination);
   const signed = await signRescueWithEvm(node, account, plan, evmWallet());
 
-  // What the chain sees: the real input is 10,000 CKB, the outputs are what the page built from 200 CKB.
   const realFee = sumReal(real, signed) - signed.getOutputsCapacity();
-  assert.ok(signed.inputs[0].previousOutput.eq(chain.plain.outPoint));
-  assert.ok(realFee > 9_799n * CKB, `fee paid to the miner: ${ccc.fixedPointToString(realFee)} CKB`);
-  assert.equal(plan.fee < CKB / 1000n, true, "the page showed a fee below 0.001 CKB");
-  // Nothing in the transaction or the signed message depends on the real capacity: the signature stays valid.
-  assert.equal(signed.hash(), plan.transaction.hash());
+  assert.equal(realFee, plan.fee);
+  assert.ok(realFee < CKB / 1000n, `fee paid to the miner: ${ccc.fixedPointToString(realFee)} CKB`);
+  assert.match(plan.approvalText, /\nCKB: 9,999\.\d+\nTokens: none\nFee: 0\.\d+ CKB\n/);
 });
 
-test("PoC: a node that under-reports a token cell's amount makes the rescue burn the token", async () => {
+test("M1 fixed: a node that under-reports a token cell's amount can't make the rescue burn the token", async () => {
   const chain = await realChain();
-  // The node reports the token cell with amount 1 instead of 2,500; xUDT allows outputs below inputs.
+  // The node reports the token cell with amount 1 instead of 2,500; the page reads 2,500 from the chain.
   const lying = [chain.adminList, chain.plain, cell(chain.lock, 176n * CKB, chain.token, amount(1n), chain.tokenCell.outPoint)];
-  const node = await offlineClient(lying, [chain.created]);
+  const node = await offlineClient(lying, [chain.created, chain.funding]);
   const account = await openRescueAccount(node, chain.address);
-  assert.equal(account.tokens[0].amount, 1n);
+  assert.equal(account.tokens[0].amount, 2_500n);
   const entry = await connectEvmBackup(account, evmWallet());
   const plan = await planRescue(node, account, entry, chain.destination);
   const signed = await signRescueWithEvm(node, account, plan, evmWallet());
   const tokenOutput = signed.outputs.findIndex((output) => output.type?.eq(chain.token));
-  assert.equal(ccc.numLeFromBytes(ccc.bytesFrom(signed.outputsData[tokenOutput]).slice(0, 16)), 1n, "2,499 of 2,500 tokens are burned");
-  assert.ok(signed.inputs.some((input) => input.previousOutput.eq(chain.tokenCell.outPoint)));
+  assert.equal(ccc.numLeFromBytes(ccc.bytesFrom(signed.outputsData[tokenOutput]).slice(0, 16)), 2_500n, "every token moves");
+
+  // A node that answers the out point's hash with a different transaction is refused.
+  const forged = chain.funding.clone();
+  forged.outputsData[1] = amount(1n);
+  const swapped = await offlineClient(lying, [chain.created]);
+  Object.assign(swapped, { getTransaction: async (hash: ccc.HexLike) => ({ transaction: ccc.hexFrom(hash) === chain.created.hash() ? chain.created : forged, status: "committed" }) });
+  await assert.rejects(openRescueAccount(swapped, chain.address), /returned a transaction that doesn't match/);
 });
 
-test("PoC: a node that reports the AdminList's out point as a plain cell makes the rescue destroy the recovery list", async () => {
+test("M1 fixed: a node that reports the AdminList's out point as a plain cell can't make the rescue destroy the list", async () => {
   const chain = await realChain();
-  // findSingletonCellByType (used to find the AdminList and to check inputs) answers with a decoy out point;
-  // findCellsByLock lists the real AdminList's out point as plain CKB.
+  // findSingletonCellByType answers with a decoy out point; findCellsByLock lists the real AdminList's out point
+  // as plain CKB at the account. The page takes the list from under its owner-only lock, and the chain says the
+  // listed "plain" cell isn't the account's, so it is never an input.
   const decoy = ccc.Cell.from({ outPoint: { txHash: `0x${"dd".repeat(32)}`, index: 0 }, cellOutput: chain.adminList.cellOutput, outputData: chain.adminList.outputData });
-  const lying = [chain.adminList, chain.plain, cell(chain.lock, 197n * CKB, undefined, "0x", chain.adminList.outPoint)];
-  const node = await offlineClient(lying, [chain.created], decoy);
+  const lying = [chain.adminList, chain.plain, cell(chain.lock, 165n * CKB, undefined, "0x", chain.adminList.outPoint)];
+  const node = await offlineClient(lying, [chain.created, chain.funding], decoy);
   const account = await openRescueAccount(node, chain.address);
-  assert.ok(account.adminList.outPoint.eq(decoy.outPoint));
+  assert.ok(account.adminList.outPoint.eq(chain.adminList.outPoint));
+  assert.ok(!account.movable.some((movable) => movable.outPoint.eq(chain.adminList.outPoint)));
   const entry = await connectEvmBackup(account, evmWallet());
   const plan = await planRescue(node, account, entry, chain.destination);
   const signed = await signRescueWithEvm(node, account, plan, evmWallet());
-  // checkRescueTransaction compared inputs with the decoy out point, so the real AdminList is spent. Omnilock
-  // still finds the RC cell among the inputs (rce_gather_rcrules_recursively falls back to inputs), the Type ID
-  // cell is consumed without a successor, and the list is gone for good.
-  assert.ok(signed.inputs.some((input) => input.previousOutput.eq(chain.adminList.outPoint)), "the real AdminList is an input");
-  assert.ok(!signed.outputs.some((output) => output.type), "no output recreates it");
+  assert.ok(!signed.inputs.some((input) => input.previousOutput.eq(chain.adminList.outPoint)), "the AdminList isn't an input");
+  assert.ok(signed.cellDeps.some(({ outPoint }) => outPoint.eq(chain.adminList.outPoint)), "it is a cell dep");
+  const destination = (await ccc.Address.fromString(chain.destination, node)).script;
+  const withList = plan.transaction.clone();
+  withList.inputs.push(ccc.CellInput.from({ previousOutput: chain.adminList.outPoint }));
+  assert.throws(() => checkRescueTransaction(withList, account, destination), /spends the recovery list|isn't one of the account's movable cells/);
 });

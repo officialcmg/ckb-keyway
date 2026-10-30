@@ -5,14 +5,15 @@ import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { createCccExternalFundingResolver } from "@fiber-pay/sdk/browser";
 import {
+  adminListLock,
   adminListTypeScript,
+  fundingLockCellDeps,
   FUNDING_LOCK_KNOWN_SCRIPTS,
   omnilockArgsFor,
   omnilockLock,
   omnilockOwnerWitnessLock,
   parseRecovery,
   secp256k1Lock,
-  type KeyWayRecovery,
 } from "../src/sdk/browser/account-lock.ts";
 import { getLockBalance } from "../src/sdk/browser/ckb-balance.ts";
 import { KeyWaySigner } from "../src/sdk/browser/keyway-signer.ts";
@@ -20,21 +21,13 @@ import { RemoteCkbSigner } from "../src/sdk/browser/remote-ckb-signer.ts";
 import { formatCkbSignature, previewFundingTransaction, signAccountGroups } from "../src/server/funding-transaction.ts";
 import { previewGeneralTransaction, previewSummaryLines } from "../src/server/transaction-policy.ts";
 import type { ReadyWallet } from "../src/server/user-wallet.ts";
+import { anchoredRecovery, answerTransactions } from "./recovery-fixture.ts";
 
 const CKB = 100_000_000n;
 const FIBER_FUNDING_LOCK = ccc.Script.from({ codeHash: "0x6c67887fe201ee0c7853f1682c0b77c0e6214044c156c7558269390a8afa6d7c", hashType: "type", args: `0x${"fd".repeat(32)}` });
 const privateKey = secp256k1.utils.randomSecretKey();
 const publicKey = ccc.hexFrom(secp256k1.getPublicKey(privateKey, true));
-const adminListTypeArgs = `0x${"3e".repeat(32)}`;
-const adminListTypeHash = adminListTypeScript({ adminListTypeArgs }).hash();
-const recovery: KeyWayRecovery = {
-  omnilockArgs: omnilockArgsFor(publicKey, adminListTypeHash),
-  adminListTypeArgs,
-  adminListTypeHash,
-  adminListOutPoint: { txHash: `0x${"ad".repeat(32)}`, index: 0 },
-  legacyAddress: "ckt1legacy",
-  enabledAt: "2026-10-23T00:00:00.000Z",
-};
+const { recovery, transactions: anchor } = await anchoredRecovery(publicKey);
 const wallet = (withRecovery: boolean) => ({
   version: 1, status: "ready", litPkpId: `0x${"11".repeat(20)}`, litPublicKey: publicKey, ckbAddress: "ckt1test",
   encryptedFiberKey: "ciphertext", primaryDeviceIdHash: "a".repeat(64), hasOpenedChannel: false,
@@ -50,7 +43,7 @@ async function offlineClient(cells: ccc.CellLike[] = []): Promise<ccc.Client> {
     findSingletonCellByType: async () => undefined,
     findCells: async function* () {},
   });
-  return client;
+  return answerTransactions(client, anchor);
 }
 
 function signWithKey(digest: ccc.Hex): ccc.Hex {
@@ -103,7 +96,6 @@ test("the owner digest and 85-byte witness reproduce the spike's on-chain Omnilo
   const spikeTypeHash = adminListTypeScript({ adminListTypeArgs: "0x3e4768432d91e76c3774ce0d9f23986f78e12d692aa92a4ed1712f593395ac95" }).hash();
   assert.equal(spikeTypeHash, "0x065073c8ae6940d42006cda37b1f31ed32288855f92930961fe788b196bb36d3");
   assert.equal(lock.args, omnilockArgsFor(owner, spikeTypeHash));
-  assert.equal((await omnilockLock(client, { omnilockArgs: lock.args })).eq(lock), true);
   assert.equal(
     ccc.Address.fromScript(lock, client).toString(),
     "ckt1qrejnmlar3r452tcg57gvq8patctcgy8acync0hxfnyka35ywafvkqgqsa2rqnau3mns0k6lqa7l4l4rwscuny7mqyr9qu7g4e55p4pqqmx6x7clx8kny2yg2hujjvykrlnc3vvkhvmdx0k2zdy",
@@ -163,8 +155,9 @@ test("general signing treats both locks as the user's own and refuses to spend t
   const alice = ccc.Script.from({ codeHash: secp.codeHash, hashType: secp.hashType, args: `0x${"22".repeat(20)}` });
   const legacy = cell(secp, 300n * CKB);
   const current = cell(omni, 500n * CKB);
-  const adminList = cell(omni, 197n * CKB, adminListTypeScript(recovery), `0x00000000${"0c".repeat(32)}02`);
-  const client = await offlineClient([legacy, current, adminList]);
+  const adminList = cell(adminListLock(recovery), 197n * CKB, adminListTypeScript(recovery), `0x00000000${"0c".repeat(32)}02`);
+  const listLockCell = cell(adminListLock(recovery), 300n * CKB);
+  const client = await offlineClient([legacy, current, adminList, listLockCell]);
 
   const sweep = await previewGeneralTransaction(wallet(true), spend([current, legacy], [{ lock: omni, capacity: 800n * CKB - 2_000n }]), client);
   assert.deepEqual(sweep.groups.map(({ kind }) => kind), ["omnilock", "secp256k1"]);
@@ -186,6 +179,15 @@ test("general signing treats both locks as the user's own and refuses to spend t
     previewGeneralTransaction(wallet(true), spend([current, adminList], [{ lock: omni, capacity: 697n * CKB - 1_000n }]), client),
     /recovery list/,
   );
+  // Nothing under the list's owner-only lock is spent here either, and nothing is sent to it.
+  await assert.rejects(
+    previewGeneralTransaction(wallet(true), spend([current, listLockCell], [{ lock: omni, capacity: 800n * CKB - 1_000n }]), client),
+    /recovery list/,
+  );
+  await assert.rejects(
+    previewGeneralTransaction(wallet(true), spend([current], [{ lock: adminListLock(recovery), capacity: 100n * CKB }, { lock: omni, capacity: 400n * CKB - 1_000n }]), client),
+    /Omnilock address of this account that isn't its own/,
+  );
   // Without recovery the Omnilock isn't the account's, and the secp256k1 account works as before.
   await assert.rejects(previewGeneralTransaction(wallet(false), spend([current], [{ lock: alice, capacity: 500n * CKB - 1_000n }]), client), /no input owned/);
   const plain = await previewGeneralTransaction(wallet(false), spend([legacy], [{ lock: alice, capacity: 300n * CKB - 1_000n }]), client);
@@ -196,7 +198,7 @@ test("channel funding from an Omnilock account is signed as the user's and never
   const offline = await offlineClient();
   const omni = await omnilockLock(offline, recovery);
   const funds = cell(omni, 2_000n * CKB);
-  const adminList = cell(omni, 197n * CKB, adminListTypeScript(recovery), `0x00000000${"0c".repeat(32)}02`);
+  const adminList = cell(adminListLock(recovery), 197n * CKB, adminListTypeScript(recovery), `0x00000000${"0c".repeat(32)}02`);
   const client = await offlineClient([funds, adminList]);
   const funding = (inputs: ccc.Cell[]) => spend(inputs, [
     { lock: FIBER_FUNDING_LOCK, capacity: 1_000n * CKB },
@@ -226,13 +228,16 @@ test("SDK signers use the account's current lock and the right placeholders", as
   const signer = new KeyWaySigner("token", publicKey, handlers, client, undefined, recovery);
 
   assert.equal((await signer.getRecommendedAddressObj()).script.eq(omni), true);
-  assert.deepEqual((await signer.getAddressObjs()).map(({ script }) => script.hash()), [omni.hash(), secp.hash()]);
+  // The old address isn't the signer's, so CCC never selects its cells: the sign-in sweep owns them.
+  assert.deepEqual((await signer.getAddressObjs()).map(({ script }) => script.hash()), [omni.hash()]);
   assert.deepEqual((await signer.getRelatedScripts(spend([legacy, current], []))).map(({ script }) => script.hash()), [omni.hash(), secp.hash()]);
   const prepared = await signer.prepareTransaction(spend([current, legacy], [{ lock: omni, capacity: 800n * CKB - 2_000n }]));
   assert.equal(prepared.getWitnessArgsAt(0)!.lock, ccc.hexFrom(new Uint8Array(85)));
   assert.equal(prepared.getWitnessArgsAt(1)!.lock, ccc.hexFrom(new Uint8Array(65)));
-  const deps = (await client.getKnownScript(ccc.KnownScript.OmniLock)).cellDeps.map(({ cellDep }) => cellDep);
-  for (const dep of deps) assert.ok(prepared.cellDeps.some((included) => included.eq(dep)));
+  // KeyWay's pinned Omnilock: the genesis secp256k1 dep group and KeyWay's own copy of the code, by data hash.
+  assert.equal(omni.hashType, "data1");
+  for (const dep of recovery.omnilock.cellDeps) assert.ok(prepared.cellDeps.some((included) => included.eq(ccc.CellDep.from(dep))));
+  assert.ok(!prepared.cellDeps.some((included) => included.outPoint.txHash === "0xec18bf0d857c981c3d1f4e17999b9b90c484b303378e94de1a57b0872f5d4602"), "not CCC's upgradable Omnilock cell");
 
   // Without recovery the signer prepares exactly what CCC's public-key signer does.
   const plain = new KeyWaySigner("token", publicKey, handlers, client);
@@ -262,32 +267,35 @@ test("the funding signer only writes placeholders on Fiber's frozen transaction"
     assert.equal(prepared.getWitnessArgsAt(0)!.lock, ccc.hexFrom(new Uint8Array(length)));
   }
 
-  // Fiber's resolver funds from the Omnilock address and gets both of its cell deps.
+  // Fiber's resolver funds from the Omnilock address; its cell deps are the pinned Omnilock's, which CCC's known
+  // scripts don't have, so the SDK supplies them from the recovery settings.
   const resolve = createCccExternalFundingResolver({
     signer: new RemoteCkbSigner("token", publicKey, () => false, client, undefined, recovery),
     knownScripts: FUNDING_LOCK_KNOWN_SCRIPTS,
   });
   const funding = await resolve(undefined);
   assert.equal(funding.fundingLockScript.args, omni.args);
+  assert.equal(funding.fundingLockScript.hash_type, "data1");
   assert.equal(funding.shutdownScript.args, omni.args);
-  assert.deepEqual(funding.fundingLockScriptCellDeps?.map(({ dep_type }) => dep_type), ["dep_group", "code"]);
+  assert.equal(funding.fundingLockScriptCellDeps, undefined);
+  assert.deepEqual(fundingLockCellDeps(recovery), [
+    { out_point: { tx_hash: recovery.omnilock.cellDeps[0].outPoint.txHash, index: "0x0" }, dep_type: "dep_group" },
+    { out_point: { tx_hash: recovery.omnilock.cellDeps[1].outPoint.txHash, index: "0x0" }, dep_type: "code" },
+  ]);
 });
 
-test("the balance is the current lock's, without the AdminList", async () => {
+test("the balance is the current lock's; the AdminList has its own lock and is never counted", async () => {
   const offline = await offlineClient();
   const secp = await secp256k1Lock(offline, publicKey);
   const omni = await omnilockLock(offline, recovery);
-  const adminList = cell(omni, 197n * CKB, adminListTypeScript(recovery));
-  const client = await offlineClient();
-  Object.assign(client, { findSingletonCellByType: async (type: ccc.Script) => type.eq(adminListTypeScript(recovery)) ? adminList : undefined });
   const read: string[] = [];
   const readBalance = async (script: ccc.Script) => { read.push(script.hash()); return 1_000n * CKB; };
-
-  assert.equal(await getLockBalance(client, omni, recovery, readBalance), 803n * CKB);
-  assert.equal(await getLockBalance(client, secp, undefined, readBalance), 1_000n * CKB);
-  // An AdminList-looking cell under someone else's lock isn't the user's to subtract.
-  assert.equal(await getLockBalance(client, secp, recovery, readBalance), 1_000n * CKB);
-  assert.deepEqual(read, [omni.hash(), secp.hash(), secp.hash()]);
+  assert.equal(await getLockBalance(omni, readBalance), 1_000n * CKB);
+  assert.equal(await getLockBalance(secp, readBalance), 1_000n * CKB);
+  assert.deepEqual(read, [omni.hash(), secp.hash()]);
+  assert.notEqual(adminListLock(recovery).hash(), omni.hash());
+  assert.equal(ccc.bytesFrom(adminListLock(recovery).args).length, 22);
+  assert.equal(adminListLock(recovery).args, `${recovery.omnilockArgs.slice(0, 44)}00`);
 });
 
 test("recovery settings must belong to the account's key", () => {
@@ -297,5 +305,9 @@ test("recovery settings must belong to the account's key", () => {
   assert.throws(() => parseRecovery(recovery, other), /recovery settings are invalid/);
   assert.throws(() => parseRecovery({ ...recovery, adminListTypeHash: `0x${"00".repeat(32)}` }, publicKey), /invalid/);
   assert.throws(() => parseRecovery({ ...recovery, adminListOutPoint: undefined }, publicKey), /invalid/);
+  assert.throws(() => parseRecovery({ ...recovery, enableTransactionHash: undefined }, publicKey), /invalid/);
+  // Only KeyWay's pinned Omnilock, with its own deps: not CCC's upgradable deployment, not another cell.
+  assert.throws(() => parseRecovery({ ...recovery, omnilock: { ...recovery.omnilock, codeHash: "0xf329effd1c475a2978453c8600e1eaf0bc2087ee093c3ee64cc96ec6847752cb", hashType: "type" } }, publicKey), /invalid/);
+  assert.throws(() => parseRecovery({ ...recovery, omnilock: { ...recovery.omnilock, cellDeps: [recovery.omnilock.cellDeps[0], { outPoint: { txHash: `0x${"66".repeat(32)}`, index: 0 }, depType: "code" }] } }, publicKey), /invalid/);
   assert.throws(() => new KeyWaySigner("token", other, { approveCkbTransaction: () => false, approveCkbMessage: () => false, requestEmailCode: async () => undefined }, undefined, undefined, recovery), /invalid/);
 });

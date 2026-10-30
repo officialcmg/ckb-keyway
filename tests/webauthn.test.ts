@@ -73,17 +73,20 @@ test("reads CCC's JoyID signature JSON and lays out the verifier's blob", () => 
   const der = p256.sign(ccc.bytesConcat(AUTH_DATA, sha256(clientData)), privateKey, { format: "der" });
   const parsed = parseJoyIdSignature(JSON.stringify({ alg: -7, signature: base64url(der), message: base64url(ccc.bytesConcat(AUTH_DATA, clientData)) }), publicKey);
   assert.ok(verifyWebAuthn(parsed, TEXT));
-  const blob = webAuthnSignatureBlob(parsed, 768);
+  const blob = webAuthnSignatureBlob(parsed, 768, 0);
   assert.equal(blob.length, 768);
-  assert.equal(blob[0], 1);
-  assert.deepEqual(blob.slice(1, 65), publicKey);
-  assert.deepEqual(blob.slice(65, 129), parsed.rs);
-  assert.equal(blob[129] | (blob[130] << 8), 37);
-  const clientAt = 131 + 37;
+  // Version 2, then the network byte that picks the approval text's address prefix.
+  assert.equal(blob[0], 2);
+  assert.equal(blob[1], 0);
+  assert.equal(webAuthnSignatureBlob(parsed, 768, 1)[1], 1);
+  assert.deepEqual(blob.slice(2, 66), publicKey);
+  assert.deepEqual(blob.slice(66, 130), parsed.rs);
+  assert.equal(blob[130] | (blob[131] << 8), 37);
+  const clientAt = 132 + 37;
   assert.equal(blob[clientAt] | (blob[clientAt + 1] << 8), clientData.length);
   assert.deepEqual(blob.slice(clientAt + 2, clientAt + 2 + clientData.length), clientData);
   assert.ok(blob.slice(clientAt + 2 + clientData.length).every((byte) => byte === 0));
-  assert.throws(() => webAuthnSignatureBlob(parsed, 200), /doesn't fit/);
-  assert.throws(() => webAuthnSignatureBlob(parsed, 1025), /can't exceed 1024/);
+  assert.throws(() => webAuthnSignatureBlob(parsed, 200, 0), /doesn't fit/);
+  assert.throws(() => webAuthnSignatureBlob(parsed, 1025, 0), /can't exceed 1024/);
   assert.throws(() => parseJoyIdSignature(JSON.stringify({ alg: -257, signature: "", message: "" }), publicKey), /not a passkey signature/);
 });

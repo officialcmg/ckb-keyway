@@ -5,15 +5,18 @@ import { p256 } from "@noble/curves/nist.js";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { sha256 } from "@noble/hashes/sha2.js";
+import * as backups from "../src/sdk/browser/recovery-backups.ts";
 import {
   backupAuth,
+  backupChallengeExpiry,
   ckbSecp256k1Auth,
   describeBackup,
+  evmApprovalSignature,
   evmBackupAuth,
-  evmOmnilockDigest,
-  evmOmnilockMessage,
-  evmOmnilockSignature,
   evmPersonalSignAddress,
+  evmPreimage,
+  evmSignature,
+  EVM_PERSONAL_SIGN_VERIFIER,
   execAuth,
   JOYID_WEBAUTHN_VERIFIER,
   joyIdBackupAuth,
@@ -26,6 +29,9 @@ import {
 
 const client = new ccc.ClientPublicTestnet({ url: "https://testnet.ckb.dev/" });
 const ACCOUNT = "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqv82scyl0ywuurakhc80ha0agm5x8ye8kca6zq0u";
+/** A nonce shaped like the server's, valid for another ten minutes. The server checks its tag. */
+const nonce = (expires = Date.now() + 600_000) => `${expires}.${"ab".repeat(16)}.${"cd".repeat(32)}`;
+const NONCE = nonce();
 
 /** A throwaway EVM key, signing like a wallet's personal_sign (r ‖ s ‖ v with v = 27 or 28). */
 function evmWallet() {
@@ -63,9 +69,14 @@ async function joyIdWallet() {
   return { address, lock, sign, publicKey };
 }
 
-test("encodes each backup as its 21-byte Omnilock auth", async () => {
+test("encodes each backup as its 21-byte Omnilock exec auth", async () => {
   const evm = evmWallet();
-  assert.equal(evmBackupAuth(evm.address.toUpperCase().replace("0X", "0x")), `0x12${evm.address.slice(2)}`);
+  // 0xFD (exec) ‖ blake160 of the 62-byte preimage naming the EVM verifier and the address.
+  const evmImage = evmPreimage(evm.address.toUpperCase().replace("0X", "0x"));
+  assert.equal(evmImage, ccc.hexFrom(ccc.bytesConcat(EVM_PERSONAL_SIGN_VERIFIER.codeHash, [0x02, 0x00], new Uint8Array(8), evm.address)));
+  assert.equal(evmBackupAuth(evm.address.toUpperCase().replace("0X", "0x")), `0xfd${ccc.hashCkbShort(evmImage).slice(2)}`);
+  // Flag 0x12's opaque "CKB transaction: 0x…" approval is gone.
+  assert.ok(!("OMNILOCK_AUTH_ETHEREUM_DISPLAYING" in backups) && !("evmOmnilockMessage" in backups));
   const joy = await joyIdWallet();
   // 0xFD (exec) ‖ blake160 of the 62-byte preimage naming the verifier and the passkey's key hash.
   const preimage = joyIdPreimage(ccc.hashCkbShort(joy.publicKey));
@@ -103,30 +114,36 @@ test("parses backup lists", () => {
 test("accepts an EVM backup only with its EIP-191 signature over this account's challenge", async () => {
   const evm = evmWallet();
   const backup = { kind: "evm" as const, address: evm.address };
-  const challenge = recoveryBackupChallenge(ACCOUNT, backup);
+  const challenge = recoveryBackupChallenge(ACCOUNT, backup, NONCE);
   assert.match(challenge, new RegExp(`Account: ${ACCOUNT}`));
+  assert.match(challenge, new RegExp(`Request: ${NONCE.replace(/\./g, "\\.")}\nValid until: ${backupChallengeExpiry(NONCE).toISOString()}$`));
   const signature = evm.personalSign(challenge);
   assert.equal(evmPersonalSignAddress(challenge, signature), evm.address);
   assert.ok(ccc.verifyMessageEvmPersonal(challenge, signature, evm.address), "CCC's EVM verifier agrees");
-  assert.deepEqual(await verifyBackupOwnership(client, ACCOUNT, { ...backup, signature }), backup);
+  assert.deepEqual(await verifyBackupOwnership(client, ACCOUNT, { ...backup, signature, challengeNonce: NONCE }), backup);
 
-  await assert.rejects(() => verifyBackupOwnership(client, "ckt1other", { ...backup, signature }), /didn't sign/);
-  await assert.rejects(() => verifyBackupOwnership(client, ACCOUNT, { ...backup, signature: evmWallet().personalSign(challenge) }), /didn't sign/);
-  await assert.rejects(() => verifyBackupOwnership(client, ACCOUNT, { ...backup, signature: "0x1234" }), /didn't sign/);
-  await assert.rejects(() => verifyBackupOwnership(client, ACCOUNT, backup), /didn't sign/);
+  await assert.rejects(() => verifyBackupOwnership(client, "ckt1other", { ...backup, signature, challengeNonce: NONCE }), /didn't sign/);
+  await assert.rejects(() => verifyBackupOwnership(client, ACCOUNT, { ...backup, signature, challengeNonce: nonce(Date.now() + 1_000_000) }), /didn't sign/, "another request's nonce");
+  await assert.rejects(() => verifyBackupOwnership(client, ACCOUNT, { ...backup, signature: evmWallet().personalSign(challenge), challengeNonce: NONCE }), /didn't sign/);
+  await assert.rejects(() => verifyBackupOwnership(client, ACCOUNT, { ...backup, signature: "0x1234", challengeNonce: NONCE }), /didn't sign/);
+  await assert.rejects(() => verifyBackupOwnership(client, ACCOUNT, { ...backup, challengeNonce: NONCE }), /didn't sign/);
+  await assert.rejects(() => verifyBackupOwnership(client, ACCOUNT, { ...backup, signature }), /approval request is invalid/);
+  // Once the nonce expires the same signature is refused.
+  const expired = nonce(Date.now() - 1);
+  await assert.rejects(() => verifyBackupOwnership(client, ACCOUNT, { ...backup, signature: evm.personalSign(recoveryBackupChallenge(ACCOUNT, backup, expired)), challengeNonce: expired }), /approval expired/);
 });
 
 test("accepts a JoyID backup only with its passkey signature and matching lock", async () => {
   const joy = await joyIdWallet();
   const backup = { kind: "joyid" as const, address: joy.address };
-  const challenge = recoveryBackupChallenge(ACCOUNT, backup);
-  const signed = joy.sign(challenge);
+  const challenge = recoveryBackupChallenge(ACCOUNT, backup, NONCE);
+  const signed = { ...joy.sign(challenge), challengeNonce: NONCE };
   assert.ok(await ccc.verifyMessageJoyId(challenge, signed.signature, signed.identity));
   assert.deepEqual(await verifyBackupOwnership(client, ACCOUNT, { ...backup, ...signed }), backup);
 
-  await assert.rejects(() => verifyBackupOwnership(client, ACCOUNT, { ...backup, ...joy.sign("something else") }), /didn't sign/);
+  await assert.rejects(() => verifyBackupOwnership(client, ACCOUNT, { ...backup, ...joy.sign("something else"), challengeNonce: NONCE }), /didn't sign/);
   const other = await joyIdWallet();
-  await assert.rejects(() => verifyBackupOwnership(client, ACCOUNT, { ...backup, ...other.sign(challenge) }), /didn't sign/, "another passkey's signature");
+  await assert.rejects(() => verifyBackupOwnership(client, ACCOUNT, { ...backup, ...other.sign(challenge), challengeNonce: NONCE }), /didn't sign/, "another passkey's signature");
   // Sub keys and session keys are refused with a reason.
   const subKey = { ...signed, identity: JSON.stringify({ ...JSON.parse(signed.identity), keyType: "sub_key" }) };
   await assert.rejects(() => verifyBackupOwnership(client, ACCOUNT, { ...backup, ...subKey }), /device added later can't be a backup\. Use the JoyID passkey your account was created with/);
@@ -148,48 +165,18 @@ test("builds the admin witness lock the spike used on chain", () => {
   assert.equal(ccc.hexFrom(exec.slice(-62)), preimage);
 });
 
-test("signs an Omnilock sighash the way flag 0x12 verifies it", () => {
+test("an EVM backup's approval signature is version ‖ network ‖ r ‖ s ‖ v, accepting either v", () => {
   const evm = evmWallet();
-  const sighash = `0x${"0a".repeat(16)}${"FF".repeat(16)}`;
-  // Omnilock's convert_eth_message_displaying: "CKB transaction: 0x" and 64 lowercase hex digits, 83 bytes.
-  const message = evmOmnilockMessage(sighash);
-  assert.equal(message, `CKB transaction: 0x${"0a".repeat(16)}${"ff".repeat(16)}`);
-  assert.equal(new TextEncoder().encode(message).length, 83);
-  assert.deepEqual(evmOmnilockDigest(sighash), keccak_256(new TextEncoder().encode(`\x19Ethereum Signed Message:\n83${message}`)));
-  // A wallet's personal_sign of that text is the signature Omnilock recovers E's address from.
-  const signature = evmOmnilockSignature(evm.personalSign(message));
-  assert.ok(ccc.bytesFrom(signature)[64] <= 1);
-  assert.equal(evmPersonalSignAddress(message, signature), evm.address);
-  // A personal_sign of the raw 32 bytes (the flag 0x01 rule) recovers someone else under 0x12.
-  const raw = evmOmnilockSignature(evm.signDigest(keccak_256(ccc.bytesConcat(new TextEncoder().encode("\x19Ethereum Signed Message:\n32"), ccc.bytesFrom(sighash)))));
-  assert.notEqual(evmPersonalSignAddress(message, raw), evm.address);
-  assert.throws(() => evmOmnilockMessage("0x00"), /32 bytes/);
-  assert.throws(() => evmOmnilockSignature("0x00"), /65 bytes/);
-});
-
-test("signs the same text as CCC's EVM signer does for its 0x12 Omnilock address", async () => {
-  const evm = evmWallet();
-  const signed: string[] = [];
-  class Wallet extends ccc.SignerEvm {
-    async connect() {}
-    async isConnected() { return true; }
-    async getEvmAccount() { return evm.address; }
-    async signMessageRaw(message: string | ccc.BytesLike) {
-      if (typeof message !== "string") throw new Error("expected text");
-      signed.push(message);
-      return evm.personalSign(message);
-    }
-  }
-  const signer = new Wallet(client);
-  const lock = await ccc.Script.fromKnownScript(client, ccc.KnownScript.OmniLock, ccc.hexFrom(ccc.bytesConcat(evmBackupAuth(evm.address), [0x00])));
-  const input = { outPoint: { txHash: `0x${"31".repeat(32)}`, index: 0 }, cellOutput: { lock, capacity: 1000n * 100_000_000n }, outputData: "0x" };
-  await client.cache.recordCells([input]);
-  const tx = ccc.Transaction.from({ inputs: [{ previousOutput: input.outPoint }], outputs: [{ lock, capacity: 999n * 100_000_000n }], outputsData: ["0x"] });
-  tx.setWitnessArgsAt(0, ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(85)) }));
-  const sighash = (await tx.getSignHashInfo(lock, client))!.message;
-  const signedTx = await signer.signOnlyTransaction(tx);
-  assert.deepEqual(signed, [evmOmnilockMessage(sighash)]);
-  // CCC writes the same 0/1 recovery id signature Omnilock checks.
-  const witness = ccc.bytesFrom(signedTx.getWitnessArgsAt(0)!.lock!);
-  assert.equal(ccc.hexFrom(witness.slice(20)), evmOmnilockSignature(evm.personalSign(evmOmnilockMessage(sighash))));
+  const text = "KeyWay recovery\nMove everything to ckt1…";
+  const signature = evm.personalSign(text);
+  assert.equal(evmPersonalSignAddress(text, signature), evm.address);
+  const normalized = evmSignature(signature);
+  assert.ok(ccc.bytesFrom(normalized)[64] <= 1);
+  assert.equal(evmPersonalSignAddress(text, normalized), evm.address);
+  const blob = ccc.bytesFrom(evmApprovalSignature(0, signature));
+  assert.equal(blob.length, 67);
+  assert.deepEqual([blob[0], blob[1]], [1, 0]);
+  assert.equal(ccc.hexFrom(blob.slice(2)), normalized);
+  assert.equal(ccc.bytesFrom(evmApprovalSignature(1, signature))[1], 1);
+  assert.throws(() => evmSignature("0x00"), /65 bytes/);
 });

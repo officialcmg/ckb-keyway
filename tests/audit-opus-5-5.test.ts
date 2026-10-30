@@ -1,22 +1,22 @@
-// Proof-of-concept tests for research/omnilock/audit-opus-5-5.md. Each test asserts the behaviour the audit
-// reports as a finding, so it passes while the finding stands and fails once it is fixed.
+// Regression tests for research/omnilock/audit-opus-5-5.md. Each began as the audit's proof of concept, asserting
+// the weakness; after the fixes (research/omnilock/audit-fixes-results.md) each runs the same scenario and asserts
+// the opposite.
 import assert from "node:assert/strict";
 import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
-import { adminListTypeScript, omnilockArgsFor, secp256k1Lock, type KeyWayRecovery } from "../src/sdk/browser/account-lock.ts";
+import { adminListLock, adminListTypeScript, KEYWAY_OMNILOCK, omnilockArgsFor, omnilockScript, secp256k1Lock, type KeyWayRecovery } from "../src/sdk/browser/account-lock.ts";
 import { backupAuth, recoveryBackupChallenge, verifyBackupOwnership, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
 import { recoveryListRecord, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
 import { adminListData, whitelistTree } from "../src/sdk/browser/recovery-smt.ts";
 import { sweepSettlement } from "../src/sdk/browser/settlement-sweep.ts";
 import { checkRescueTransaction, openRescueAccount, planRescue, rescueEntryForEvm, RescueError } from "../src/rescue/rescue.ts";
-import { planBackupChange } from "../src/server/recovery.ts";
+import { checkBackupChangeTransaction, planBackupChange } from "../src/server/recovery.ts";
 import { planLegacySweep } from "../src/server/legacy-sweep.ts";
 import type { ReadyWallet } from "../src/server/user-wallet.ts";
 
 const CKB = 100_000_000n;
-const TYPE_ID = "0x00000000000000000000000000000000000000000000000000545950455f4944";
 const litKey = secp256k1.utils.randomSecretKey();
 const publicKey = ccc.hexFrom(secp256k1.getPublicKey(litKey, true));
 const evmKey = secp256k1.utils.randomSecretKey();
@@ -52,24 +52,43 @@ const cell = (lock: ccc.Script, capacity: bigint, type?: ccc.Script, outputData:
 const amount = (value: bigint) => ccc.hexFrom(ccc.numLeToBytes(value, 16));
 const occupied = (output: ccc.CellOutput, data: ccc.HexLike) => ccc.fixedPointFrom(output.occupiedSize + ccc.bytesFrom(data).length);
 
-/** A recovery account: its AdminList (under `adminListLock`, the account's Omnilock by default) and its record. */
-async function recoveryChain(options: { adminListLock?: (omnilock: ccc.Script) => ccc.Script; extra?: (omnilock: ccc.Script, secp: ccc.Script) => ccc.Cell[] } = {}) {
+type Output = { cellOutput: ccc.CellOutputLike; outputData: ccc.Hex };
+
+/**
+ * A recovery account made the way KeyWay makes it: a cell of the account's secp256k1 address, spent by the
+ * transaction that turned recovery on, whose output 0 is the AdminList (under the key's owner-only lock unless
+ * `adminListLock` says otherwise) with its record, then 1,000 CKB at the account and any `extra` outputs.
+ * `report` lets the node describe a cell differently from what the chain holds.
+ */
+async function recoveryChain(options: {
+  adminListLock?: (recovery: Pick<KeyWayRecovery, "omnilock" | "omnilockArgs">) => ccc.Script;
+  extra?: (omnilock: ccc.Script, secp: ccc.Script) => Output[];
+  report?: (cell: ccc.Cell, index: number) => ccc.Cell;
+  backups?: RecoveryBackup[];
+} = {}) {
   const base = await offlineClient();
-  const backups: RecoveryBackup[] = [{ kind: "evm", address: evmAddress }];
-  const adminListTypeArgs = ccc.hexFrom(new Uint8Array(32).fill(0x42));
-  const adminType = adminListTypeScript({ adminListTypeArgs });
-  const omnilock = await ccc.Script.fromKnownScript(base, ccc.KnownScript.OmniLock, omnilockArgsFor(publicKey, adminType.hash()));
+  const backups: RecoveryBackup[] = options.backups ?? [{ kind: "evm", address: evmAddress }];
   const secp = await secp256k1Lock(base, publicKey);
+  const funding = ccc.Transaction.from({ inputs: [{ previousOutput: { txHash: `0x${(nextCell++).toString(16).padStart(64, "0")}`, index: 0 } }], outputs: [{ lock: secp, capacity: 60_000n * CKB }], outputsData: ["0x"] });
+  const input0 = ccc.CellInput.from({ previousOutput: { txHash: funding.hash(), index: 0 } });
+  const adminListTypeArgs = ccc.hashTypeId(input0, 0);
+  const adminType = adminListTypeScript({ adminListTypeArgs });
+  const omnilock = omnilockScript({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: omnilockArgsFor(publicKey, adminType.hash()) });
+  const pinned = { omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: omnilock.args };
   const { root } = whitelistTree(await Promise.all(backups.map((backup) => backupAuth(base, backup))));
-  const listLock = options.adminListLock?.(omnilock) ?? omnilock;
-  const created = ccc.Transaction.from({ outputs: [{ lock: listLock, type: adminType, capacity: 197n * CKB }], outputsData: [adminListData(root)] });
-  setRecoveryListRecord(created, 0, await recoveryListRecord(base, backups));
-  const adminList = ccc.Cell.from({ outPoint: { txHash: created.hash(), index: 0 }, cellOutput: created.outputs[0], outputData: created.outputsData[0] });
-  const cells = [adminList, cell(omnilock, 1_000n * CKB), ...(options.extra?.(omnilock, secp) ?? [])];
-  const client = await offlineClient(cells, [created]);
+  const listLock = options.adminListLock?.(pinned) ?? adminListLock(pinned);
+  const outputs: Output[] = [
+    { cellOutput: { lock: listLock, type: adminType, capacity: 165n * CKB }, outputData: adminListData(root) },
+    { cellOutput: { lock: omnilock, capacity: 1_000n * CKB }, outputData: "0x" },
+    ...(options.extra?.(omnilock, secp) ?? []),
+  ];
+  const enable = ccc.Transaction.from({ inputs: [input0], outputs: outputs.map(({ cellOutput }) => cellOutput), outputsData: outputs.map(({ outputData }) => outputData) });
+  setRecoveryListRecord(enable, 0, await recoveryListRecord(base, backups));
+  const real = enable.outputs.map((cellOutput, index) => ccc.Cell.from({ outPoint: { txHash: enable.hash(), index }, cellOutput, outputData: enable.outputsData[index] }));
+  const client = await offlineClient(real.map((cell, index) => options.report?.(cell, index) ?? cell), [funding, enable]);
   const recovery: KeyWayRecovery = {
-    omnilockArgs: omnilock.args, adminListTypeArgs, adminListTypeHash: adminType.hash(),
-    adminListOutPoint: { txHash: created.hash(), index: 0 }, legacyAddress: ccc.Address.fromScript(secp, client).toString(),
+    omnilockArgs: omnilock.args, omnilock: KEYWAY_OMNILOCK.testnet, adminListTypeArgs, adminListTypeHash: adminType.hash(),
+    adminListOutPoint: { txHash: enable.hash(), index: 0 }, enableTransactionHash: enable.hash(), legacyAddress: ccc.Address.fromScript(secp, client).toString(),
     enabledAt: "2026-10-29T00:00:00.000Z", backups,
   };
   const wallet = {
@@ -77,10 +96,10 @@ async function recoveryChain(options: { adminListLock?: (omnilock: ccc.Script) =
     encryptedFiberKey: "ciphertext", primaryDeviceIdHash: "a".repeat(64), hasOpenedChannel: false,
     createdAt: "2026-10-29T00:00:00.000Z", updatedAt: "2026-10-29T00:00:00.000Z", recovery,
   } as ReadyWallet;
-  return { client, omnilock, secp, adminList, wallet, address: ccc.Address.fromScript(omnilock, client).toString() };
+  return { client, omnilock, secp, adminList: real[0], real, enable, wallet, recovery, address: ccc.Address.fromScript(omnilock, client).toString() };
 }
 
-test("finding: with recovery on, a settlement key holding a minimum-capacity token cell can never be swept", async () => {
+test("M1 fixed: with recovery on, a settlement key holding a minimum-capacity token cell is swept", async () => {
   // A Fiber settlement key holding what a force-closed token channel leaves: an xUDT cell at its exact
   // secp256k1 minimum (142 CKB), and some plain CKB.
   const base = await offlineClient();
@@ -94,80 +113,137 @@ test("finding: with recovery on, a settlement key holding a minimum-capacity tok
   const client = await offlineClient([tokenCell, cell(from, 5_000n * CKB)], [], sent);
   Object.assign(client, { findSingletonCellByType: async () => undefined });
   // With recovery on, the destination is the account's Omnilock (create-keyway.ts sweepNow, managed-node.ts).
-  const omnilock = await ccc.Script.fromKnownScript(client, ccc.KnownScript.OmniLock, omnilockArgsFor(publicKey, `0x${"42".repeat(32)}`));
+  const omnilock = omnilockScript({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: omnilockArgsFor(publicKey, `0x${"42".repeat(32)}`) });
 
-  // CCC raises the token output to its 176 CKB minimum, then looks for 34 more CKB in new inputs instead of taking
-  // them from the 5,000 CKB plain output it is building, finds none (every cell is already an input) and throws.
-  // The sweep loops (create-keyway.ts sweepNow, managed-node.ts sweepHostedSettlement) swallow the error and
-  // retry every 10 minutes, so neither the tokens nor the plain CKB ever leave the settlement key.
-  await assert.rejects(sweepSettlement(client, settlementKey, omnilock, 0n), /Insufficient CKB, need 34 extra CKB/);
-  assert.equal(sent.length, 0);
-  // The same cells sweep fine to a secp256k1 destination (the account's lock before recovery).
-  await sweepSettlement(client, settlementKey, await secp256k1Lock(client, publicKey), 0n);
+  // The token output is sized for the Omnilock (176 CKB) and the 34 CKB difference comes out of the plain CKB.
+  await sweepSettlement(client, settlementKey, omnilock, 0n);
   assert.equal(sent.length, 1);
+  const [swept] = sent;
+  const tokenOutput = swept.outputs.find((output) => output.type?.eq(token))!;
+  assert.ok(tokenOutput.lock.eq(omnilock));
+  assert.equal(tokenOutput.capacity, 176n * CKB);
+  assert.equal(swept.outputsData[swept.outputs.indexOf(tokenOutput)], amount(1_000n));
+  const plain = swept.outputs.find((output) => !output.type)!;
+  assert.ok(plain.lock.eq(omnilock));
+  assert.ok(plain.capacity > 5_000n * CKB - 34n * CKB - CKB && plain.capacity < 5_000n * CKB - 34n * CKB);
+  // The same cells still sweep to a secp256k1 destination (the account's lock before recovery).
+  await sweepSettlement(client, settlementKey, await secp256k1Lock(client, publicKey), 0n);
+  assert.equal(sent.length, 2);
+
+  // 90 CKB tops the token cell up and the 56 CKB left, too little for a plain cell at an Omnilock, rides in it.
+  const small: ccc.Transaction[] = [];
+  await sweepSettlement(await offlineClient([cell(from, 142n * CKB, token, amount(1_000n)), cell(from, 90n * CKB)], [], small), settlementKey, omnilock, 0n);
+  assert.equal(small.length, 1);
+  assert.equal(small[0].outputs.length, 1);
+  assert.ok(small[0].outputs[0].type?.eq(token) && small[0].outputs[0].capacity > 231n * CKB);
+  // 61 CKB tops up one token cell but not two: the second waits on the key for a later sweep.
+  const poor: ccc.Transaction[] = [];
+  const tokenCells = [cell(from, 142n * CKB, token, amount(1_000n)), cell(from, 142n * CKB, token, amount(7n))];
+  await sweepSettlement(await offlineClient([...tokenCells, cell(from, 61n * CKB)], [], poor), settlementKey, omnilock, 0n);
+  assert.equal(poor.length, 1);
+  assert.equal(poor[0].outputs.filter((output) => output.type).length, 1);
+  assert.equal(poor[0].inputs.length, 2);
+  assert.equal(tokenCells.filter(({ outPoint }) => poor[0].inputs.some(({ previousOutput }) => previousOutput.eq(outPoint))).length, 1);
 });
 
-/** A rescue account whose node lies about one cell: `real` is what the chain holds, `reported` what the node says. */
-async function lyingNodeRescue(reported: (lock: ccc.Script, token: ccc.Script) => ccc.Cell) {
-  const base = await offlineClient();
-  const xudt = await base.getKnownScript(ccc.KnownScript.XUdt);
-  const token = ccc.Script.from({ codeHash: xudt.codeHash, hashType: xudt.hashType, args: `0x${"77".repeat(32)}` });
-  let lie: ccc.Cell | undefined;
-  const { client, address } = await recoveryChain({ extra: (omnilock) => [lie = reported(omnilock, token)] });
+test("M2 fixed: a lying CKB node can't make the rescue page burn the account's CKB as fee", async () => {
+  // On chain the cell holds 50,000 CKB; the node reports 61. The page reads the cell from the transaction that
+  // created it (whose hash it checks against the out point), so the rescue moves all 50,000 CKB.
+  const { client, address } = await recoveryChain({
+    extra: (omnilock) => [{ cellOutput: { lock: omnilock, capacity: 50_000n * CKB }, outputData: "0x" }],
+    report: (cell, index) => index === 2 ? ccc.Cell.from({ ...cell, cellOutput: { ...cell.cellOutput, capacity: 61n * CKB } }) : cell,
+  });
   const account = await openRescueAccount(client, address);
+  assert.equal(account.ckb, 51_000n * CKB);
   const destination = await secp256k1Lock(client, ccc.hexFrom(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true)));
   const plan = await planRescue(client, account, rescueEntryForEvm(account, [evmAddress]), ccc.Address.fromScript(destination, client).toString());
   checkRescueTransaction(plan.transaction, account, destination);
-  return { plan, lie: lie!, account, token };
-}
+  const realFee = 51_000n * CKB - plan.transaction.getOutputsCapacity();
+  assert.equal(realFee, plan.fee);
+  assert.ok(realFee < CKB / 100n);
+  // And the backup signs a text the chain rebuilds from the real inputs: a node's lie would make it fail.
+  assert.match(plan.approvalText, /\nCKB: 50,999\.\d+\n/);
 
-test("finding: a lying CKB node can make the rescue page burn the account's CKB as fee", async () => {
-  // On chain the cell holds 50,000 CKB; the node reports 61. The out point is all the transaction commits to,
-  // so the backup signs a transaction whose real fee is ~50,000 CKB, and the page's own checks pass.
-  const { plan, lie } = await lyingNodeRescue((lock) => cell(lock, 61n * CKB));
-  const realInputs = 1_000n * CKB + 50_000n * CKB;
-  const realFee = realInputs - plan.transaction.getOutputsCapacity();
-  assert.ok(plan.transaction.inputs.some(({ previousOutput }) => previousOutput.eq(lie.outPoint)));
-  assert.ok(realFee > 49_900n * CKB, `real fee ${ccc.fixedPointToString(realFee)} CKB`);
-  assert.ok(plan.fee < CKB / 100n, "the page shows a normal fee");
+  // A node that returns some other transaction for the out point's hash is refused outright.
+  const forged = await recoveryChain();
+  const original = forged.client.getTransaction.bind(forged.client);
+  Object.assign(forged.client, { getTransaction: async (hash: ccc.HexLike) => {
+    const found = await original(hash);
+    if (!found || ccc.hexFrom(hash) !== forged.enable.hash()) return found;
+    const copy = found.transaction.clone();
+    copy.outputs[1].capacity = 61n * CKB;
+    return { ...found, transaction: copy };
+  } });
+  await assert.rejects(openRescueAccount(forged.client, forged.address), (error: unknown) => error instanceof RescueError && error.code === "rpc");
 });
 
-test("finding: a lying CKB node can make the rescue page burn the account's tokens", async () => {
-  // On chain the cell is an xUDT cell with 2,500 tokens; the node reports it as plain CKB. The rescue spends it
-  // into a plain output and xUDT lets inputs exceed outputs, so the tokens are destroyed.
-  const { plan, lie, account } = await lyingNodeRescue((lock) => cell(lock, 176n * CKB));
-  assert.ok(plan.transaction.inputs.some(({ previousOutput }) => previousOutput.eq(lie.outPoint)));
-  assert.equal(account.tokens.length, 0);
-  assert.ok(plan.transaction.outputs.every((output) => !output.type));
-});
-
-test("finding: once a backup moves the AdminList to another lock, KeyWay can't remove that backup and keeps sending funds to the address", async () => {
-  // A backup spends the AdminList through the administrator path (accepted on testnet, see testnet-adminlist-hijack.ts)
-  // and recreates it, same Type ID and list, under its own lock. Omnilock still finds it as a cell dep by type.
-  const thief = await secp256k1Lock(await offlineClient(), ccc.hexFrom(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true)));
-  const { client, wallet, address, omnilock } = await recoveryChain({
-    adminListLock: () => thief,
-    extra: (_omnilock, secp) => [cell(secp, 5_000n * CKB)],
+test("M2 fixed: a lying CKB node can't make the rescue page burn the account's tokens", async () => {
+  // On chain the cell is an xUDT cell with 2,500 tokens; the node reports it as plain CKB. The page reads the
+  // cell from its creating transaction, so the tokens move one to one.
+  const base = await offlineClient();
+  const xudt = await base.getKnownScript(ccc.KnownScript.XUdt);
+  const token = ccc.Script.from({ codeHash: xudt.codeHash, hashType: xudt.hashType, args: `0x${"77".repeat(32)}` });
+  const { client, address } = await recoveryChain({
+    extra: (omnilock) => [{ cellOutput: { lock: omnilock, capacity: 176n * CKB, type: token }, outputData: amount(2_500n) }],
+    report: (cell, index) => index === 2 ? ccc.Cell.from({ ...cell, cellOutput: { ...cell.cellOutput, type: undefined }, outputData: "0x" }) : cell,
   });
-  await assert.rejects(planBackupChange(client, wallet, { change: "remove", backup: { kind: "evm", address: evmAddress } }), /isn't this account's/);
-  await assert.rejects(planBackupChange(client, wallet, { change: "add", backup: { kind: "evm", address: `0x${"ab".repeat(20)}` } }), /isn't this account's/);
-  // The sign-in sweep still moves the old address's funds into the Omnilock the backup now controls for good.
+  const account = await openRescueAccount(client, address);
+  assert.deepEqual(account.tokens.map(({ typeHash, amount: value }) => ({ typeHash, value })), [{ typeHash: token.hash(), value: 2_500n }]);
+  const destination = await secp256k1Lock(client, ccc.hexFrom(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true)));
+  const plan = await planRescue(client, account, rescueEntryForEvm(account, [evmAddress]), ccc.Address.fromScript(destination, client).toString());
+  const index = plan.transaction.outputs.findIndex((output) => output.type?.eq(token));
+  assert.ok(index >= 0);
+  assert.equal(plan.transaction.outputsData[index], amount(2_500n));
+  assert.match(plan.approvalText, /\nTokens: 1 token cell\n/);
+});
+
+test("M3 fixed: the AdminList is locked to the account's key alone, so a backup can't move it", async () => {
+  // The list sits under the Lit key's Omnilock without administrator mode: a backup's identity can't unlock it
+  // (proved on testnet: research/omnilock/audit-fixes-results.md), and the account's address doesn't change.
+  const second = { kind: "evm" as const, address: `0x${"ab".repeat(20)}` };
+  const { client, wallet, address, omnilock, adminList } = await recoveryChain({ backups: [{ kind: "evm", address: evmAddress }, second], extra: (_omnilock, secp) => [{ cellOutput: { lock: secp, capacity: 5_000n * CKB }, outputData: "0x" }] });
+  const listArgs = ccc.bytesFrom(adminList.cellOutput.lock.args);
+  assert.equal(listArgs.length, 22);
+  assert.equal(listArgs[21], 0x00, "no administrator mode on the list's lock");
+  assert.equal(adminList.cellOutput.lock.codeHash, omnilock.codeHash);
+  // KeyWay removes and adds backups with the Lit key, on the owner path of both locks.
+  const removal = await planBackupChange(client, wallet, { change: "remove", backup: second });
+  await checkBackupChangeTransaction(client, removal.transaction, wallet.recovery!, removal.backups);
+  assert.ok(removal.transaction.outputs[0].lock.eq(adminList.cellOutput.lock));
+  // Only KeyWay's own list update, which recreates the list under the same owner-only lock, spends it.
+  const moved = removal.transaction.clone();
+  moved.outputs[0].lock = omnilock;
+  await assert.rejects(checkBackupChangeTransaction(client, moved, wallet.recovery!, removal.backups), /doesn't recreate the recovery list/);
+  // The sign-in sweep still targets the account's own Omnilock, and the rescue page finds the list.
   const sweep = await planLegacySweep(client, wallet);
   assert.equal(sweep.status, "ready");
   if (sweep.status === "ready") assert.ok(sweep.transaction.outputs.every((output) => output.lock.eq(omnilock)));
-  // And the rescue page says no backup can move the funds, though Omnilock accepts the list as a cell dep.
-  await assert.rejects(openRescueAccount(client, address), (error: unknown) => error instanceof RescueError && error.code === "list-missing");
+  const account = await openRescueAccount(client, address);
+  assert.ok(account.adminList.outPoint.eq(adminList.outPoint));
+
+  // A list somehow found under another lock (only the Lit key could put it there now) is still refused.
+  const thief = await secp256k1Lock(await offlineClient(), ccc.hexFrom(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true)));
+  const hijacked = await recoveryChain({ adminListLock: () => thief });
+  await assert.rejects(planBackupChange(hijacked.client, hijacked.wallet, { change: "add", backup: second }), /doesn't match the chain|isn't this account's/);
 });
 
-test("info: a backup's ownership proof has no nonce or expiry and verifies again after the backup is removed", async () => {
+test("I1 fixed: a backup's ownership proof carries KeyWay's nonce and expires", async () => {
   const { client, secp } = await recoveryChain();
   const account = ccc.Address.fromScript(secp, client).toString();
   const backup = { kind: "evm" as const, address: evmAddress };
-  const text = new TextEncoder().encode(recoveryBackupChallenge(account, backup));
-  const digest = keccak_256(ccc.bytesConcat(new TextEncoder().encode(`\x19Ethereum Signed Message:\n${text.length}`), text));
-  const raw = secp256k1.sign(digest, evmKey, { prehash: false, format: "recovered" });
-  const proof = { ...backup, signature: ccc.hexFrom(ccc.bytesConcat(raw.slice(1), [raw[0] + 27])) };
-  // The same signature is accepted for turning recovery on, adding the backup, and re-adding it any time later.
-  assert.deepEqual(await verifyBackupOwnership(client, account, proof), backup);
-  assert.deepEqual(await verifyBackupOwnership(client, account, JSON.parse(JSON.stringify(proof))), backup);
+  const sign = (nonce: string) => {
+    const text = new TextEncoder().encode(recoveryBackupChallenge(account, backup, nonce));
+    const digest = keccak_256(ccc.bytesConcat(new TextEncoder().encode(`\x19Ethereum Signed Message:\n${text.length}`), text));
+    const raw = secp256k1.sign(digest, evmKey, { prehash: false, format: "recovered" });
+    return { ...backup, signature: ccc.hexFrom(ccc.bytesConcat(raw.slice(1), [raw[0] + 27])), challengeNonce: nonce };
+  };
+  const fresh = `${Date.now() + 600_000}.${"ab".repeat(16)}.${"cd".repeat(32)}`;
+  assert.deepEqual(await verifyBackupOwnership(client, account, sign(fresh)), backup);
+  // The same signature for another request, without a nonce, or after its expiry is refused.
+  await assert.rejects(verifyBackupOwnership(client, account, { ...sign(fresh), challengeNonce: `${Date.now() + 900_000}.${"ab".repeat(16)}.${"cd".repeat(32)}` }), /didn't sign/);
+  const { challengeNonce: _dropped, ...bare } = sign(fresh);
+  await assert.rejects(verifyBackupOwnership(client, account, bare), /approval request is invalid/);
+  const stale = `${Date.now() - 1}.${"ab".repeat(16)}.${"cd".repeat(32)}`;
+  await assert.rejects(verifyBackupOwnership(client, account, sign(stale)), /approval expired/);
+  // The server also checks the nonce is one it issued to this user: tests/recovery-flow.test.ts.
 });

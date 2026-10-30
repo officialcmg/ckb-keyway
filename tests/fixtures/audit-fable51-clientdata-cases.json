@@ -50,8 +50,7 @@
   {
    "name": "leading BOM",
    "clientData": "77u/eyJ0eXBlIjoid2ViYXV0aG4uZ2V0IiwiY2hhbGxlbmdlIjoiUTB0Q0lIUnlZVzV6WVdOMGFXOXVPaUF3ZURoaE9HRTRZVGhoT0dFNFlUaGhPR0U0WVRoaE9HRTRZVGhoT0dFNFlUaGhPR0U0WVRoaE9HRTRZVGhoT0dFNFlUaGhPR0U0WVRoaE9HRTRZVGhoT0dFIn0=",
-   "expected": false,
-   "expectedTs": true
+   "expected": false
   },
   {
    "name": "duplicate type",

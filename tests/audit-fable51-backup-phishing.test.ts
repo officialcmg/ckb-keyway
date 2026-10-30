@@ -1,15 +1,18 @@
-// Audit PoC (audit/omnilock-fable-5-1): everything a thief needs to drain a recovery account, except one signature,
-// is public on chain. The backup's EVM address is in the list record of every enable/change transaction, the
-// AdminList and its SMT proofs are public, and Omnilock's flag 0x12 asks the wallet to sign only the text
-// "CKB transaction: 0x<sighash>", which names neither destination nor amount. A phishing page the backup wallet
-// visits for any other reason can ask for exactly that signature and the funds leave to the thief's address.
+// Regression test for the audit's M3 (audit/omnilock-fable-5-1). Everything a thief needs to drain a recovery
+// account, except one signature, is public on chain, and Omnilock's flag 0x12 asked the backup's wallet to sign
+// only "CKB transaction: 0x<sighash>", which names neither destination nor amount. Backups now approve a readable
+// text naming the destination, the CKB, the token cells and the fee, which KeyWay's exec verifier rebuilds from the
+// transaction (contracts/keyway-approval). A phishing page can still ask, but the wallet shows the thief's address
+// and the whole balance; and a signature over a text with another destination or amount doesn't verify on chain
+// (contracts/tests/tests/approval.rs, and the testnet dry runs in research/omnilock/audit-fixes-results.md).
 import assert from "node:assert/strict";
 import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
-import { omnilockArgsFor, secp256k1Lock } from "../src/sdk/browser/account-lock.ts";
-import { backupAuth, evmOmnilockMessage, evmPersonalSignAddress, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
+import { KEYWAY_OMNILOCK, omnilockArgsFor, omnilockScript } from "../src/sdk/browser/account-lock.ts";
+import { recoveryApprovalText, rescueApproval } from "../src/sdk/browser/recovery-approval.ts";
+import { backupAuth, evmPersonalSignAddress, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
 import { decodeRecoveryList, readRecoveryList, recoveryListRecord, recoveryListRecordOf, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
 import { adminListData, whitelistTree } from "../src/sdk/browser/recovery-smt.ts";
 import { signRecoverySpendWithEvm } from "../src/sdk/browser/recovery-spend.ts";
@@ -19,7 +22,7 @@ const TYPE_ID = "0x00000000000000000000000000000000000000000000000000545950455f4
 const publicKey = ccc.hexFrom(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true));
 const backupKey = secp256k1.utils.randomSecretKey();
 const backupAddress = ccc.hexFrom(keccak_256(secp256k1.getPublicKey(backupKey, false).slice(1)).slice(12));
-const thiefLock = ccc.Script.from({ codeHash: `0x${"9b".repeat(32)}`, hashType: "type", args: `0x${"ab".repeat(20)}` });
+const thiefLock = ccc.Script.from({ codeHash: "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8", hashType: "type", args: `0x${"ab".repeat(20)}` });
 
 async function offlineClient(cells: ccc.Cell[], transactions: ccc.Transaction[] = []): Promise<ccc.Client> {
   const client = new ccc.ClientPublicTestnet({ url: "https://testnet.ckb.dev/" });
@@ -38,11 +41,11 @@ async function offlineClient(cells: ccc.Cell[], transactions: ccc.Transaction[] 
   return client;
 }
 
-test("PoC: one personal_sign of an opaque 83-byte text, requested by any page, moves everything to the thief", async () => {
+test("M3 fixed: the backup's wallet shows where everything goes and how much, and only that text verifies", async () => {
   const base = await offlineClient([]);
   const backups: RecoveryBackup[] = [{ kind: "evm", address: backupAddress }];
   const adminType = ccc.Script.from({ codeHash: TYPE_ID, hashType: "type", args: ccc.hexFrom(new Uint8Array(32).fill(0x42)) });
-  const lock = await ccc.Script.fromKnownScript(base, ccc.KnownScript.OmniLock, omnilockArgsFor(publicKey, adminType.hash()));
+  const lock = omnilockScript({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: omnilockArgsFor(publicKey, adminType.hash()) });
   const { root } = whitelistTree(await Promise.all(backups.map((backup) => backupAuth(base, backup))));
   const enable = ccc.Transaction.from({ outputs: [{ lock, type: adminType, capacity: 197n * CKB }], outputsData: [adminListData(root)] });
   setRecoveryListRecord(enable, 0, await recoveryListRecord(base, backups));
@@ -71,18 +74,25 @@ test("PoC: one personal_sign of an opaque 83-byte text, requested by any page, m
       return ccc.hexFrom(ccc.bytesConcat(raw.slice(1), [raw[0] + 27]));
     },
   };
-  const signed = await signRecoverySpendWithEvm(drain, { client, lock, list: list.entries, entry: list.entries[0], adminList: adminList.outPoint }, wallet);
+  const signed = await signRecoverySpendWithEvm(drain, { client, lock, omnilock: KEYWAY_OMNILOCK.testnet, list: list.entries, entry: list.entries[0], adminList: adminList.outPoint, inputCapacity: 10_000n * CKB }, wallet);
 
   assert.equal(requests.length, 1);
-  assert.match(requests[0], /^CKB transaction: 0x[0-9a-f]{64}$/, "no destination, amount, account or app name in what the wallet shows");
-  // The text is the group's sighash (witness lock zeroed at its final length), as Omnilock computes it.
+  const thief = ccc.Address.fromScript(thiefLock, client).toString();
+  assert.equal(requests[0].split("\n").slice(0, 5).join("\n"), `KeyWay recovery\nMove everything to ${thief}\nCKB: 9,999\nTokens: none\nFee: 1 CKB`);
+  assert.doesNotMatch(requests[0], /^CKB transaction: /);
+  // The text ends with the group's sighash (witness lock zeroed at its final length), as Omnilock computes it,
+  // and the verifier rebuilds every line from the transaction: the same text for another destination or amount
+  // is a different text.
   const witnessArgs = signed.getWitnessArgsAt(0)!;
   const zeroed = signed.clone();
   zeroed.setWitnessArgsAt(0, ccc.WitnessArgs.from({ ...witnessArgs, lock: ccc.hexFrom(new Uint8Array(ccc.bytesFrom(witnessArgs.lock!).length)) }));
-  assert.equal(requests[0], evmOmnilockMessage((await zeroed.getSignHashInfo(lock, client))!.message));
-  // The signature recovers to the backup over exactly that message, so Omnilock (flag 0x12) accepts it.
+  const sighash = (await zeroed.getSignHashInfo(lock, client))!.message;
+  assert.equal(requests[0], recoveryApprovalText(client, rescueApproval(signed, lock, 10_000n * CKB), sighash));
+  const elsewhere = signed.clone();
+  elsewhere.outputs[0].lock = ccc.Script.from({ ...thiefLock, args: `0x${"cd".repeat(20)}` });
+  assert.notEqual(recoveryApprovalText(client, rescueApproval(elsewhere, lock, 10_000n * CKB), sighash), requests[0]);
+  // The witness carries version 1 ‖ network ‖ the personal_sign signature, through the EVM exec verifier.
   const witness = ccc.bytesFrom(witnessArgs.lock!);
-  const signature = ccc.hexFrom(witness.slice(16 + 4, 16 + 4 + 65));
-  assert.equal(evmPersonalSignAddress(requests[0], signature), backupAddress);
-  assert.ok(signed.outputs[0].lock.eq(thiefLock));
+  assert.deepEqual([witness[20], witness[21]], [1, 0]);
+  assert.equal(evmPersonalSignAddress(requests[0], witness.slice(22, 87)), backupAddress);
 });

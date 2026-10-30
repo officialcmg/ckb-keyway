@@ -2,40 +2,39 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
-import { adminListTypeScript, omnilockArgsFor, secp256k1Lock, type KeyWayRecovery } from "../src/sdk/browser/account-lock.ts";
+import { secp256k1Lock, type KeyWayRecovery } from "../src/sdk/browser/account-lock.ts";
 import { database } from "../src/server/database.ts";
 import { formatCkbSignature } from "../src/server/funding-transaction.ts";
 import { sweepLegacyAddress, type LegacySweepContext } from "../src/server/legacy-sweep.ts";
 import { saveWallet, type ReadyWallet } from "../src/server/user-wallet.ts";
+import { anchoredRecovery } from "./recovery-fixture.ts";
 
 const enabled = Boolean(process.env.KEYWAY_AUTH_TEST_DATABASE_URL);
 const CKB = 100_000_000n;
 
 let nextCell = 1;
-async function harness(withRecovery = true) {
+async function harness(withRecovery: boolean | ((recovery: KeyWayRecovery) => KeyWayRecovery) = true) {
   const privateKey = secp256k1.utils.randomSecretKey();
   const publicKey = ccc.hexFrom(secp256k1.getPublicKey(privateKey, true));
-  const adminListTypeArgs = ccc.hexFrom(crypto.getRandomValues(new Uint8Array(32)));
-  const adminListTypeHash = adminListTypeScript({ adminListTypeArgs }).hash();
-  const recovery: KeyWayRecovery = {
-    omnilockArgs: omnilockArgsFor(publicKey, adminListTypeHash), adminListTypeArgs, adminListTypeHash,
-    adminListOutPoint: { txHash: `0x${"ad".repeat(32)}`, index: 0 }, legacyAddress: "ckt1legacy", enabledAt: new Date().toISOString(),
-  };
+  const anchor = await anchoredRecovery(publicKey, { seed: nextCell++ + 1_000_000 });
+  const recovery = typeof withRecovery === "function" ? withRecovery(anchor.recovery) : anchor.recovery;
   const client = new ccc.ClientPublicTestnet({ url: "https://testnet.ckb.dev/" });
   const secp = await secp256k1Lock(client, publicKey);
   const cells: ccc.Cell[] = [];
-  const addCell = async (capacity: bigint) => {
-    const cell = ccc.Cell.from({ outPoint: { txHash: `0x${(nextCell++).toString(16).padStart(64, "e")}`, index: 0 }, cellOutput: { lock: secp, capacity }, outputData: "0x" });
+  const addRaw = async (cell: ccc.Cell) => {
     await client.cache.recordCells([cell]);
     cells.push(cell);
   };
+  const addCell = async (capacity: bigint) => addRaw(ccc.Cell.from({ outPoint: { txHash: `0x${(nextCell++).toString(16).padStart(64, "e")}`, index: 0 }, cellOutput: { lock: secp, capacity }, outputData: "0x" }));
   /** What the node says about each sent transaction. */
   const pool = new Map<string, { status: ccc.TransactionStatus; transaction: ccc.Transaction }>();
   Object.assign(client, {
     findSingletonCellByType: async () => undefined,
     findCellsByLock: async function* (lock: ccc.ScriptLike) { for (const cell of cells) if (cell.cellOutput.lock.eq(ccc.Script.from(lock))) yield cell; },
-    getTransaction: async (hash: ccc.HexLike) => pool.get(ccc.hexFrom(hash)),
+    getTransaction: async (hash: ccc.HexLike) => pool.get(ccc.hexFrom(hash)) ?? anchored.get(ccc.hexFrom(hash)),
+    sendTransactionDry: async () => 1_000_000n,
   });
+  const anchored = new Map(anchor.transactions.map((transaction) => [transaction.hash(), { status: "committed" as const, transaction }]));
   await addCell(300n * CKB);
 
   const user = { id: crypto.randomUUID() };
@@ -65,7 +64,7 @@ async function harness(withRecovery = true) {
     },
   };
   return {
-    user, context, broadcasts, signings, pool, addCell, recovery, client,
+    user, context, broadcasts, signings, pool, addCell, addRaw, recovery, client, publicKey,
     hold: () => { let release!: () => void; gate = new Promise((resolve) => { release = resolve; }); return () => { release(); gate = undefined; }; },
     failOnce: () => { failNext = true; },
   };
@@ -135,6 +134,34 @@ test("the sign-in sweep never double-sends", { skip: !enabled }, async (t) => {
     assert.equal((await sweepLegacyAddress(h.context)).status, "pending");
     await sql`update keyway_v2_legacy_sweeps set sent_at = now() - interval '11 minutes' where user_id = ${h.user.id}`;
     assert.equal((await sweepLegacyAddress(h.context)).status, "swept");
+  });
+
+  await t.test("signs nothing for a recovery record the chain doesn't back", async () => {
+    // A record pointing at a list made from someone else's cell (written straight into the database).
+    const other = await anchoredRecovery(ccc.hexFrom(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true)), { seed: nextCell++ + 2_000_000 });
+    const h = await harness((own) => ({ ...own, enableTransactionHash: other.enable.hash() }));
+    const original = h.client.getTransaction.bind(h.client);
+    Object.assign(h.client, { getTransaction: async (hash: ccc.HexLike) => ccc.hexFrom(hash) === other.enable.hash() ? { status: "committed", transaction: other.enable } : original(hash) });
+    await assert.rejects(sweepLegacyAddress(h.context), /recovery record doesn't match the chain/);
+    assert.equal(h.signings.length, 0);
+    assert.equal(h.broadcasts.length, 0);
+  });
+
+  await t.test("leaves a token cell the node refuses to move and sweeps the rest", async () => {
+    const h = await harness();
+    const xudt = await h.client.getKnownScript(ccc.KnownScript.XUdt);
+    const secp = await secp256k1Lock(h.client, h.publicKey);
+    const token = ccc.Cell.from({ outPoint: { txHash: `0x${(nextCell++).toString(16).padStart(64, "f")}`, index: 0 }, cellOutput: { lock: secp, capacity: 142n * CKB, type: { codeHash: xudt.codeHash, hashType: xudt.hashType, args: `0x${"77".repeat(32)}` } }, outputData: ccc.hexFrom(ccc.numLeToBytes(5n, 16)) });
+    await h.addRaw(token);
+    Object.assign(h.client, { sendTransactionDry: async (transaction: ccc.Transaction) => {
+      const index = transaction.inputs.findIndex(({ previousOutput }) => previousOutput.eq(token.outPoint));
+      if (index >= 0) throw new Error(`Verification failed Script(TransactionScriptError { source: Inputs[${index}].Type, cause: ValidationFailure: see error code -52 })`);
+      return 1_000_000n;
+    } });
+    assert.equal((await sweepLegacyAddress(h.context)).status, "swept");
+    assert.equal(h.broadcasts.length, 1);
+    assert.ok(!h.broadcasts[0].inputs.some(({ previousOutput }) => previousOutput.eq(token.outPoint)));
+    assert.ok(h.broadcasts[0].outputs.every((output) => !output.type));
   });
 
   await t.test("does nothing for accounts without recovery or with nothing at the old address", async () => {
