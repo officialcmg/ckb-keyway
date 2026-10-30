@@ -1,5 +1,6 @@
-//! Runs the real RISC-V binaries in CKB-VM through ckb-debugger, with the argument Omnilock's exec passes.
-//! Build them first: `cargo build -p joyid-webauthn --release --target riscv64imac-unknown-none-elf`.
+//! Runs the real RISC-V binaries in CKB-VM through ckb-debugger, with the argument Omnilock's exec passes and,
+//! for the verifier, a rescue transaction to rebuild the approval text from (`rescue.json`: everything to one
+//! secp256k1 address). Build them first: `cargo build -p joyid-webauthn --release --target riscv64imac-unknown-none-elf`.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use p256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
@@ -16,10 +17,19 @@ fn binary(name: &str) -> PathBuf {
     path
 }
 
-/// Exit code and cycles of one ckb-debugger run with `argument` as argv[0].
+fn rescue_file() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/rescue.json")
+}
+
+/// Exit code and cycles of one ckb-debugger run with `argument` as argv[0]; the verifier runs as input 0's lock
+/// of the rescue transaction.
 fn run(name: &str, argument: &str) -> (i64, u64) {
     let debugger = std::env::var("CKB_DEBUGGER").unwrap_or_else(|_| "ckb-debugger".into());
-    let output = Command::new(debugger).arg("--bin").arg(binary(name)).arg(argument).output().expect("ckb-debugger must be installed");
+    let mut command = Command::new(debugger);
+    if name == BINARY {
+        command.arg("--tx-file").arg(rescue_file()).args(["--script", "input.0.lock"]);
+    }
+    let output = command.arg("--bin").arg(binary(name)).arg(argument).output().expect("ckb-debugger must be installed");
     let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     let field = |label: &str| {
         text.lines().find_map(|line| line.strip_prefix(label)).map(|value| value.trim().replace(',', "")).unwrap_or_else(|| panic!("no {label} in {text}"))
@@ -33,8 +43,16 @@ fn blake160(data: &[u8]) -> [u8; 20] {
     joyid_webauthn::blake160(data)
 }
 
+/// The approval text the verifier rebuilds from rescue.json: 10,000 CKB less a 765-shannon fee, to one
+/// secp256k1 address, no tokens.
+fn approval(msg: &[u8; 32]) -> String {
+    format!("KeyWay recovery\nMove everything to {RESCUE_DESTINATION}\nCKB: 9,999.99999235\nTokens: none\nFee: 0.00000765 CKB\nTransaction: 0x{}", hex::encode(msg))
+}
+
+const RESCUE_DESTINATION: &str = "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygfhutwy";
+
 fn challenge(msg: &[u8; 32]) -> String {
-    URL_SAFE_NO_PAD.encode(format!("CKB transaction: 0x{}", hex::encode(msg)))
+    URL_SAFE_NO_PAD.encode(approval(msg))
 }
 
 /// The clientDataJSON a browser produces for JoyID's testnet page, with Chrome's extra key.
@@ -75,7 +93,7 @@ impl Passkey {
 }
 
 fn blob(public_key: &[u8], rs: &[u8], auth_data: &[u8], client_data: &[u8], slot: usize) -> Vec<u8> {
-    let mut blob = vec![1u8];
+    let mut blob = vec![2u8, 0];
     blob.extend(public_key);
     blob.extend(rs);
     blob.extend((auth_data.len() as u16).to_le_bytes());
@@ -167,8 +185,12 @@ fn rejects_wrong_challenges() {
     // Padded base64url, upper-case hex.
     let padded = format!("{}=", challenge(&MSG));
     expect(&signed(&passkey, &client_data(&padded), 0x05, 0), 107);
-    let upper = URL_SAFE_NO_PAD.encode(format!("CKB transaction: 0x{}", hex::encode_upper(MSG)));
+    let upper = URL_SAFE_NO_PAD.encode(approval(&MSG).replace(&hex::encode(MSG), &hex::encode_upper(MSG)));
     expect(&signed(&passkey, &client_data(&upper), 0x05, 0), 107);
+    // The text before readable approvals.
+    expect(&signed(&passkey, &client_data(&URL_SAFE_NO_PAD.encode(format!("CKB transaction: 0x{}", hex::encode(MSG)))), 0x05, 0), 107);
+    // The mainnet prefix for the same destination: the network byte says testnet.
+    expect(&signed(&passkey, &client_data(&URL_SAFE_NO_PAD.encode(approval(&MSG).replace("ckt1", "ckb1"))), 0x05, 0), 107);
     let good = challenge(&MSG);
     // Only present in another field, or in a nested object, or smuggled inside the origin string.
     expect(&signed(&passkey, &format!(r#"{{"type":"webauthn.get","challenge":"x","origin":"{good}"}}"#), 0x05, 0), 107);
@@ -287,12 +309,14 @@ fn rejects_malformed_lengths() {
         edit(&mut bytes);
         argument(&hash, &MSG, &bytes)
     };
-    expect(&with(&|bytes| bytes[0] = 2), 102);
+    expect(&with(&|bytes| bytes[0] = 1), 102);
+    expect(&with(&|bytes| bytes[0] = 3), 102);
+    expect(&with(&|bytes| bytes[1] = 2), 110);
     expect(&with(&|bytes| bytes.truncate(bytes.len() - 1)), 102);
     expect(&with(&|bytes| bytes.push(1)), 102);
     expect(&with(&|bytes| { bytes.resize(700, 0); bytes[699] = 1; }), 102);
-    expect(&with(&|bytes| bytes[129] = 200), 102);
-    expect(&with(&|bytes| { let at = 131 + 37; bytes[at] = 0xff; bytes[at + 1] = 0xff; }), 102);
+    expect(&with(&|bytes| bytes[130] = 200), 102);
+    expect(&with(&|bytes| { let at = 132 + 37; bytes[at] = 0xff; bytes[at + 1] = 0xff; }), 102);
     expect(&with(&|bytes| bytes.truncate(100)), 102);
     // Over Omnilock's 1024-byte signature limit.
     expect(&with(&|bytes| bytes.resize(1025, 0)), 100);

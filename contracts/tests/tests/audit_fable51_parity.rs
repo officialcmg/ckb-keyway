@@ -7,7 +7,7 @@
 //!    VM, which fails the lock safely, but a parser that panics is a parser that was not reasoned about).
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use joyid_webauthn::{base64url, challenge_text, check_client_data, verify, Error, CHALLENGE_TEXT};
+use joyid_webauthn::{base64url, check_client_data, verify, Error};
 use p256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -34,10 +34,10 @@ fn fixture() -> Fixture {
 #[test]
 fn client_data_rules_agree_with_the_typescript_side() {
     let fixture = fixture();
-    let mut msg = [0u8; 32];
-    hex::decode_to_slice(&fixture.msg, &mut msg).unwrap();
+    // The cases' challenge is the base64url of this text; the parser doesn't care what the text says.
+    let text = format!("CKB transaction: 0x{}", fixture.msg);
     let mut challenge = [0u8; 111];
-    base64url(&challenge_text(&msg), &mut challenge);
+    base64url(text.as_bytes(), &mut challenge);
     let mut disagreements = Vec::new();
     for case in &fixture.cases {
         let json = STANDARD.decode(&case.client_data).unwrap();
@@ -49,18 +49,24 @@ fn client_data_rules_agree_with_the_typescript_side() {
     assert!(disagreements.is_empty(), "{disagreements:#?}");
 }
 
-/// A valid blob from a fresh P-256 key for `msg`, as the SDK's webAuthnSignatureBlob makes it.
+/// The approval text the verifier would rebuild for some rescue with this sighash.
+fn approval(msg: &[u8; 32]) -> Vec<u8> {
+    format!("KeyWay recovery\nMove everything to ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqfkjp7ljqd2tnjqxjvsvpwfgqvz5fz5rcqgqrxl6\nCKB: 100\nTokens: none\nFee: 0.00000765 CKB\nTransaction: 0x{}", hex::encode(msg)).into_bytes()
+}
+
+/// A valid version 2 blob from a fresh P-256 key for `msg`'s approval, as the SDK's webAuthnSignatureBlob makes it.
 fn valid_blob(msg: &[u8; 32]) -> (Vec<u8>, [u8; 20]) {
     let key = SigningKey::from_slice(&[7u8; 32]).unwrap();
     let public_key = key.verifying_key().to_encoded_point(false).as_bytes()[1..].to_vec();
-    let mut challenge = [0u8; 111];
-    base64url(&challenge_text(msg), &mut challenge);
+    let text = approval(msg);
+    let mut challenge = vec![0u8; text.len().div_ceil(3) * 4 - (3 - text.len() % 3) % 3];
+    base64url(&text, &mut challenge);
     let client_data = format!(r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://testnet.joyid.dev","crossOrigin":false}}"#, String::from_utf8_lossy(&challenge));
     let mut auth_data = Sha256::digest(b"testnet.joyid.dev").to_vec();
     auth_data.extend([0x05, 0, 0, 0, 0]);
     let digest = Sha256::new().chain_update(&auth_data).chain_update(Sha256::digest(client_data.as_bytes())).finalize();
     let signature: Signature = key.sign_prehash(&digest).unwrap();
-    let mut blob = vec![1u8];
+    let mut blob = vec![2u8, 0];
     blob.extend(&public_key);
     blob.extend(signature.to_bytes());
     blob.extend((auth_data.len() as u16).to_le_bytes());
@@ -71,14 +77,13 @@ fn valid_blob(msg: &[u8; 32]) -> (Vec<u8>, [u8; 20]) {
 }
 
 #[test]
-fn a_valid_blob_verifies_and_the_challenge_is_83_bytes() {
+fn a_valid_blob_verifies_only_for_its_approval() {
     let msg = [0x8au8; 32];
     let (blob, pubkey_hash) = valid_blob(&msg);
-    assert_eq!(CHALLENGE_TEXT, 83);
-    assert_eq!(verify(&pubkey_hash, &msg, &blob), Ok(()));
+    assert_eq!(verify(&pubkey_hash, &approval(&msg), &blob), Ok(()));
     let mut other = msg;
     other[0] ^= 1;
-    assert_eq!(verify(&pubkey_hash, &other, &blob), Err(Error::Challenge));
+    assert_eq!(verify(&pubkey_hash, &approval(&other), &blob), Err(Error::Challenge));
 }
 
 /// xorshift, so the run is reproducible without a dependency.
@@ -109,13 +114,17 @@ fn random_mutations_of_a_valid_blob_never_panic_and_never_verify() {
             _ => { let i = (rng.next() as usize) % mutated.len(); mutated.insert(i, rng.next() as u8); }
         }
         if mutated.len() > 1024 { mutated.truncate(1024); }
-        let result = std::panic::catch_unwind(|| verify(&pubkey_hash, &msg, &mutated));
+        let text = approval(&msg);
+        let result = std::panic::catch_unwind(|| verify(&pubkey_hash, &text, &mutated));
         let result = result.expect("verify must not panic");
         if mutated != blob {
             // The signature covers the public key hash, authenticatorData and clientDataJSON; the only
             // accepted change is extra zero padding.
             let padding_only = mutated.len() > blob.len() && mutated[..blob.len()] == blob[..] && mutated[blob.len()..].iter().all(|&b| b == 0);
-            assert_eq!(result.is_ok(), padding_only, "mutation accepted: {mutated:?}");
+            // The network byte only picks the address prefix the chain writes into the text, which this
+            // host-side check is handed already built.
+            let network_only = mutated.len() == blob.len() && mutated[1] <= 1 && mutated[..1] == blob[..1] && mutated[2..] == blob[2..];
+            assert_eq!(result.is_ok(), padding_only || network_only, "mutation accepted: {mutated:?}");
             if result.is_err() { rejected += 1; }
         }
     }

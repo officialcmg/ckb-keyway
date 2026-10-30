@@ -97,7 +97,8 @@ export function webAuthnSignatureLength(assertion: WebAuthnAssertion): number {
 export function clientDataMatches(json: Uint8Array, challenge: string): boolean {
   let text: string;
   try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(json);
+    // A leading byte-order mark stays in the text and fails the parse, as on chain.
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(json);
   } catch {
     return false;
   }

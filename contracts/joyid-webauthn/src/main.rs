@@ -28,7 +28,14 @@ fn program_entry() -> i8 {
     if argv.len() != 1 {
         return joyid_webauthn::Error::Args as i8;
     }
-    match joyid_webauthn::verify_exec_argument(argv[0].to_bytes()) {
+    let run = || -> Result<(), joyid_webauthn::Error> {
+        let argument = joyid_webauthn::parse_argument(argv[0].to_bytes())?;
+        let network = joyid_webauthn::signature_network(argument.signature())?;
+        let mut text = [0u8; joyid_webauthn::MAX_TEXT];
+        let length = keyway_approval::chain::rescue_text(network, &argument.msg, &mut text)?;
+        joyid_webauthn::verify(&argument.pubkey_hash, &text[..length], argument.signature())
+    };
+    match run() {
         Ok(()) => 0,
         Err(error) => error as i8,
     }
