@@ -4,31 +4,30 @@ import { keccak_256 } from "@noble/hashes/sha3.js";
 import { parseJoyIdSignature, verifyWebAuthn } from "./webauthn";
 
 /**
- * Backup signers for opt-in account recovery. Each backup is an Omnilock auth, 21 bytes: a flag and a 20-byte
- * id, and the AdminList's whitelist holds one SMT key per backup. A backup is accepted only with a signature
- * over `recoveryBackupChallenge`, proving the user controls it.
+ * Backup signers for opt-in account recovery. Each backup is an Omnilock exec identity (auth flag 0xFD), 21 bytes:
+ * the flag and blake160 of a 62-byte preimage naming one of KeyWay's verifiers (contracts/) by data hash and the
+ * backup's own 20-byte id. The AdminList's whitelist holds one SMT key per backup. A backup is accepted only with a
+ * signature over `recoveryBackupChallenge`, proving the user controls it.
  *
- * - EVM wallet, flag 0x12 (EthereumDisplaying): id = the 20-byte address. The wallet personal_signs the text
- *   "CKB transaction: 0x" followed by the sighash in 64 lowercase hex digits (83 bytes, `evmOmnilockMessage`), so
- *   Omnilock recovers the signer from a 65-byte r ‖ s ‖ recid signature over
- *   keccak256("\x19Ethereum Signed Message:\n83" ‖ that text), with recid 0 or 1 (a wallet's v of 27 or 28, minus 27).
- * - JoyID passkey, flag 0xFD (exec): id = blake160 of the 62-byte preimage `joyIdPreimage`, which names KeyWay's
- *   WebAuthn verifier (contracts/joyid-webauthn) by code hash and the passkey by blake160 of its public key, the
- *   20 bytes in the JoyID main key's lock args after 0x0001. Omnilock execs the verifier, which accepts only the
- *   passkey's WebAuthn signature over "CKB transaction: 0x" and the sighash (`joyIdOmnilockMessage`).
+ * Both kinds approve a spend by signing the same readable text (`recoveryApprovalText`): where everything goes,
+ * how much CKB, how many token cells, the fee and the transaction's sighash. The verifier rebuilds that text from
+ * the transaction it runs in and refuses anything that isn't a rescue to one address, so the wallet shows what is
+ * approved and a signature for one destination or amount can't move funds anywhere else.
+ * - EVM wallet: id = the 20-byte address; contracts/evm-personal-sign checks an EIP-191 personal_sign of the
+ *   text by that address.
+ * - JoyID passkey: id = blake160 of the passkey's public key, the 20 bytes in the JoyID main key's lock args after
+ *   0x0001; contracts/joyid-webauthn checks a WebAuthn assertion whose challenge is the text.
  * - CKB secp256k1 key, flag 0x00: id = blake160(public key). Used in tests; not accepted as a backup.
  */
 export type RecoveryBackup = { kind: "evm"; address: string } | { kind: "joyid"; address: string };
 
-/** A backup with its signature over the recovery challenge. */
+/** A backup with its signature over the recovery challenge for `challengeNonce`. */
 export type RecoveryBackupProof =
-  | { kind: "evm"; address: string; signature: string }
+  | { kind: "evm"; address: string; signature: string; challengeNonce: string }
   /** `signature` and `identity` as CCC's JoyID signer returns them from signMessage. */
-  | { kind: "joyid"; address: string; signature: string; identity: string };
+  | { kind: "joyid"; address: string; signature: string; identity: string; challengeNonce: string };
 
 export const OMNILOCK_AUTH_CKB = 0x00;
-/** Omnilock's IdentityFlagsEthereumDisplaying: personal_sign of "CKB transaction: 0x…". */
-export const OMNILOCK_AUTH_ETHEREUM_DISPLAYING = 0x12;
 /** Omnilock's IdentityFlagsExec: the identity is blake160 of a preimage naming a binary Omnilock execs. */
 export const OMNILOCK_AUTH_EXEC = 0xfd;
 export const MAX_RECOVERY_BACKUPS = 8;
@@ -38,20 +37,25 @@ const JOYID_ES256 = -7;
 const JOYID_RS256 = -257;
 
 /**
- * KeyWay's WebAuthn (P-256) verifier for JoyID backups, contracts/joyid-webauthn. Referenced by data hash
- * (hash_type data1), so the code a backup's identity names can never change; the testnet cell's lock can't be
- * unlocked, and anyone can redeploy the same bytes (build/joyid-webauthn) if it were ever gone.
- * Deployed by research/omnilock/phase4/deploy-verifier.ts.
+ * KeyWay's verifiers, referenced by data hash (hash_type data1), so the code a backup's identity names can never
+ * change; the testnet cells' locks can't be unlocked, and anyone can redeploy the same bytes (contracts/build) if
+ * a cell were ever gone. Deployed by research/omnilock/audit-fixes/deploy-verifiers.ts.
  */
-export const JOYID_WEBAUTHN_VERIFIER = {
-  codeHash: "0x24306cbe18769a05ca453722a53628ebb2453b72d1d6e6ed7a12b878b1ce9720",
+export const EVM_PERSONAL_SIGN_VERIFIER = {
+  codeHash: "0x33bd1c699b633d685a6f60f6b0ca16fe8bb896f81323926ca6e0671bf8ab3c88",
   hashType: "data1",
-  testnetCellDep: { outPoint: { txHash: "0x333fa2abd90d32133cd3aca9be68a2042f0bdf3d191c384d6bc77b3cd6ae387b", index: 0 }, depType: "code" },
+  testnetCellDep: { outPoint: { txHash: "0xff16f2aa117ba8e67aeb8946a8d3cb0c5f4627eab4fd8d7d5ecd938d7fa9014f", index: 0 }, depType: "code" },
 } as const;
-/** The verifier's cell dep on the client's network. It is deployed on testnet only so far. */
-export function joyIdVerifierCellDep(client: ccc.Client): ccc.CellDepLike {
-  if (client.addressPrefix !== "ckt") throw new Error("JoyID backups are only available on CKB testnet");
-  return JOYID_WEBAUTHN_VERIFIER.testnetCellDep;
+export const JOYID_WEBAUTHN_VERIFIER = {
+  codeHash: "0xf1185da23bf04b638010038b40ec64b587654db5cb98eb39f0373ad8919bcd89",
+  hashType: "data1",
+  testnetCellDep: { outPoint: { txHash: "0xb99678308cde0a54f856a00ec1e2ec46a318cdf05ef375cc381933dc00c7fb17", index: 0 }, depType: "code" },
+} as const;
+
+/** The verifier a backup of this kind needs as a cell dep. They are deployed on testnet only so far. */
+export function verifierCellDep(client: ccc.Client, kind: RecoveryBackup["kind"]): ccc.CellDepLike {
+  if (client.addressPrefix !== "ckt") throw new Error("Recovery backups are only available on CKB testnet");
+  return (kind === "evm" ? EVM_PERSONAL_SIGN_VERIFIER : JOYID_WEBAUTHN_VERIFIER).testnetCellDep;
 }
 
 /** Exec preimage hash type byte for data1 (Omnilock looks the binary up by data hash for anything but 1). */
@@ -63,18 +67,29 @@ const auth = (flag: number, id: ccc.BytesLike): ccc.Hex => {
   return ccc.hexFrom(ccc.bytesConcat([flag], bytes));
 };
 
-export function evmBackupAuth(address: string): ccc.Hex {
-  return auth(OMNILOCK_AUTH_ETHEREUM_DISPLAYING, normalizeEvmAddress(address));
+/**
+ * An exec identity's preimage, 62 bytes: verifier code hash ‖ hash type (data1) ‖ place 0 (cell dep) ‖ length 0 ‖
+ * offset 0 (the whole cell, u32 LE each) ‖ the backup's 20-byte id.
+ */
+export function execPreimage(codeHash: ccc.HexLike, id: ccc.BytesLike): ccc.Hex {
+  const bytes = ccc.bytesFrom(id);
+  if (bytes.length !== 20) throw new Error("A backup's id must be 20 bytes");
+  return ccc.hexFrom(ccc.bytesConcat(codeHash, [DATA1, 0x00], new Uint8Array(8), bytes));
 }
 
-/**
- * The exec identity's preimage, 62 bytes: verifier code hash ‖ hash type (data1) ‖ place 0 (cell dep) ‖ length 0 ‖
- * offset 0 (the whole cell, u32 LE each) ‖ blake160 of the passkey's public key.
- */
+/** The EVM verifier's preimage for an address. */
+export function evmPreimage(address: string): ccc.Hex {
+  return execPreimage(EVM_PERSONAL_SIGN_VERIFIER.codeHash, normalizeEvmAddress(address));
+}
+
+/** 0xFD ‖ blake160(preimage) for an EVM address. */
+export function evmBackupAuth(address: string): ccc.Hex {
+  return execAuth(evmPreimage(address));
+}
+
+/** The WebAuthn verifier's preimage for blake160 of a passkey's public key. */
 export function joyIdPreimage(pubkeyHash: ccc.BytesLike, codeHash: ccc.HexLike = JOYID_WEBAUTHN_VERIFIER.codeHash): ccc.Hex {
-  const hash = ccc.bytesFrom(pubkeyHash);
-  if (hash.length !== 20) throw new Error("A passkey's public key hash must be 20 bytes");
-  return ccc.hexFrom(ccc.bytesConcat(codeHash, [DATA1, 0x00], new Uint8Array(8), hash));
+  return execPreimage(codeHash, pubkeyHash);
 }
 
 /** 0xFD ‖ blake160(preimage) for a JoyID main-key lock. */
@@ -145,8 +160,21 @@ export function describeBackup(backup: RecoveryBackup): string {
   return backup.kind === "evm" ? `EVM wallet ${short(backup.address)}` : `JoyID ${short(backup.address)}`;
 }
 
-/** The message a backup signs to prove the user controls it. `account` is the account's secp256k1 address. */
-export function recoveryBackupChallenge(account: string, backup: RecoveryBackup): string {
+/** How long a backup has to sign the recovery challenge after KeyWay issues its nonce. */
+export const BACKUP_CHALLENGE_TTL_MS = 15 * 60_000;
+
+/** When a challenge nonce (`<expiry in ms>.<random>.<server tag>`, issued by KeyWay's server) stops being accepted. */
+export function backupChallengeExpiry(nonce: string): Date {
+  const match = /^(\d{13})\.[0-9a-f]{32}\.[0-9a-f]{64}$/.exec(typeof nonce === "string" ? nonce : "");
+  if (!match) throw new Error("The backup's approval request is invalid. Start adding the backup again");
+  return new Date(Number(match[1]));
+}
+
+/**
+ * The message a backup signs to prove the user controls it. `account` is the account's secp256k1 address;
+ * `nonce` comes from KeyWay's server and expires, so a signature only works for one request, briefly.
+ */
+export function recoveryBackupChallenge(account: string, backup: RecoveryBackup, nonce: string): string {
   return [
     "KeyWay account recovery",
     "",
@@ -154,23 +182,31 @@ export function recoveryBackupChallenge(account: string, backup: RecoveryBackup)
     "",
     `Account: ${account}`,
     `Backup: ${backup.kind === "evm" ? `EVM wallet ${normalizeEvmAddress(backup.address)}` : `JoyID ${backup.address}`}`,
+    `Request: ${nonce}`,
+    `Valid until: ${backupChallengeExpiry(nonce).toISOString()}`,
   ].join("\n");
 }
 
 /** The address an EIP-191 personal_sign signature (r ‖ s ‖ v) recovers to. */
 export function evmPersonalSignAddress(message: string | Uint8Array, signature: ccc.HexLike): ccc.Hex {
   const bytes = typeof message === "string" ? new TextEncoder().encode(message) : message;
-  return evmAddressFrom(evmPersonalSignDigest(bytes), evmOmnilockSignature(signature));
+  return evmAddressFrom(evmPersonalSignDigest(bytes), evmSignature(signature));
 }
 
-/** A wallet's 65-byte r ‖ s ‖ v signature with v reduced to the 0/1 recovery id Omnilock expects. */
-export function evmOmnilockSignature(signature: ccc.HexLike): ccc.Hex {
+/** A wallet's 65-byte r ‖ s ‖ v signature with v reduced to the 0/1 recovery id. */
+export function evmSignature(signature: ccc.HexLike): ccc.Hex {
   const bytes = ccc.bytesFrom(signature).slice();
   if (bytes.length !== 65) throw new Error("An EVM signature must be 65 bytes");
   if (bytes[64] >= 27) bytes[64] -= 27;
   if (bytes[64] > 1) throw new Error("The EVM signature's recovery id is invalid");
   return ccc.hexFrom(bytes);
 }
+
+/** The EVM verifier's signature: version 1 ‖ network byte ‖ r ‖ s ‖ v, 67 bytes. */
+export function evmApprovalSignature(networkByte: 0 | 1, signature: ccc.HexLike): ccc.Hex {
+  return ccc.hexFrom(ccc.bytesConcat([1, networkByte], evmSignature(signature)));
+}
+export const EVM_APPROVAL_SIGNATURE_LENGTH = 67;
 
 function evmAddressFrom(digest: Uint8Array, signature: ccc.Hex): ccc.Hex {
   const bytes = ccc.bytesFrom(signature);
@@ -179,33 +215,21 @@ function evmAddressFrom(digest: Uint8Array, signature: ccc.Hex): ccc.Hex {
   return ccc.hexFrom(keccak_256(uncompressed.slice(1)).slice(12));
 }
 
-/**
- * The text an EVM backup (flag 0x12) personal_signs to approve a transaction: "CKB transaction: 0x" and the
- * 32-byte sighash in lowercase hex, as Omnilock's `convert_eth_message_displaying` rebuilds it.
- */
-export function evmOmnilockMessage(sighash: ccc.HexLike): string {
-  const bytes = ccc.bytesFrom(sighash);
-  if (bytes.length !== 32) throw new Error("A sighash must be 32 bytes");
-  return `CKB transaction: ${ccc.hexFrom(bytes)}`;
-}
-
-/** The digest Omnilock checks a flag-0x12 signature against: personal_sign's hash of `evmOmnilockMessage`. */
-export function evmOmnilockDigest(sighash: ccc.HexLike): Uint8Array {
-  return evmPersonalSignDigest(new TextEncoder().encode(evmOmnilockMessage(sighash)));
-}
-
-const evmPersonalSignDigest = (bytes: Uint8Array) =>
+export const evmPersonalSignDigest = (bytes: Uint8Array) =>
   keccak_256(ccc.bytesConcat(new TextEncoder().encode(`\x19Ethereum Signed Message:\n${bytes.length}`), bytes));
 
 /**
- * Checks a backup's signature over the recovery challenge for this account and returns the backup. EVM:
- * EIP-191 personal_sign by that address. JoyID: a WebAuthn assertion, checked as the on-chain verifier checks
- * spends, by the passkey (main key) whose public key is the one in the JoyID address's lock args.
+ * Checks a backup's signature over the recovery challenge for this account and its nonce, and returns the backup.
+ * EVM: EIP-191 personal_sign by that address. JoyID: a WebAuthn assertion, checked as the on-chain verifier checks
+ * spends, by the passkey (main key) whose public key is the one in the JoyID address's lock args. An expired nonce
+ * is refused; that the server issued it is the server's own check.
  */
-export async function verifyBackupOwnership(client: ccc.Client, account: string, value: unknown): Promise<RecoveryBackup> {
+export async function verifyBackupOwnership(client: ccc.Client, account: string, value: unknown, now = new Date()): Promise<RecoveryBackup> {
   const backup = parseBackup(value);
   const proof = value as Record<string, unknown>;
-  const challenge = recoveryBackupChallenge(account, backup);
+  if (typeof proof.challengeNonce !== "string") throw new Error("The backup's approval request is invalid. Start adding the backup again");
+  if (backupChallengeExpiry(proof.challengeNonce) <= now) throw new Error(`${describeBackup(backup)}'s approval expired. Sign with it again`);
+  const challenge = recoveryBackupChallenge(account, backup, proof.challengeNonce);
   const refused = () => new Error(`${describeBackup(backup)} didn't sign the recovery approval`);
   const lock = backup.kind === "joyid" ? await joyIdLock(client, backup.address) : undefined;
   if (typeof proof.signature !== "string") throw refused();
@@ -252,12 +276,6 @@ export function joyIdMainKey(identityJson: string, signatureJson?: string): ccc.
   return /^0x[0-9a-fA-F]{128}$/.test(publicKey) ? ccc.hexFrom(publicKey) : undefined;
 }
 
-/**
- * The text a JoyID backup signs to approve a transaction, the same as an EVM backup's: "CKB transaction: 0x" and
- * the sighash in lowercase hex. JoyID's page shows it and signs its UTF-8 bytes as the WebAuthn challenge.
- */
-export const joyIdOmnilockMessage = evmOmnilockMessage;
-
 // Molecule, for the two tables the admin witness needs.
 const u32 = (value: number) => ccc.numLeToBytes(value, 4);
 function table(fields: Uint8Array[]): Uint8Array {
@@ -269,7 +287,7 @@ const fixvec = (bytes: Uint8Array) => ccc.bytesConcat(u32(bytes.length), bytes);
 
 /**
  * OmniLockWitnessLock for the administrator path: { signature, omni_identity: { identity: auth,
- * proofs: [{ mask: 3, proof }] }, preimage }. The preimage is only there for an exec (0xFD) backup.
+ * proofs: [{ mask: 3, proof }] }, preimage }. Every backup is an exec (0xFD) identity, so the preimage is there.
  */
 export function omnilockAdminWitnessLock(input: { signature: ccc.HexLike; auth: ccc.HexLike; proof: ccc.HexLike; preimage?: ccc.HexLike }): ccc.Hex {
   const authBytes = ccc.bytesFrom(input.auth);

@@ -10,6 +10,7 @@ import {
   planRescue,
   RESCUE_NETWORKS,
   rescueClient,
+  RescueError,
   rescueEntryForJoyId,
   sendRescue,
   signRescueWithEvm,
@@ -51,6 +52,8 @@ export function RescueView() {
   const [error, setError] = useState<{ step: "account" | "backup" | "review" | "sign"; text: string }>();
   // One client per lookup, so every later step talks to the node the account was read from.
   const [client, setClient] = useState<ccc.Client>();
+  // Cells the node refused to move in an earlier try, left out of the next one.
+  const [excluded, setExcluded] = useState<ccc.OutPoint[]>([]);
 
   const run = async (step: NonNullable<typeof error>["step"], what: Busy, task: () => Promise<void>) => {
     setBusy(what);
@@ -65,7 +68,7 @@ export function RescueView() {
   };
 
   const reset = (from: "account" | "backup" | "review") => {
-    if (from === "account") { setAccount(undefined); setClient(undefined); }
+    if (from === "account") { setAccount(undefined); setClient(undefined); setExcluded([]); }
     if (from !== "review") setBackup(undefined);
     setPlan(undefined);
     setSent(undefined);
@@ -108,7 +111,18 @@ export function RescueView() {
     const signed = backup!.kind === "evm"
       ? await signRescueWithEvm(client!, account!, plan!, backup!.ethereum)
       : await signRescueWithJoyId(client!, account!, plan!, backup!.signer);
-    setSent(await sendRescue(client!, signed));
+    try {
+      setSent(await sendRescue(client!, signed));
+    } catch (cause) {
+      if (!(cause instanceof RescueError) || cause.code !== "blocked" || !cause.cell) throw cause;
+      // Leave the blamed cell out, rebuild, and ask for a new signature over the new transaction.
+      const nextExcluded = [...excluded, cause.cell];
+      const nextAccount = await openRescueAccount(client!, address, nextExcluded);
+      setExcluded(nextExcluded);
+      setAccount(nextAccount);
+      setPlan(await planRescue(client!, nextAccount, nextAccount.entries.find(({ auth }) => auth === backup!.entry.auth) ?? backup!.entry, destination));
+      throw cause;
+    }
   });
 
   const explorer = EXPLORERS[network];
@@ -159,11 +173,15 @@ export function RescueView() {
 
         {account && (
           <div className="rescue-account">
+            <p className="rescue-note">
+              These amounts come from the CKB node above. Each cell is checked against the transaction that created it, so
+              the node can&apos;t change what a cell holds, only leave cells out. If the balance looks wrong, use another node.
+            </p>
             <dl className="detail-list">
               <div><dt>CKB</dt><dd>{ckb(account.ckb)}</dd></div>
               {account.tokens.map((token) => <div key={token.typeHash}><dt>Token</dt><dd>{token.amountText}</dd></div>)}
               {account.tokenCkb > 0n && <div><dt>Held by token cells</dt><dd>{ckb(account.tokenCkb)}</dd></div>}
-              <div><dt>Recovery list</dt><dd>{ckb(account.adminList.cellOutput.capacity)}, stays</dd></div>
+              <div><dt>Recovery list</dt><dd>{ckb(account.adminList.cellOutput.capacity)}, stays (only the account&apos;s own key can move it)</dd></div>
               {account.other.length > 0 && <div><dt>Other cells, not moved</dt><dd>{account.other.length} ({ckb(account.other.reduce((sum, cell) => sum + cell.cellOutput.capacity, 0n))})</dd></div>}
             </dl>
             <div className="rescue-backups">
@@ -248,9 +266,14 @@ export function RescueView() {
               backups and can&apos;t be moved by a rescue
               {account.other.length > 0 ? `, and ${account.other.length} other cell${account.other.length === 1 ? "" : "s"} this page doesn't move` : ""}.
             </p>
-            {plan.entry.backup.kind === "evm" && (
-              <p className="rescue-copy">Your EVM wallet will ask you to sign a message that reads &ldquo;CKB transaction: 0x…&rdquo;. That message approves exactly this transaction.</p>
-            )}
+            <div className="rescue-approval">
+              <p className="rescue-copy">
+                Your {plan.entry.backup.kind === "evm" ? "EVM wallet" : "JoyID passkey"} will ask you to sign this text. Check that the
+                address and amounts in it are yours before you sign. The network rebuilds the same text from the transaction, so the
+                signature can&apos;t move funds anywhere else.
+              </p>
+              <pre className="rescue-approval__text mono">{plan.approvalText}</pre>
+            </div>
             {!sent && (
               <button type="button" className={`btn btn--route btn--lg rescue-action${busy === "sign" ? " btn--busy" : ""}`} onClick={sign} disabled={Boolean(busy)}>
                 {busy === "sign" ? <><SpinnerIcon /> Waiting for the signature</> : "Sign and send"}
