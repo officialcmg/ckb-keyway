@@ -83,11 +83,14 @@ export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.Hex
   });
   const plan = planSweep(plainTotal - extra, tokens.length, keepReserve);
   if (!plan) return undefined;
-  let { toUser } = plan;
-  const { reserve } = plan;
-  // Too little for a plain cell of its own and no reserve to join: it rides in the first token cell.
-  if (reserve === 0n && toUser > 0n && toUser < MIN_PLAIN_CELL + SWEEP_FEE_MARGIN && tokens.length > 0) {
-    tokens[0].output.capacity += toUser;
+  let { toUser, reserve } = plan;
+  // Too little for a plain cell of its own at the destination (95 CKB at an Omnilock): it joins the reserve, or
+  // rides in the first token cell, or waits for a later sweep.
+  const minimumPlain = ccc.fixedPointFrom(ccc.CellOutput.from({ lock: to, capacity: 0n }).occupiedSize);
+  if (toUser > 0n && toUser < minimumPlain + SWEEP_FEE_MARGIN) {
+    if (reserve > 0n) reserve += toUser;
+    else if (tokens.length > 0) tokens[0].output.capacity += toUser;
+    else return undefined;
     toUser = 0n;
   }
   const plainOutputs = [

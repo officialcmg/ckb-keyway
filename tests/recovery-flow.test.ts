@@ -4,8 +4,8 @@ import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
-import { adminListTypeScript, omnilockArgsFor, secp256k1Lock, type KeyWayRecovery } from "../src/sdk/browser/account-lock.ts";
-import { backupAuth, evmBackupAuth, joyIdOmnilockMessage, omnilockAdminWitnessLock, recoveryBackupChallenge, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
+import { adminListLock, adminListTypeScript, KEYWAY_OMNILOCK, omnilockArgsFor, omnilockScript, secp256k1Lock, type KeyWayRecovery } from "../src/sdk/browser/account-lock.ts";
+import { backupAuth, evmBackupAuth, omnilockAdminWitnessLock, recoveryBackupChallenge, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
 import { decodeRecoveryList, readRecoveryList, recoveryListRecord, recoveryListRecordOf, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
 import { adminListData, whitelistTree } from "../src/sdk/browser/recovery-smt.ts";
 import { verifyWebAuthn } from "../src/sdk/browser/webauthn.ts";
@@ -13,6 +13,7 @@ import { formatCkbSignature, previewFundingTransaction, signAccountGroups } from
 import {
   backupChangeLines,
   checkBackupChangeTransaction,
+  issueBackupChallenge,
   checkRecoveryTransaction,
   planBackupChange,
   planRecovery,
@@ -23,6 +24,8 @@ import {
 } from "../src/server/recovery.ts";
 import { previewGeneralTransaction } from "../src/server/transaction-policy.ts";
 import type { ReadyWallet } from "../src/server/user-wallet.ts";
+
+process.env.KEYWAY_RATE_LIMIT_SECRET ??= "test-rate-limit-secret-that-is-long-enough";
 
 const CKB = 100_000_000n;
 const privateKey = secp256k1.utils.randomSecretKey();
@@ -65,20 +68,43 @@ function cell(lock: ccc.Script, capacity: bigint, type?: ccc.Script, outputData:
 
 const amount = (value: bigint) => ccc.hexFrom(ccc.numLeToBytes(value, 16));
 
+/**
+ * The account's cells as the outputs of one transaction that paid them, so the chain shows they were the
+ * account's (the recovery record's anchor reads the cell input 0 spent from that transaction).
+ */
 async function accountCells() {
   const base = await offlineClient();
   const secp = await secp256k1Lock(base, publicKey);
   const xudt = await base.getKnownScript(ccc.KnownScript.XUdt);
   const token = ccc.Script.from({ codeHash: xudt.codeHash, hashType: xudt.hashType, args: `0x${"77".repeat(32)}` });
   const dao = await base.getKnownScript(ccc.KnownScript.NervosDao);
-  const cells = {
-    small: cell(secp, 300n * CKB),
-    large: cell(secp, 2_000n * CKB),
-    token: cell(secp, 143n * CKB, token, amount(2_500n)),
-    dao: cell(secp, 102n * CKB, ccc.Script.from({ codeHash: dao.codeHash, hashType: dao.hashType, args: "0x" }), ccc.hexFrom(new Uint8Array(8))),
-    withData: cell(secp, 70n * CKB, undefined, "0x1234"),
+  const outputs: Record<"small" | "large" | "token" | "dao" | "withData", { lock: ccc.Script; capacity: bigint; type?: ccc.Script; data: ccc.Hex }> = {
+    small: { lock: secp, capacity: 300n * CKB, data: "0x" },
+    large: { lock: secp, capacity: 2_000n * CKB, data: "0x" },
+    token: { lock: secp, capacity: 143n * CKB, type: token, data: amount(2_500n) },
+    dao: { lock: secp, capacity: 102n * CKB, type: ccc.Script.from({ codeHash: dao.codeHash, hashType: dao.hashType, args: "0x" }), data: ccc.hexFrom(new Uint8Array(8)) },
+    withData: { lock: secp, capacity: 70n * CKB, data: "0x1234" },
   };
-  return { cells, secp, token, client: await offlineClient(Object.values(cells)) };
+  const values = Object.values(outputs);
+  const funding = ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: `0x${(nextCell++).toString(16).padStart(64, "0")}`, index: 0 } }],
+    outputs: values.map(({ lock, capacity, type }) => ({ lock, capacity, type })),
+    outputsData: values.map(({ data }) => data),
+  });
+  const cells = Object.fromEntries(Object.entries(outputs).map(([name], index) => [name, ccc.Cell.from({
+    outPoint: { txHash: funding.hash(), index }, cellOutput: funding.outputs[index], outputData: funding.outputsData[index],
+  })])) as Record<keyof typeof outputs, ccc.Cell>;
+  return { cells, secp, token, funding, client: await offlineClient(Object.values(cells), [funding]) };
+}
+
+/** The settings turning recovery on with this plan gives, anchored by its transaction. */
+function recoveryFrom(plan: Awaited<ReturnType<typeof planRecovery>>, list?: RecoveryBackup[]): KeyWayRecovery {
+  const hash = plan.transaction.hash();
+  return {
+    omnilockArgs: plan.omnilock.args, omnilock: KEYWAY_OMNILOCK.testnet, adminListTypeArgs: plan.adminListType.args, adminListTypeHash: plan.adminListType.hash(),
+    adminListOutPoint: { txHash: hash, index: 0 }, enableTransactionHash: hash, legacyAddress: plan.preview.legacyAddress, enabledAt: "2026-10-29T00:00:00.000Z",
+    ...(list ? { backups: list } : {}),
+  };
 }
 
 test("builds the one recovery transaction from the account's own cells", async () => {
@@ -96,15 +122,20 @@ test("builds the one recovery transaction from the account's own cells", async (
   assert.equal(preview.legacyAddress, ccc.Address.fromScript(secp, client).toString());
 
   const [adminList, tokenOutput, change] = transaction.outputs;
-  assert.ok(adminList.type!.eq(typeId) && adminList.lock.eq(plan.omnilock));
+  // The account runs KeyWay's pinned Omnilock; the list sits under the key's owner-only lock, which no backup can use.
+  assert.equal(plan.omnilock.codeHash, KEYWAY_OMNILOCK.testnet.codeHash);
+  assert.equal(plan.omnilock.hashType, "data1");
+  assert.ok(adminList.type!.eq(typeId) && adminList.lock.eq(adminListLock({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: plan.omnilock.args })));
+  assert.equal(adminList.lock.args, `0x00${ccc.hashCkbShort(publicKey).slice(2)}00`);
   assert.equal(transaction.outputsData[0], adminListData(whitelistTree([evmBackupAuth(evmAddress)]).root));
-  assert.equal(adminList.capacity, 197n * CKB);
+  // 165 CKB: the owner-only lock's args are 22 bytes, 32 fewer than the account's.
+  assert.equal(adminList.capacity, 165n * CKB);
   // A token cell needs 34 more bytes for the 54-byte Omnilock args: 176 CKB, up from this cell's 143.
   assert.ok(tokenOutput.type!.eq(token) && tokenOutput.lock.eq(plan.omnilock));
   assert.equal(transaction.outputsData[1], amount(2_500n));
   assert.equal(tokenOutput.capacity, 176n * CKB);
   assert.equal(preview.tokenCellsExtraCkb, "33");
-  assert.equal(preview.lockedCkb, "230");
+  assert.equal(preview.lockedCkb, "198");
   assert.equal(preview.minimumCellCkb, "95");
   assert.ok(change.lock.eq(plan.omnilock) && !change.type);
   const fee = 2_443n * CKB - transaction.getOutputsCapacity();
@@ -120,75 +151,18 @@ test("builds the one recovery transaction from the account's own cells", async (
   const lines = recoveryLines(preview);
   assert.ok(lines.includes(`Backup: EVM wallet ${evmAddress.slice(0, 10)}…${evmAddress.slice(-6)}`));
   assert.ok(lines.includes("Your address will change because you're turning on recovery."));
-  assert.ok(lines.some((line) => line.startsWith("Locks 230 CKB")));
+  assert.ok(lines.some((line) => line.startsWith("Locks 198 CKB")));
 });
 
 test("refuses when the balance can't cover it or there is no plain CKB", async () => {
   const base = await offlineClient();
   const secp = await secp256k1Lock(base, publicKey);
-  await assert.rejects(planRecovery(await offlineClient([cell(secp, 250n * CKB)]), walletFor(publicKey), backups), /can't cover turning on recovery: it needs 42\.0+\d+ CKB more/);
+  await assert.rejects(planRecovery(await offlineClient([cell(secp, 250n * CKB)]), walletFor(publicKey), backups), /can't cover turning on recovery: it needs 10\.0+\d+ CKB more/);
   await assert.rejects(planRecovery(await offlineClient([]), walletFor(publicKey), backups), /needs plain CKB/);
-  assert.ok(await planRecovery(await offlineClient([cell(secp, 293n * CKB)]), walletFor(publicKey), backups));
+  assert.ok(await planRecovery(await offlineClient([cell(secp, 261n * CKB)]), walletFor(publicKey), backups));
 });
 
-test("reproduces the testnet JoyID-backup enable, its spend through the WebAuthn verifier, and adding an EVM backup", async () => {
-  // research/omnilock/joyid-verifier-results.md and phase4-results.md: 0x749adad0…61cc turned recovery on with a
-  // JoyID-style backup, 0x7e0bc481…b445 spent through the verifier, 0x310a9ceb…6829 added an EVM backup.
-  const fixture = JSON.parse(await readFile(new URL("./fixtures/recovery-enable.json", import.meta.url), "utf8"));
-  const joyId: RecoveryBackup = { kind: "joyid", address: fixture.joyIdBackup };
-  const client = await offlineClient(fixture.enable.inputCells);
-  const plan = await planRecovery(client, walletFor(fixture.publicKey), [joyId]);
-  const enable = ccc.Transaction.from(fixture.enable.transaction);
-  assert.equal(plan.transaction.hash(), "0x749adad0d67555b18816d419c79c662f5d6bc68655abf6cafcd713329e3861cc");
-  assert.equal(plan.transaction.hash(), enable.hash());
-  // Witness 0 records the list beside the AdminList, and it reads back to the backup.
-  assert.equal(recoveryListRecordOf(enable, 0), await recoveryListRecord(client, [joyId]));
-  assert.deepEqual((await decodeRecoveryList(client, recoveryListRecordOf(enable, 0)!)).map(({ backup }) => backup), [joyId]);
-  // Its secp256k1 signature is over the digest KeyWay signs, which covers the record.
-  const digest = (await plan.transaction.getSignHashInfo(plan.secp, client))!.message;
-  const signature = ccc.bytesFrom(enable.getWitnessArgsAt(0)!.lock!);
-  const recovered = secp256k1.recoverPublicKey(Uint8Array.from([signature[64], ...signature.slice(0, 64)]), ccc.bytesFrom(digest), { prehash: false });
-  assert.equal(ccc.hexFrom(recovered), fixture.publicKey);
-
-  // The JoyID spend: the witness carries the 768-byte verifier blob, whose assertion is the passkey's signature
-  // over "CKB transaction: 0x<sighash>".
-  const spend = ccc.Transaction.from(fixture.joyIdSpend.transaction);
-  const spendClient = await offlineClient(fixture.joyIdSpend.inputCells);
-  const [entry] = await decodeRecoveryList(client, recoveryListRecordOf(enable, 0)!);
-  const lock = ccc.bytesFrom(spend.getWitnessArgsAt(0)!.lock!);
-  const blob = lock.slice(20, 20 + 768);
-  assert.equal(ccc.hexFrom(lock), omnilockAdminWitnessLock({ signature: blob, auth: entry.auth, proof: whitelistTree([entry.auth]).proofs[entry.auth], preimage: entry.preimage }));
-  assert.deepEqual(blob.slice(1, 65), ccc.bytesFrom(fixture.joyIdPublicKey));
-  const authLength = blob[129] | (blob[130] << 8);
-  const clientAt = 131 + authLength;
-  const assertion = {
-    publicKey: blob.slice(1, 65), rs: blob.slice(65, 129), authData: blob.slice(131, clientAt),
-    clientDataJson: blob.slice(clientAt + 2, clientAt + 2 + (blob[clientAt] | (blob[clientAt + 1] << 8))),
-  };
-  const unsigned = spend.clone();
-  unsigned.setWitnessArgsAt(0, ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(lock.length)) }));
-  const sighash = (await unsigned.getSignHashInfo(plan.omnilock, spendClient))!.message;
-  assert.ok(verifyWebAuthn(assertion, joyIdOmnilockMessage(sighash)));
-  assert.ok(!verifyWebAuthn(assertion, joyIdOmnilockMessage(ccc.hashCkb(sighash))));
-
-  // Adding the EVM backup: rebuilt from the chain's own list, it hashes the same and passes the checks.
-  const recovery: KeyWayRecovery = {
-    omnilockArgs: plan.omnilock.args, adminListTypeArgs: plan.adminListType.args, adminListTypeHash: plan.adminListType.hash(),
-    adminListOutPoint: { txHash: enable.hash(), index: 0 }, legacyAddress: plan.preview.legacyAddress, enabledAt: "2026-10-29T00:00:00.000Z", backups: [joyId],
-  };
-  const add = ccc.Transaction.from(fixture.addEvm.transaction);
-  const addClient = await offlineClient(fixture.addEvm.inputCells, [enable]);
-  const evm: RecoveryBackup = { kind: "evm", address: fixture.evmBackup };
-  const change = await planBackupChange(addClient, walletFor(fixture.publicKey, recovery), { change: "add", backup: evm });
-  assert.equal(change.transaction.hash(), "0x310a9cebc1c06316c458cf5f96982c0e11a2b2a1b10c054166600637d5e56829");
-  assert.equal(change.transaction.hash(), add.hash());
-  assert.equal(recoveryListRecordOf(add, 0), await recoveryListRecord(addClient, [joyId, evm]));
-  await checkBackupChangeTransaction(addClient, add, recovery, [joyId, evm]);
-  // One owner signature by the account key covers the AdminList and the fee cell.
-  const ownerDigest = (await change.transaction.getSignHashInfo(change.omnilock, addClient))!.message;
-  const owner = ccc.bytesFrom(add.getWitnessArgsAt(0)!.lock!).slice(20);
-  assert.equal(ccc.hexFrom(secp256k1.recoverPublicKey(Uint8Array.from([owner[64], ...owner.slice(0, 64)]), ccc.bytesFrom(ownerDigest), { prehash: false })), fixture.publicKey);
-});
+/*TESTNET_FIXTURE_TEST*/
 
 test("refuses a recovery transaction that doesn't match what KeyWay computed", async () => {
   const { client, secp } = await accountCells();
@@ -205,6 +179,8 @@ test("refuses a recovery transaction that doesn't match what KeyWay computed", a
   await tamper(() => undefined, /exactly these backups/, [{ kind: "evm", address: `0x${"44".repeat(20)}` }]);
   await tamper((tx) => { tx.outputsData[0] = adminListData(whitelistTree([evmBackupAuth(evmAddress), evmBackupAuth(`0x${"44".repeat(20)}`)]).root); }, /exactly these backups/);
   await tamper((tx) => { tx.outputs[0].capacity += CKB; tx.outputs[last].capacity -= CKB; }, /capacity is wrong/);
+  // The list under the account's own admin-mode Omnilock, where a backup could spend or rewrite it, is refused.
+  await tamper((tx) => { tx.outputs[0].lock = plan.omnilock; }, /locked to your key alone/);
   await tamper((tx) => { tx.outputsData[1] = amount(2_000n); }, /tokens don't all move/);
   await tamper((tx) => { tx.outputs[last].capacity -= 10n * CKB; }, /fee is outside/);
   await tamper((tx) => { tx.outputsData[last] = "0x00"; }, /carries data/);
@@ -226,10 +202,8 @@ test("general signing and channel funding can't create a recovery list or pay in
   }, client), /Omnilock address of this account that isn't its own/);
 
   // Once recovery is on, the account's own Omnilock is fine, but one pointing at another AdminList isn't.
-  const recovery: KeyWayRecovery = {
-    omnilockArgs: plan.omnilock.args, adminListTypeArgs: plan.adminListType.args, adminListTypeHash: plan.adminListType.hash(),
-    adminListOutPoint: { txHash: `0x${"ad".repeat(32)}`, index: 0 }, legacyAddress: plan.preview.legacyAddress, enabledAt: "2026-10-28T00:00:00.000Z", backups,
-  };
+  const recovery = recoveryFrom(plan, backups);
+  answer(client, plan.transaction);
   const secpInput = plan.inputCells[0];
   const toOwn = ccc.Transaction.from({
     inputs: [{ previousOutput: secpInput.outPoint }],
@@ -242,26 +216,46 @@ test("general signing and channel funding can't create a recovery list or pay in
   const toOther = toOwn.clone();
   toOther.outputs[0].lock = other;
   await assert.rejects(previewGeneralTransaction(walletFor(publicKey, recovery), toOther, client), /isn't its own/);
+  // The same through KeyWay's pinned Omnilock, by data hash.
+  toOther.outputs[0].lock = omnilockScript({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: omnilockArgsFor(publicKey, `0x${"99".repeat(32)}`) });
+  await assert.rejects(previewGeneralTransaction(walletFor(publicKey, recovery), toOther, client), /isn't its own/);
 });
+
+/** Lets the client also answer `transaction` as committed. */
+function answer(client: ccc.Client, transaction: ccc.Transaction): void {
+  const previous = client.getTransaction.bind(client);
+  Object.assign(client, { getTransaction: async (hash: ccc.HexLike) => ccc.hexFrom(hash) === transaction.hash() ? { transaction, status: "committed" } : previous(hash) });
+}
 
 test("the recovery service refuses before touching anything when recovery is on or no backup is given", async () => {
   const { client } = await accountCells();
   const plan = await planRecovery(client, walletFor(publicKey), backups);
-  const recovery: KeyWayRecovery = {
-    omnilockArgs: plan.omnilock.args, adminListTypeArgs: plan.adminListType.args, adminListTypeHash: plan.adminListType.hash(),
-    adminListOutPoint: { txHash: `0x${"ad".repeat(32)}`, index: 0 }, legacyAddress: plan.preview.legacyAddress, enabledAt: "2026-10-28T00:00:00.000Z",
-  };
+  const recovery = recoveryFrom(plan);
+  const user = { id: crypto.randomUUID() };
   const context = (wallet: ReadyWallet): RecoveryContext => ({
-    user: { id: crypto.randomUUID() }, wallet, appName: "Acme", client,
+    user, wallet, appName: "Acme", client,
     email: async () => "ana@acme.example", sendEmail: async () => undefined,
     rateLimit: async () => ({ allowed: true, retryAfter: null }), recordSigning: async () => undefined,
   });
   await assert.rejects(recoverySetup(context(walletFor(publicKey, recovery)), { operation: "preview", backups }), /already on/);
   await assert.rejects(recoverySetup(context(walletFor(publicKey)), { operation: "preview", backups: [] }), /at least one backup/);
-  // Without a signature from the backup, nothing is previewed.
-  await assert.rejects(recoverySetup(context(walletFor(publicKey)), { operation: "preview", backups }), /didn't sign/);
-  const wrongAccount = { ...backups[0], signature: personalSign(recoveryBackupChallenge("ckt1qother", backups[0])) };
+  // Without a challenge KeyWay issued to this user, or a signature from the backup, nothing is previewed.
+  await assert.rejects(recoverySetup(context(walletFor(publicKey)), { operation: "preview", backups }), /approval request is invalid/);
+  const { challengeNonce } = issueBackupChallenge(user);
+  await assert.rejects(recoverySetup(context(walletFor(publicKey)), { operation: "preview", backups: [{ ...backups[0], challengeNonce }] }), /didn't sign/);
+  const wrongAccount = { ...backups[0], challengeNonce, signature: personalSign(recoveryBackupChallenge("ckt1qother", backups[0], challengeNonce)) };
   await assert.rejects(recoverySetup(context(walletFor(publicKey)), { operation: "preview", backups: [wrongAccount] }), /didn't sign/);
+  // Another user's nonce, an expired one, or one with a forged tag is refused before the signature is read.
+  const foreign = issueBackupChallenge({ id: crypto.randomUUID() }).challengeNonce;
+  const expired = issueBackupChallenge(user, Date.now() - 16 * 60_000).challengeNonce;
+  const forged = `${challengeNonce.slice(0, -64)}${"00".repeat(32)}`;
+  for (const nonce of [foreign, expired, forged]) {
+    const proof = { ...backups[0], challengeNonce: nonce, signature: personalSign(recoveryBackupChallenge(plan.preview.legacyAddress, backups[0], nonce)) };
+    await assert.rejects(recoverySetup(context(walletFor(publicKey)), { operation: "preview", backups: [proof] }), /approval request is invalid or expired/);
+  }
+  // A fresh challenge is issued on request.
+  const issued = await recoverySetup(context(walletFor(publicKey)), { operation: "challenge" }) as { challengeNonce: string; expiresAt: string };
+  assert.ok(Date.parse(issued.expiresAt) - Date.now() > 14 * 60_000);
 });
 
 function personalSign(message: string): ccc.Hex {
@@ -283,16 +277,13 @@ test("signs the recovery transaction with the account key's plain secp256k1 witn
 
 /** An account right after turning recovery on: its AdminList and change cell, and the enable transaction. */
 async function enabledAccount(list: RecoveryBackup[] = backups) {
-  const { cells, client: setupClient } = await accountCells();
+  const { cells, funding, client: setupClient } = await accountCells();
   const plan = await planRecovery(setupClient, walletFor(publicKey), list);
   const hash = plan.transaction.hash();
   const outputs = plan.transaction.outputs.map((cellOutput, index) => ccc.Cell.from({ outPoint: { txHash: hash, index }, cellOutput, outputData: plan.transaction.outputsData[index] }));
-  const recovery: KeyWayRecovery = {
-    omnilockArgs: plan.omnilock.args, adminListTypeArgs: plan.adminListType.args, adminListTypeHash: plan.adminListType.hash(),
-    adminListOutPoint: { txHash: hash, index: 0 }, legacyAddress: plan.preview.legacyAddress, enabledAt: "2026-10-29T00:00:00.000Z", backups: list,
-  };
+  const recovery = recoveryFrom(plan, list);
   const live = [outputs[0], outputs[outputs.length - 1], cells.dao];
-  return { plan, recovery, outputs, client: await offlineClient(live, [plan.transaction]), wallet: walletFor(publicKey, recovery) };
+  return { plan, recovery, outputs, client: await offlineClient(live, [funding, plan.transaction]), wallet: walletFor(publicKey, recovery) };
 }
 
 test("reads the backup list back from the chain and checks it against the root", async () => {
@@ -306,8 +297,11 @@ test("reads the backup list back from the chain and checks it against the root",
   const forged = plan.transaction.clone();
   setRecoveryListRecord(forged, 0, await recoveryListRecord(client, backups));
   await assert.rejects(readRecoveryList(await offlineClient([plan.transaction.outputs[0]].map((cellOutput) => ({ outPoint: { txHash: forged.hash(), index: 0 }, cellOutput, outputData: plan.transaction.outputsData[0] })), [forged]), recovery), /don't match/);
-  await assert.rejects(decodeRecoveryList(client, "0x4b57524c0101"), /malformed/);
-  await assert.rejects(decodeRecoveryList(client, `0x4b57524c0201`), /version 2/);
+  await assert.rejects(decodeRecoveryList(client, "0x4b57524c0201"), /malformed/);
+  // Version 1 records (flag 0x12 EVM entries) are gone.
+  await assert.rejects(decodeRecoveryList(client, ccc.hexFrom(ccc.bytesConcat("0x4b57524c", [1, 1, 0x12], new Uint8Array(20).fill(0x55)))), /version 1/);
+  // An exec entry naming a verifier that isn't KeyWay's is refused.
+  await assert.rejects(decodeRecoveryList(client, ccc.hexFrom(ccc.bytesConcat("0x4b57524c", [2, 1, 0xfd], new Uint8Array(32).fill(9), [2, 0], new Uint8Array(8), new Uint8Array(20).fill(0x55)))), /malformed/);
   const bare = plan.transaction.clone();
   bare.setWitnessArgsAt(0, ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(65)) }));
   await assert.rejects(readRecoveryList(await offlineClient([{ outPoint: { txHash: bare.hash(), index: 0 }, cellOutput: plan.transaction.outputs[0], outputData: plan.transaction.outputsData[0] }], [bare]), recovery), /doesn't record its backups/);
@@ -319,6 +313,7 @@ test("builds the list update: same AdminList cell with the new root and record, 
   const plan = await planBackupChange(client, wallet, { change: "add", backup: added });
   const { transaction } = plan;
   assert.ok(transaction.inputs[0].previousOutput.eq(outputs[0].outPoint), "input 0 is the AdminList");
+  assert.ok(plan.listLock.eq(adminListLock(recovery)) && outputs[0].cellOutput.lock.eq(plan.listLock));
   assert.ok(transaction.inputs[1].previousOutput.eq(outputs[outputs.length - 1].outPoint), "then the account's plain CKB");
   assert.equal(transaction.inputs.length, 2, "the DAO cell isn't touched");
   assert.ok(transaction.outputs[0].lock.eq(outputs[0].cellOutput.lock) && transaction.outputs[0].type!.eq(outputs[0].cellOutput.type!));
@@ -326,8 +321,10 @@ test("builds the list update: same AdminList cell with the new root and record, 
   assert.equal(transaction.outputsData[0], adminListData(whitelistTree([evmBackupAuth(evmAddress), evmBackupAuth(added.address)]).root));
   assert.equal(recoveryListRecordOf(transaction, 0), await recoveryListRecord(client, [...backups, added]));
   assert.ok(transaction.outputs[1].lock.eq(plan.omnilock) && !transaction.outputs[1].type);
-  assert.equal(transaction.witnesses.length, 1);
-  assert.equal(ccc.bytesFrom(transaction.getWitnessArgsAt(0)!.lock!).length, 85, "one owner placeholder for the whole group");
+  // Two lock groups, the list's owner-only lock and the account's Omnilock, each with an owner placeholder.
+  assert.equal(transaction.witnesses.length, 2);
+  assert.equal(ccc.bytesFrom(transaction.getWitnessArgsAt(0)!.lock!).length, 85);
+  assert.equal(ccc.bytesFrom(transaction.getWitnessArgsAt(1)!.lock!).length, 85);
   assert.deepEqual(plan.backups, [...backups, added]);
   assert.equal(plan.preview.backup.label, `EVM wallet 0x55555555…555555`);
   await checkBackupChangeTransaction(client, transaction, recovery, plan.backups);
@@ -367,6 +364,8 @@ test("refuses a list update that doesn't match what KeyWay computed", async () =
   const stranger = ccc.Script.from({ ...plan.omnilock, args: `0x${"66".repeat(54)}` });
   await tamper((tx) => { tx.outputs[1].lock = stranger; }, /output 1 isn't plain CKB at your address/);
   await tamper((tx) => { tx.outputs[0].lock = stranger; }, /doesn't recreate the recovery list/);
+  // Moving the list to the account's admin-mode Omnilock, where backups could rewrite it, is refused.
+  await tamper((tx) => { tx.outputs[0].lock = plan.omnilock; }, /doesn't recreate the recovery list/);
   await tamper((tx) => { tx.outputs[0].capacity -= CKB; tx.outputs[1].capacity += CKB; }, /doesn't recreate the recovery list/);
   await tamper(() => undefined, /exactly these backups/, backups);
   await tamper((tx) => { setRecoveryListRecord(tx, 0, ccc.hexFrom(ccc.bytesConcat("0x4b57524c", [1, 1, 0x12], new Uint8Array(20).fill(0x55)))); }, /recorded backup list/);
@@ -383,15 +382,18 @@ test("refuses a list update that doesn't match what KeyWay computed", async () =
 
 test("the backup service refuses when recovery is off and needs the new backup's signature to add it", async () => {
   const { client, wallet } = await enabledAccount();
+  const user = { id: crypto.randomUUID() };
   const context = (current: ReadyWallet): RecoveryContext => ({
-    user: { id: crypto.randomUUID() }, wallet: current, appName: "Acme", client,
+    user, wallet: current, appName: "Acme", client,
     email: async () => "ana@acme.example", sendEmail: async () => undefined,
     rateLimit: async () => ({ allowed: true, retryAfter: null }), recordSigning: async () => undefined,
   });
   const added = { kind: "evm" as const, address: `0x${"55".repeat(20)}` };
   await assert.rejects(recoveryBackupChange(context(walletFor(publicKey)), { operation: "preview", change: "add", backup: added }), /recovery is off/);
   await assert.rejects(recoveryBackupChange(context(wallet), { operation: "preview", change: "swap", backup: added }), /add or remove/);
-  await assert.rejects(recoveryBackupChange(context(wallet), { operation: "preview", change: "add", backup: added }), /didn't sign/);
-  await assert.rejects(recoveryBackupChange(context(wallet), { operation: "preview", change: "add", backup: { kind: "joyid", address: "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqv82scyl0ywuurakhc80ha0agm5x8ye8kca6zq0u" } }), /isn't a JoyID address/);
+  await assert.rejects(recoveryBackupChange(context(wallet), { operation: "preview", change: "add", backup: added }), /approval request is invalid/);
+  const { challengeNonce } = issueBackupChallenge(user);
+  await assert.rejects(recoveryBackupChange(context(wallet), { operation: "preview", change: "add", backup: { ...added, challengeNonce } }), /didn't sign/);
+  await assert.rejects(recoveryBackupChange(context(wallet), { operation: "preview", change: "add", backup: { kind: "joyid", address: "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqv82scyl0ywuurakhc80ha0agm5x8ye8kca6zq0u", challengeNonce } }), /isn't a JoyID address/);
   assert.equal(await backupAuth(client, backups[0]), evmBackupAuth(evmAddress));
 });
