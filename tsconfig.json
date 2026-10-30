@@ -38,6 +38,15 @@
   ],
   "exclude": [
     "node_modules",
-    "docs-site"
+    "docs-site",
+    "research/omnilock/phase2",
+    "research/omnilock/phase3",
+    "research/omnilock/phase4/change-backup.ts",
+    "research/omnilock/phase4/evm-spend.ts",
+    "research/omnilock/phase4/joyid-enable.ts",
+    "research/omnilock/phase4/joyid-negative.ts",
+    "research/omnilock/phase4/joyid-spend.ts",
+    "research/omnilock/phase5",
+    "research/omnilock/audit-opus-5-5/testnet-adminlist-hijack.ts"
   ]
 }

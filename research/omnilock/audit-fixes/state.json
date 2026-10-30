@@ -28,5 +28,55 @@
     "hashType": "data1",
     "size": 41200,
     "capacity": "41261"
-  }
+  },
+  "userId": "c0667d3a-48ac-415d-8a10-cd0928472f8e",
+  "enable": "0xe44afcb8ae5c43c28c555fce402297122b51f8e12fa7d41812adc03a94d2b7c0",
+  "address": "ckt1qp4jndh3qdrtg0z5pefcq6ag3ws0uwsv8g5aw3yw742cgry0svv05qsqxeum2s9m5acd8paszkecg2vp6clwvdwaq9r6pmm0ssqpm9u7dnxpdhf08y8yskwdzce7x50aekmwpyqlylwfzdax8p4",
+  "recovery": {
+    "backups": [
+      {
+        "kind": "evm",
+        "address": "0x766d1913d0968dbea2b0cacf02c9c9bc5acce148"
+      },
+      {
+        "kind": "joyid",
+        "address": "ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqqx5mevhu2n8qppphl94sa872nhak598fasm0q2pz"
+      }
+    ],
+    "omnilock": {
+      "cellDeps": [
+        {
+          "depType": "depGroup",
+          "outPoint": {
+            "index": 0,
+            "txHash": "0xf8de3bb47d055cdf460d93a2a6e1b05f7432f9777c8c474abf4eec1d4aee5d37"
+          }
+        },
+        {
+          "depType": "code",
+          "outPoint": {
+            "index": 0,
+            "txHash": "0xf4ce65847089d24bbc8e7d999f396d4227d34376bbfef0f5e3c11967c5a13271"
+          }
+        }
+      ],
+      "codeHash": "0x6b29b6f10346b43c540e53806ba88ba0fe3a0c3a29d7448ef555840c8f8318fa",
+      "hashType": "data1"
+    },
+    "enabledAt": "2026-10-30T10:41:42.326Z",
+    "omnilockArgs": "0x003679b540bba770d387b015b3842981d63ee635dd0147a0ef6f84001d979e6ccc16dd2f390e4859cd1633e351fdcdb6e0901f27dc91",
+    "legacyAddress": "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqfk0x65pwa8wrfc0vq4kwzznqwk8mnrthgp5f26f",
+    "adminListOutPoint": {
+      "index": 0,
+      "txHash": "0x40a93da31989304a170dab4ca5651dc87f3e10c1141c2e3bbe4e0d5d0b22dbc9"
+    },
+    "adminListTypeArgs": "0x3ad32b62fcc51f642a5ac5d9da5ae7ecd9a5fdc45e9b252921497b673c6240bd",
+    "adminListTypeHash": "0x47a0ef6f84001d979e6ccc16dd2f390e4859cd1633e351fdcdb6e0901f27dc91",
+    "enableTransactionHash": "0xe44afcb8ae5c43c28c555fce402297122b51f8e12fa7d41812adc03a94d2b7c0"
+  },
+  "add": "0x5042f4295d96cdc3a31f5a72c200eccc23b8a4598bbb6c87b4d4a0e8e3d1b8bc",
+  "remove": "0x40a93da31989304a170dab4ca5651dc87f3e10c1141c2e3bbe4e0d5d0b22dbc9",
+  "rescueJ1": "0xe7a8a2c4464efb3558fc351efd697b2ce4f9ef7f6a7c4b000c8a9c6bc5d8100a",
+  "refund": "0x0afb8483ccd97588339b70b9e52941bdf7eadd4ee25d452b445d013f3610788c",
+  "rescueE1": "0xbaf1690323464a7b430eafbdcfbb10e745fc82688d2c04ad3a0796e06495e2dd"
 }

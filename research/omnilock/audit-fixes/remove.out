@@ -1,0 +1,4 @@
+test_tx_pool_accept ok, cycles 3918005 size 972
+remove tx 0x40a93da31989304a170dab4ca5651dc87f3e10c1141c2e3bbe4e0d5d0b22dbc9
+settled; notice email: A recovery backup was removed in KeyWay audit-fix testnet proof
+backups [{"kind":"evm","address":"0x766d1913d0968dbea2b0cacf02c9c9bc5acce148"},{"kind":"joyid","address":"ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqqx5mevhu2n8qppphl94sa872nhak598fasm0q2pz"}] address unchanged true

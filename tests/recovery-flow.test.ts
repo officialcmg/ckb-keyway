@@ -5,7 +5,8 @@ import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { adminListLock, adminListTypeScript, KEYWAY_OMNILOCK, omnilockArgsFor, omnilockScript, secp256k1Lock, type KeyWayRecovery } from "../src/sdk/browser/account-lock.ts";
-import { backupAuth, evmBackupAuth, omnilockAdminWitnessLock, recoveryBackupChallenge, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
+import { recoveryApprovalText, rescueApproval } from "../src/sdk/browser/recovery-approval.ts";
+import { backupAuth, evmBackupAuth, evmPersonalSignAddress, recoveryBackupChallenge, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
 import { decodeRecoveryList, readRecoveryList, recoveryListRecord, recoveryListRecordOf, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
 import { adminListData, whitelistTree } from "../src/sdk/browser/recovery-smt.ts";
 import { verifyWebAuthn } from "../src/sdk/browser/webauthn.ts";
@@ -162,7 +163,68 @@ test("refuses when the balance can't cover it or there is no plain CKB", async (
   assert.ok(await planRecovery(await offlineClient([cell(secp, 261n * CKB)]), walletFor(publicKey), backups));
 });
 
-/*TESTNET_FIXTURE_TEST*/
+test("reproduces the testnet proof: enable, adding a backup, and both backups' rescues through the approval verifiers", async () => {
+  // research/omnilock/audit-fixes-results.md: 0xe44afcb8…b7c0 turned recovery on with an EVM and a JoyID-style
+  // backup, 0x5042f429…b8bc added an EVM backup, 0xe7a8a2c4…100a and 0xbaf16903…e2dd are the two rescues.
+  const fixture = JSON.parse(await readFile(new URL("./fixtures/recovery-audit-fixes.json", import.meta.url), "utf8"));
+  const evm: RecoveryBackup = { kind: "evm", address: fixture.evmBackup };
+  const joy: RecoveryBackup = { kind: "joyid", address: fixture.joyIdBackup };
+  const funding = ccc.Transaction.from(fixture.enableFunding);
+  const enable = ccc.Transaction.from(fixture.enable.transaction);
+  const client = await offlineClient(fixture.enable.inputCells, [funding]);
+  const plan = await planRecovery(client, walletFor(fixture.publicKey), [evm, joy]);
+  assert.equal(plan.transaction.hash(), "0xe44afcb8ae5c43c28c555fce402297122b51f8e12fa7d41812adc03a94d2b7c0");
+  assert.equal(plan.transaction.hash(), enable.hash());
+  // The account runs KeyWay's pinned Omnilock; the list is under the key's owner-only lock; the record reads back.
+  assert.equal(plan.omnilock.codeHash, KEYWAY_OMNILOCK.testnet.codeHash);
+  assert.equal(enable.outputs[0].lock.args, `0x00${ccc.hashCkbShort(fixture.publicKey).slice(2)}00`);
+  assert.deepEqual((await decodeRecoveryList(client, recoveryListRecordOf(enable, 0)!)).map(({ backup }) => backup), [evm, joy]);
+
+  // Adding the third backup: rebuilt from the chain's own list, it hashes the same and passes the checks.
+  const recovery = recoveryFrom(plan, [evm, joy]);
+  const add = ccc.Transaction.from(fixture.add.transaction);
+  const addClient = await offlineClient(fixture.add.inputCells, [funding, enable]);
+  const added: RecoveryBackup = { kind: "evm", address: fixture.addedBackup };
+  const change = await planBackupChange(addClient, walletFor(fixture.publicKey, recovery), { change: "add", backup: added });
+  assert.equal(change.transaction.hash(), "0x5042f4295d96cdc3a31f5a72c200eccc23b8a4598bbb6c87b4d4a0e8e3d1b8bc");
+  assert.equal(change.transaction.hash(), add.hash());
+  await checkBackupChangeTransaction(addClient, add, recovery, [evm, joy, added]);
+  // Two owner signatures by the account key: the list's owner-only lock and the account's Omnilock.
+  for (const [index, script] of [[0, change.listLock], [1, change.omnilock]] as const) {
+    const digest = (await change.transaction.getSignHashInfo(script, addClient))!.message;
+    const owner = ccc.bytesFrom(add.getWitnessArgsAt(index)!.lock!).slice(20);
+    assert.equal(ccc.hexFrom(secp256k1.recoverPublicKey(Uint8Array.from([owner[64], ...owner.slice(0, 64)]), ccc.bytesFrom(digest), { prehash: false })), fixture.publicKey);
+  }
+
+  // Each rescue's backup signed the readable text the verifier rebuilds from that transaction.
+  const approvalOf = async (recorded: { transaction: ccc.TransactionLike; inputCells: ccc.CellLike[] }) => {
+    const transaction = ccc.Transaction.from(recorded.transaction);
+    const spendClient = await offlineClient(recorded.inputCells);
+    const lock = ccc.Script.from(recorded.inputCells[0].cellOutput.lock);
+    const witness = ccc.bytesFrom(transaction.getWitnessArgsAt(0)!.lock!);
+    const zeroed = transaction.clone();
+    zeroed.setWitnessArgsAt(0, ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(witness.length)) }));
+    const sighash = (await zeroed.getSignHashInfo(lock, spendClient))!.message;
+    const inputs = recorded.inputCells.reduce((sum, cell) => sum + ccc.CellOutput.from(cell.cellOutput).capacity, 0n);
+    return { text: recoveryApprovalText(spendClient, rescueApproval(transaction, lock, inputs), sighash), witness, transaction };
+  };
+  const joyRescue = await approvalOf(fixture.rescueJoyId);
+  assert.match(joyRescue.text, /^KeyWay recovery\nMove everything to ckt1q[0-9a-z]+\nCKB: 9,834\.99993392\nTokens: none\nFee: 0\.0000246 CKB\nTransaction: 0x[0-9a-f]{64}$/);
+  const blob = joyRescue.witness.slice(20, 20 + 1024);
+  assert.deepEqual([blob[0], blob[1]], [2, 0]);
+  assert.deepEqual(blob.slice(2, 66), ccc.bytesFrom(fixture.joyIdPublicKey));
+  const clientAt = 132 + (blob[130] | (blob[131] << 8));
+  const assertion = {
+    publicKey: blob.slice(2, 66), rs: blob.slice(66, 130), authData: blob.slice(132, clientAt),
+    clientDataJson: blob.slice(clientAt + 2, clientAt + 2 + (blob[clientAt] | (blob[clientAt + 1] << 8))),
+  };
+  assert.ok(verifyWebAuthn(assertion, joyRescue.text));
+  assert.ok(!verifyWebAuthn(assertion, joyRescue.text.replace("CKB: 9,834", "CKB: 9,833")));
+  const evmRescue = await approvalOf(fixture.rescueEvm);
+  assert.match(evmRescue.text, /\nCKB: 8,999\.99998975\nTokens: none\nFee: 0\.00001025 CKB\n/);
+  assert.deepEqual([evmRescue.witness[20], evmRescue.witness[21]], [1, 0]);
+  assert.equal(evmPersonalSignAddress(evmRescue.text, evmRescue.witness.slice(22, 87)), fixture.evmBackup);
+});
 
 test("refuses a recovery transaction that doesn't match what KeyWay computed", async () => {
   const { client, secp } = await accountCells();
