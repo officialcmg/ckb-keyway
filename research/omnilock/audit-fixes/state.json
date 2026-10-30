@@ -1,0 +1,32 @@
+{
+  "omnilock": {
+    "outPoint": {
+      "txHash": "0xf4ce65847089d24bbc8e7d999f396d4227d34376bbfef0f5e3c11967c5a13271",
+      "index": 0
+    },
+    "codeHash": "0x6b29b6f10346b43c540e53806ba88ba0fe3a0c3a29d7448ef555840c8f8318fa",
+    "hashType": "data1",
+    "size": 139936,
+    "capacity": "139997"
+  },
+  "evm-personal-sign": {
+    "outPoint": {
+      "txHash": "0xff16f2aa117ba8e67aeb8946a8d3cb0c5f4627eab4fd8d7d5ecd938d7fa9014f",
+      "index": 0
+    },
+    "codeHash": "0x33bd1c699b633d685a6f60f6b0ca16fe8bb896f81323926ca6e0671bf8ab3c88",
+    "hashType": "data1",
+    "size": 89768,
+    "capacity": "89829"
+  },
+  "joyid-webauthn": {
+    "outPoint": {
+      "txHash": "0xb99678308cde0a54f856a00ec1e2ec46a318cdf05ef375cc381933dc00c7fb17",
+      "index": 0
+    },
+    "codeHash": "0xf1185da23bf04b638010038b40ec64b587654db5cb98eb39f0373ad8919bcd89",
+    "hashType": "data1",
+    "size": 41200,
+    "capacity": "41261"
+  }
+}
