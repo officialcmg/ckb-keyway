@@ -1,6 +1,6 @@
 import * as ccc from "@ckb-ccc/core";
 import type { User } from "./auth-user.ts";
-import { accountLocks, omnilockOwnerWitnessLock, refuseAdminListSpend, witnessLockLength, type KeyWayLockKind } from "../sdk/browser/account-lock.ts";
+import { accountLocks, omnilockOwnerWitnessLock, refuseAdminListSpend, refuseForeignOmnilockOutputs, verifyRecoveryAnchor, witnessLockLength, type KeyWayLockKind } from "../sdk/browser/account-lock.ts";
 import { isXudtCompatible } from "../sdk/browser/tokens.ts";
 import { loadLitAction } from "./lit-actions.ts";
 import { signCkbDigest } from "./lit.ts";
@@ -46,6 +46,8 @@ export async function previewFundingTransaction(
   if (transaction.headerDeps.length !== 0) throw new Error("Funding transactions cannot include header dependencies");
 
   const signer = new ccc.SignerCkbPublicKey(client, wallet.litPublicKey);
+  // The account's address comes from its recovery record, so the record must be one the chain backs.
+  if (wallet.recovery) await verifyRecoveryAnchor(client, wallet.litPublicKey, wallet.recovery);
   const locks = await accountLocks(client, wallet.litPublicKey, wallet.recovery);
   const own = locks.map(({ script }) => script);
   const isOwn = (lock: ccc.Script) => own.some((script) => script.eq(lock));
@@ -55,6 +57,7 @@ export async function previewFundingTransaction(
   if (ownedInputs.length === 0) {
     throw new Error("Funding transaction has no input controlled by this KeyWay wallet");
   }
+  refuseForeignOmnilockOutputs(transaction, await client.getKnownScript(ccc.KnownScript.OmniLock), wallet.litPublicKey, wallet.recovery);
 
   const fundingOutputs = transaction.outputs.filter(({ lock }) => (
     lock.codeHash.toLowerCase() === TESTNET_FUNDING_LOCK_CODE_HASH && lock.hashType === "type"

@@ -1,0 +1,170 @@
+---
+title: "Account address & recovery"
+description: "Opt-in backups that can move a user's funds without KeyWay, why turning them on changes the address once, and what it costs."
+icon: LifeBuoy
+---
+
+A KeyWay account is controlled by the user's Lit key, reached through their email. Account recovery is an opt-in extra: the user names **backups**, an EVM wallet or a JoyID passkey, that can move everything in the account to a wallet of their choice **without KeyWay**. If KeyWay, Lit or your app goes away, a backup and a public CKB node are enough.
+
+<Info>
+  Recovery runs on CKB testnet. It is off until the user turns it on.
+</Info>
+
+## The address changes once
+
+Without recovery, the account's address is a standard secp256k1 address of the Lit key. Turning recovery on moves the account to an [Omnilock](https://github.com/cryptape/omnilock) address in administrator mode:
+
+```text
+args = 0x00 ‖ blake160(Lit public key) ‖ 0x01 ‖ AdminList type hash
+```
+
+- The Lit key stays the everyday signer (Omnilock's owner path). Signing, Fiber and approvals work as before.
+- The **AdminList** is a cell that holds the backup list (a sparse Merkle tree root, with a Type ID so its hash never changes). A backup signs through Omnilock's administrator path with a proof that it's on the list.
+- The AdminList has its own lock: the same Omnilock and Lit key **without** administrator mode (`0x00 ‖ blake160(Lit public key) ‖ 0x00`). Only the Lit key can spend it, through KeyWay's own list update. Backups can't spend, move or rewrite it. Omnilock finds the list by its type hash alone, so its lock isn't part of the address.
+- Adding or removing a backup only rewrites the AdminList. **The address doesn't change again.**
+- Omnilock is referenced by its **data hash** (`data1`), not by type, so nobody can change the code under an account. On testnet the code cell is KeyWay's own copy of the official binary, under a lock nobody can unlock. The record of each account stores the code hash and cell deps it was turned on with.
+
+Turning recovery on is one transaction, signed by the Lit key: it creates the AdminList and moves the account's plain CKB and tokens to the new address. Cells it can't move (Nervos DAO, NFTs, cells with data) stay at the old address, which remains the user's.
+
+The change takes effect once the transaction is committed: `recovery.enable()` resolves then, and `useCkbWallet().address` becomes the new address and `legacyAddress` the old one. Tell users to share only the new one. If the network drops the transaction, nothing changes and the user can try again.
+
+### The sign-in check
+
+Funds can still arrive at the old address: old payers, channels opened before, Fiber settlements. Each time a user with recovery signs in, KeyWay moves the plain CKB and tokens it finds there to the new address, in one transaction signed with the user's own key and no dialog. Nothing runs between sign-ins. The SDK doesn't spend from the old address itself, so the two never compete for the same cells.
+
+### The record is checked against the chain
+
+KeyWay stores each account's recovery settings, including the transaction that turned recovery on. Before the settings are used (at sign-in, for the sign-in check, and for signing), KeyWay checks on chain that this transaction is committed, that it spent a cell of the user's own secp256k1 address, that the AdminList's Type ID comes from that cell, and that the list has its owner-only lock. Nobody but the Lit key can spend the user's cells, so nobody else can make such a list. The SDK runs the same check on what KeyWay's server returns, so the server alone can't move a user to someone else's list.
+
+## Costs
+
+| | Without recovery | With recovery |
+| --- | --- | --- |
+| Recovery list (AdminList cell) | — | 165 CKB, locked while recovery is on |
+| Smallest plain CKB cell | 61 CKB | 95 CKB |
+| Smallest token cell (xUDT) | 142 CKB | 176 CKB |
+
+The longer Omnilock lock is what raises the minimums. The preview shows the exact amounts before the user approves. The AdminList's 165 CKB is the user's but stays locked while recovery is on; the rescue page doesn't move it.
+
+## Backups
+
+A list holds one to eight backups. Each is an Omnilock exec identity that names one of KeyWay's verifiers (in [`contracts`](https://github.com/officialcmg/ckb-keyway/tree/main/contracts), referenced by data hash so they can't change) and the backup's 20-byte ID.
+
+Both kinds of backup approve a move by signing the same short text, which their wallet shows as written:
+
+```text
+KeyWay recovery
+Move everything to ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq…
+CKB: 9,834.99993392
+Tokens: none
+Fee: 0.0000246 CKB
+Transaction: 0xa2f7a3bbf1ad74bb694e1a834d1ac174b72ec3f3b817a80152f8335004516a5d
+```
+
+- **Move everything to** is where every output of the transaction goes, in full address format.
+- **CKB** is everything the destination receives, including the CKB held by token cells. **Tokens** counts the token cells. **Fee** is what the transaction pays the network.
+- **Transaction** is its signing hash, which binds the signature to this one transaction.
+
+The verifier rebuilds this text from the transaction it runs in and accepts only a signature over exactly that text. It refuses any transaction that doesn't send everything to one address. So a signature can't be replayed on another destination or amount, and a page that asks a backup to sign a move to someone else's address has to show that address. Tell users to read the address before they sign.
+
+**EVM wallet**. Any wallet that speaks EIP-1193 (`window.ethereum`). It signs the text with `personal_sign`. The wallet's network doesn't matter: it only signs a message.
+
+**JoyID passkey**. The passkey the user's JoyID account was created with. JoyID's page shows the text and the passkey signs it. A passkey synced by the user's platform (iCloud Keychain, Google Password Manager) works on every device it syncs to. Devices added to a JoyID account later and JoyID session keys can't be backups.
+
+Both verifiers are deployed on testnet only.
+
+Adding a backup always needs **the backup's own signature** over a recovery challenge, so a typo can't name a wallet nobody controls. The challenge includes a one-time request from KeyWay that expires after 15 minutes.
+
+## The emailed code
+
+A backup can move everything without KeyWay, so changing who can do that is always confirmed by email:
+
+- Turning recovery on, adding a backup and removing one **always** need the six-digit emailed code, even when the user's daily amount would allow a transfer without it. The email names the backup and says what it will be able to do.
+- The last backup can't be removed.
+- Each change takes effect once its transaction is committed. KeyWay then sends a second email with the account's full address, every backup, and a link to the rescue page. It is the user's way back to their funds if KeyWay is gone: ask them to keep it.
+
+KeyWay's server builds and checks every recovery transaction itself. Ordinary signing never spends the AdminList, and funds sent by the turn-on transaction and the sign-in check can only go to the user's own address.
+
+## The rescue page
+
+[ckbkeyway.dev/rescue](https://ckbkeyway.dev/rescue) moves everything from a KeyWay address to an address the user chooses, signed once by one backup. It needs only:
+
+- the KeyWay address (from the app or the notice email),
+- one backup on the list,
+- a public CKB node (configurable).
+
+It doesn't call KeyWay's servers, use a database, Lit or any KeyWay secret. It reads the address, finds the AdminList by its type hash under its owner-only lock, rebuilds the list from chain data and checks it against the list's root, shows the balance, and builds one transaction that moves the CKB and tokens. It shows the exact text the backup will sign before asking for the signature.
+
+The balance comes from the node, but the node can't change what a cell holds: the page reads each cell from the transaction that created it and checks that transaction's hash. A node can only leave cells out, so a balance that looks low means trying another node. The page sends only to addresses whose lock it knows (the network's standard locks and KeyWay's Omnilock), so funds can't go to a lock nobody can spend.
+
+The code is in [`src/rescue`](https://github.com/officialcmg/ckb-keyway/tree/main/src/rescue), with tests, so anyone can audit it or host it themselves.
+
+### What a backup can't move
+
+A backup reaches only what sits at the account's address. These are outside its reach and need KeyWay (and Lit) to move:
+
+- **Fiber channel balances.** Funds in an open channel belong to the channel until it closes.
+- **Force-close settlements.** A force-closed channel pays out to the Fiber node's own key (KeyWay's for hosted nodes); KeyWay moves it to the account afterwards.
+- **The fee reserve**, 62 CKB kept on the node's key while any channel might need settling.
+- **The AdminList's 165 CKB**, which only the Lit key can unlock.
+- Cells the rescue page doesn't move: Nervos DAO deposits, NFTs and other contracts' cells, cells with data, and tokens whose type script needs extensions to move. The page lists them.
+
+Keep large balances at the account's address, not in channels, if backups are how users would get them back.
+
+## API
+
+```tsx
+import { useCkbWallet } from "@ckb-keyway/react";
+
+function Recovery() {
+  const { address, legacyAddress, recovery } = useCkbWallet();
+
+  async function turnOn() {
+    const evm = await recovery.createEvmBackup(); // asks window.ethereum to sign the recovery challenge
+    const { ckbAddress } = await recovery.enable([evm]); // dialog, then the emailed code
+  }
+
+  return <p>Recovery is {recovery.status}, {recovery.backups.length} backups</p>;
+}
+```
+
+A JoyID backup comes from CCC's JoyID signer:
+
+```ts
+import { ccc } from "@ckb-ccc/core";
+import { JoyId } from "@ckb-ccc/joy-id";
+
+const joyId = new JoyId.CkbSigner(new ccc.ClientPublicTestnet(), "Your app", "https://your.app/icon.png");
+await recovery.addBackup(await recovery.createJoyIdBackup(joyId));
+await recovery.removeBackup({ kind: "evm", address: "0x30033cae613a8331b8a7b756ce46cd7999ec1ef8" });
+```
+
+| `recovery` member | Behavior |
+| --- | --- |
+| `status` | `on` or `off`. |
+| `backups` | The list, as `RecoveryBackup` (`{ kind: "evm" \| "joyid", address }`). |
+| `legacyAddress` | The address from before recovery was on. |
+| `createEvmBackup(ethereum?)` | Gets a challenge from KeyWay, then asks an EVM wallet (`window.ethereum` by default) for its address and its signature over the recovery challenge. Returns a `RecoveryBackupProof`, valid for 15 minutes. |
+| `createJoyIdBackup(signer)` | The same with a CCC JoyID signer. |
+| `enable(backups)` | Turns recovery on with these backups: preview, approval, emailed code. Resolves once the transaction is committed, with `RecoveryEnabled` (`transactionHash`, `ckbAddress`, `recovery`). |
+| `addBackup(proof)` | Adds a backup: preview, approval, emailed code. Resolves once committed, with `BackupChanged`. |
+| `removeBackup(backup)` | Removes a backup the same way. The last one can't be removed. |
+
+### Approval props
+
+`KeyWayProvider` shows its own dialogs. To use yours, pass:
+
+| Prop | Receives |
+| --- | --- |
+| `approveRecovery` | `RecoveryPreview`: `newAddress`, `legacyAddress`, `backups` (with a `label` each), `adminListCkb`, `minimumCellCkb`, `tokenCellsExtraCkb`, `lockedCkb`, `feeCkb`, `movedCkb`, `tokens`, `cellsLeft`, `transactionHash`, `network`. |
+| `approveBackupChange` | `BackupChangePreview`: `change` (`add` or `remove`), `backup`, `backups` after the change, `feeCkb`, `transactionHash`, `network`. |
+
+Return `true` to go ahead or `false` to cancel. The emailed code follows either way and is always KeyWay's own prompt.
+
+## Known limits
+
+- **Omnilock has no public audit.** KeyWay pins it by data hash, so an upgrade can't change the code for KeyWay accounts. On mainnet the code cell is the official one, under its deployer's multisig: if they ever replaced it, the dep would be gone until anyone redeployed the same bytes. Funds would be frozen in that case, never stolen.
+- **KeyWay's verifiers are unaudited.** They are small and [open source](https://github.com/officialcmg/ckb-keyway/tree/main/contracts), referenced by data hash so they can't change, and their builds are reproducible.
+- **A backup can move everything once the user signs the text.** The text names the destination; a user who signs a move to someone else's address loses the funds. Choose backups you control, and read the address before signing.
+- **Message signing still reports the Lit public key.** `signer.signMessage()` signs with the account's secp256k1 key, so a verifier that derives an address from the signature gets the old address, not the Omnilock one.
+- **Testnet only.** The rescue page has a mainnet switch, prepared but untested, and the verifiers aren't deployed on mainnet.

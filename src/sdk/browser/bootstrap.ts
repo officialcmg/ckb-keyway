@@ -1,4 +1,5 @@
-import type { KeyWayRecovery } from "./account-lock";
+import * as ccc from "@ckb-ccc/core";
+import { parseRecovery, verifyRecoveryAnchor, type KeyWayRecovery } from "./account-lock";
 import { KeyWayApiClient } from "./api-client";
 import { createFiberKeyRecipient } from "./fiber-key-wrap";
 
@@ -27,11 +28,22 @@ export async function bootstrapKeyWay(
   nodeMode: "browser" | "managed" = "browser",
 ): Promise<{ provisioned: boolean; restoreRequired: boolean; wallet: PublicWallet }> {
   if (!authToken) throw new Error("Authenticated KeyWay session is required");
-  return navigator.locks.request("ckb-keyway:bootstrap", async () => {
+  const result = await navigator.locks.request("ckb-keyway:bootstrap", async () => {
     const deviceIdHash = await getDeviceIdHash();
     // Lit creates the Fiber key inside its secure enclave; neither this browser nor KeyWay's server sends one.
     return requestBootstrap(api, authToken, { deviceIdHash, nodeMode, keyCustody: "lit" });
   });
+  await checkWalletRecovery(result.wallet);
+  return result;
+}
+
+/**
+ * The account's address comes from its recovery settings, so the SDK checks them against the chain itself: a
+ * record the server alone made up (or changed) can't move the account to someone else's recovery list.
+ */
+export async function checkWalletRecovery(wallet: Pick<PublicWallet, "litPublicKey" | "recovery">, client: ccc.Client = new ccc.ClientPublicTestnet()): Promise<void> {
+  const recovery = parseRecovery(wallet.recovery, wallet.litPublicKey);
+  if (recovery) await verifyRecoveryAnchor(client, wallet.litPublicKey, recovery);
 }
 
 export async function getDeviceIdHash(): Promise<string> {

@@ -1,0 +1,45 @@
+{
+  "userId": "62d78160-13ea-4eac-9f93-7c711269a90c",
+  "enable": "0x5d488515e7acc62f4b98bfd4d53b35254c4a4d113bfbc8f0cac9eff3514cab13",
+  "recovery": {
+    "omnilockArgs": "0x00011d78005ae967c07a7e39bc7c807370a128f93d01873f340a7b41c4de544389bc97a2cf0b792758aa483bc280ba3b09592a64ab52",
+    "adminListTypeArgs": "0x5b4a91fe2173cb30129f31de0a4db5e3fd136db6446c74c13a19fa6cc4cd3d6e",
+    "adminListTypeHash": "0x873f340a7b41c4de544389bc97a2cf0b792758aa483bc280ba3b09592a64ab52",
+    "adminListOutPoint": {
+      "txHash": "0x5d488515e7acc62f4b98bfd4d53b35254c4a4d113bfbc8f0cac9eff3514cab13",
+      "index": 0
+    },
+    "legacyAddress": "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqgpr4uqqkhfvlq85l3eh37gqums5y50j0gk3n9em",
+    "enabledAt": "2026-10-29T08:16:46.940Z",
+    "backups": [
+      {
+        "kind": "evm",
+        "address": "0x30033cae613a8331b8a7b756ce46cd7999ec1ef8"
+      },
+      {
+        "kind": "joyid",
+        "address": "ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq9t2pwvmv7pqxy32jug4p3yd0rgptagcycxsx9hu"
+      }
+    ]
+  },
+  "newAddress": "ckt1qrejnmlar3r452tcg57gvq8patctcgy8acync0hxfnyka35ywafvkqgqqywhsqz6a9nuq7n78x78eqrnwzsj37faqxrn7dq20dqufhj5gwyme9azeu9hjf6c4fyrhs5qhgasjkf2vj44ypl035x",
+  "legacyAddress": "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqgpr4uqqkhfvlq85l3eh37gqums5y50j0gk3n9em",
+  "joyIdBackup": "ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq9t2pwvmv7pqxy32jug4p3yd0rgptagcycxsx9hu",
+  "evmBackup": "0x30033cae613a8331b8a7b756ce46cd7999ec1ef8",
+  "noticeEmail": "Account recovery is on in KeyWay phase 5 testnet proof\n\nYour account address (CKB testnet):\nckt1qrejnmlar3r452tcg57gvq8patctcgy8acync0hxfnyka35ywafvkqgqqywhsqz6a9nuq7n78x78eqrnwzsj37faqxrn7dq20dqufhj5gwyme9azeu9hjf6c4fyrhs5qhgasjkf2vj44ypl035x\n\nBackups:\nEVM wallet 0x30033cae613a8331b8a7b756ce46cd7999ec1ef8\nJoyID ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq9t2pwvmv7pqxy32jug4p3yd0rgptagcycxsx9hu\n\nIf KeyWay phase 5 testnet proof or KeyWay is ever unavailable, any of these backups can move everything at this address to a wallet you choose at https://ckbkeyway.dev/rescue. It needs only this address and the backup.\n\nKeep this email. If you didn't make this change, sign in to KeyWay phase 5 testnet proof and check your backups now.\n\nSecured by CKB KeyWay",
+  "fundEvm": "0xeb62fdb52930200799533fc84e3ca8d443b3a7aef2f8b0694aa829c519cb4b8c",
+  "tokenTypeHash": "0xbbe6998f7c25bf801211811ed115900f67fc920407f8036538b8540904503dcf",
+  "rescueEvm": "0x66fafd9ad691784ca81674a304ae7f6aedf6b35d67cfe23431dd0f6adc61c91d",
+  "rescueEvmPrompt": "CKB transaction: 0x8d00d5b9a0a8eca446c3ce5d0924897b3e8a03b1a847b4c4a2a6464ecb275d02",
+  "rescueEvmFirst": "0x61985471826a64ff8308797ba51b3b2f77c0acd729e8d0086c237d5d2c984c79",
+  "fundEvm2": "0x27d757e3b4ebbef342d9cf53591ba160e6befe83ede1c31479f0a893e4b8da68",
+  "fundJoyId": "0x82e59474cc199dd225c642807d9766c1ea726a169e6eb0a8ae06a1c2bf6771fe",
+  "rescueJoyId": "0x3400554e24c52b4ea61a84624571b5173393a02bf04406623dd2f44b840b9e59",
+  "fundNegative": "0x6a1d46d8fc1a5841e02d0c0af36635cf27665fbb0a8f3b71c56a0f1f4126d488",
+  "negative": {
+    "1. EVM wallet not on the list": "rejected: error code 59 Inputs[0].Lock",
+    "2. destination swapped after E1 signed": "rejected: error code -31 Inputs[0].Lock",
+    "3. another passkey signing as J1": "refused before sending: JoyID's signature doesn't verify",
+    "4. E1 also spending the AdminList": "accepted (dry run only, not sent), cycles 2608653"
+  }
+}

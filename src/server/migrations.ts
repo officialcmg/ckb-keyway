@@ -304,4 +304,25 @@ export const migrations: Array<{
       await sql`create index keyway_v2_token_outflows_recent on keyway_v2_token_outflows (user_id, asset, signed_at)`;
     },
   },
+  {
+    version: 16, name: "recovery-approvals",
+    up: async (sql) => {
+      // Turning account recovery on is approved like a transaction, always with an emailed code. Only widens the check.
+      await sql`alter table keyway_v2_signature_requests drop constraint keyway_v2_signature_requests_purpose_check`;
+      await sql`alter table keyway_v2_signature_requests add constraint keyway_v2_signature_requests_purpose_check
+        check (purpose in ('transaction', 'message', 'settings', 'payment', 'recovery'))`;
+    },
+  },
+  {
+    version: 17, name: "legacy-address-sweeps",
+    up: async (sql) => {
+      // The last sweep from a recovery account's old address, kept until it is committed or gone, so a sweep
+      // still in the mempool is never rebuilt.
+      await sql`create table keyway_v2_legacy_sweeps (
+        user_id uuid primary key,
+        transaction_hash text not null check (transaction_hash ~ '^0x[0-9a-f]{64}$'),
+        sent_at timestamptz not null default now()
+      )`;
+    },
+  },
 ];

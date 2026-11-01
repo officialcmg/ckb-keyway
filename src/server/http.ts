@@ -1,5 +1,5 @@
 import * as ccc from "@ckb-ccc/core";
-import { currentLock } from "../sdk/browser/account-lock.ts";
+import { currentLock, verifyRecoveryAnchor } from "../sdk/browser/account-lock.ts";
 import type { User } from "./auth-user.ts";
 import { bootstrap } from "./bootstrap.ts";
 import { markChannelOpened, readWallet } from "./user-wallet.ts";
@@ -38,6 +38,8 @@ import { fiberPayment } from "./fiber-payments.ts";
 import { runIdempotentMutation } from "./idempotency.ts";
 import { recordSigningEvent } from "./security-alerts.ts";
 import { messageSigning, signingSettings, transactionSigning, type SigningContext } from "./general-signing.ts";
+import { recoveryBackupChange, recoverySetup, settleRecoveryChange } from "./recovery.ts";
+import { sweepLegacyAfterSignIn } from "./legacy-sweep.ts";
 
 export async function handleKeyWayRequest(request: Request): Promise<Response> {
   const cors = await corsHeaders(request);
@@ -78,6 +80,8 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
       : path === "/api/keyway/sign-transaction" ? await signTransactionRequest(request)
       : path === "/api/keyway/sign-message" ? await generalSigningRequest(request, "message")
       : path === "/api/keyway/signing-settings" ? await generalSigningRequest(request, "settings")
+      : path === "/api/keyway/recovery" ? await generalSigningRequest(request, "recovery")
+      : path === "/api/keyway/recovery-backups" ? await generalSigningRequest(request, "recovery-backups")
       : path === "/api/keyway/developer/apps" ? await developerAppsRequest(request)
       : path === "/api/keyway/managed-node" ? await managedNodeHttpRequest(request)
       : jsonError("Not found", 404);
@@ -134,7 +138,9 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
 async function ownLockScript(user: User) {
   const wallet = await readWallet(user);
   if (wallet?.status !== "ready") throw new Error("KeyWay wallet is not ready");
-  const script = await currentLock(new ccc.ClientPublicTestnet(), wallet.litPublicKey, wallet.recovery);
+  const client = new ccc.ClientPublicTestnet();
+  if (wallet.recovery) await verifyRecoveryAnchor(client, wallet.litPublicKey, wallet.recovery);
+  const script = await currentLock(client, wallet.litPublicKey, wallet.recovery);
   return { code_hash: script.codeHash, hash_type: script.hashType, args: script.args } as never;
 }
 
@@ -178,9 +184,23 @@ async function bootstrapRequest(request: Request): Promise<Response> {
   // Lit creates the Fiber key; SDKs that send their own key are no longer accepted.
   if (keyCustody !== "lit") throw new Error("Update @ckb-keyway/react to 0.2.4 or later");
   if (nodeMode !== undefined && nodeMode !== "browser" && nodeMode !== "managed") throw new Error("Node mode is invalid");
-  return Response.json(await versionedMutation(request, user.id, "bootstrap", body, () =>
+  const result = await versionedMutation(request, user.id, "bootstrap", body, () =>
     bootstrap(user, deviceIdHash, nodeMode),
-  ));
+  );
+  // A recovery change sent earlier takes effect here once its transaction is committed.
+  let wallet = result.wallet;
+  if (wallet.recoveryPending) {
+    const scope = await resolveAuthScope(request);
+    const { encryptedFiberKey: _encrypted, ...settled } = await settleRecoveryChange({ user, appName: scope.name, email: () => sessionEmail(request), sendEmail: sendTransactionalEmail });
+    wallet = settled;
+  }
+  // Every sign-in bootstraps, in both node modes. With recovery on, the record must be one the chain backs, and
+  // anything at the old address moves to the new one after this response.
+  if (wallet.recovery) {
+    await verifyRecoveryAnchor(new ccc.ClientPublicTestnet(), wallet.litPublicKey, wallet.recovery);
+    sweepLegacyAfterSignIn(user);
+  }
+  return Response.json({ ...result, wallet });
 }
 
 async function fiberKeyRequest(request: Request): Promise<Response> {
@@ -313,7 +333,7 @@ async function signTransactionRequest(request: Request): Promise<Response> {
 
 async function generalSigningRequest(
   request: Request,
-  kind: "transaction" | "message" | "settings",
+  kind: "transaction" | "message" | "settings" | "recovery" | "recovery-backups",
   parsedBody?: Record<string, unknown>,
 ): Promise<Response> {
   const user = await authenticateUser(request);
@@ -330,8 +350,12 @@ async function generalSigningRequest(
     rateLimit: consumeRateLimit,
     recordSigning: recordSigningEvent,
   };
-  const run = () => kind === "transaction" ? transactionSigning(context, body) : kind === "message" ? messageSigning(context, body) : signingSettings(context, body);
-  const result = body.operation === "sign" ? await versionedMutation(request, user.id, `general-${kind}`, body, run) : await run();
+  const run = () => kind === "transaction" ? transactionSigning(context, body)
+    : kind === "message" ? messageSigning(context, body)
+    : kind === "recovery" ? recoverySetup(context, body)
+    : kind === "recovery-backups" ? recoveryBackupChange(context, body)
+    : signingSettings(context, body);
+  const result = body.operation === "sign" || body.operation === "enable" || body.operation === "apply" ? await versionedMutation(request, user.id, `general-${kind}`, body, run) : await run();
   return Response.json(result, { headers: { "Cache-Control": "no-store" } });
 }
 

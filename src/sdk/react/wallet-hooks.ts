@@ -1,12 +1,15 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { createEvmBackup, createJoyIdBackup, recoveryAccountAddress, type EthereumProvider } from "../browser/account-recovery";
 import { getCkbAccountBalance } from "../browser/ckb-balance";
+import type { RecoveryBackup, RecoveryBackupProof } from "../browser/recovery-backups";
+import type * as ccc from "@ckb-ccc/core";
 import type { KeyWay, KeyWayChannel, OpenKeyWayChannelOptions, ChannelOpenProgress } from "../browser/create-keyway";
 import { useKeyWayContext } from "./keyway-provider";
 
 export function useCkbWallet() {
-  const { authenticated, wallet, signer, error: recoveryError } = useKeyWayContext();
+  const { authenticated, wallet, signer, error: recoveryError, enableRecovery, changeRecoveryBackup, requestBackupChallenge } = useKeyWayContext();
   const [balance, setBalance] = useState<bigint>();
   const [balanceError, setBalanceError] = useState<Error>();
   const [refreshing, setRefreshing] = useState(false);
@@ -51,6 +54,35 @@ export function useCkbWallet() {
     refreshing,
     refreshBalance,
     error: wallet ? balanceError : recoveryError,
+    /** Opt-in account recovery: backup signers that can recover the account. Turning it on changes the address. */
+    recovery: {
+      status: wallet?.recovery ? "on" as const : "off" as const,
+      backups: wallet?.recovery?.backups ?? [],
+      legacyAddress: wallet?.recovery?.legacyAddress,
+      /** Turns recovery on with these backups, after the user approves and enters the emailed code. */
+      enable: async (backups: RecoveryBackupProof[]) => {
+        const result = await enableRecovery(backups);
+        void refreshBalance().catch(() => undefined);
+        return result;
+      },
+      /**
+       * Adds a backup from `createEvmBackup` or `createJoyIdBackup`, after the user approves and enters the emailed
+       * code. The address doesn't change.
+       */
+      addBackup: (backup: RecoveryBackupProof) => changeRecoveryBackup("add", backup),
+      /** Removes a backup, after the user approves and enters the emailed code. The last backup can't be removed. */
+      removeBackup: (backup: RecoveryBackup) => changeRecoveryBackup("remove", backup),
+      /** Asks an injected EVM wallet (`window.ethereum` by default) to sign up as a backup. */
+      createEvmBackup: async (ethereum?: EthereumProvider) => {
+        if (!wallet) throw new Error("Recover the CKB account before adding a backup");
+        return createEvmBackup(await recoveryAccountAddress(wallet.litPublicKey), await requestBackupChallenge(), ethereum);
+      },
+      /** Asks a CCC JoyID signer (from @ckb-ccc/joy-id) to sign up as a backup with its passkey. */
+      createJoyIdBackup: async (joyIdSigner: ccc.Signer) => {
+        if (!wallet) throw new Error("Recover the CKB account before adding a backup");
+        return createJoyIdBackup(await recoveryAccountAddress(wallet.litPublicKey, joyIdSigner.client), await requestBackupChallenge(), joyIdSigner);
+      },
+    },
   };
 }
 
