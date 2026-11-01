@@ -238,3 +238,22 @@ JoyID passkey (testnet):
    page. Sign; the page should report "Sent".
 9. If anything shows a different text, or the node refuses with code 107, stop there. Send the text the page
    showed and the error.
+
+## Founder's test with a real JoyID passkey and a real EVM wallet (2026-11-02)
+
+Run locally against this branch: the backup test page turned recovery on for a funded throwaway account with both
+backups (the real ownership check, with the challenge nonce), then the rescue page moved everything with each.
+
+| Step | Transaction |
+|---|---|
+| Turn recovery on (JoyID and EVM wallet as backups) | `0x4f92cc74821833e1dde65851db206b3dd3af2d8b9d73c5ebef62241ff34c14d1` |
+| Rescue with the real JoyID passkey (main key), 9,834.99 CKB | `0xd7a4292caa14573ebfbe5d96f02d1228ebefbe0118b575607ada3db35d4f8c20` |
+| Rescue with a real EVM wallet (`personal_sign`), 999.99 CKB after a 1,000 CKB refill | `0xe600d434be73b92c1b5013f3451f45375e311a020d3ddd35af13328a8733d4cf` |
+
+Both rescues use KeyWay's Omnilock copy (`0xf4ce6584…:0`) and the AdminList as cell deps, plus the matching
+verifier (`0xff16f2aa…:0` for the EVM wallet).
+
+The first EVM attempt failed with `TransactionFailedToResolve … Unknown(OutPoint(0x4f92…:1))`: the page was still
+on the JoyID rescue's lookup and built the transaction from cells that rescue had already spent. Fixed in
+`app/rescue/rescue-view.tsx` (Review reads the account again) and `src/rescue/rescue.ts` `sendRescue` (a spent
+input gets a plain "press Review again" message instead of the node's error).

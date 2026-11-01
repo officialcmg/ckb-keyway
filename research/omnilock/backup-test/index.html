@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Backup test</title>
+<style>
+  :root { --bg: #f6f6f3; --card: #fff; --ink: #16181d; --muted: #646a73; --line: #e3e3de; --accent: #1f6f5c; --bad: #b42318; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #111315; --card: #1a1d20; --ink: #eceef0; --muted: #9aa1a9; --line: #2b2f34; --accent: #5cc4a6; --bad: #f97066; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  main { max-width: 640px; margin: 0 auto; padding: 40px 16px 64px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .lead { color: var(--muted); margin: 0 0 28px; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin-bottom: 14px; }
+  section[data-state="locked"] { opacity: .45; }
+  h2 { font-size: 16px; margin: 0 0 6px; display: flex; gap: 10px; align-items: center; }
+  .num { width: 24px; height: 24px; border-radius: 50%; border: 1.5px solid var(--line); display: inline-grid; place-items: center; font-size: 13px; flex: none; }
+  section[data-state="done"] .num { background: var(--accent); border-color: var(--accent); color: var(--card); }
+  p { margin: 0 0 12px; color: var(--muted); }
+  button, a.button { font: inherit; font-weight: 600; background: var(--ink); color: var(--card); border: 0; border-radius: 8px; padding: 9px 16px; cursor: pointer; text-decoration: none; display: inline-block; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.small { background: transparent; color: var(--ink); border: 1px solid var(--line); padding: 3px 10px; font-size: 13px; font-weight: 500; }
+  .buttons { display: flex; gap: 8px; flex-wrap: wrap; }
+  .note { margin-top: 10px; font-size: 14px; color: var(--muted); }
+  section[data-state="error"] .note { color: var(--bad); }
+  .row { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+  .mono { font: 12.5px ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; flex: 1; color: var(--ink); }
+  .label { font-size: 13px; color: var(--muted); margin-top: 12px; }
+  ol { margin: 8px 0 0; padding-left: 20px; color: var(--ink); }
+  ol li { margin: 6px 0; }
+  pre { font: 12.5px ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; margin: 6px 0; white-space: pre-wrap; color: var(--ink); }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Backup test</h1>
+  <p class="lead">Testnet only. Makes a test KeyWay account with your JoyID and EVM wallet as its backups, then you rescue it with each one.</p>
+
+  <section id="step1" data-state="todo">
+    <h2><span class="num">1</span> Connect your backups</h2>
+    <p>Connect both to test both. One is fine too.</p>
+    <div class="buttons">
+      <button id="connect-joyid" data-again="1">Connect JoyID</button>
+      <button id="connect-evm" data-again="1">Connect EVM wallet</button>
+    </div>
+    <div class="label">JoyID address</div>
+    <div class="row"><div class="mono" id="joyid">—</div></div>
+    <div class="label">EVM wallet address</div>
+    <div class="row"><div class="mono" id="evm">—</div></div>
+    <div class="note"></div>
+  </section>
+
+  <section id="step2" data-state="locked">
+    <h2><span class="num">2</span> Make the test account</h2>
+    <p>Each backup signs a short message proving it's yours (it ends with "Request" and "Valid until" lines). The page then turns recovery on for a test account funded with testnet CKB.</p>
+    <button id="setup">Make test account</button>
+    <div class="note"></div>
+    <div id="step2-result" hidden>
+      <div class="label">Test account address</div>
+      <div class="row"><div class="mono" id="account"></div><button class="small" data-copy="account">Copy</button></div>
+      <div class="label">Balance: <span id="account-balance"></span> · <a id="enable-tx" target="_blank" rel="noopener">see transaction</a></div>
+    </div>
+  </section>
+
+  <section id="step3" data-state="locked">
+    <h2><span class="num">3</span> Rescue it with JoyID</h2>
+    <a class="button" href="http://localhost:3123/rescue" target="_blank" rel="noopener">Open the rescue page</a>
+    <ol>
+      <li>Paste the <b>test account address</b> and press <b>Look up</b>.</li>
+      <li>Press <b>JoyID</b> and approve.</li>
+      <li>Paste this as the destination:
+        <div class="row"><div class="mono" id="destination-joyid">—</div><button class="small" data-copy="destination-joyid">Copy</button></div>
+      </li>
+      <li>Press <b>Review</b>. The page shows the text JoyID will ask you to sign, like:
+        <pre>KeyWay recovery
+Move everything to ckt1…
+CKB: …
+Tokens: none
+Fee: … CKB
+Transaction: 0x…</pre>
+      </li>
+      <li>Press <b>Sign and send</b>. <b>Check JoyID shows the same lines.</b></li>
+    </ol>
+    <div class="note"></div>
+  </section>
+
+  <section id="step4" data-state="locked">
+    <h2><span class="num">4</span> Refill, then rescue it with your EVM wallet</h2>
+    <p>Step 3 moved everything out, so put 1,000 testnet CKB back first.</p>
+    <button id="refill" data-again="1">Refill test account</button>
+    <ol>
+      <li>Open the rescue page again, paste the test account address, press <b>Look up</b>.</li>
+      <li>Press <b>EVM wallet</b> and approve.</li>
+      <li>Destination: any testnet CKB address you have (your JoyID one from step 3 works).</li>
+      <li>Press <b>Review</b>, then <b>Sign and send</b>. <b>Check your wallet shows the same lines as the page.</b></li>
+      <li>Tell Claude both transaction hashes, and anything that looked off.</li>
+    </ol>
+    <div class="note"></div>
+  </section>
+</main>
+<script type="module" src="/client.js"></script>
+</body>
+</html>
