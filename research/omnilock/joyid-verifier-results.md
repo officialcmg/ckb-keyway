@@ -162,3 +162,12 @@ The cloud can't use a passkey. To repeat with one (testnet.joyid.dev, an account
   Requiring it would be a one-line change to the verifier and a redeploy (a new code hash, so new backup auths).
 - Sub keys are refused. Supporting them would mean verifying JoyID's CoTA SMT proof for the key against the CoTA
   cell on chain at setup.
+
+## Real JoyID run (founder, 2026-10-29)
+
+A real JoyID testnet account (main passkey, synced through Google Password Manager) was added as the only backup
+through `src/server/recovery.ts` (the WebAuthn ownership check passed on a real JoyID signature), then rescued
+through the rescue page (`/rescue`) with that JoyID:
+`0xd98417d1d6aba477de0333265c575e13252491d35f342003e86fc43ee33b94cf` (committed; 9802.99996548 CKB to the JoyID
+address, verifier cell `0x333fa2ab…` as a cell dep, witness 935 bytes). JoyID's sign page showed "Sign Request
+from KeyWay rescue", the page origin, and the message `CKB transaction: 0x<sighash>` in full.
