@@ -18,6 +18,16 @@ export function isXudtCompatible(script: { codeHash: string; hashType: string })
   return XUDT_COMPATIBLE.some((known) => known.codeHash === script.codeHash.toLowerCase() && known.hashType === script.hashType);
 }
 
+/**
+ * Whether a token cell's xUDT args are just the owner's lock hash (optionally with zero flags). Args that carry
+ * flags name extension scripts or need witness data to move, which KeyWay's sweeps and the rescue page can't
+ * supply, so those cells are left where they are rather than block everything else.
+ */
+export function hasPlainTokenArgs(type: { args: string }): boolean {
+  const args = ccc.bytesFrom(type.args);
+  return args.length === 32 || (args.length === 36 && args.slice(32).every((byte) => byte === 0));
+}
+
 /** A token's ID: the hash of its type script, given in Fiber's RPC shape or as molecule bytes from an invoice. */
 export function tokenAsset(script: { code_hash: string; hash_type: string; args: string } | string): string {
   if (typeof script === "string") return ccc.hashCkb(script);

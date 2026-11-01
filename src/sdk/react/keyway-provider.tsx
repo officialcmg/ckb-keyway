@@ -27,7 +27,7 @@ import { bootstrapKeyWay, type PublicWallet } from "../browser/bootstrap";
 import type { ApproveFiberChannelOpen, FiberChannelOpenPreview } from "../browser/remote-ckb-signer";
 import type { ApproveFiberPayment } from "../browser/fiber-payment";
 import type { RequestEmailCode } from "../browser/email-code";
-import { changeRecoveryBackup, enableRecovery, type ApproveBackupChange, type ApproveRecovery, type BackupChanged, type BackupChangePreview, type RecoveryEnabled, type RecoveryPreview } from "../browser/account-recovery";
+import { changeRecoveryBackup, enableRecovery, requestBackupChallenge, type ApproveBackupChange, type ApproveRecovery, type BackupChanged, type BackupChangePreview, type RecoveryEnabled, type RecoveryPreview } from "../browser/account-recovery";
 import type { RecoveryBackup, RecoveryBackupProof } from "../browser/recovery-backups";
 import { KeyWaySigner, type ApproveCkbMessage, type ApproveCkbTransaction, type MessagePreview, type TransactionPreview } from "../browser/keyway-signer";
 import { KeyWayChannelCloseModal, KeyWayChannelSettingsModal, KeyWayEmailCodeModal, KeyWayMessageModal, KeyWayBackupChangeModal, KeyWayPeerModal, KeyWayRecoveryModal, KeyWayTransactionModal } from "./signing-modals";
@@ -129,6 +129,8 @@ export type KeyWayContextValue = {
   enableRecovery: (backups: RecoveryBackupProof[]) => Promise<RecoveryEnabled>;
   /** Adds or removes a recovery backup, after the user's approval and the emailed code. */
   changeRecoveryBackup: (change: "add" | "remove", backup: RecoveryBackupProof | RecoveryBackup) => Promise<BackupChanged>;
+  /** A fresh nonce from KeyWay that a new backup signs to prove the user controls it. */
+  requestBackupChallenge: () => Promise<string>;
 };
 
 const KeyWayContext = createContext<KeyWayContextValue | undefined>(undefined);
@@ -466,6 +468,11 @@ export function KeyWayProvider({
     return result;
   }
 
+  async function backupChallenge(): Promise<string> {
+    if (!authToken) throw new Error("Sign in before adding a backup");
+    return requestBackupChallenge(authToken, new KeyWayApiClient({ appId }));
+  }
+
   async function changeBackup(change: "add" | "remove", backup: RecoveryBackupProof | RecoveryBackup): Promise<BackupChanged> {
     if (!authToken || !wallet) throw new Error("Sign in before changing backups");
     const result = await changeRecoveryBackup({
@@ -504,6 +511,7 @@ export function KeyWayProvider({
       stopFiber: disconnect,
       enableRecovery: turnOnRecovery,
       changeRecoveryBackup: changeBackup,
+      requestBackupChallenge: backupChallenge,
     }}>
       {children}
       {loginOpen && !authenticated ? (

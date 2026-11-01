@@ -1,6 +1,6 @@
 import * as ccc from "@ckb-ccc/core";
 import { formatAsset, isXudtCompatible } from "../sdk/browser/tokens.ts";
-import { accountLocks, refuseAdminListSpend, refuseForeignOmnilockOutputs, type KeyWayRecovery } from "../sdk/browser/account-lock.ts";
+import { accountLocks, refuseAdminListSpend, refuseForeignOmnilockOutputs, verifyRecoveryAnchor, type KeyWayRecovery } from "../sdk/browser/account-lock.ts";
 import { signingGroups, type SigningGroup } from "./funding-transaction.ts";
 import type { ReadyWallet } from "./user-wallet.ts";
 
@@ -111,6 +111,8 @@ export async function previewGeneralTransaction(
   if (transaction.headerDeps.length > 8) throw new Error("Transaction has too many header dependencies");
 
   const signer = new ccc.SignerCkbPublicKey(client, wallet.litPublicKey);
+  // The account's address comes from its recovery record, so the record must be one the chain backs.
+  if (wallet.recovery) await verifyRecoveryAnchor(client, wallet.litPublicKey, wallet.recovery);
   const locks = await accountLocks(client, wallet.litPublicKey, wallet.recovery);
   const own = locks.map(({ script }) => script);
   const inputCells = await Promise.all(transaction.inputs.map((cellInput) => cellInput.getCell(client)));
