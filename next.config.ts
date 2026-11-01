@@ -24,6 +24,15 @@ const nextConfig: NextConfig = {
           { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=(), payment=(), usb=()" },
         ],
       },
+      {
+        // JoyID signs in a popup that answers through window.opener, which same-origin isolation cuts off. The
+        // rescue page runs no Fiber node, so it doesn't need cross-origin isolation.
+        source: "/rescue",
+        headers: [
+          { key: "Cross-Origin-Opener-Policy", value: "same-origin-allow-popups" },
+          { key: "Cross-Origin-Embedder-Policy", value: "unsafe-none" },
+        ],
+      },
     ];
   },
 };

@@ -1,0 +1,11 @@
+[workspace]
+
+[package]
+name = "smt-ref"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sparse-merkle-tree = "0.6.1"
+blake2b-rs = "0.2"
+hex = "0.4"

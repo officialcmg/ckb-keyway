@@ -1,6 +1,6 @@
 import * as ccc from "@ckb-ccc/core";
 import { formatAsset, isXudtCompatible } from "../sdk/browser/tokens.ts";
-import { accountLocks, refuseAdminListSpend, type KeyWayRecovery } from "../sdk/browser/account-lock.ts";
+import { accountLocks, refuseAdminListSpend, refuseForeignOmnilockOutputs, verifyRecoveryAnchor, type KeyWayRecovery } from "../sdk/browser/account-lock.ts";
 import { signingGroups, type SigningGroup } from "./funding-transaction.ts";
 import type { ReadyWallet } from "./user-wallet.ts";
 
@@ -111,12 +111,15 @@ export async function previewGeneralTransaction(
   if (transaction.headerDeps.length > 8) throw new Error("Transaction has too many header dependencies");
 
   const signer = new ccc.SignerCkbPublicKey(client, wallet.litPublicKey);
+  // The account's address comes from its recovery record, so the record must be one the chain backs.
+  if (wallet.recovery) await verifyRecoveryAnchor(client, wallet.litPublicKey, wallet.recovery);
   const locks = await accountLocks(client, wallet.litPublicKey, wallet.recovery);
   const own = locks.map(({ script }) => script);
   const inputCells = await Promise.all(transaction.inputs.map((cellInput) => cellInput.getCell(client)));
   const groups = signingGroups(locks, inputCells);
   if (groups.length === 0) throw new Error("Transaction has no input owned by this KeyWay account");
   refuseAdminListSpend(transaction, inputCells, wallet.recovery);
+  refuseForeignOmnilockOutputs(transaction, await client.getKnownScript(ccc.KnownScript.OmniLock), wallet.litPublicKey, wallet.recovery);
   // CCC's own groups for this key are its secp256k1 lock and anyone-can-pay locks; only the first is signed.
   const secp = locks.find(({ kind }) => kind === "secp256k1")!.script;
   const related = await signer.getRelatedScripts(transaction);
