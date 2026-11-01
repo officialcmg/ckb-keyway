@@ -1,0 +1,4 @@
+test_tx_pool_accept ok, cycles 3935007 size 1035
+add tx 0x5042f4295d96cdc3a31f5a72c200eccc23b8a4598bbb6c87b4d4a0e8e3d1b8bc
+settled; notice email: A recovery backup was added in KeyWay audit-fix testnet proof
+backups [{"kind":"evm","address":"0x766d1913d0968dbea2b0cacf02c9c9bc5acce148"},{"kind":"joyid","address":"ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqqx5mevhu2n8qppphl94sa872nhak598fasm0q2pz"},{"kind":"evm","address":"0x17c636953f129a41164c1417bc3adaef2fd7cfe3"}] address unchanged true

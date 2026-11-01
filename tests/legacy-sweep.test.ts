@@ -2,21 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
-import { adminListTypeScript, omnilockArgsFor, secp256k1Lock, type KeyWayRecovery } from "../src/sdk/browser/account-lock.ts";
+import { adminListTypeScript, omnilockArgsFor, omnilockScript, secp256k1Lock } from "../src/sdk/browser/account-lock.ts";
 import { formatCkbSignature, signAccountGroups } from "../src/server/funding-transaction.ts";
-import { checkLegacySweepTransaction, lastSweepDecision, planLegacySweep, sweepLegacyAfterSignIn } from "../src/server/legacy-sweep.ts";
+import { blamedTokenCell, checkLegacySweepTransaction, lastSweepDecision, planLegacySweep, sweepCellKind, sweepLegacyAfterSignIn } from "../src/server/legacy-sweep.ts";
 import type { ReadyWallet } from "../src/server/user-wallet.ts";
+import { anchoredRecovery } from "./recovery-fixture.ts";
 
 const CKB = 100_000_000n;
 const privateKey = secp256k1.utils.randomSecretKey();
 const publicKey = ccc.hexFrom(secp256k1.getPublicKey(privateKey, true));
-const adminListTypeArgs = `0x${"5a".repeat(32)}`;
-const adminListTypeHash = adminListTypeScript({ adminListTypeArgs }).hash();
-const recovery: KeyWayRecovery = {
-  omnilockArgs: omnilockArgsFor(publicKey, adminListTypeHash), adminListTypeArgs, adminListTypeHash,
-  adminListOutPoint: { txHash: `0x${"ad".repeat(32)}`, index: 0 }, legacyAddress: "ckt1legacy", enabledAt: "2026-10-29T00:00:00.000Z",
-  backups: [{ kind: "evm", address: `0x${"44".repeat(20)}` }],
-};
+const { recovery } = await anchoredRecovery(publicKey, { backups: [{ kind: "evm", address: `0x${"44".repeat(20)}` }] });
 const wallet = {
   version: 1, status: "ready", litPkpId: `0x${"11".repeat(20)}`, litPublicKey: publicKey, ckbAddress: "ckt1new",
   encryptedFiberKey: "ciphertext", primaryDeviceIdHash: "a".repeat(64), hasOpenedChannel: false,
@@ -47,7 +42,7 @@ async function scripts() {
   const known = async (script: ccc.KnownScript, args: string) => ccc.Script.fromKnownScript(base, script, args as ccc.Hex);
   return {
     secp: await secp256k1Lock(base, publicKey),
-    omnilock: await known(ccc.KnownScript.OmniLock, recovery.omnilockArgs),
+    omnilock: omnilockScript(recovery),
     xudt: await known(ccc.KnownScript.XUdt, `0x${"77".repeat(32)}`),
     sudt: await known(ccc.KnownScript.SUdt, `0x${"78".repeat(32)}`),
     dao: await known(ccc.KnownScript.NervosDao, "0x"),
@@ -231,4 +226,23 @@ test("starting the sweep after sign-in returns at once and only logs a failure",
     if (saved !== undefined) process.env.DATABASE_URL = saved;
   }
   assert.match(JSON.stringify(logged), /old address sweep failed.*DATABASE_URL is required/);
+});
+
+test("leaves xUDT cells whose args carry extension flags, and finds the token cell a dry run blames", async () => {
+  const s = await scripts();
+  const base = new ccc.ClientPublicTestnet({ url: "https://testnet.ckb.dev/" });
+  const known = { xudt: await base.getKnownScript(ccc.KnownScript.XUdt), sudt: await base.getKnownScript(ccc.KnownScript.SUdt) };
+  const withArgs = (args: string) => ({ cellOutput: ccc.CellOutput.from({ lock: s.secp, capacity: 142n * CKB, type: { ...s.xudt, args } }), outputData: amount(5n) });
+  assert.equal(sweepCellKind(withArgs(`0x${"77".repeat(32)}`), known), "token");
+  assert.equal(sweepCellKind(withArgs(`0x${"77".repeat(32)}00000000`), known), "token");
+  // Owner mode or extension scripts: moving them may need scripts or witness data the sweep can't supply.
+  assert.equal(sweepCellKind(withArgs(`0x${"77".repeat(32)}01000000${"ab".repeat(32)}`), known), "other");
+  assert.equal(sweepCellKind(withArgs(`0x${"77".repeat(32)}00000080`), known), "other");
+
+  const transaction = ccc.Transaction.from({ inputs: [cell(s.secp, 100n * CKB), cell(s.secp, 142n * CKB, s.xudt, amount(5n))].map(({ outPoint }) => ({ previousOutput: outPoint })) });
+  const dry = (outcome: () => Promise<unknown>) => Object.assign(new ccc.ClientPublicTestnet({ url: "https://testnet.ckb.dev/" }), { sendTransactionDry: outcome });
+  const refusal = "TransactionFailedToVerify: Verification failed Script(TransactionScriptError { source: Inputs[1].Type, cause: ValidationFailure: see error code -52 })";
+  assert.ok((await blamedTokenCell(dry(async () => { throw new Error(refusal); }), transaction))!.eq(transaction.inputs[1].previousOutput));
+  assert.equal(await blamedTokenCell(dry(async () => 1_000n), transaction), undefined);
+  assert.equal(await blamedTokenCell(dry(async () => { throw new Error("Inputs[0].Lock failed"); }), transaction), undefined);
 });

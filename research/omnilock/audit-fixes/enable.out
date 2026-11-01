@@ -1,0 +1,5 @@
+preview {"newAddress":"ckt1qp4jndh3qdrtg0z5pefcq6ag3ws0uwsv8g5aw3yw742cgry0svv05qsqxeum2s9m5acd8paszkecg2vp6clwvdwaq9r6pmm0ssqpm9u7dnxpdhf08y8yskwdzce7x50aekmwpyqlylwfzdax8p4","adminListCkb":"165","feeCkb":"0.00001137"}
+test_tx_pool_accept ok, cycles 2663557 size 758
+enable tx 0xe44afcb8ae5c43c28c555fce402297122b51f8e12fa7d41812adc03a94d2b7c0 pending true
+settled; notice email: Account recovery is on in KeyWay audit-fix testnet proof
+account address ckt1qp4jndh3qdrtg0z5pefcq6ag3ws0uwsv8g5aw3yw742cgry0svv05qsqxeum2s9m5acd8paszkecg2vp6clwvdwaq9r6pmm0ssqpm9u7dnxpdhf08y8yskwdzce7x50aekmwpyqlylwfzdax8p4

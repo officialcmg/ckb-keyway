@@ -1,7 +1,7 @@
 import * as ccc from "@ckb-ccc/core";
-import { isAdminListCell, omnilockArgsFor, secp256k1Lock, OMNILOCK_OWNER_WITNESS_LOCK_LENGTH, SECP256K1_WITNESS_LOCK_LENGTH, type KeyWayRecovery } from "../sdk/browser/account-lock.ts";
+import { isAdminListCell, omnilockArgsFor, omnilockScript, secp256k1Lock, verifyRecoveryAnchor, OMNILOCK_OWNER_WITNESS_LOCK_LENGTH, SECP256K1_WITNESS_LOCK_LENGTH, type KeyWayRecovery } from "../sdk/browser/account-lock.ts";
 import { addTokenCellDeps } from "../sdk/browser/settlement-sweep.ts";
-import { isXudtCompatible } from "../sdk/browser/tokens.ts";
+import { hasPlainTokenArgs, isXudtCompatible } from "../sdk/browser/tokens.ts";
 import type { User } from "./auth-user.ts";
 import { database, type DatabaseSql } from "./database.ts";
 import { signAccountGroups, type SigningGroup } from "./funding-transaction.ts";
@@ -56,6 +56,8 @@ export async function sweepLegacyAddress(context: LegacySweepContext): Promise<L
   return withSweepLock(context.user.id, async (sql) => {
     const wallet = await readWallet(context.user, sql);
     if (wallet?.status !== "ready" || !wallet.recovery) return { status: "off" };
+    // Only to a recovery list the chain shows this account made.
+    await verifyRecoveryAnchor(client, wallet.litPublicKey, wallet.recovery);
 
     const [last] = await sql<Array<{ transaction_hash: string; sent_at: Date }>>`
       select transaction_hash, sent_at from keyway_v2_legacy_sweeps where user_id = ${context.user.id}
@@ -70,30 +72,58 @@ export async function sweepLegacyAddress(context: LegacySweepContext): Promise<L
       await sql`delete from keyway_v2_legacy_sweeps where user_id = ${context.user.id}`;
     }
 
-    const plan = await planLegacySweep(client, wallet, spent);
-    if (plan.left.length > 0) {
-      console.info("[keyway] cells left at the old address", { cells: plan.left.map(describeCell) });
-    }
-    if (plan.status === "empty") return { status: "empty" };
-    if (plan.status === "short") return { status: "short", shortCkb: formatCkb(plan.shortBy) };
+    // A token cell whose own scripts refuse the move (the node's dry run names it) is left out and the sweep
+    // rebuilt, so one such cell doesn't hold back everything else.
+    const exclude = [...spent];
+    for (let attempt = 0; ; attempt++) {
+      const plan = await planLegacySweep(client, wallet, exclude);
+      if (plan.left.length > 0 && attempt === 0) {
+        console.info("[keyway] cells left at the old address", { cells: plan.left.map(describeCell) });
+      }
+      if (plan.status === "empty") return { status: "empty" };
+      if (plan.status === "short") return { status: "short", shortCkb: formatCkb(plan.shortBy) };
 
-    await checkLegacySweepTransaction(client, plan.transaction, wallet.litPublicKey, wallet.recovery);
-    await (context.recordSigning ?? recordSigningEvent)(context.user.id);
-    const signed = await signAccountGroups(plan.transaction, plan.groups, client, (digest) => sign({ wallet, signDigest: context.signDigest }, digest));
-    const transactionHash = signed.hash();
-    // Recorded before sending, so a crash in between can't lead to a second, conflicting transaction.
-    await sql`
-      insert into keyway_v2_legacy_sweeps (user_id, transaction_hash, sent_at) values (${context.user.id}, ${transactionHash}, now())
-      on conflict (user_id) do update set transaction_hash = excluded.transaction_hash, sent_at = excluded.sent_at
-    `;
-    try {
-      await (context.broadcast ?? ((transaction) => client.sendTransaction(transaction, "passthrough")))(signed);
-    } catch (error) {
-      await sql`delete from keyway_v2_legacy_sweeps where user_id = ${context.user.id} and transaction_hash = ${transactionHash}`;
-      throw error;
+      await checkLegacySweepTransaction(client, plan.transaction, wallet.litPublicKey, wallet.recovery);
+      await (context.recordSigning ?? recordSigningEvent)(context.user.id);
+      const signed = await signAccountGroups(plan.transaction, plan.groups, client, (digest) => sign({ wallet, signDigest: context.signDigest }, digest));
+      const blamed = attempt < MAX_BLAMED ? await blamedTokenCell(client, signed) : undefined;
+      if (blamed) {
+        console.info("[keyway] a token cell at the old address can't be moved; leaving it", { outPoint: `${blamed.txHash}:${blamed.index}` });
+        exclude.push(blamed);
+        continue;
+      }
+      const transactionHash = signed.hash();
+      // Recorded before sending, so a crash in between can't lead to a second, conflicting transaction.
+      await sql`
+        insert into keyway_v2_legacy_sweeps (user_id, transaction_hash, sent_at) values (${context.user.id}, ${transactionHash}, now())
+        on conflict (user_id) do update set transaction_hash = excluded.transaction_hash, sent_at = excluded.sent_at
+      `;
+      try {
+        await (context.broadcast ?? ((transaction) => client.sendTransaction(transaction, "passthrough")))(signed);
+      } catch (error) {
+        await sql`delete from keyway_v2_legacy_sweeps where user_id = ${context.user.id} and transaction_hash = ${transactionHash}`;
+        throw error;
+      }
+      return { status: "swept", transactionHash, movedCkb: formatCkb(plan.movedShannons), tokenCells: plan.tokenCells, topUp: Boolean(plan.topUp) };
     }
-    return { status: "swept", transactionHash, movedCkb: formatCkb(plan.movedShannons), tokenCells: plan.tokenCells, topUp: Boolean(plan.topUp) };
   });
+}
+
+/** How many cells a sweep leaves out before giving up until the next sign-in. */
+const MAX_BLAMED = 3;
+
+/**
+ * The input of the old address a node's dry run refuses because of that input's type script, if any. Only token
+ * cells carry a type script here, so this is a token the sweep can't move.
+ */
+export async function blamedTokenCell(client: ccc.Client, transaction: ccc.Transaction): Promise<ccc.OutPoint | undefined> {
+  try {
+    await client.sendTransactionDry(transaction, "passthrough");
+    return undefined;
+  } catch (error) {
+    const match = /Inputs\[(\d+)\]\.Type/i.exec(error instanceof Error ? error.message : String(error));
+    return match ? transaction.inputs[Number(match[1])]?.previousOutput : undefined;
+  }
 }
 
 /**
@@ -133,12 +163,12 @@ async function tokenScripts(client: ccc.Client): Promise<TokenScripts> {
 
 const matches = (type: ccc.Script, known: ccc.ScriptInfo) => type.codeHash === known.codeHash && type.hashType === known.hashType;
 
-/** Plain CKB, a standard token (xUDT, sUDT, or xUDT-compatible such as RUSD) with its amount, or anything else. */
+/** Plain CKB, a standard token (xUDT without extension flags, sUDT, or xUDT-compatible such as RUSD) with its amount, or anything else. */
 export function sweepCellKind(cell: { cellOutput: ccc.CellOutput; outputData: ccc.Hex }, known: TokenScripts): "plain" | "token" | "other" {
   const type = cell.cellOutput.type;
   if (!type) return cell.outputData === "0x" ? "plain" : "other";
   const token = matches(type, known.xudt) || matches(type, known.sudt) || isXudtCompatible(type);
-  return token && ccc.bytesFrom(cell.outputData).length >= 16 ? "token" : "other";
+  return token && hasPlainTokenArgs(type) && ccc.bytesFrom(cell.outputData).length >= 16 ? "token" : "other";
 }
 
 const occupied = (output: ccc.CellOutput, data: ccc.HexLike) => ccc.fixedPointFrom(output.occupiedSize + ccc.bytesFrom(data).length);
@@ -163,7 +193,7 @@ export type LegacySweepPlan = { left: ccc.Cell[] } & (
 export async function planLegacySweep(client: ccc.Client, wallet: ReadyWallet, exclude: ccc.OutPoint[] = []): Promise<LegacySweepPlan> {
   const recovery = requiredRecovery(wallet);
   const secp = await secp256k1Lock(client, wallet.litPublicKey);
-  const omnilock = await ccc.Script.fromKnownScript(client, ccc.KnownScript.OmniLock, omnilockArgsFor(wallet.litPublicKey, recovery.adminListTypeHash));
+  const omnilock = omnilockScript({ omnilock: recovery.omnilock, omnilockArgs: omnilockArgsFor(wallet.litPublicKey, recovery.adminListTypeHash) });
   const known = await tokenScripts(client);
   const cells: ccc.Cell[] = [];
   for await (const cell of client.findCellsByLock(secp, null, true)) {
@@ -191,7 +221,7 @@ export async function planLegacySweep(client: ccc.Client, wallet: ReadyWallet, e
       outputsData: [...tokens.map((cell) => cell.outputData), ...plain.map(() => "0x")],
     });
     await transaction.addCellDepsOfKnownScripts(client, ccc.KnownScript.Secp256k1Blake160);
-    if (topUp) await transaction.addCellDepsOfKnownScripts(client, ccc.KnownScript.OmniLock);
+    if (topUp) transaction.addCellDeps(recovery.omnilock.cellDeps);
     await addTokenCellDeps(client, transaction, tokens.filter((cell) => !matches(cell.cellOutput.type!, known.sudt)));
     if (tokens.some((cell) => matches(cell.cellOutput.type!, known.sudt))) await transaction.addCellDepsOfKnownScripts(client, ccc.KnownScript.SUdt);
     await transaction.prepareSighashAllWitness(secp, SECP256K1_WITNESS_LOCK_LENGTH, client);
@@ -251,7 +281,7 @@ async function largestPlainCell(client: ccc.Client, lock: ccc.Script, recovery: 
 export async function checkLegacySweepTransaction(client: ccc.Client, transaction: ccc.Transaction, publicKey: ccc.HexLike, recovery: KeyWayRecovery): Promise<void> {
   const refuse = (reason: string) => { throw new Error(`The old address sweep doesn't match what KeyWay allows: ${reason}`); };
   const secp = await secp256k1Lock(client, publicKey);
-  const omnilock = await ccc.Script.fromKnownScript(client, ccc.KnownScript.OmniLock, omnilockArgsFor(publicKey, recovery.adminListTypeHash));
+  const omnilock = omnilockScript({ omnilock: recovery.omnilock, omnilockArgs: omnilockArgsFor(publicKey, recovery.adminListTypeHash) });
   const known = await tokenScripts(client);
   if (transaction.version !== 0n || transaction.headerDeps.length > 0) refuse("unexpected version or header deps");
   const inputCells = await Promise.all(transaction.inputs.map((input) => input.getCell(client)));
