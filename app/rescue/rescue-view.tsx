@@ -104,7 +104,12 @@ export function RescueView() {
   const review = (event: FormEvent) => {
     event.preventDefault();
     reset("review");
-    void run("review", "review", async () => setPlan(await planRescue(client!, account!, backup!.entry, destination)));
+    // Read the account again: cells move between the lookup and the review (an earlier rescue, a deposit).
+    void run("review", "review", async () => {
+      const fresh = await openRescueAccount(client!, address, excluded);
+      setAccount(fresh);
+      setPlan(await planRescue(client!, fresh, fresh.entries.find(({ auth }) => auth === backup!.entry.auth) ?? backup!.entry, destination));
+    });
   };
 
   const sign = () => void run("sign", "sign", async () => {

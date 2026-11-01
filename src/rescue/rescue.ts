@@ -430,6 +430,7 @@ export async function sendRescue(client: ccc.Client, transaction: ccc.Transactio
     const text = error instanceof Error ? error.message : String(error);
     const cell = blamedInput(transaction, text);
     if (cell) throw new RescueError("blocked", "One token cell at this address can't be moved by this page. It has been left out; review the rescue and sign again", cell);
+    if (/TransactionFailedToResolve|(Dead|Unknown)\(OutPoint/i.test(text)) throw new Error("The balance at this address changed since you reviewed the rescue. Press Review again, then sign");
     // Some public nodes don't offer the dry run; the real send still checks everything.
     if (!/method not found|-32601/i.test(text)) throw new Error(`The CKB node refused the rescue: ${text.slice(0, 240)}`);
   }
