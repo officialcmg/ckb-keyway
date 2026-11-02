@@ -672,7 +672,7 @@ export function KeyWayFiberButton({
   );
 }
 
-function KeyWayLoginModal({
+export function KeyWayLoginModal({
   api,
   appName,
   theme,
@@ -876,7 +876,7 @@ function MailIcon() {
   return <svg aria-hidden="true" width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect width="18" height="14" x="3" y="5" rx="2" /><path d="m3 7 9 6 9-6" /></svg>;
 }
 
-function KeyWayFundingModal({
+export function KeyWayFundingModal({
   theme,
   preview,
   answer,
