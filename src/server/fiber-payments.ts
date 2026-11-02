@@ -52,8 +52,8 @@ export async function fiberPayment(context: PaymentContext, node: FiberCaller, b
   const request = await loadRequest(context.user, "payment", nonce, digest);
   if (body.stage === "request-email-code") {
     if (!request.requires_email_code) throw new Error("This payment doesn't need an email code");
-    await sendCode(context, "payment", nonce, "Confirm a payment", request.summary.lines ?? []);
-    return { sent: true };
+    const sentTo = await sendCode(context, "payment", nonce, "Confirm a payment", request.summary.lines ?? []);
+    return { sent: true, sentTo };
   }
   if (body.stage !== "send") throw new Error("A valid payment stage is required");
   if (request.requires_email_code) await verifyCode(context.user, "payment", nonce, body.emailCode);

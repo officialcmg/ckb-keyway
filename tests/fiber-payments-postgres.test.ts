@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { fiberPayment, type PaymentContext } from "../src/server/fiber-payments.ts";
+import { database } from "../src/server/database.ts";
 import { signingSettings, type SigningContext } from "../src/server/general-signing.ts";
 
 const enabled = Boolean(process.env.KEYWAY_AUTH_TEST_DATABASE_URL);
@@ -34,6 +35,17 @@ function harness(amount: bigint, options: { failSend?: boolean } = {}) {
   return { context, node, emails, sent, settings, codeFrom: () => /code is (\d{6})/.exec(emails.at(-1)!.plaintext)![1] };
 }
 
+/** Moves a pending request, and its code, this many minutes into the past, as if that time had gone by. */
+async function age(nonce: string, minutes: number) {
+  const sql = await database();
+  const shift = `${minutes} minutes`;
+  await sql`
+    update keyway_v2_signature_requests
+    set expires_at = expires_at - ${shift}::interval, email_code_expires_at = email_code_expires_at - ${shift}::interval
+    where nonce = ${nonce}
+  `;
+}
+
 const pay = (h: ReturnType<typeof harness>, extra: Record<string, unknown>, invoice = "fibt1test") =>
   fiberPayment(h.context, h.node, { method: "sendPayment", params: { invoice }, ...extra }) as Promise<Record<string, unknown>>;
 
@@ -63,7 +75,33 @@ test("hosted Fiber payments: daily amount, email codes and overlapping approvals
     const preview = await pay(h, { stage: "preview" });
     await assert.rejects(() => pay(h, { stage: "send", confirmationNonce: preview.confirmationNonce }, "fibt1other"), /invalid or expired/);
     await pay(h, { stage: "send", confirmationNonce: preview.confirmationNonce });
-    await assert.rejects(() => pay(h, { stage: "send", confirmationNonce: preview.confirmationNonce }), /invalid or expired/);
+    await assert.rejects(() => pay(h, { stage: "send", confirmationNonce: preview.confirmationNonce }), /This request expired\. Start again\./);
+  });
+
+  await t.test("a payment approval lives as long as its code, and each resend extends both", async () => {
+    const h = harness(40n * CKB);
+    await h.settings(1n);
+    const sent = async () => {
+      const preview = await pay(h, { stage: "preview" });
+      const request = await pay(h, { stage: "request-email-code", confirmationNonce: preview.confirmationNonce });
+      assert.equal(request.sentTo, "ana@acmepay.example");
+      return String(preview.confirmationNonce);
+    };
+    const confirmLate = await sent();
+    await age(confirmLate, 6);
+    await pay(h, { stage: "send", confirmationNonce: confirmLate, emailCode: h.codeFrom() });
+
+    const resendLate = await sent();
+    await age(resendLate, 6);
+    await pay(h, { stage: "request-email-code", confirmationNonce: resendLate });
+    await age(resendLate, 9);
+    await pay(h, { stage: "send", confirmationNonce: resendLate, emailCode: h.codeFrom() });
+    assert.equal(h.sent.length, 2);
+
+    const expired = await sent();
+    await age(expired, 11);
+    await assert.rejects(() => pay(h, { stage: "request-email-code", confirmationNonce: expired }), /^Error: This request expired\. Start again\.$/);
+    await assert.rejects(() => pay(h, { stage: "send", confirmationNonce: expired, emailCode: h.codeFrom() }), /^Error: This request expired\. Start again\.$/);
   });
 
   await t.test("overlapping approvals can't both slip under the amount", async () => {

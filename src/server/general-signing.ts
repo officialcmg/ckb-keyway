@@ -27,8 +27,10 @@ export type SigningContext = {
   signDigest?: (digest: ccc.Hex, wallet: ReadyWallet) => Promise<ccc.Hex>;
 };
 
+// An approval waits this long for the user; sending a code moves its expiry to the code's, so it always outlives it.
 const REQUEST_TTL_MS = 5 * 60_000;
 const CODE_TTL_MS = 10 * 60_000;
+export const REQUEST_EXPIRED = "This request expired. Start again.";
 const MAX_CODE_ATTEMPTS = 5;
 const MAX_MESSAGE_BYTES = 4096;
 
@@ -48,8 +50,8 @@ export async function transactionSigning(context: SigningContext, body: Record<s
   if (body.operation === "request-email-code") {
     const request = await loadRequest(context.user, "transaction", nonce, digest);
     if (!request.requires_email_code) throw new Error("This transaction doesn't need an email code");
-    await sendCode(context, "transaction", nonce, "Confirm a transaction", request.summary.lines ?? []);
-    return { sent: true };
+    const sentTo = await sendCode(context, "transaction", nonce, "Confirm a transaction", request.summary.lines ?? []);
+    return { sent: true, sentTo };
   }
   if (body.operation !== "sign") throw new Error("A valid signing operation is required");
   const request = await loadRequest(context.user, "transaction", nonce, digest);
@@ -205,8 +207,8 @@ export async function signingSettings(context: SigningContext, body: Record<stri
       `Change: ${next.size === 0 ? "turn email confirmation off" : describeAmount(next, change.asset)}`,
     ];
     const confirmationNonce = await issueRequest(context.user, "settings", digest, { lines }, true);
-    await sendCode(context, "settings", confirmationNonce, "Confirm a security change", lines);
-    return { requiresEmailCode: true, confirmationNonce };
+    const sentTo = await sendCode(context, "settings", confirmationNonce, "Confirm a security change", lines);
+    return { requiresEmailCode: true, confirmationNonce, sentTo };
   }
   const nonce = requiredNonce(body.confirmationNonce);
   await loadRequest(context.user, "settings", nonce, digest);
@@ -305,32 +307,41 @@ export type RequestRow = { requires_email_code: boolean; summary: { lines?: stri
 
 export async function loadRequest(user: User, purpose: Purpose, nonce: string, digest: string): Promise<RequestRow> {
   const sql = await database();
-  const [row] = await sql<RequestRow[]>`
-    select requires_email_code, summary from keyway_v2_signature_requests
-    where user_id = ${user.id} and purpose = ${purpose} and nonce = ${nonce} and request_digest = ${digest} and expires_at > now()
+  const [row] = await sql<Array<RequestRow & { request_digest: string }>>`
+    select requires_email_code, summary, request_digest from keyway_v2_signature_requests
+    where user_id = ${user.id} and purpose = ${purpose} and nonce = ${nonce} and expires_at > now()
   `;
-  if (!row) throw new Error("Signing confirmation is invalid or expired");
-  return row;
+  if (!row) throw new Error(REQUEST_EXPIRED);
+  if (row.request_digest !== digest) throw new Error("Signing confirmation is invalid or expired");
+  return { requires_email_code: row.requires_email_code, summary: row.summary };
 }
 
 export async function consumeRequest(user: User, purpose: Purpose, nonce: string): Promise<void> {
   const sql = await database();
   const rows = await sql`delete from keyway_v2_signature_requests where user_id = ${user.id} and purpose = ${purpose} and nonce = ${nonce} returning 1`;
-  if (!rows[0]) throw new Error("Signing confirmation is invalid or expired");
+  if (!rows[0]) throw new Error(REQUEST_EXPIRED);
 }
 
-export async function sendCode(context: Pick<SigningContext, "user" | "appName" | "email" | "sendEmail" | "rateLimit">, purpose: Purpose, nonce: string, heading: string, lines: string[]): Promise<void> {
+/**
+ * Emails a new code for a pending request and returns the address it went to. Each send replaces the code,
+ * resets its attempts and gives the code, and the request with it, the full code lifetime again; the per-user
+ * email limit bounds how often that can happen.
+ */
+export async function sendCode(context: Pick<SigningContext, "user" | "appName" | "email" | "sendEmail" | "rateLimit">, purpose: Purpose, nonce: string, heading: string, lines: string[]): Promise<string> {
   await limit(context, "step-up-email", { max: 5, window: 600 });
   const code = randomInt(0, 1_000_000).toString().padStart(6, "0");
   const sql = await database();
   const rows = await sql`
     update keyway_v2_signature_requests
-    set email_code_hash = ${codeHash(nonce, code)}, email_code_expires_at = ${new Date(Date.now() + CODE_TTL_MS)}, email_attempts = 0
-    where user_id = ${context.user.id} and purpose = ${purpose} and nonce = ${nonce} returning 1
+    set email_code_hash = ${codeHash(nonce, code)}, email_code_expires_at = now() + ${`${CODE_TTL_MS} milliseconds`}::interval, email_attempts = 0,
+      expires_at = greatest(expires_at, now() + ${`${CODE_TTL_MS} milliseconds`}::interval)
+    where user_id = ${context.user.id} and purpose = ${purpose} and nonce = ${nonce} and expires_at > now() returning 1
   `;
-  if (!rows[0]) throw new Error("Signing confirmation is invalid or expired");
+  if (!rows[0]) throw new Error(REQUEST_EXPIRED);
+  const to = await context.email();
   const template = createConfirmationEmailTemplate(context.appName, code, heading, lines);
-  await context.sendEmail(await context.email(), template, `keyway-step-up/${nonce}/${Date.now()}`);
+  await context.sendEmail(to, template, `keyway-step-up/${nonce}/${Date.now()}`);
+  return to;
 }
 
 export async function verifyCode(user: User, purpose: Purpose, nonce: string, code: unknown): Promise<void> {
@@ -338,7 +349,7 @@ export async function verifyCode(user: User, purpose: Purpose, nonce: string, co
   const sql = await database();
   const [row] = await sql<Array<{ email_code_hash: string | null; email_attempts: number }>>`
     update keyway_v2_signature_requests set email_attempts = email_attempts + 1
-    where user_id = ${user.id} and purpose = ${purpose} and nonce = ${nonce} and email_code_expires_at > now()
+    where user_id = ${user.id} and purpose = ${purpose} and nonce = ${nonce} and expires_at > now() and email_code_expires_at > now()
     returning email_code_hash, email_attempts
   `;
   if (!row?.email_code_hash) throw new Error("The email code has expired. Request a new one");
