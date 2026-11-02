@@ -1,0 +1,99 @@
+fetched: 2026-11-02T23:43:56Z
+
+################ https://testnet.joyid.dev
+-- response headers of https://testnet.joyid.dev/sign-message (security-relevant):
+strict-transport-security: max-age=63072000
+x-frame-options: DENY
+   (no Cross-Origin-Opener-Policy / COEP / CSP header is sent)
+-- main bundle https://testnet.joyid.dev/assets/index-KHmlX32p.js sha256 1f91e61a0579188059115592175ef519db30f4a2530d424943230ce01c904c31 bytes 7697634
+-- sign-message chunk https://testnet.joyid.dev/assets/index-DBbMSMVu.js sha256 a44605e9314df553ea50d2df99223399fe14e5531fc1459bec2c07e032e10721
+
+== sendMessageToDapp (popup: window.opener.postMessage; redirect: _data_ in QUERY + location.replace)
+   [main.js @ character offset 5035466]
+   sendMessageToDapp=async(sn,an,cn)=>{const ln=new URL(an);if(cn===DappCommunicationType.Popup)throw window.opener&&window.opener.postMessage(sn,ln.origin),new Error("Dapp window is closed, please reopen it and try again");cn===DappCommunicationType.Redirect&&(ln.searchParams.set("_data_",encodeSearch(sn)),location.replace(ln.href
+
+== useGuardRedirectUri (referrer origin must match redirectURL origin; allowed protocols)
+   [main.js @ character offset 6082643]
+   useGuardRedirectUri=()=>sn=>{if(isNativeApp())return null;if(document.referrer)try{const an=new URL(document.referrer),cn=new URL(sn);if(an.origin!==cn.origin&&an.origin!==location.origin){const ln=new DappError("Invalid redirectURL: The origin of the redirectURL must be the same as the origin of the referrer.",DappErrorName.NotAllowed);return jsxRuntimeExports.jsx(AuthContainer,{children:jsxRuntimeExports.jsx(AlertPage,{error:ln})})}}catch{}try{const an=new URL(sn);if(allowProtocols.has(an.protocol))return null;co
+
+== generateSignedInfo (message = base64url(authenticatorData || clientDataJSON))
+   [main.js @ character offset 6061758]
+   generateSignedInfo=(sn,an,cn,ln)=>{const un=an;if(ln&&cn===DappRequestType.Auth)throw new Error("Auth request challenge should not be data");if(typeof sn=="string")return{signature:bufferToBase64URLString(hexToArrayBuffer(sn)),challenge:un,message:bufferToBase64URLString(ln?hexToArrayBuffer(un):utf8StringToBuffer$1(un))};const fn=base64URLStringToBuffer(sn.response.authenticatorData),gn=base64URLStringToBuffer(sn.response.clientDataJSON),Zn=bufferToBase64URLString(appendBuffer(fn,gn));return{signature:sn.response.signature,challenge:un,message:Zn}},sendS
+
+== sendSignedMessageToDapp (one result object for both modes)
+   [main.js @ character offset 6062313]
+   sendSignedMessageToDapp=async(sn,an,cn,ln,un=DappRequestType.Auth)=>{const{signature:fn,challenge:gn,message:Zn}=generateSignedInfo(sn,an.challenge,un,an.isData??!1),Zr={signature:fn,message:Zn,challenge:gn,alg:cn.alg,pubkey:isSessionAccount(cn)||cn.alg===SigningAlg.RS256?cn.pubkey:cn.pubkey.slice(2),keyType:cn.keyType,state:an.state},{ethAddress:Do,nostrPubkey:Uo}=cn;isSessionAccount(cn)&&(Zr.attestation=formatAttestation(cn).attestation);const Cl=un===DappRequestType.Auth?{data:{address:cn.address,ethAddress:Do,nostrPubkey:Uo,nativeSegwit:cn.nativeSegwit,taproot:cn.taproot,...Zr},type:DappRequestType.Auth}:{data:{...Zr},type:DappRequestType.SignMessage};await sendMessageToDapp({...Cl,state:an.state},an.redirectURL,ln)},useSendSignedMessageToDapp=sn
+
+== useSendSignedMessageToDapp (CKB text: challenge = base64url(utf8(text)); isData: hex bytes)
+   [main.js @ character offset 6063044]
+   useSendSignedMessageToDapp=sn=>{const an=useErrorHandler(),cn=useSignMessage(utf8StringToBuffer$1,gn=>bufferToBase64URLString(utf8StringToBuffer$1(gn))),ln=useSignMessage(hexToArrayBuffer,gn=>bufferToBase64URLString(hexToArrayBuffer(gn))),un=useEnsureSessionKey(),fn=useToast();return async(gn,Zn,Zr,Do)=>{var Uo;try{if(isSessionAccount(Zn)&&await un(Zn),sn===DappRequestType.SignMessage&&gn.requestNetwork==="ethereum"){const El=gn,Sl=El.isData?hexToBuffer(El.challenge):El.challenge,_l=await signEthMessage(Zn,Sl);if(Do){await Do(_l);return}const Rl={signature:_l};gn.state&&(Rl.state=gn.state),await sendMessageToDapp({type:DappRequestType.SignMessage,data:Rl},gn.redirectURL,Zr);return}if(sn===DappRequestType.SignMessage&&((Uo=gn.requestNetwork)!=null&&Uo.startsWith("btc-"))){const El=gn,Sl=await getBtcAccount(Zn,getBtcAddressType(El.address)),_l=El.signMessageType==="bip322-simple"?signMessageOfBIP322Simple(Sl,El.challenge,El.address):signMessageOfECDSA(Sl.keypair,El.challenge);if(Do){await Do(_l);return}const Rl={signature:_l};gn.state&&(Rl.state=gn.state),await sendMessageToDapp({type:DappRequestType.SignMessage,data:Rl},gn.redirectURL,Zr);return}if(sn===DappRequestType.SignMessage&&gn.isData){const El=await ln(gn.challenge,Zn);await sendSignedMessageToDapp(El,gn,Zn,Zr,sn);return}const Cl=await cn(gn.challenge,Zn);await sendSignedMessageToDapp(Cl,gn,Zn,Zr,sn)}catch(Cl){Cl instanceof Error&&Cl.message.includes("postMessage")?fn({title:"Please reopen this page and try again",status:"error"}):an(Cl)}}},useSignMiniAppMessage=()=>{const sn=useErrorHandler(),an=useSignMessage(utf8StringToBuffer$1,fn=>bufferToBase64URLString(utf8StringToBuffer$1(fn))),cn=useSignMessage(hexToArrayB
+
+== useSignMessage (WebAuthn startAuthentication with the mapped challenge)
+   [main.js @ character offset 5172631]
+   useSignMessage=(sn,an=cn=>cn)=>async(cn,ln,un=!1)=>{if(un)return signNostrMessage(ln,cn);if(ln.isMnemonic){const gn=an(cn);return signCkbNativeWebauthnMessage(ln,gn)}if(isSessionAccount(ln)){const gn=await Signer.fromIndexedDB(ln.pubkey),Zn=sn(cn);return gn.signMessage(Zn)}const fn=an(cn);return startAuthentication({challenge:fn,userVerification:"required",allowCredentials:[{id:ln.id,type:"public-key",transports:["internal","ble","cable","hybrid","usb"]}]})},useVerifyAccount=()=>async(sn,an)=>{const cn=generateRand
+
+== AUTH_MESSAGE_PREFIX (Auth with a challenge signs a PREFIXED text)
+   [main.js @ character offset 6078199]
+   AUTH_MESSAGE_PREFIX=`JoyID authorize prefix:
+`,generateAuthP
+
+== useSdkPopupGuard (popup mode warns when window.opener is gone)
+   [main.js @ character offset 6066955]
+   useSdkPopupGuard=(sn="Dapp",an=DappCommunicationType.Popup)=>{const cn=reactExports.useRef(!1),ln=useAtomValue(disablePopupGuardAtom),un=useConfirm();reactExports.useEffect(()=>{if(isNativeApp())return()=>{};const fn=setInterval(()=>{an===DappCommunicationType.Popup&&!window.opener&&!cn.current&&ln===!1&&(cn.current=!0,un({status:"warning",title:`The ${sn} window has been closed, rendering this operation invalid. Ple
+
+== sign-ckb-raw-tx delivery is hard-coded popup
+   [main.js @ character offset 6789326]
+   ;return async(ln,un,fn,gn)=>{try{const Zn=await sn(ln,un,gn);await sendMessageToDapp({type:DappRequestType.SignCkbRawTx,data:{tx:Zn}},fn,DappCommunicationType.Popup)}catch(Zn){Zn instanceof Error&&Zn.message.includes("postMessage")?cn({title:"Please reopen this page and try again
+
+== SignMessage page: one component for both modes; shows name, host, message
+   [signmessage.js @ character offset 3460]
+   ight:"bold",textAlign:"center",children:o("sign",{title:e.name})}),t.jsx(v,{fontSize:"14px",fontWeight:"bold",textAlign:"center",color:"#3D45FB",whiteSpace:"pre-line",children:x}),t.jsx(we,{requestNetwork:e.requestNetwork})]}),t.jsx(ge,{mt:"18px",title:o("messages"),message:e.challenge}),t.jsx(C,{pb:0,mt:"auto",pt:"16px",bg:"white",w:"100%",flexDirection:"column",children:Q}),t.jsxs(xe,{as:"footer",bg:"white",mt:"32px",w:"full",children:[t.jsx(j,{w:"120px"
+
+== SignMessage route: type defaults to redirect, referrer check
+   [signmessage.js @ character offset 4161]
+   T=()=>{const[e]=je(),a=e.get("type"),n=_e(e.get("_data_")||""),x=!1,o=ye();if(n instanceof D)return t.jsx(M,{children:t.jsx(F,{error:n})});if(n.redirectURL){const i=new URL(n.redirectURL),h=o(n.redirectURL);if(h)return h;if(document.referrer&&new URL(i).origin!==new URL(document.referrer).origin&&a==="redirect"){const f=new D("Invalid redirectURL: The origin of the redirectURL must be the same as the origin of the referrer.",S.NotAllowed);return t.jsx(M,{children:t.jsx(F,{error:f})})}}return t.jsx(b,{request:be(n),type:a??"redirect",enableRemoteAuth:x})}});export{qe as __tla,T as default};
+
+
+################ https://app.joy.id
+-- response headers of https://app.joy.id/sign-message (security-relevant):
+strict-transport-security: max-age=63072000
+x-frame-options: DENY
+   (no Cross-Origin-Opener-Policy / COEP / CSP header is sent)
+-- main bundle https://app.joy.id/assets/index-CTCvN3gI.js sha256 9ea3918e09d404ede3016037f55aab60f99a352ea2f6007501d059a0eb9ae1b6 bytes 7703257
+
+== sendMessageToDapp (popup: window.opener.postMessage; redirect: _data_ in QUERY + location.replace)
+   [main.js @ character offset 5042574]
+   sendMessageToDapp=async(sn,an,cn)=>{const ln=new URL(an);if(cn===DappCommunicationType.Popup)throw window.opener&&window.opener.postMessage(sn,ln.origin),new Error("Dapp window is closed, please reopen it and try again");cn===DappCommunicationType.Redirect&&(ln.searchParams.set("_data_",encodeSearch(sn)),location.replace(ln.href
+
+== useGuardRedirectUri (referrer origin must match redirectURL origin; allowed protocols)
+   [main.js @ character offset 6089178]
+   useGuardRedirectUri=()=>sn=>{if(isNativeApp())return null;if(document.referrer)try{const an=new URL(document.referrer),cn=new URL(sn);if(an.origin!==cn.origin&&an.origin!==location.origin){const ln=new DappError("Invalid redirectURL: The origin of the redirectURL must be the same as the origin of the referrer.",DappErrorName.NotAllowed);return jsxRuntimeExports.jsx(AuthContainer,{children:jsxRuntimeExports.jsx(AlertPage,{error:ln})})}}catch{}try{const an=new URL(sn);if(allowProtocols.has(an.protocol))return null;co
+
+== generateSignedInfo (message = base64url(authenticatorData || clientDataJSON))
+   [main.js @ character offset 6068325]
+   generateSignedInfo=(sn,an,cn,ln)=>{const un=an;if(ln&&cn===DappRequestType.Auth)throw new Error("Auth request challenge should not be data");if(typeof sn=="string")return{signature:bufferToBase64URLString(hexToArrayBuffer(sn)),challenge:un,message:bufferToBase64URLString(ln?hexToArrayBuffer(un):utf8StringToBuffer$1(un))};const fn=base64URLStringToBuffer(sn.response.authenticatorData),gn=base64URLStringToBuffer(sn.response.clientDataJSON),Zn=bufferToBase64URLString(appendBuffer(fn,gn));return{signature:sn.response.signature,challenge:un,message:Zn}},sendS
+
+== sendSignedMessageToDapp (one result object for both modes)
+   [main.js @ character offset 6068880]
+   sendSignedMessageToDapp=async(sn,an,cn,ln,un=DappRequestType.Auth)=>{const{signature:fn,challenge:gn,message:Zn}=generateSignedInfo(sn,an.challenge,un,an.isData??!1),Zr={signature:fn,message:Zn,challenge:gn,alg:cn.alg,pubkey:isSessionAccount(cn)||cn.alg===SigningAlg.RS256?cn.pubkey:cn.pubkey.slice(2),keyType:cn.keyType,state:an.state},{ethAddress:Do,nostrPubkey:Uo}=cn;isSessionAccount(cn)&&(Zr.attestation=formatAttestation(cn).attestation);const Cl=un===DappRequestType.Auth?{data:{address:cn.address,ethAddress:Do,nostrPubkey:Uo,nativeSegwit:cn.nativeSegwit,taproot:cn.taproot,...Zr},type:DappRequestType.Auth}:{data:{...Zr},type:DappRequestType.SignMessage};await sendMessageToDapp({...Cl,state:an.state},an.redirectURL,ln)},useSendSignedMessageToDapp=sn
+
+== useSendSignedMessageToDapp (CKB text: challenge = base64url(utf8(text)); isData: hex bytes)
+   [main.js @ character offset 6069611]
+   useSendSignedMessageToDapp=sn=>{const an=useErrorHandler(),cn=useSignMessage(utf8StringToBuffer$1,gn=>bufferToBase64URLString(utf8StringToBuffer$1(gn))),ln=useSignMessage(hexToArrayBuffer,gn=>bufferToBase64URLString(hexToArrayBuffer(gn))),un=useEnsureSessionKey(),fn=useToast();return async(gn,Zn,Zr,Do)=>{var Uo;try{if(isSessionAccount(Zn)&&await un(Zn),sn===DappRequestType.SignMessage&&gn.requestNetwork==="ethereum"){const El=gn,Sl=El.isData?hexToBuffer(El.challenge):El.challenge,_l=await signEthMessage(Zn,Sl);if(Do){await Do(_l);return}const Rl={signature:_l};gn.state&&(Rl.state=gn.state),await sendMessageToDapp({type:DappRequestType.SignMessage,data:Rl},gn.redirectURL,Zr);return}if(sn===DappRequestType.SignMessage&&((Uo=gn.requestNetwork)!=null&&Uo.startsWith("btc-"))){const El=gn,Sl=await getBtcAccount(Zn,getBtcAddressType(El.address)),_l=El.signMessageType==="bip322-simple"?signMessageOfBIP322Simple(Sl,El.challenge,El.address):signMessageOfECDSA(Sl.keypair,El.challenge);if(Do){await Do(_l);return}const Rl={signature:_l};gn.state&&(Rl.state=gn.state),await sendMessageToDapp({type:DappRequestType.SignMessage,data:Rl},gn.redirectURL,Zr);return}if(sn===DappRequestType.SignMessage&&gn.isData){const El=await ln(gn.challenge,Zn);await sendSignedMessageToDapp(El,gn,Zn,Zr,sn);return}const Cl=await cn(gn.challenge,Zn);await sendSignedMessageToDapp(Cl,gn,Zn,Zr,sn)}catch(Cl){Cl instanceof Error&&Cl.message.includes("postMessage")?fn({title:"Please reopen this page and try again",status:"error"}):an(Cl)}}},useSignMiniAppMessage=()=>{const sn=useErrorHandler(),an=useSignMessage(utf8StringToBuffer$1,fn=>bufferToBase64URLString(utf8StringToBuffer$1(fn))),cn=useSignMessage(hexToArrayB
+
+== useSignMessage (WebAuthn startAuthentication with the mapped challenge)
+   [main.js @ character offset 5179802]
+   useSignMessage=(sn,an=cn=>cn)=>async(cn,ln,un=!1)=>{if(un)return signNostrMessage(ln,cn);if(ln.isMnemonic){const gn=an(cn);return signCkbNativeWebauthnMessage(ln,gn)}if(isSessionAccount(ln)){const gn=await Signer.fromIndexedDB(ln.pubkey),Zn=sn(cn);return gn.signMessage(Zn)}const fn=an(cn);return startAuthentication({challenge:fn,userVerification:"required",allowCredentials:[{id:ln.id,type:"public-key",transports:["internal","ble","cable","hybrid","usb"]}]})},useVerifyAccount=()=>async(sn,an)=>{const cn=generateRand
+
+== AUTH_MESSAGE_PREFIX (Auth with a challenge signs a PREFIXED text)
+   [main.js @ character offset 6084804]
+   AUTH_MESSAGE_PREFIX=`JoyID authorize prefix:
+`,generateAuthP
+
+== useSdkPopupGuard (popup mode warns when window.opener is gone)
+   [main.js @ character offset 6073522]
+   useSdkPopupGuard=(sn="Dapp",an=DappCommunicationType.Popup)=>{const cn=reactExports.useRef(!1),ln=useAtomValue(disablePopupGuardAtom),un=useConfirm();reactExports.useEffect(()=>{if(isNativeApp())return()=>{};const fn=setInterval(()=>{an===DappCommunicationType.Popup&&!window.opener&&!cn.current&&ln===!1&&(cn.current=!0,un({status:"warning",title:`The ${sn} window has been closed, rendering this operation invalid. Ple
+
+== sign-ckb-raw-tx delivery is hard-coded popup
+   [main.js @ character offset 6794597]
+   ;return async(ln,un,fn,gn)=>{try{const Zn=await sn(ln,un,gn);await sendMessageToDapp({type:DappRequestType.SignCkbRawTx,data:{tx:Zn}},fn,DappCommunicationType.Popup)}catch(Zn){Zn instanceof Error&&Zn.message.includes("postMessage")?cn({title:"Please reopen this page and try again

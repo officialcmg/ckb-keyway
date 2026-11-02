@@ -1,0 +1,17 @@
+1. request URL type param: popup vs redirect
+   request fields that differ: [ 'redirectURL' ] -> https://app.example/wallet?tab=recovery&joyid-redirect=true
+   request URL length (redirect): 1174 chars
+3. return URL is https://app.example/wallet with query keys [ 'tab', 'joyid-redirect', '_data_' ] and fragment ""
+   return URL length: 2458 chars (Vercel CDN limit 14 KB)
+4. signature JSON identical: true
+   field-by-field equal: signature, message, challenge, alg (number -7), pubkey, keyType; state = {"v":1,"id":"ffffffffffffffffffffffffffffffff"}
+5. verifyWebAuthn(redirect): true
+   verifyBackupOwnership(redirect) -> joyid (address matches)
+6. top-level state: {"v":1,"id":"ffffffffffffffffffffffffffffffff"} | data.state: {"v":1,"id":"ffffffffffffffffffffffffffffffff"}
+   Auth via getRedirectResponse has state? false -> read top-level state with decodeSearch(_data_) instead: {"v":1,"id":"ffffffffffffffffffffffffffffffff"}
+   state "12345" -> "12345"
+   state "true" -> "true"
+   state "abc" -> "abc"
+   state {"id":"007"} -> {"id":"007"}
+   reject -> RedirectErrorWithState User Rejected {"v":1,"id":"ffffffffffffffffffffffffffffffff"}
+ALL ASSERTIONS PASSED

@@ -1,0 +1,121 @@
+{
+  "chromium": "153.0.8010.12",
+  "POPUP  app COOP=same-origin COEP=require-corp": {
+    "appBefore": {
+      "crossOriginIsolated": true,
+      "sab": "function"
+    },
+    "popupResult": {
+      "popupHandleClosed": true,
+      "received": null
+    },
+    "walletSaw": [
+      {
+        "type": "popup",
+        "openerIsNull": true,
+        "referrer": "http://localhost:4100/"
+      }
+    ]
+  },
+  "POPUP  app COOP=same-origin-allow-popups COEP=unsafe-none": {
+    "appBefore": {
+      "crossOriginIsolated": false,
+      "sab": "undefined"
+    },
+    "popupResult": {
+      "popupHandleClosed": false,
+      "received": {
+        "type": "SignMessage",
+        "data": {
+          "signature": "sig",
+          "message": "msg",
+          "challenge": "hello",
+          "alg": -7,
+          "pubkey": "00",
+          "keyType": "main_key"
+        }
+      }
+    },
+    "walletSaw": [
+      {
+        "type": "popup",
+        "openerIsNull": false,
+        "referrer": "http://localhost:4100/"
+      }
+    ]
+  },
+  "HYBRID helper window + redirect + BroadcastChannel, app COOP=same-origin COEP=require-corp": {
+    "hybrid": {
+      "received": {
+        "signature": "sig",
+        "message": "msg",
+        "challenge": "hello",
+        "alg": -7,
+        "pubkey": "00",
+        "keyType": "main_key",
+        "state": {
+          "v": 1,
+          "id": "1510a4b1-31c2-48c0-b56e-5d0cc88b1e49"
+        }
+      },
+      "helperClosed": true,
+      "stillIsolated": true
+    },
+    "walletSaw": [
+      {
+        "type": "redirect",
+        "openerIsNull": true,
+        "referrer": "http://localhost:4100/"
+      }
+    ],
+    "openPages": [
+      "http://localhost:4100/wallet"
+    ]
+  },
+  "REDIRECT app COOP=same-origin COEP=require-corp": {
+    "result": {
+      "crossOriginIsolated": true,
+      "sab": "function",
+      "returnedURL": "http://localhost:4100/wallet?tab=recovery&joyid-redirect=true&_data_=%3Ftype%3DSignMessage%26data%3D%257B%2522signature%2522%253A%2522sig%2522%252C%2522message%2522%253A%2522msg%2522%252C%2522challenge%2522%253A%2522hello%2522%252C%2522alg%2522%253A-7%252C%2522pubkey%2522%253A%252200%2522%252C%2522keyType%2522%253A%2522main_key%2522%252C%2522state%2522%253A%257B%2522v%2522%253A1%252C%2522id%2522%253A%252243ce70aa-edfc-4120-b634-273384027377%2522%257D%257D%26state%3D%257B%2522v%2522%253A1%252C%2522id%2522%253A%252243ce70aa-edfc-4120-b634-273384027377%2522%257D",
+      "pending": "{\"state\":{\"v\":1,\"id\":\"43ce70aa-edfc-4120-b634-273384027377\"},\"op\":\"backup\",\"startedAt\":1793663143764}",
+      "local": "kept",
+      "data": {
+        "signature": "sig",
+        "message": "msg",
+        "challenge": "hello",
+        "alg": -7,
+        "pubkey": "00",
+        "keyType": "main_key",
+        "state": {
+          "v": 1,
+          "id": "43ce70aa-edfc-4120-b634-273384027377"
+        }
+      },
+      "historyLengthOnReturn": 3,
+      "fiberLockReacquired": true,
+      "urlAfterReplace": "http://localhost:4100/wallet",
+      "done": true
+    },
+    "walletSaw": [
+      {
+        "type": "redirect",
+        "openerIsNull": true,
+        "referrer": "http://localhost:4100/"
+      }
+    ],
+    "referers": {
+      "cross:same-origin": "http://localhost:4100/",
+      "same:same-origin": "http://localhost:4100/wallet?tab=recovery&joyid-redirect=true&_data_=%3Ftype%3DSignMessage%26data%3D%257B%2522signature%2522%253A%2522sig%2522%252C%2522message%2522%253A%2522msg%2522%252C%2522challenge%2522%253A%2522hello%2522%252C%2522alg%2522%253A-7%252C%2522pubkey%2522%253A%252200%2522%252C%2522keyType%2522%253A%2522main_key%2522%252C%2522state%2522%253A%257B%2522v%2522%253A1%252C%2522id%2522%253A%252243ce70aa-edfc-4120-b634-273384027377%2522%257D%257D%26state%3D%257B%2522v%2522%253A1%252C%2522id%2522%253A%252243ce70aa-edfc-4120-b634-273384027377%2522%257D"
+    },
+    "serverLog": [
+      "wallet GET /sign-message?type=redirect&_data_=%3FredirectURL%3Dhttp%253A%252F%252Flocalhost%253A4100%252Fwallet%253Ftab%253Drecovery%2526joyid-redirect%253Dtrue%26joyidApp…",
+      "wallet GET /joyid-common.js",
+      "wallet GET /report?o=%7B%22type%22%3A%22redirect%22%2C%22openerIsNull%22%3Atrue%2C%22referrer%22%3A%22http%3A%2F%2Flocalhost%3A4100%2F%22%7D",
+      "app  GET /wallet?tab=recovery&joyid-redirect=true&_data_=%3Ftype%3DSignMessage%26data%3D%257B%2522signature%2522%253A%2522sig%2522%252C%2522message%2522%253A%2522msg%2522%252C%2522challenge%2522%253A%2522hello%2522%252C%2522alg%2522%253A-7%252C%2522pubkey%2522%253A%252200%2522%252C%2522keyType%2522%253A%2522main_key%2522%252C%2522state%2522%253A%257B%2522v%2522%253A1%252C%2522id%2522%253A%252243ce70aa-edfc-4120-b634-273384027377%2522%257D%257D%26state%3D%257B%2522v%2522%253A1%252C%2522id%2522%253A%252243ce70aa-edfc-4120-b634-273384027377%2522%257D",
+      "app  GET /joyid-common.js",
+      "wallet GET /pixel?probe=cross",
+      "app  GET /pixel?probe=same"
+    ]
+  },
+  "after history.back()": "http://localhost:4100/wallet?tab=recovery"
+}
