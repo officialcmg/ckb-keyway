@@ -92,6 +92,19 @@ async function harness() {
   return { user, wallet, legacyAddress, publicKey, client, context, emails, broadcasts, proof, sign, settle, chain, addCell, codeFrom: () => /code is (\d{6})/.exec(emails.findLast(({ plaintext }) => /code is \d{6}/.test(plaintext))!.plaintext)![1] };
 }
 
+/** Moves a pending request, and its code, this many minutes into the past, as if that time had gone by. */
+async function age(nonce: string, minutes: number) {
+  const sql = await database();
+  const shift = `${minutes} minutes`;
+  await sql`
+    update keyway_v2_signature_requests
+    set expires_at = expires_at - ${shift}::interval, email_code_expires_at = email_code_expires_at - ${shift}::interval
+    where nonce = ${nonce}
+  `;
+}
+
+const EXPIRED = /^Error: This request expired\. Start again\.$/;
+
 type Preview = { preview: { newAddress: string; adminListCkb: string; transactionHash: string }; confirmationNonce: string; requiresEmailCode: boolean };
 
 test("turning recovery on: preview, emailed code, enable", { skip: !enabled }, async (t) => {
@@ -173,6 +186,38 @@ test("turning recovery on: preview, emailed code, enable", { skip: !enabled }, a
     const preview = await recoverySetup(h.context(h.wallet), { operation: "preview", backups: [h.proof] }) as Preview;
     assert.equal(preview.requiresEmailCode, true);
     await assert.rejects(recoverySetup(h.context(h.wallet), { operation: "enable", backups: [h.proof], confirmationNonce: preview.confirmationNonce }), /expired|six-digit/);
+  });
+
+  await t.test("the approval lives as long as its code, and each resend extends both", async () => {
+    const h = await harness();
+    const body = { backups: [h.proof] };
+    const preview = await recoverySetup(h.context(h.wallet), { ...body, operation: "preview" }) as Preview;
+    const nonce = preview.confirmationNonce;
+    const sent = await recoverySetup(h.context(h.wallet), { ...body, operation: "request-email-code", confirmationNonce: nonce }) as { sentTo: string };
+    assert.equal(sent.sentTo, "ana@acmepay.example");
+    await age(nonce, 6);
+    await recoverySetup(h.context(h.wallet), { ...body, operation: "request-email-code", confirmationNonce: nonce });
+    await age(nonce, 9);
+    await recoverySetup(h.context(h.wallet), { ...body, operation: "enable", confirmationNonce: nonce, emailCode: h.codeFrom() });
+    assert.equal(h.broadcasts.length, 1);
+  });
+
+  await t.test("confirms six minutes after the code, and says plainly once the request expired", async () => {
+    const h = await harness();
+    const body = { backups: [h.proof] };
+    const ask = async () => {
+      const preview = await recoverySetup(h.context(h.wallet), { ...body, operation: "preview" }) as Preview;
+      await recoverySetup(h.context(h.wallet), { ...body, operation: "request-email-code", confirmationNonce: preview.confirmationNonce });
+      return preview.confirmationNonce;
+    };
+    const expired = await ask();
+    await age(expired, 11);
+    await assert.rejects(recoverySetup(h.context(h.wallet), { ...body, operation: "request-email-code", confirmationNonce: expired }), EXPIRED);
+    await assert.rejects(recoverySetup(h.context(h.wallet), { ...body, operation: "enable", confirmationNonce: expired, emailCode: h.codeFrom() }), EXPIRED);
+    const late = await ask();
+    await age(late, 6);
+    await recoverySetup(h.context(h.wallet), { ...body, operation: "enable", confirmationNonce: late, emailCode: h.codeFrom() });
+    assert.equal(h.broadcasts.length, 1);
   });
 
   await t.test("refuses when the account's cells changed since the preview", async () => {
@@ -286,6 +331,30 @@ test("adding and removing backups: preview, emailed code, apply", { skip: !enabl
     assert.ok(h.emails.at(-1)!.plaintext.includes((await readWallet(h.user) as ReadyWallet).ckbAddress));
     assert.ok(h.emails.at(-1)!.plaintext.includes(`EVM wallet ${second.address}`) && !h.emails.at(-1)!.plaintext.includes(h.proof.address));
     assert.deepEqual((await readWallet(h.user) as ReadyWallet).recovery?.backups, [backup]);
+  });
+
+  await t.test("a backup change lives as long as its code, and says plainly once it expired", async () => {
+    const h = await enabledHarness();
+    const wallet = await readWallet(h.user) as ReadyWallet;
+    const proof = h.sign(evmWallet());
+    const body = { change: "add", backup: proof };
+    const ask = async () => {
+      const preview = await recoveryBackupChange(h.context(wallet), { ...body, operation: "preview" }) as { confirmationNonce: string };
+      const sent = await recoveryBackupChange(h.context(wallet), { ...body, operation: "request-email-code", confirmationNonce: preview.confirmationNonce }) as { sentTo: string };
+      assert.equal(sent.sentTo, "ana@acmepay.example");
+      return preview.confirmationNonce;
+    };
+    const expired = await ask();
+    await age(expired, 11);
+    await assert.rejects(recoveryBackupChange(h.context(wallet), { ...body, operation: "request-email-code", confirmationNonce: expired }), EXPIRED);
+    await assert.rejects(recoveryBackupChange(h.context(wallet), { ...body, operation: "apply", confirmationNonce: expired, emailCode: h.codeFrom() }), EXPIRED);
+    const late = await ask();
+    await age(late, 6);
+    await recoveryBackupChange(h.context(wallet), { ...body, operation: "request-email-code", confirmationNonce: late });
+    await age(late, 9);
+    const before = h.broadcasts.length;
+    await recoveryBackupChange(h.context(wallet), { ...body, operation: "apply", confirmationNonce: late, emailCode: h.codeFrom() });
+    assert.equal(h.broadcasts.length, before + 1);
   });
 
   await t.test("needs the code even when a daily amount is set", async () => {

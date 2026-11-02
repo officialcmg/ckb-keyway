@@ -9,7 +9,7 @@ import { formatAsset, hasPlainTokenArgs, isXudtCompatible } from "../sdk/browser
 import { withUserLock } from "./database.ts";
 import { createRecoveryNoticeEmailTemplate } from "./email-template.ts";
 import { serializeTransaction, signAccountGroups } from "./funding-transaction.ts";
-import { consumeRequest, hashText, issueRequest, limit, loadRequest, sendCode, sign, verifyCode, type SigningContext } from "./general-signing.ts";
+import { consumeRequest, hashText, issueRequest, limit, loadRequest, REQUEST_EXPIRED, sendCode, sign, verifyCode, type SigningContext } from "./general-signing.ts";
 import { feeRateCap, formatCkb } from "./transaction-policy.ts";
 import type { User } from "./auth-user.ts";
 import { readWallet, saveWallet, type PendingRecoveryChange, type ReadyWallet } from "./user-wallet.ts";
@@ -81,8 +81,8 @@ export async function recoverySetup(context: RecoveryContext, body: Record<strin
   if (body.operation === "request-email-code") {
     const plan = await planRecovery(client, context.wallet, backups);
     const request = await loadRequest(context.user, "recovery", nonce, planDigest(plan, backups));
-    await sendCode(context, "recovery", nonce, "Turn on account recovery", request.summary.lines ?? []);
-    return { sent: true };
+    const sentTo = await sendCode(context, "recovery", nonce, "Turn on account recovery", request.summary.lines ?? []);
+    return { sent: true, sentTo };
   }
   if (body.operation !== "enable") throw new Error("A valid recovery operation is required");
   return withUserLock(context.user.id, async (sql) => {
@@ -94,8 +94,8 @@ export async function recoverySetup(context: RecoveryContext, body: Record<strin
     const plan = await planRecovery(client, wallet, backups);
     // The digest binds the approval to this exact transaction; any change in the account's cells refuses it.
     const digest = planDigest(plan, backups);
-    await loadRequest(context.user, "recovery", nonce, digest).catch(() => {
-      throw new Error("This approval expired or your account changed since the preview. Review turning on recovery again");
+    await loadRequest(context.user, "recovery", nonce, digest).catch((cause) => {
+      throw cause instanceof Error && cause.message === REQUEST_EXPIRED ? cause : new Error("Your account changed since the preview. Review turning on recovery again");
     });
     await verifyCode(context.user, "recovery", nonce, body.emailCode);
     await consumeRequest(context.user, "recovery", nonce);
@@ -443,8 +443,8 @@ export async function recoveryBackupChange(context: RecoveryContext, body: Recor
   if (body.operation === "request-email-code") {
     const plan = await planBackupChange(client, context.wallet, change);
     const request = await loadRequest(context.user, "recovery", nonce, changeDigest(plan, change));
-    await sendCode(context, "recovery", nonce, change.change === "add" ? "Add a recovery backup" : "Remove a recovery backup", request.summary.lines ?? []);
-    return { sent: true };
+    const sentTo = await sendCode(context, "recovery", nonce, change.change === "add" ? "Add a recovery backup" : "Remove a recovery backup", request.summary.lines ?? []);
+    return { sent: true, sentTo };
   }
   if (body.operation !== "apply") throw new Error("A valid backup operation is required");
   return withUserLock(context.user.id, async (sql) => {
@@ -454,8 +454,8 @@ export async function recoveryBackupChange(context: RecoveryContext, body: Recor
     refusePending(wallet);
     if (change.change === "add") await verifyBackups(client, context.user, wallet, [body.backup]);
     const plan = await planBackupChange(client, wallet, change);
-    await loadRequest(context.user, "recovery", nonce, changeDigest(plan, change)).catch(() => {
-      throw new Error("This approval expired or your account changed since the preview. Review the backup change again");
+    await loadRequest(context.user, "recovery", nonce, changeDigest(plan, change)).catch((cause) => {
+      throw cause instanceof Error && cause.message === REQUEST_EXPIRED ? cause : new Error("Your account changed since the preview. Review the backup change again");
     });
     await verifyCode(context.user, "recovery", nonce, body.emailCode);
     await consumeRequest(context.user, "recovery", nonce);

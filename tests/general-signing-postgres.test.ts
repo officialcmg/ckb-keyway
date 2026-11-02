@@ -3,6 +3,7 @@ import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { formatCkbSignature } from "../src/server/funding-transaction.ts";
+import { database } from "../src/server/database.ts";
 import { messageSigning, signingSettings, transactionSigning, type SigningContext } from "../src/server/general-signing.ts";
 import type { ValidatedTransaction } from "../src/server/transaction-policy.ts";
 import type { ReadyWallet } from "../src/server/user-wallet.ts";
@@ -55,6 +56,17 @@ function harness(outflow: bigint, tokenOutflows: Array<{ asset: string; amount: 
   return { context, emails, codeFrom: () => /code is (\d{6})/.exec(emails.at(-1)!.plaintext)![1] };
 }
 
+/** Moves a pending request, and its code, this many minutes into the past, as if that time had gone by. */
+async function age(nonce: string, minutes: number) {
+  const sql = await database();
+  const shift = `${minutes} minutes`;
+  await sql`
+    update keyway_v2_signature_requests
+    set expires_at = expires_at - ${shift}::interval, email_code_expires_at = email_code_expires_at - ${shift}::interval
+    where nonce = ${nonce}
+  `;
+}
+
 const tx = (marker: number) => ({ outputs: [{ lock: { codeHash: `0x${"9b".repeat(32)}`, hashType: "type", args: "0x" }, capacity: 100n * CKB + BigInt(marker) }], witnesses: ["0x"] });
 
 test("general signing binds approvals, email codes and threshold changes", { skip: !enabled }, async (t) => {
@@ -67,7 +79,7 @@ test("general signing binds approvals, email codes and threshold changes", { ski
     await assert.rejects(() => transactionSigning(context, { operation: "sign", transaction: tx(2), confirmationNonce: preview.confirmationNonce }), /invalid or expired/);
     const signed = await transactionSigning(context, { operation: "sign", transaction: tx(1), confirmationNonce: preview.confirmationNonce }) as { transaction: unknown };
     assert.ok(signed.transaction);
-    await assert.rejects(() => transactionSigning(context, { operation: "sign", transaction: tx(1), confirmationNonce: preview.confirmationNonce }), /invalid or expired/);
+    await assert.rejects(() => transactionSigning(context, { operation: "sign", transaction: tx(1), confirmationNonce: preview.confirmationNonce }), /^Error: This request expired\. Start again\.$/);
   });
 
   await t.test("asks for an emailed code at or above the user's threshold", async () => {
@@ -166,6 +178,54 @@ test("general signing binds approvals, email codes and threshold changes", { ski
     await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: null, confirmationNonce: pending.confirmationNonce, emailCode: codeFrom() });
     assert.deepEqual(await signingSettings(context, { operation: "get" }), { dailyAmounts: {} });
     await assert.rejects(() => signingSettings(context, { operation: "set", emailThresholdShannons: "1" }), /valid settings operation/);
+  });
+
+  await t.test("a transaction approval lives as long as its code, and each resend extends both", async () => {
+    const { context, emails, codeFrom } = harness(100n * CKB);
+    await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: "1" });
+    const sent = async (marker: number) => {
+      const preview = await transactionSigning(context, { operation: "preview", transaction: tx(marker) }) as { confirmationNonce: string };
+      const request = await transactionSigning(context, { operation: "request-email-code", transaction: tx(marker), confirmationNonce: preview.confirmationNonce }) as { sentTo: string };
+      assert.equal(request.sentTo, "ana@acmepay.example");
+      return preview.confirmationNonce;
+    };
+    const sign = (marker: number, confirmationNonce: string) => transactionSigning(context, { operation: "sign", transaction: tx(marker), confirmationNonce, emailCode: codeFrom() });
+    const resend = (marker: number, confirmationNonce: string) => transactionSigning(context, { operation: "request-email-code", transaction: tx(marker), confirmationNonce });
+
+    // Six minutes after the code was sent: past the old five-minute approval, within the code's ten.
+    const confirmLate = await sent(30);
+    await age(confirmLate, 6);
+    assert.ok(await sign(30, confirmLate));
+
+    // A resend after six minutes works, and gives the new code (and the request) ten minutes again.
+    const resendLate = await sent(31);
+    await age(resendLate, 6);
+    await resend(31, resendLate);
+    assert.equal(emails.length, 3);
+    await age(resendLate, 9);
+    assert.ok(await sign(31, resendLate));
+
+    // Past the real expiry, resending and confirming both say so plainly.
+    const expired = await sent(32);
+    await age(expired, 11);
+    await assert.rejects(() => resend(32, expired), /^Error: This request expired\. Start again\.$/);
+    await assert.rejects(() => sign(32, expired), /^Error: This request expired\. Start again\.$/);
+  });
+
+  await t.test("a security change lives as long as its code", async () => {
+    const { context, codeFrom } = harness(0n);
+    await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (100n * CKB).toString() });
+    const change = (extra: Record<string, unknown> = {}) => signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: null, ...extra });
+    const pending = await change() as { confirmationNonce: string; sentTo: string };
+    assert.equal(pending.sentTo, "ana@acmepay.example");
+    await age(pending.confirmationNonce, 6);
+    await change({ confirmationNonce: pending.confirmationNonce, emailCode: codeFrom() });
+    assert.deepEqual(await signingSettings(context, { operation: "get" }), { dailyAmounts: {} });
+
+    await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (100n * CKB).toString() });
+    const late = await change() as { confirmationNonce: string };
+    await age(late.confirmationNonce, 11);
+    await assert.rejects(() => change({ confirmationNonce: late.confirmationNonce, emailCode: codeFrom() }), /^Error: This request expired\. Start again\.$/);
   });
 
   await t.test("signs approved messages in CKB's message format", async () => {
