@@ -98,7 +98,7 @@ This removes the user's confirmation of each action, so your app signs for them.
 - Testnet only.
 - The network fee may be at most 100 shannons per byte of the transaction (about 100 times the normal rate), and never less than 0.01 CKB. Normal transactions pay far less.
 - Each user can start up to 10 signing requests a minute (transactions and messages together).
-- Email confirmation codes: up to 5 every 10 minutes per user. Each code lasts 10 minutes and allows 5 wrong attempts.
+- Email confirmation codes: up to 5 every 10 minutes per user. Each code lasts 10 minutes and allows 5 wrong attempts. An approval waits 5 minutes for its first code; once a code is sent, the approval lasts as long as the code, and each new code gives both another 10 minutes. After that the prompt says "This request expired. Start again."
 
 <Callout type="warn">
 The approval dialog runs inside your app's page. If your app has an XSS bug, or a user's session token leaks, an attacker could request and approve transactions until the user's 24-hour email-confirmation amount is reached. Protect your app with a strict Content Security Policy, and encourage users to set a confirmation amount.
