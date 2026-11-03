@@ -206,8 +206,10 @@ export async function signingSettings(context: SigningContext, body: Record<stri
       `Email confirmation for ${assetName(change.asset)}: ${describeAmount(current, change.asset)}`,
       `Change: ${next.size === 0 ? "turn email confirmation off" : describeAmount(next, change.asset)}`,
     ];
+    // Checked before the new request replaces the old one, so a refused resend leaves the last code usable.
+    await codeLimit(context);
     const confirmationNonce = await issueRequest(context.user, "settings", digest, { lines }, true);
-    const sentTo = await sendCode(context, "settings", confirmationNonce, "Confirm a security change", lines);
+    const sentTo = await sendCode(context, "settings", confirmationNonce, "Confirm a security change", lines, { limited: true });
     return { requiresEmailCode: true, confirmationNonce, sentTo };
   }
   const nonce = requiredNonce(body.confirmationNonce);
@@ -327,9 +329,8 @@ export async function consumeRequest(user: User, purpose: Purpose, nonce: string
  * resets its attempts and gives the code, and the request with it, the full code lifetime again; the per-user
  * email limit bounds how often that can happen.
  */
-export async function sendCode(context: Pick<SigningContext, "user" | "appName" | "email" | "sendEmail" | "rateLimit">, purpose: Purpose, nonce: string, heading: string, lines: string[]): Promise<string> {
-  const allowed = await context.rateLimit(`step-up-email:${context.user.id}`, { max: 5, window: 600 });
-  if (!allowed.allowed) throw new Error(`Too many codes sent. Try again in ${waitText(allowed.retryAfter ?? 600)}`);
+export async function sendCode(context: Pick<SigningContext, "user" | "appName" | "email" | "sendEmail" | "rateLimit">, purpose: Purpose, nonce: string, heading: string, lines: string[], options: { limited?: boolean } = {}): Promise<string> {
+  if (!options.limited) await codeLimit(context);
   const code = randomInt(0, 1_000_000).toString().padStart(6, "0");
   const sql = await database();
   const rows = await sql`
@@ -343,6 +344,12 @@ export async function sendCode(context: Pick<SigningContext, "user" | "appName" 
   const template = createConfirmationEmailTemplate(context.appName, code, heading, lines);
   await context.sendEmail(to, template, `keyway-step-up/${nonce}/${Date.now()}`);
   return to;
+}
+
+/** Up to 5 emailed codes per user every 10 minutes, across all purposes. */
+async function codeLimit(context: Pick<SigningContext, "user" | "rateLimit">): Promise<void> {
+  const allowed = await context.rateLimit(`step-up-email:${context.user.id}`, { max: 5, window: 600 });
+  if (!allowed.allowed) throw new Error(`Too many codes sent. Try again in ${waitText(allowed.retryAfter ?? 600)}`);
 }
 
 function waitText(seconds: number): string {

@@ -77,6 +77,8 @@ export function useDialogFocus(panel: RefObject<HTMLElement | null>, onEscape?: 
       // Only when focus would otherwise be lost: another dialog that opened in its place keeps it.
       queueMicrotask(() => {
         const active = document.activeElement;
+        // Still in the page means React only re-ran the effect (StrictMode), not that the dialog closed.
+        if (node.isConnected) return;
         if ((!active || active === document.body || node.contains(active)) && opener?.isConnected) opener.focus();
       });
     };
@@ -220,8 +222,10 @@ export function ResendLine({ palette, resend, disabled, prompt, style, waitSecon
   const wait = state.kind === "sent" ? Math.max(1, Math.ceil((state.until - now) / 1000)) : 0;
   return (
     <div style={{ margin: "16px 0 0", fontSize: 14, color: palette.muted, ...style }}>
-      <p role="status" aria-live="polite" style={{ margin: 0 }}>
-        {state.kind === "sent" ? <><span style={{ color: palette.success, fontWeight: 600 }}>New code sent.</span> Send another in {wait}s</> : null}
+      {/* Only "New code sent." is announced; the countdown beside it would be read out every second. */}
+      <p style={{ margin: 0 }}>
+        <span role="status" aria-live="polite" style={{ color: palette.success, fontWeight: 600 }}>{state.kind === "sent" ? "New code sent." : ""}</span>
+        {state.kind === "sent" ? <span aria-hidden="true"> Send another in {wait}s</span> : null}
       </p>
       {state.kind === "error" ? <p role="alert" style={{ margin: "0 0 6px", color: palette.error }}>{state.message}</p> : null}
       {state.kind !== "sent" ? (
@@ -241,7 +245,8 @@ export type ApprovalStep = { busy?: boolean; failure?: string };
 
 /**
  * Cancel and the confirming button. Once approved, the dialog stays open with the button busy until the next
- * step is ready; if that fails, the reason replaces the buttons, with Close.
+ * step is ready, and Cancel becomes Close: it only hides the dialog, since the approved step is already
+ * running. If that step fails, the reason replaces the buttons, with Close.
  */
 export function Actions({ palette, confirm, busyLabel, step, answer }: {
   palette: ModalPalette;
@@ -265,7 +270,7 @@ export function Actions({ palette, confirm, busyLabel, step, answer }: {
     <>
       <p role="status" style={visuallyHidden}>{busy ? busyLabel : ""}</p>
       <div style={modalActions}>
-        <button type="button" autoFocus disabled={busy} style={{ ...modalButton, borderColor: palette.border, color: palette.text, opacity: busy ? 0.5 : 1 }} onClick={() => answer(false)}>Cancel</button>
+        <button type="button" autoFocus style={{ ...modalButton, borderColor: palette.border, color: palette.text }} onClick={() => answer(false)}>{busy ? "Close" : "Cancel"}</button>
         <button
           type="button"
           aria-disabled={busy || undefined}

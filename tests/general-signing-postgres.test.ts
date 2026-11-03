@@ -228,6 +228,26 @@ test("general signing binds approvals, email codes and threshold changes", { ski
     await assert.rejects(() => change({ confirmationNonce: late.confirmationNonce, emailCode: codeFrom() }), /^Error: This request expired\. Start again\.$/);
   });
 
+  await t.test("the code limit applies to resends, and a refused settings resend keeps the last code usable", async () => {
+    const { context, codeFrom } = harness(0n);
+    let sent = 0;
+    context.rateLimit = async (key) => key.startsWith("step-up-email:") && ++sent > 5 ? { allowed: false, retryAfter: 412 } : { allowed: true, retryAfter: null };
+    await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (100n * CKB).toString() });
+    const change = (extra: Record<string, unknown> = {}) => signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: null, ...extra });
+    let pending = await change() as { confirmationNonce: string };
+    for (let resend = 0; resend < 4; resend++) pending = await change() as { confirmationNonce: string };
+    await assert.rejects(change, /^Error: Too many codes sent\. Try again in 7 minutes$/);
+    await change({ confirmationNonce: pending.confirmationNonce, emailCode: codeFrom() });
+    assert.deepEqual(await signingSettings(context, { operation: "get" }), { dailyAmounts: {} });
+
+    // The same limit stops transaction resends, and the request stays valid.
+    const signing = harness(100n * CKB);
+    await signingSettings(signing.context, { operation: "set-daily-amount", asset: "ckb", amount: "1" });
+    signing.context.rateLimit = context.rateLimit;
+    const preview = await transactionSigning(signing.context, { operation: "preview", transaction: tx(40) }) as { confirmationNonce: string };
+    await assert.rejects(() => transactionSigning(signing.context, { operation: "request-email-code", transaction: tx(40), confirmationNonce: preview.confirmationNonce }), /Too many codes sent/);
+  });
+
   await t.test("signs approved messages in CKB's message format", async () => {
     const { context } = harness(0n);
     const preview = await messageSigning(context, { operation: "preview", message: "Log in to Acme Pay" }) as { confirmationNonce: string; preview: { message: string } };
