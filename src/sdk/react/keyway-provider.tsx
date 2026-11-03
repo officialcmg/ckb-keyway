@@ -26,15 +26,15 @@ import {
 import { bootstrapKeyWay, type PublicWallet } from "../browser/bootstrap";
 import type { ApproveFiberChannelOpen, FiberChannelOpenPreview } from "../browser/remote-ckb-signer";
 import type { ApproveFiberPayment } from "../browser/fiber-payment";
-import type { RequestEmailCode } from "../browser/email-code";
+import type { EmailCodeReason, RequestEmailCode } from "../browser/email-code";
+import { friendlyKeyWayError } from "../browser/friendly-error";
 import { changeRecoveryBackup, enableRecovery, requestBackupChallenge, type ApproveBackupChange, type ApproveRecovery, type BackupChanged, type BackupChangePreview, type RecoveryEnabled, type RecoveryPreview } from "../browser/account-recovery";
 import type { RecoveryBackup, RecoveryBackupProof } from "../browser/recovery-backups";
 import { KeyWaySigner, type ApproveCkbMessage, type ApproveCkbTransaction, type MessagePreview, type TransactionPreview } from "../browser/keyway-signer";
-import { KeyWayChannelCloseModal, KeyWayChannelSettingsModal, KeyWayEmailCodeModal, KeyWayMessageModal, KeyWayBackupChangeModal, KeyWayPeerModal, KeyWayRecoveryModal, KeyWayTransactionModal } from "./signing-modals";
-import type { ApproveFiberChannelClose, ApproveFiberChannelSettings, ApproveFiberPeer, FiberChannelClosePreview, FiberChannelSettingsPreview, FiberPeerPreview } from "../browser/fiber-actions";
+import { KeyWayChannelCloseModal, KeyWayChannelSettingsModal, KeyWayEmailCodeModal, KeyWayFundingModal, KeyWayMessageModal, KeyWayBackupChangeModal, KeyWayPeerModal, KeyWayRecoveryModal, KeyWayTransactionModal } from "./signing-modals";
+import type { ApproveFiberChannelClose, ApproveFiberChannelSettings, ApproveFiberPeer, FiberApprovedAction, FiberChannelClosePreview, FiberChannelSettingsPreview, FiberPeerPreview } from "../browser/fiber-actions";
+import { CodeInput, ResendLine, Shell, StatusLine, type ApprovalStep } from "./dialog";
 import {
-  modalBackdrop,
-  modalPanel,
   modalClose,
   modalBack,
   modalIcon,
@@ -44,21 +44,8 @@ import {
   modalFootnote,
   modalLabel,
   modalInput,
-  otpLabel,
-  otpSlots,
-  otpSlot,
-  otpInput,
-  otpCaret,
-  visuallyHidden,
-  modalStatus,
-  resendCopy,
-  resendButton,
-  fundingDetails,
-  modalActions,
   modalButton,
   modalPrimaryButton,
-  ModalPalette,
-  modalPalette,
 } from "./modal-styles";
 
 
@@ -135,6 +122,78 @@ export type KeyWayContextValue = {
 
 const KeyWayContext = createContext<KeyWayContextValue | undefined>(undefined);
 
+type Approval<P> = ApprovalStep & { preview: P; resolve: (approved: boolean) => void };
+
+/**
+ * One built-in approval dialog. After the user approves, it stays open and busy until the next step shows
+ * (`handOff`, when the code prompt opens) or the action ends (`settle`); a failure stays in it until closed.
+ */
+function useApproval<P>() {
+  const [request, setRequest] = useState<Approval<P>>();
+  const [actions] = useState(() => {
+    let current: Approval<P> | undefined;
+    const set = (next: Approval<P> | undefined) => { current = next; setRequest(next); };
+    return {
+      ask: (preview: P) => new Promise<boolean>((resolve) => {
+        if (current && !current.busy && current.failure === undefined) current.resolve(false);
+        set({ preview, resolve });
+      }),
+      answer: (approved: boolean) => {
+        if (!current || current.busy) return;
+        if (current.failure !== undefined) return set(undefined);
+        current.resolve(approved);
+        set(approved ? { ...current, busy: true } : undefined);
+      },
+      settle: (error?: unknown) => {
+        if (!current?.busy) return;
+        const text = error instanceof Error ? error.message : error === undefined ? "" : String(error);
+        set(text && !/cancelled|not approved/i.test(text) ? { ...current, busy: false, failure: friendlyKeyWayError(text) } : undefined);
+      },
+      handOff: () => { if (current?.busy) set(undefined); },
+      dismiss: () => {
+        if (current && !current.busy && current.failure === undefined) current.resolve(false);
+        set(undefined);
+      },
+    };
+  });
+  return { request, ...actions };
+}
+
+/** Reports how an action ended to `settle`, and passes its result or error on unchanged. */
+async function settles<T>(work: Promise<T>, settle: (error?: unknown) => void): Promise<T> {
+  try {
+    const value = await work;
+    settle();
+    return value;
+  } catch (error) {
+    settle(error);
+    throw error;
+  }
+}
+
+/** The provider's signer: it tells the approval dialog left open after approval when signing has finished. */
+class ProviderSigner extends KeyWaySigner {
+  constructor(
+    authToken: string,
+    publicKey: ConstructorParameters<typeof KeyWaySigner>[1],
+    handlers: ConstructorParameters<typeof KeyWaySigner>[2],
+    client: ConstructorParameters<typeof KeyWaySigner>[3],
+    api: ConstructorParameters<typeof KeyWaySigner>[4],
+    recovery: ConstructorParameters<typeof KeyWaySigner>[5],
+    private readonly settled: { transaction: (error?: unknown) => void; message: (error?: unknown) => void },
+  ) {
+    super(authToken, publicKey, handlers, client, api, recovery);
+  }
+
+  override signOnlyTransaction(transaction: Parameters<KeyWaySigner["signOnlyTransaction"]>[0]) {
+    return settles(super.signOnlyTransaction(transaction), this.settled.transaction);
+  }
+
+  override signMessageRaw(text: Parameters<KeyWaySigner["signMessageRaw"]>[0]) {
+    return settles(super.signMessageRaw(text), this.settled.message);
+  }
+}
+
 export function KeyWayProvider({
   children,
   appId,
@@ -173,29 +232,36 @@ export function KeyWayProvider({
   const [user, setUser] = useState<KeyWayUser>();
   const [ready, setReady] = useState(false);
   const [loginOpen, setLoginOpen] = useState(false);
-  const [transactionRequest, setTransactionRequest] = useState<{ preview: TransactionPreview; resolve: (approved: boolean) => void }>();
-  const [messageRequest, setMessageRequest] = useState<{ preview: MessagePreview; resolve: (approved: boolean) => void }>();
-  const [recoveryRequest, setRecoveryRequest] = useState<{ preview: RecoveryPreview; resolve: (approved: boolean) => void }>();
-  const [backupChangeRequest, setBackupChangeRequest] = useState<{ preview: BackupChangePreview; resolve: (approved: boolean) => void }>();
+  const transaction = useApproval<TransactionPreview>();
+  const message = useApproval<MessagePreview>();
+  const recovery = useApproval<RecoveryPreview>();
+  const backupChange = useApproval<BackupChangePreview>();
+  const channelClose = useApproval<FiberChannelClosePreview>();
+  const peer = useApproval<FiberPeerPreview>();
+  const channelSettings = useApproval<FiberChannelSettingsPreview>();
+  const funding = useApproval<FiberChannelOpenPreview>();
+  const approvalsRef = useRef({ transaction, message, recovery, backupChange, channelClose, peer, channelSettings, funding });
+  approvalsRef.current = { transaction, message, recovery, backupChange, channelClose, peer, channelSettings, funding };
   const [codeRequest, setCodeRequest] = useState<{
-    reason: "transaction" | "settings" | "payment" | "recovery" | "recovery-backup";
+    reason: EmailCodeReason;
     error?: string;
+    sentTo?: string;
     resend: () => Promise<void>;
+    verify?: (code: string) => Promise<void>;
     resolve: (code: string | undefined) => void;
-  }>();
-  const [actionRequest, setActionRequest] = useState<
-    | { kind: "close"; preview: FiberChannelClosePreview; resolve: (approved: boolean) => void }
-    | { kind: "peer"; preview: FiberPeerPreview; resolve: (approved: boolean) => void }
-    | { kind: "settings"; preview: FiberChannelSettingsPreview; resolve: (approved: boolean) => void }
-  >();
-  const [fundingRequest, setFundingRequest] = useState<{
-    preview: FiberChannelOpenPreview;
-    resolve: (approved: boolean) => void;
   }>();
   const authenticated = ready && Boolean(authToken && user);
 
-  // The code prompt is always the SDK's own, even when an app brings its own approval UI.
-  const requestEmailCode: RequestEmailCode = (request) => new Promise<string | undefined>((resolve) => setCodeRequest({ ...request, resolve }));
+  // The code prompt is always the SDK's own, even when an app brings its own approval UI. It is the next step
+  // of whatever the user just approved, so that dialog closes as the prompt opens.
+  const requestEmailCode: RequestEmailCode = (request) => new Promise<string | undefined>((resolve) => {
+    for (const approval of Object.values(approvalsRef.current)) approval.handOff();
+    setCodeRequest({ ...request, resolve });
+  });
+  const fiberSettled = (action: FiberApprovedAction, error?: unknown) => {
+    const approvals = approvalsRef.current;
+    ({ close: approvals.channelClose, peer: approvals.peer, settings: approvals.channelSettings, funding: approvals.funding })[action].settle(error);
+  };
 
   async function connect() {
     if (!authToken) throw new Error("Log in before connecting KeyWay");
@@ -220,20 +286,17 @@ export function KeyWayProvider({
           apiClient: api,
           approveFiberChannelOpen: (preview) => {
             if (run !== runRef.current) return false;
-            return callbacksRef.current.approveFiberChannelOpen?.(preview) ??
-              new Promise<boolean>((resolve) => setFundingRequest({ preview, resolve }));
+            return callbacksRef.current.approveFiberChannelOpen?.(preview) ?? approvalsRef.current.funding.ask(preview);
           },
           // Read at payment time, so an app can add or drop its own confirmation without restarting Fiber.
           approveFiberPayment: (preview) => callbacksRef.current.approveFiberPayment?.(preview) ?? true,
           requestEmailCode,
           // Each reads the app's prop at the time of the action, falling back to the built-in dialog.
           approvals: () => ({
-            approveFiberChannelClose: (preview) => callbacksRef.current.approveFiberChannelClose?.(preview) ??
-              new Promise<boolean>((resolve) => setActionRequest({ kind: "close", preview, resolve })),
-            approveFiberPeerConnect: (preview) => callbacksRef.current.approveFiberPeerConnect?.(preview) ??
-              new Promise<boolean>((resolve) => setActionRequest({ kind: "peer", preview, resolve })),
-            approveFiberChannelSettings: (preview) => callbacksRef.current.approveFiberChannelSettings?.(preview) ??
-              new Promise<boolean>((resolve) => setActionRequest({ kind: "settings", preview, resolve })),
+            approveFiberChannelClose: (preview) => callbacksRef.current.approveFiberChannelClose?.(preview) ?? approvalsRef.current.channelClose.ask(preview),
+            approveFiberPeerConnect: (preview) => callbacksRef.current.approveFiberPeerConnect?.(preview) ?? approvalsRef.current.peer.ask(preview),
+            approveFiberChannelSettings: (preview) => callbacksRef.current.approveFiberChannelSettings?.(preview) ?? approvalsRef.current.channelSettings.ask(preview),
+            settled: fiberSettled,
           }),
           ...(fiberNode === "browser" ? { onLeaseLost: (leaseError: Error) => {
             if (run !== runRef.current) return;
@@ -279,10 +342,7 @@ export function KeyWayProvider({
 
   async function disconnect() {
     ++runRef.current;
-    fundingRequest?.resolve(false);
-    setFundingRequest(undefined);
-    actionRequest?.resolve(false);
-    setActionRequest(undefined);
+    for (const approval of [funding, channelClose, peer, channelSettings]) approval.dismiss();
     const current = connectionRef.current;
     connectionRef.current = undefined;
     setConnection(undefined);
@@ -308,8 +368,7 @@ export function KeyWayProvider({
   async function logout() {
     const token = authToken;
     ++runRef.current;
-    fundingRequest?.resolve(false);
-    setFundingRequest(undefined);
+    funding.dismiss();
     setStatus("disconnecting");
     setError(undefined);
     await operationRef.current;
@@ -445,25 +504,25 @@ export function KeyWayProvider({
 
   const signer = useMemo(() => {
     if (!wallet || !authToken) return undefined;
-    return new KeyWaySigner(authToken, wallet.litPublicKey, {
-      approveCkbTransaction: (preview) => callbacksRef.current.approveCkbTransaction?.(preview) ??
-        new Promise<boolean>((resolve) => setTransactionRequest({ preview, resolve })),
-      approveCkbMessage: (preview) => callbacksRef.current.approveCkbMessage?.(preview) ??
-        new Promise<boolean>((resolve) => setMessageRequest({ preview, resolve })),
+    return new ProviderSigner(authToken, wallet.litPublicKey, {
+      approveCkbTransaction: (preview) => callbacksRef.current.approveCkbTransaction?.(preview) ?? approvalsRef.current.transaction.ask(preview),
+      approveCkbMessage: (preview) => callbacksRef.current.approveCkbMessage?.(preview) ?? approvalsRef.current.message.ask(preview),
       requestEmailCode,
-    }, undefined, new KeyWayApiClient({ appId }), wallet.recovery);
+    }, undefined, new KeyWayApiClient({ appId }), wallet.recovery, {
+      transaction: (error) => approvalsRef.current.transaction.settle(error),
+      message: (error) => approvalsRef.current.message.settle(error),
+    });
   }, [wallet?.litPublicKey, wallet?.recovery?.omnilockArgs, authToken, appId]);
 
   async function turnOnRecovery(backups: RecoveryBackupProof[]): Promise<RecoveryEnabled> {
     if (!authToken || !wallet) throw new Error("Sign in before turning on recovery");
-    const result = await enableRecovery({
+    const result = await settles(enableRecovery({
       authToken,
       backups,
       api: new KeyWayApiClient({ appId }),
-      approve: (preview) => callbacksRef.current.approveRecovery?.(preview) ??
-        new Promise<boolean>((resolve) => setRecoveryRequest({ preview, resolve })),
+      approve: (preview) => callbacksRef.current.approveRecovery?.(preview) ?? recovery.ask(preview),
       requestEmailCode,
-    });
+    }), recovery.settle);
     setWallet((current) => current && current.litPublicKey === wallet.litPublicKey ? { ...current, ckbAddress: result.ckbAddress, recovery: result.recovery } : current);
     return result;
   }
@@ -475,15 +534,14 @@ export function KeyWayProvider({
 
   async function changeBackup(change: "add" | "remove", backup: RecoveryBackupProof | RecoveryBackup): Promise<BackupChanged> {
     if (!authToken || !wallet) throw new Error("Sign in before changing backups");
-    const result = await changeRecoveryBackup({
+    const result = await settles(changeRecoveryBackup({
       authToken,
       change,
       backup,
       api: new KeyWayApiClient({ appId }),
-      approve: (preview) => callbacksRef.current.approveBackupChange?.(preview) ??
-        new Promise<boolean>((resolve) => setBackupChangeRequest({ preview, resolve })),
+      approve: (preview) => callbacksRef.current.approveBackupChange?.(preview) ?? backupChange.ask(preview),
       requestEmailCode,
-    });
+    }), backupChange.settle);
     setWallet((current) => current && current.litPublicKey === wallet.litPublicKey ? { ...current, recovery: result.recovery } : current);
     return result;
   }
@@ -532,64 +590,26 @@ export function KeyWayProvider({
           }}
         />
       ) : null}
-      {transactionRequest ? (
-        <KeyWayTransactionModal
-          theme={theme}
-          appName={resolvedAppName}
-          preview={transactionRequest.preview}
-          answer={(approved) => { transactionRequest.resolve(approved); setTransactionRequest(undefined); }}
-        />
-      ) : null}
-      {messageRequest ? (
-        <KeyWayMessageModal
-          theme={theme}
-          appName={resolvedAppName}
-          preview={messageRequest.preview}
-          answer={(approved) => { messageRequest.resolve(approved); setMessageRequest(undefined); }}
-        />
-      ) : null}
-      {recoveryRequest ? (
-        <KeyWayRecoveryModal
-          theme={theme}
-          appName={resolvedAppName}
-          preview={recoveryRequest.preview}
-          answer={(approved) => { recoveryRequest.resolve(approved); setRecoveryRequest(undefined); }}
-        />
-      ) : null}
-      {backupChangeRequest ? (
-        <KeyWayBackupChangeModal
-          theme={theme}
-          appName={resolvedAppName}
-          preview={backupChangeRequest.preview}
-          answer={(approved) => { backupChangeRequest.resolve(approved); setBackupChangeRequest(undefined); }}
-        />
-      ) : null}
+      {transaction.request ? <KeyWayTransactionModal theme={theme} appName={resolvedAppName} preview={transaction.request.preview} step={transaction.request} answer={transaction.answer} /> : null}
+      {message.request ? <KeyWayMessageModal theme={theme} appName={resolvedAppName} preview={message.request.preview} step={message.request} answer={message.answer} /> : null}
+      {recovery.request ? <KeyWayRecoveryModal theme={theme} appName={resolvedAppName} preview={recovery.request.preview} step={recovery.request} answer={recovery.answer} /> : null}
+      {backupChange.request ? <KeyWayBackupChangeModal theme={theme} appName={resolvedAppName} preview={backupChange.request.preview} step={backupChange.request} answer={backupChange.answer} /> : null}
       {codeRequest ? (
         <KeyWayEmailCodeModal
           key={codeRequest.error ?? "first"}
           theme={theme}
           reason={codeRequest.reason}
           error={codeRequest.error}
+          sentTo={codeRequest.sentTo}
           resend={codeRequest.resend}
+          verify={codeRequest.verify}
           answer={(code) => { codeRequest.resolve(code); setCodeRequest(undefined); }}
         />
       ) : null}
-      {actionRequest ? (() => {
-        const answer = (approved: boolean) => { actionRequest.resolve(approved); setActionRequest(undefined); };
-        if (actionRequest.kind === "close") return <KeyWayChannelCloseModal theme={theme} appName={resolvedAppName} preview={actionRequest.preview} answer={answer} />;
-        if (actionRequest.kind === "peer") return <KeyWayPeerModal theme={theme} appName={resolvedAppName} preview={actionRequest.preview} answer={answer} />;
-        return <KeyWayChannelSettingsModal theme={theme} appName={resolvedAppName} preview={actionRequest.preview} answer={answer} />;
-      })() : null}
-      {fundingRequest ? (
-        <KeyWayFundingModal
-          theme={theme}
-          preview={fundingRequest.preview}
-          answer={(approved) => {
-            fundingRequest.resolve(approved);
-            setFundingRequest(undefined);
-          }}
-        />
-      ) : null}
+      {channelClose.request ? <KeyWayChannelCloseModal theme={theme} appName={resolvedAppName} fiberNode={fiberNode} preview={channelClose.request.preview} step={channelClose.request} answer={channelClose.answer} /> : null}
+      {peer.request ? <KeyWayPeerModal theme={theme} appName={resolvedAppName} preview={peer.request.preview} step={peer.request} answer={peer.answer} /> : null}
+      {channelSettings.request ? <KeyWayChannelSettingsModal theme={theme} appName={resolvedAppName} preview={channelSettings.request.preview} step={channelSettings.request} answer={channelSettings.answer} /> : null}
+      {funding.request ? <KeyWayFundingModal theme={theme} appName={resolvedAppName} preview={funding.request.preview} step={funding.request} answer={funding.answer} /> : null}
     </KeyWayContext.Provider>
   );
 }
@@ -672,6 +692,7 @@ export function KeyWayFiberButton({
   );
 }
 
+/** The SDK's email login: the address, then the six-digit code KeyWay emails to it. */
 export function KeyWayLoginModal({
   api,
   appName,
@@ -691,9 +712,7 @@ export function KeyWayLoginModal({
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string>();
   const [verificationState, setVerificationState] = useState<"idle" | "success" | "error">("idle");
-  const [codeFocused, setCodeFocused] = useState(false);
   const codeInputRef = useRef<HTMLInputElement>(null);
-  const palette = modalPalette(theme);
 
   async function submit() {
     setPending(true);
@@ -710,162 +729,104 @@ export function KeyWayLoginModal({
       authenticated({ authToken: result.sessionToken, user: result.user, expiresAt: result.expiresAt });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not complete email login");
-      if (challengeId) setVerificationState("error");
+      if (challengeId) {
+        // A wrong code is cleared so the next one can be typed straight away.
+        setVerificationState("error");
+        setCode("");
+        requestAnimationFrame(() => codeInputRef.current?.focus());
+      }
     } finally {
       setPending(false);
     }
   }
 
   async function resend() {
-    setPending(true);
     setError(undefined);
-    setCode("");
     setVerificationState("idle");
-    try {
-      setChallengeId((await api.sendCode(email)).challengeId);
-      codeInputRef.current?.focus();
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Could not resend the code");
-    } finally {
-      setPending(false);
-    }
+    const next = await api.sendCode(email);
+    setChallengeId(next.challengeId);
+    setCode("");
+    codeInputRef.current?.focus();
   }
 
   useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") close();
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [close]);
+    if (challengeId && code.length === 6 && !pending && verificationState !== "success") void submit();
+  }, [code, challengeId]);
 
-  useEffect(() => {
-    if (challengeId && code.length === 6 && !pending && verificationState === "idle") void submit();
-  }, [code, challengeId, pending, verificationState]);
+  // The email field is gone once the code is sent, so focus moves to the code.
+  useEffect(() => { if (challengeId) codeInputRef.current?.focus(); }, [challengeId]);
 
-  useEffect(() => {
-    if (!challengeId) {
-      setCodeFocused(false);
-      return;
-    }
-    codeInputRef.current?.focus();
-    setCodeFocused(document.activeElement === codeInputRef.current);
-  }, [challengeId]);
-
-  const codeColor = verificationState === "success" ? palette.success
-    : verificationState === "error" ? palette.error
-    : palette.border;
-  const codeBackground = verificationState === "success" ? palette.successSurface
-    : verificationState === "error" ? palette.errorSurface
-    : palette.surface;
-
+  const checking = Boolean(challengeId) && pending;
   return (
-    <div
-      role="presentation"
-      style={{ ...modalBackdrop, background: palette.backdrop }}
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) close();
-      }}
-    >
-      <section role="dialog" aria-modal="true" aria-labelledby="keyway-login-title" style={{ ...modalPanel, background: palette.panel, borderColor: palette.border, color: palette.text }}>
-        <style>{`@keyframes ckb-keyway-caret { 0%, 45% { opacity: 1; } 46%, 100% { opacity: 0; } }`}</style>
-        {!challengeId ? (
-          <button type="button" aria-label="Close login" onClick={close} style={{ ...modalClose, color: palette.muted }}>&times;</button>
-        ) : (
-          <button type="button" aria-label="Back" disabled={pending} style={{ ...modalBack, background: palette.surface, color: palette.muted }} onClick={() => {
-            setChallengeId(undefined);
-            setCode("");
-            setError(undefined);
-            setVerificationState("idle");
-          }}><ArrowLeftIcon /></button>
-        )}
-        <div style={{ ...modalIcon, background: palette.surface, color: palette.muted }}><MailIcon /></div>
-        <p style={{ ...modalEyebrow, color: palette.muted }}>{appName}</p>
-        <h2 id="keyway-login-title" style={modalTitle}>{challengeId ? "Enter confirmation code" : "Log in or sign up"}</h2>
-        <p style={{ ...modalCopy, color: palette.muted }}>{challengeId
-          ? <>Check <strong style={{ color: palette.text }}>{email}</strong> for a six-digit code.</>
-          : `Use your email to continue to ${appName}.`}</p>
-        <form onSubmit={(event) => {
-          event.preventDefault();
-          if (!challengeId || code.length === 6) void submit();
-        }}>
+    <Shell theme={theme} labelId="keyway-login-title" width={420} onEscape={checking ? undefined : close} onBackdrop={checking ? undefined : close}>
+      {(palette) => (
+        <>
           {!challengeId ? (
-            <label style={{ ...modalLabel, color: palette.muted }}>
-              Email address
-              <input
-                autoFocus
-                required
-                type="email"
-                autoComplete="email"
-                value={email}
-                onChange={(event) => setEmail(event.target.value)}
-                placeholder="you@example.com"
-                style={{ ...modalInput, background: palette.surface, borderColor: palette.border, color: palette.text }}
-              />
-            </label>
+            <button type="button" aria-label="Close login" onClick={close} style={{ ...modalClose, color: palette.muted }}>&times;</button>
           ) : (
-            <label style={otpLabel} onClick={() => codeInputRef.current?.focus()}>
-              <span style={visuallyHidden}>One-time code</span>
-              <span style={otpSlots}>
-                {Array.from({ length: 6 }, (_, index) => {
-                  const active = codeFocused && code.length < 6 && index === code.length;
-                  return (
-                    <span key={index} aria-hidden="true" style={{
-                      ...otpSlot,
-                      borderColor: active ? palette.text : codeColor,
-                      background: codeBackground,
-                      color: palette.text,
-                      boxShadow: active ? `0 0 0 1px ${palette.text}` : undefined,
-                    }}>
-                      {code[index] ?? (active ? <span style={{ ...otpCaret, background: palette.text }} /> : "")}
-                    </span>
-                  );
-                })}
-              </span>
-              <input
-                ref={codeInputRef}
-                autoFocus
-                required
-                inputMode="numeric"
-                autoComplete="one-time-code"
-                pattern="[0-9]{6}"
-                maxLength={6}
+            <button type="button" aria-label="Back" disabled={pending} style={{ ...modalBack, background: palette.surface, color: palette.muted }} onClick={() => {
+              setChallengeId(undefined);
+              setCode("");
+              setError(undefined);
+              setVerificationState("idle");
+            }}><ArrowLeftIcon /></button>
+          )}
+          <div style={{ ...modalIcon, background: palette.surface, color: palette.muted }}><MailIcon /></div>
+          <p style={{ ...modalEyebrow, color: palette.muted }}>{appName}</p>
+          <h2 id="keyway-login-title" style={modalTitle}>{challengeId ? "Enter confirmation code" : "Log in or sign up"}</h2>
+          <p style={{ ...modalCopy, color: palette.muted }}>{challengeId
+            ? <>Check <strong style={{ color: palette.text, overflowWrap: "anywhere" }}>{email}</strong> for a six-digit code. It expires in 10 minutes.</>
+            : `Use your email to continue to ${appName}.`}</p>
+          <form onSubmit={(event) => {
+            event.preventDefault();
+            if (!challengeId || code.length === 6) void submit();
+          }}>
+            {!challengeId ? (
+              <label style={{ ...modalLabel, color: palette.muted }}>
+                Email address
+                <input
+                  autoFocus
+                  required
+                  type="email"
+                  autoComplete="email"
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  placeholder="you@example.com"
+                  style={{ ...modalInput, background: palette.surface, borderColor: palette.border, color: palette.text }}
+                />
+              </label>
+            ) : (
+              <CodeInput
+                palette={palette}
                 value={code}
-                onFocus={() => setCodeFocused(true)}
-                onBlur={() => setCodeFocused(false)}
-                onChange={(event) => {
-                  setCode(event.target.value.replace(/\D/g, "").slice(0, 6));
+                inputRef={codeInputRef}
+                label="One-time code"
+                readOnly={pending || verificationState === "success"}
+                state={verificationState}
+                describedBy={error ? "keyway-login-error" : undefined}
+                onChange={(next) => {
+                  setCode(next);
                   setError(undefined);
                   setVerificationState("idle");
                 }}
-                style={otpInput}
               />
-            </label>
-          )}
-          {verificationState === "success" ? <p role="status" style={{ ...modalStatus, color: palette.success }}>Code verified</p> : null}
-          {challengeId && pending && verificationState === "idle" ? <p role="status" style={{ ...modalStatus, color: palette.muted }}>Checking code...</p> : null}
-          {error ? <p role="alert" style={{ ...modalStatus, color: palette.error }}>{friendlyOtpError(error)}</p> : null}
-          {!challengeId ? (
-            <button type="submit" disabled={pending} style={{ ...modalButton, ...modalPrimaryButton, background: palette.primary, color: palette.primaryText }}>
-              {pending ? "Sending code..." : "Continue"}
-            </button>
-          ) : (
-            <p style={{ ...resendCopy, color: palette.muted }}>Didn't get an email?{" "}
-              <button type="button" disabled={pending} style={{ ...resendButton, color: palette.text }} onClick={() => void resend()}>
-                {pending ? "Sending..." : "Resend code"}
+            )}
+            {verificationState === "success" ? <StatusLine palette={palette} tone="success">Code verified</StatusLine> : null}
+            {checking && verificationState === "idle" ? <StatusLine palette={palette} tone="muted">Checking code…</StatusLine> : null}
+            {error ? <p id="keyway-login-error" role="alert" style={{ minHeight: 21, margin: "14px 0 0", fontSize: 14, fontWeight: 600, color: palette.error }}>{error}</p> : null}
+            {!challengeId ? (
+              <button type="submit" disabled={pending} style={{ ...modalButton, ...modalPrimaryButton, background: palette.primary, color: palette.primaryText }}>
+                {pending ? "Sending code…" : "Continue"}
               </button>
-            </p>
-          )}
-        </form>
-        <p style={{ ...modalFootnote, color: palette.subtle }}>Secured by <strong>CKB KeyWay</strong></p>
-      </section>
-    </div>
+            ) : (
+              <ResendLine palette={palette} resend={resend} waitSeconds={60} disabled={pending || verificationState === "success"} prompt="Didn't get an email?" style={{ margin: "22px 0 0", textAlign: "center" }} />
+            )}
+          </form>
+          <p style={{ ...modalFootnote, color: palette.subtle }}>Secured by <strong>CKB KeyWay</strong></p>
+        </>
+      )}
+    </Shell>
   );
-}
-
-function friendlyOtpError(message: string): string {
-  if (/code|otp|authenticate|invalid/i.test(message)) return "Incorrect or expired code";
-  return message;
 }
 
 function ArrowLeftIcon() {
@@ -874,48 +835,6 @@ function ArrowLeftIcon() {
 
 function MailIcon() {
   return <svg aria-hidden="true" width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect width="18" height="14" x="3" y="5" rx="2" /><path d="m3 7 9 6 9-6" /></svg>;
-}
-
-export function KeyWayFundingModal({
-  theme,
-  preview,
-  answer,
-}: {
-  theme: "light" | "dark";
-  preview: FiberChannelOpenPreview;
-  answer: (approved: boolean) => void;
-}) {
-  const palette = modalPalette(theme);
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") answer(false);
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [answer]);
-
-  return (
-    <div role="presentation" style={{ ...modalBackdrop, background: palette.backdrop }}>
-      <section role="dialog" aria-modal="true" aria-labelledby="keyway-funding-title" style={{ ...modalPanel, background: palette.panel, borderColor: palette.border, color: palette.text }}>
-        <p style={{ ...modalEyebrow, color: palette.muted }}>ON-CHAIN CONFIRMATION</p>
-        <h2 id="keyway-funding-title" style={modalTitle}>Activate Fiber payments?</h2>
-        <dl style={fundingDetails}>
-          {preview.token && <><dt>Channel funding</dt><dd>{preview.token.amountText}</dd></>}
-          <dt>{preview.token ? "CKB reserve" : "Channel funding"}</dt><dd>{preview.amountCkb} CKB</dd>
-          {preview.peer && <><dt>Peer</dt><dd style={{ overflowWrap: "anywhere" }}>{preview.peer.slice(0, 12)}…{preview.peer.slice(-6)}</dd></>}
-          {preview.feeReserveCkb && <><dt>Fee reserve</dt><dd>{preview.feeReserveCkb} CKB</dd></>}
-          <dt>Network fee</dt><dd>{preview.feeCkb} CKB</dd>
-          <dt>Network</dt><dd>CKB testnet</dd>
-        </dl>
-        <p style={{ ...modalCopy, color: palette.muted }}>{preview.token ? "This locks the token, and some CKB as a reserve," : "This locks testnet CKB"} into a payment channel. It does not send funds to another wallet, and a normal close returns your side to your own account.</p>
-        {preview.feeReserveCkb && <p style={{ ...modalCopy, color: palette.muted }}>The fee reserve stays on your own Fiber node so it can claim your funds if a channel is ever force-closed. You get it back once all your channels are closed.</p>}
-        <div style={modalActions}>
-          <button type="button" autoFocus style={{ ...modalButton, borderColor: palette.border, color: palette.text }} onClick={() => answer(false)}>Cancel</button>
-          <button type="button" style={{ ...modalButton, ...modalPrimaryButton, background: palette.primary, color: palette.primaryText }} onClick={() => answer(true)}>Confirm activation</button>
-        </div>
-      </section>
-    </div>
-  );
 }
 
 type StoredSession = { authToken: string; user: KeyWayUser; appId?: string; expiresAt: string };

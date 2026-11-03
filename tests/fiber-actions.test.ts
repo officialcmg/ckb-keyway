@@ -34,13 +34,16 @@ test("actions show the user what changes, run only when approved, and refuse wit
   const seen: unknown[] = [];
   let allow = true;
   const io = { listChannels: async () => ({ channels: [channel] }) as never, act: async (method: string, params: Record<string, unknown>) => { acted.push({ method, params }); } };
+  const settled: string[] = [];
   const actions = createFiberActions(io, () => ({
     approveFiberChannelClose: (preview) => { seen.push(preview); return allow; },
     approveFiberChannelSettings: (preview) => { seen.push(preview); return allow; },
+    settled: (action, error) => { settled.push(error ? `${action}: ${(error as Error).message}` : action); },
   }));
   await actions.shutdownChannel({ channel_id: id });
   assert.deepEqual(seen[0], { channelId: id, peer: channel.pubkey, asset: "ckb", returning: "10000000000", returningText: "100 CKB", force: false, network: "CKB testnet" });
   await actions.updateChannel({ channel_id: id, tlc_fee_proportional_millionths: "0x7d0", enabled: false });
+  assert.equal((seen[1] as { asset: string }).asset, "ckb");
   assert.deepEqual((seen[1] as { changes: unknown }).changes, [
     { setting: "enabled", from: "true", to: "false" },
     { setting: "tlc_fee_proportional_millionths", from: "0x3e8", to: "0x7d0" },
@@ -50,6 +53,14 @@ test("actions show the user what changes, run only when approved, and refuse wit
   // No approval function at all: refused, never silent.
   await assert.rejects(() => actions.connectPeer({ pubkey: channel.pubkey }), /not approved/);
   assert.equal(acted.length, 2);
+  // Each approved action reports when it has run, so a dialog left open after approval can close.
+  assert.deepEqual(settled, ["close", "settings"]);
+  const failing = createFiberActions({ ...io, act: async () => { throw new Error("Peer is offline"); } }, () => ({
+    approveFiberChannelClose: () => true,
+    settled: (action, error) => { settled.push(`${action}: ${(error as Error).message}`); },
+  }));
+  await assert.rejects(() => failing.shutdownChannel({ channel_id: id }), /offline/);
+  assert.equal(settled.at(-1), "close: Peer is offline");
 });
 
 test("hosted nodes refuse private and internal peer addresses", async () => {

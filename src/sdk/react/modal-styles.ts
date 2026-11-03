@@ -8,7 +8,7 @@ export const modalBackdrop: CSSProperties = {
   display: "grid",
   placeItems: "center",
   overflowY: "auto",
-  padding: "24px",
+  padding: "clamp(12px, 4vw, 24px)",
   backdropFilter: "blur(6px)",
 };
 
@@ -16,7 +16,7 @@ export const modalPanel: CSSProperties = {
   position: "relative",
   width: "min(100%, 420px)",
   boxSizing: "border-box",
-  padding: "38px 34px 28px",
+  padding: "clamp(28px, 8vw, 38px) clamp(18px, 6vw, 34px) clamp(20px, 6vw, 28px)",
   border: "1px solid",
   borderRadius: 24,
   boxShadow: "0 24px 70px rgba(15, 23, 42, 0.2)",
@@ -180,25 +180,51 @@ export const resendButton: CSSProperties = {
 
 export const fundingDetails: CSSProperties = {
   display: "grid",
-  gridTemplateColumns: "1fr auto",
-  gap: "10px 24px",
+  gap: 10,
   margin: "24px 0",
+  fontSize: 14,
+  lineHeight: 1.45,
+  textAlign: "left",
+};
+
+export const detailRow: CSSProperties = {
+  display: "flex",
+  flexWrap: "wrap",
+  alignItems: "baseline",
+  justifyContent: "space-between",
+  gap: "2px 16px",
+};
+
+export const detailLabel: CSSProperties = {
+  margin: 0,
+  flex: "0 1 auto",
+  overflowWrap: "break-word",
+};
+
+export const detailValue: CSSProperties = {
+  margin: "0 0 0 auto",
+  minWidth: 0,
+  maxWidth: "100%",
+  textAlign: "right",
+  overflowWrap: "anywhere",
   fontFamily: "ui-monospace, monospace",
   fontSize: 13,
 };
 
 export const modalActions: CSSProperties = {
   display: "flex",
+  flexWrap: "wrap",
   justifyContent: "flex-end",
   gap: 10,
   marginTop: 24,
 };
 
 export const modalButton: CSSProperties = {
+  flex: "1 1 120px",
   width: "100%",
   minHeight: 44,
   marginTop: 18,
-  padding: "0 18px",
+  padding: "0 14px",
   border: "1px solid transparent",
   borderRadius: 12,
   background: "transparent",
@@ -226,6 +252,7 @@ export type ModalPalette = {
   successSurface: string;
   error: string;
   errorSurface: string;
+  focus: string;
 };
 
 export function modalPalette(theme: "light" | "dark"): ModalPalette {
@@ -235,7 +262,7 @@ export function modalPalette(theme: "light" | "dark"): ModalPalette {
     surface: "#27272a",
     text: "#fafafa",
     muted: "#a1a1aa",
-    subtle: "#71717a",
+    subtle: "#8e8e96",
     border: "#3f3f46",
     primary: "#fafafa",
     primaryText: "#18181b",
@@ -243,13 +270,14 @@ export function modalPalette(theme: "light" | "dark"): ModalPalette {
     successSurface: "rgba(34, 197, 94, 0.14)",
     error: "#fb7185",
     errorSurface: "rgba(244, 63, 94, 0.14)",
+    focus: "#93c5fd",
   } : {
     backdrop: "rgba(15, 23, 42, 0.38)",
     panel: "#ffffff",
     surface: "#f5f6fa",
     text: "#111827",
     muted: "#667085",
-    subtle: "#98a2b3",
+    subtle: "#6b7280",
     border: "#d9deea",
     primary: "#111827",
     primaryText: "#ffffff",
@@ -257,5 +285,6 @@ export function modalPalette(theme: "light" | "dark"): ModalPalette {
     successSurface: "#e8f8ef",
     error: "#c62f3c",
     errorSurface: "#fff0f1",
+    focus: "#2563eb",
   };
 }

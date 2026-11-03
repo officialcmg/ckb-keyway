@@ -38,6 +38,8 @@ export class RemoteCkbSigner extends KeyWayAccountSigner {
     client: ccc.Client = new ccc.ClientPublicTestnet(),
     private readonly api = new KeyWayApiClient(),
     recovery?: KeyWayRecovery,
+    /** Told once an approved funding transaction is signed, or signing failed. */
+    private readonly settled?: (error?: unknown) => void,
   ) {
     super(client, publicKey, recovery);
   }
@@ -51,15 +53,22 @@ export class RemoteCkbSigner extends KeyWayAccountSigner {
     const shown = token ? { ...preview.preview, token: { ...token, amountText: formatAsset(BigInt(token.amount), token.asset) } } : preview.preview;
     if (!await this.approveChannelOpen(shown)) throw new Error("The channel opening was not approved");
 
-    const signed = await this.request({
-      operation: "sign",
-      transaction: serialized,
-      confirmationNonce: preview.confirmationNonce,
-    });
-    if (!signed || typeof signed !== "object" || !("transaction" in signed)) {
-      throw new Error("KeyWay returned an invalid signed transaction");
+    try {
+      const signed = await this.request({
+        operation: "sign",
+        transaction: serialized,
+        confirmationNonce: preview.confirmationNonce,
+      });
+      if (!signed || typeof signed !== "object" || !("transaction" in signed)) {
+        throw new Error("KeyWay returned an invalid signed transaction");
+      }
+      const transaction = ccc.Transaction.from((signed as { transaction: ccc.TransactionLike }).transaction);
+      this.settled?.();
+      return transaction;
+    } catch (error) {
+      this.settled?.(error);
+      throw error;
     }
-    return ccc.Transaction.from((signed as { transaction: ccc.TransactionLike }).transaction);
   }
 
   private async request(body: Record<string, unknown>): Promise<unknown> {

@@ -113,7 +113,7 @@ export async function enableRecovery(options: {
   const sent = await withEmailCode(
     options.requestEmailCode,
     "recovery",
-    () => api.recovery(options.authToken, { ...base, operation: "request-email-code", confirmationNonce }).then(() => undefined),
+    () => api.recovery(options.authToken, { ...base, operation: "request-email-code", confirmationNonce }),
     (emailCode) => api.recovery(options.authToken, { ...base, operation: "enable", confirmationNonce, emailCode }) as Promise<{ transactionHash: string }>,
   );
   const settled = await waitForCommit(() => api.recovery(options.authToken, { operation: "status" }) as never, sent.transactionHash, options.wait);
@@ -158,7 +158,7 @@ export async function changeRecoveryBackup(options: {
   const sent = await withEmailCode(
     options.requestEmailCode,
     "recovery-backup",
-    () => api.recoveryBackups(options.authToken, { ...base, operation: "request-email-code", confirmationNonce }).then(() => undefined),
+    () => api.recoveryBackups(options.authToken, { ...base, operation: "request-email-code", confirmationNonce }),
     (emailCode) => api.recoveryBackups(options.authToken, { ...base, operation: "apply", confirmationNonce, emailCode }) as Promise<{ transactionHash: string }>,
   );
   const settled = await waitForCommit(() => api.recoveryBackups(options.authToken, { operation: "status" }) as never, sent.transactionHash, options.wait);

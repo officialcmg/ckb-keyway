@@ -328,7 +328,8 @@ export async function consumeRequest(user: User, purpose: Purpose, nonce: string
  * email limit bounds how often that can happen.
  */
 export async function sendCode(context: Pick<SigningContext, "user" | "appName" | "email" | "sendEmail" | "rateLimit">, purpose: Purpose, nonce: string, heading: string, lines: string[]): Promise<string> {
-  await limit(context, "step-up-email", { max: 5, window: 600 });
+  const allowed = await context.rateLimit(`step-up-email:${context.user.id}`, { max: 5, window: 600 });
+  if (!allowed.allowed) throw new Error(`Too many codes sent. Try again in ${waitText(allowed.retryAfter ?? 600)}`);
   const code = randomInt(0, 1_000_000).toString().padStart(6, "0");
   const sql = await database();
   const rows = await sql`
@@ -342,6 +343,11 @@ export async function sendCode(context: Pick<SigningContext, "user" | "appName" 
   const template = createConfirmationEmailTemplate(context.appName, code, heading, lines);
   await context.sendEmail(to, template, `keyway-step-up/${nonce}/${Date.now()}`);
   return to;
+}
+
+function waitText(seconds: number): string {
+  if (seconds < 90) return `${Math.max(1, Math.ceil(seconds))} seconds`;
+  return `${Math.ceil(seconds / 60)} minutes`;
 }
 
 export async function verifyCode(user: User, purpose: Purpose, nonce: string, code: unknown): Promise<void> {

@@ -30,6 +30,9 @@ export type FiberPeerPreview = {
 export type FiberChannelSettingsPreview = {
   channelId: string;
   peer: string;
+  /** "ckb", or the channel's token type script hash: the unit of `tlc_minimum_value`. */
+  asset?: string;
+  /** `tlc_expiry_delta` is in milliseconds, `tlc_minimum_value` in the asset's smallest unit. */
   changes: Array<{ setting: "enabled" | "tlc_expiry_delta" | "tlc_minimum_value" | "tlc_fee_proportional_millionths"; from?: string; to: string }>;
 };
 
@@ -41,7 +44,11 @@ export type FiberActionApprovals = {
   approveFiberChannelClose?: ApproveFiberChannelClose;
   approveFiberPeerConnect?: ApproveFiberPeer;
   approveFiberChannelSettings?: ApproveFiberChannelSettings;
+  /** Told when an approved action (or the funding signature) has run or failed, so a dialog left open can close. */
+  settled?: (action: FiberApprovedAction, error?: unknown) => void;
 };
+
+export type FiberApprovedAction = "close" | "peer" | "settings" | "funding";
 
 type ActionIo = {
   listChannels: (params: ListChannelsParams) => Promise<ListChannelsResult>;
@@ -60,15 +67,26 @@ export function createFiberActions(io: ActionIo, approvals: () => FiberActionApp
     return found;
   }
   const refuse = (what: string) => { throw new Error(`The ${what} was not approved`); };
+  async function run(action: FiberApprovedAction, method: Parameters<ActionIo["act"]>[0], params: Record<string, unknown>) {
+    try {
+      await io.act(method, params);
+    } catch (error) {
+      approvals().settled?.(action, error);
+      throw error;
+    }
+    approvals().settled?.(action);
+  }
+  const assetOf = (raw: Parameters<typeof normalizeChannel>[0]) => {
+    const { asset } = normalizeChannel(raw);
+    return asset.kind === "ckb" ? "ckb" : tokenAsset({ code_hash: asset.typeScript.code_hash, hash_type: asset.typeScript.hash_type, args: asset.typeScript.args });
+  };
 
   return {
     async shutdownChannel(input: unknown): Promise<void> {
       const params = approveFiberParams("shutdownChannel", input);
       const raw = await channel(String(params.channel_id));
       const normalized = normalizeChannel(raw);
-      const asset = normalized.asset.kind === "ckb" ? "ckb" : tokenAsset({
-        code_hash: normalized.asset.typeScript.code_hash, hash_type: normalized.asset.typeScript.hash_type, args: normalized.asset.typeScript.args,
-      });
+      const asset = assetOf(raw);
       const preview: FiberChannelClosePreview = {
         channelId: normalized.id,
         peer: normalized.peer,
@@ -79,24 +97,25 @@ export function createFiberActions(io: ActionIo, approvals: () => FiberActionApp
         network: "CKB testnet",
       };
       if (!await approvals().approveFiberChannelClose?.(preview)) refuse("channel close");
-      await io.act("shutdownChannel", params);
+      await run("close", "shutdownChannel", params);
     },
     async connectPeer(input: unknown): Promise<void> {
       const params = approveFiberParams("connectPeer", input);
       const preview: FiberPeerPreview = { action: "connect", pubkey: params.pubkey as string | undefined, address: params.address as string | undefined, openChannels: 0 };
       if (!await approvals().approveFiberPeerConnect?.(preview)) refuse("peer connection");
-      await io.act("connectPeer", params);
+      await run("peer", "connectPeer", params);
     },
     async disconnectPeer(input: unknown): Promise<void> {
       const params = approveFiberParams("disconnectPeer", input);
       const pubkey = String(params.pubkey).toLowerCase();
       const openChannels = (await io.listChannels({})).channels.filter((item) => item.pubkey.toLowerCase().replace(/^0x/, "") === pubkey.replace(/^0x/, "")).length;
       if (!await approvals().approveFiberPeerConnect?.({ action: "disconnect", pubkey: String(params.pubkey), openChannels })) refuse("peer disconnection");
-      await io.act("disconnectPeer", params);
+      await run("peer", "disconnectPeer", params);
     },
     async updateChannel(input: unknown): Promise<void> {
       const params = approveFiberParams("updateChannel", input);
-      const raw = await channel(String(params.channel_id)) as unknown as Record<string, unknown>;
+      const found = await channel(String(params.channel_id));
+      const raw = found as unknown as Record<string, unknown>;
       const keys = ["enabled", "tlc_expiry_delta", "tlc_minimum_value", "tlc_fee_proportional_millionths"] as const;
       const current: Record<string, unknown> = { ...raw, tlc_minimum_value: raw.tlc_minimum_value ?? raw.tlc_min_value };
       const changes = keys.filter((key) => params[key] !== undefined).map((key) => ({
@@ -105,8 +124,8 @@ export function createFiberActions(io: ActionIo, approvals: () => FiberActionApp
         to: String(params[key]),
       }));
       if (changes.length === 0) throw new Error("Pass at least one setting to change");
-      if (!await approvals().approveFiberChannelSettings?.({ channelId: String(params.channel_id), peer: String(raw.pubkey), changes })) refuse("channel settings change");
-      await io.act("updateChannel", params);
+      if (!await approvals().approveFiberChannelSettings?.({ channelId: String(params.channel_id), peer: String(raw.pubkey), asset: assetOf(found), changes })) refuse("channel settings change");
+      await run("settings", "updateChannel", params);
     },
   };
 }
