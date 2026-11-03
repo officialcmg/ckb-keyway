@@ -4,14 +4,15 @@
  * DEVELOPMENT ONLY. Renders each SDK dialog with example data, one per `?scene=`, so its states can be
  * checked and screenshotted (`research/ui-audit`). Loaded only when NODE_ENV is not "production".
  */
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import type { KeyWayApiClient } from "@/src/sdk/browser/api-client";
 import type { TransactionPreview } from "@/src/sdk/browser/keyway-signer";
 import type { RecoveryPreview, BackupChangePreview } from "@/src/sdk/browser/account-recovery";
 import type { FiberChannelOpenPreview } from "@/src/sdk/browser/remote-ckb-signer";
-import { KeyWayFundingModal, KeyWayLoginModal } from "@/src/sdk/react/keyway-provider";
+import { KeyWayLoginModal } from "@/src/sdk/react/keyway-provider";
 import {
   KeyWayBackupChangeModal,
+  KeyWayFundingModal,
   KeyWayChannelCloseModal,
   KeyWayChannelSettingsModal,
   KeyWayEmailCodeModal,
@@ -37,10 +38,10 @@ const TRANSACTION: TransactionPreview = {
   sendingCkb: "0",
   receivingCkb: "0",
   feeCkb: "0.00001432",
-  tokens: [{ id: "0x45b32a…df52", standard: "xUDT", amount: "-2500000000", amountText: "-25 RUSD" }],
+  tokens: [{ id: "0x45b32a…df52", asset: RUSD, standard: "xUDT", amount: "-2500000000", amountText: "-25 RUSD" }],
   nfts: [],
   dao: [],
-  recipients: [{ address: ADDRESS.replace("zda0", "zdb1"), kind: "wallet", walletType: "standard", ckb: "143", tokens: [{ id: "0x45b32a…df52", amount: "2500000000" }], nfts: [] }],
+  recipients: [{ address: ADDRESS.replace("zda0", "zdb1"), kind: "wallet", walletType: "standard", ckb: "143", tokens: [{ id: "0x45b32a…df52", amount: "2500000000", amountText: "25 RUSD" }], nfts: [] }],
   unrecognized: [],
   otherSigners: 0,
   details: {
@@ -49,6 +50,12 @@ const TRANSACTION: TransactionPreview = {
   },
   transactionHash: HASH,
   requiresEmailCode: true,
+};
+
+const UNKNOWN_TOKEN: TransactionPreview = {
+  ...TRANSACTION,
+  tokens: [{ id: "0x9a1f03…77c2", asset: `0x9a1f03${"5".repeat(52)}c0de77c2`, standard: "xUDT", amount: "-1000", amountText: "-1000 of token 0x9a1f0355…de77c2" }],
+  recipients: [{ ...TRANSACTION.recipients[0], tokens: [{ id: "0x9a1f03…77c2", amount: "1000", amountText: "1000 of token 0x9a1f0355…de77c2" }] }],
 };
 
 const CKB_TRANSACTION: TransactionPreview = {
@@ -97,39 +104,82 @@ const FUNDING: FiberChannelOpenPreview = {
 };
 
 /** A login API that never reaches KeyWay: the code step opens at once, and "000000" is the wrong code. */
-function loginApi(verify: "ok" | "wrong" | "slow"): KeyWayApiClient {
+function loginApi(verify: "ok" | "slow"): KeyWayApiClient {
   return {
-    sendCode: () => later({ challengeId: "challenge" }, 200),
+    sendCode: () => later({ challengeId: "challenge" }, 150),
     verifyCode: (_id: string, code: string) => verify === "slow" ? never()
-      : verify === "wrong" || code === "000000" ? fail("Invalid OTP")
-      : later({ sessionToken: "token", user: { id: "user" }, expiresAt: new Date(Date.now() + 3600_000).toISOString() }),
+      : code === "000000" ? fail("Incorrect or expired code", 300)
+      : later({ sessionToken: "token", user: { id: "user" }, expiresAt: new Date(Date.now() + 3600_000).toISOString() }, 300),
   } as unknown as KeyWayApiClient;
 }
 
+const SENT_TO = "ana@acmepay.example";
+const EXPIRED = "This request expired. Start again.";
+const BUSY = { busy: true };
+const FAILED = { failure: "No Fiber route is currently available for this payment." };
+
 function scenes(theme: Theme): Record<string, ReactNode> {
-  const common = { theme, appName: "Acme Pay" };
+  const common = { theme, appName: "Acme Pay", answer: ignore };
+  const close = { channelId: "0x1", peer: PEER, asset: "ckb", returning: "80300000000", returningText: "803 CKB", force: false, network: "CKB testnet" as const };
+  const settings = { channelId: "0x1", peer: PEER, asset: "ckb", changes: [
+    { setting: "enabled" as const, from: "true", to: "false" },
+    { setting: "tlc_expiry_delta" as const, from: "0x5265c00", to: "0x2932e00" },
+    { setting: "tlc_minimum_value" as const, from: "0x0", to: "0x5f5e100" },
+    { setting: "tlc_fee_proportional_millionths" as const, from: "0x3e8", to: "0x7d0" },
+  ] };
+  const code = (props: Partial<Parameters<typeof KeyWayEmailCodeModal>[0]>) => (
+    <KeyWayEmailCodeModal theme={theme} reason="transaction" sentTo={SENT_TO} resend={() => later(undefined, 200)} verify={() => never()} answer={ignore} {...props} />
+  );
+  const approval = (name: string, render: (step?: { busy?: boolean; failure?: string }) => ReactNode) => ({
+    [name]: render(), [`${name}-busy`]: render(BUSY), [`${name}-failed`]: render(FAILED),
+  });
   return {
-    "transaction": <KeyWayTransactionModal {...common} preview={TRANSACTION} answer={ignore} />,
-    "transaction-ckb": <KeyWayTransactionModal {...common} preview={CKB_TRANSACTION} answer={ignore} />,
-    "message": <KeyWayMessageModal {...common} preview={{ message: "Sign in to Acme Pay\nNonce: 8f3a2c" }} answer={ignore} />,
-    "code": <KeyWayEmailCodeModal theme={theme} reason="transaction" resend={() => later(undefined)} answer={ignore} />,
-    "code-error": <KeyWayEmailCodeModal theme={theme} reason="transaction" error="That email code isn't right" resend={() => later(undefined)} answer={ignore} />,
-    "code-resend-error": <KeyWayEmailCodeModal theme={theme} reason="transaction" resend={() => fail("Too many signing requests. Try again in 412 seconds")} answer={ignore} />,
-    "close": <KeyWayChannelCloseModal {...common} preview={{ channelId: "0x1", peer: PEER, asset: "ckb", returning: "80300000000", returningText: "803 CKB", force: false, network: "CKB testnet" }} answer={ignore} />,
-    "close-force": <KeyWayChannelCloseModal {...common} preview={{ channelId: "0x1", peer: PEER, asset: "ckb", returning: "80300000000", returningText: "803 CKB", force: true, network: "CKB testnet" }} answer={ignore} />,
-    "peer": <KeyWayPeerModal {...common} preview={{ action: "disconnect", pubkey: PEER, openChannels: 1 }} answer={ignore} />,
-    "settings": <KeyWayChannelSettingsModal {...common} preview={{ channelId: "0x1", peer: PEER, changes: [
-      { setting: "tlc_expiry_delta", from: "0x5265c00", to: "0x2932e00" },
-      { setting: "tlc_minimum_value", from: "0x0", to: "0x5f5e100" },
-      { setting: "tlc_fee_proportional_millionths", from: "0x3e8", to: "0x7d0" },
-    ] }} answer={ignore} />,
-    "recovery": <KeyWayRecoveryModal {...common} preview={RECOVERY} answer={ignore} />,
-    "backup": <KeyWayBackupChangeModal {...common} preview={BACKUP} answer={ignore} />,
-    "funding": <KeyWayFundingModal theme={theme} preview={FUNDING} answer={ignore} />,
+    ...approval("transaction", (step) => <KeyWayTransactionModal {...common} preview={TRANSACTION} step={step} />),
+    "transaction-ckb": <KeyWayTransactionModal {...common} preview={CKB_TRANSACTION} />,
+    "transaction-unknown-token": <KeyWayTransactionModal {...common} preview={UNKNOWN_TOKEN} />,
+    ...approval("message", (step) => <KeyWayMessageModal {...common} preview={{ message: "Sign in to Acme Pay\nNonce: 8f3a2c" }} step={step} />),
+    "code": code({}),
+    "code-checking": code({}),
+    "code-wrong": code({ verify: () => fail("That email code isn't right", 300) }),
+    "code-success": code({ verify: () => later(undefined, 50) }),
+    "code-expired": code({ verify: () => fail(EXPIRED, 300) }),
+    "code-resent": code({}),
+    "code-resend-error": code({ resend: () => fail("Too many codes sent. Try again in 7 minutes", 200) }),
+    "code-settings-no-address": code({ reason: "settings", sentTo: undefined }),
+    ...approval("close", (step) => <KeyWayChannelCloseModal {...common} preview={close} step={step} />),
+    "close-force": <KeyWayChannelCloseModal {...common} preview={{ ...close, force: true }} />,
+    "close-force-browser": <KeyWayChannelCloseModal {...common} fiberNode="browser" preview={{ ...close, force: true }} />,
+    ...approval("peer", (step) => <KeyWayPeerModal {...common} preview={{ action: "disconnect", pubkey: PEER, openChannels: 1 }} step={step} />),
+    ...approval("settings", (step) => <KeyWayChannelSettingsModal {...common} preview={settings} step={step} />),
+    "settings-token": <KeyWayChannelSettingsModal {...common} preview={{ ...settings, asset: RUSD, changes: [{ setting: "tlc_minimum_value", from: "0x0", to: "0x2faf080" }] }} />,
+    ...approval("recovery", (step) => <KeyWayRecoveryModal {...common} preview={RECOVERY} step={step} />),
+    ...approval("backup", (step) => <KeyWayBackupChangeModal {...common} preview={BACKUP} step={step} />),
+    ...approval("funding", (step) => <KeyWayFundingModal {...common} preview={FUNDING} step={step} />),
     "login": <KeyWayLoginModal api={loginApi("ok")} appName="Acme Pay" theme={theme} close={ignore} authenticated={ignore} />,
-    "login-wrong": <KeyWayLoginModal api={loginApi("wrong")} appName="Acme Pay" theme={theme} close={ignore} authenticated={ignore} />,
+    "login-code": <KeyWayLoginModal api={loginApi("ok")} appName="Acme Pay" theme={theme} close={ignore} authenticated={ignore} />,
     "login-slow": <KeyWayLoginModal api={loginApi("slow")} appName="Acme Pay" theme={theme} close={ignore} authenticated={ignore} />,
+    "login-wrong": <KeyWayLoginModal api={loginApi("ok")} appName="Acme Pay" theme={theme} close={ignore} authenticated={ignore} />,
+    "login-success": <KeyWayLoginModal api={loginApi("ok")} appName="Acme Pay" theme={theme} close={ignore} authenticated={ignore} />,
+    "login-resent": <KeyWayLoginModal api={loginApi("ok")} appName="Acme Pay" theme={theme} close={ignore} authenticated={ignore} />,
   };
+}
+
+/** A transaction from the app's button through approval, the busy step and the code, to check focus comes back. */
+function Flow({ theme }: { theme: Theme }) {
+  const [stage, setStage] = useState<"none" | "approve" | "busy" | "code">("none");
+  return (
+    <>
+      <p><button type="button" id="flow-open" onClick={() => setStage("approve")}>Send 25 RUSD</button></p>
+      {stage === "approve" || stage === "busy" ? (
+        <KeyWayTransactionModal theme={theme} appName="Acme Pay" preview={TRANSACTION} step={stage === "busy" ? BUSY : undefined} answer={(approved) => {
+          if (!approved) return setStage("none");
+          setStage("busy");
+          setTimeout(() => setStage("code"), 400);
+        }} />
+      ) : null}
+      {stage === "code" ? <KeyWayEmailCodeModal theme={theme} reason="transaction" sentTo={SENT_TO} resend={() => later(undefined, 200)} verify={() => later(undefined, 200)} answer={() => setStage("none")} /> : null}
+    </>
+  );
 }
 
 export function Gallery({ scene, theme }: { scene?: string; theme: Theme }) {
@@ -142,7 +192,7 @@ export function Gallery({ scene, theme }: { scene?: string; theme: Theme }) {
       <ul>
         {Object.keys(all).map((name) => <li key={name}><a data-scene={name} href={`?scene=${name}&theme=${theme}`} style={{ color: "inherit" }}>{name}</a></li>)}
       </ul>
-      {shown}
+      {scene === "flow" ? <Flow theme={theme} /> : shown}
     </div>
   );
 }

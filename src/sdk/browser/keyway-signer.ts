@@ -14,8 +14,11 @@ export type TransactionPreview = {
   /** Plain CKB arriving in the account. */
   receivingCkb: string;
   feeCkb: string;
-  /** Net change per token: `amount` in raw units with a sign, `amountText` for people, such as "-25 RUSD". */
-  tokens: Array<{ id: string; standard: "xUDT" | "sUDT"; amount: string; amountText?: string }>;
+  /**
+   * Net change per token: `amount` in raw units with a sign, `amountText` for people, such as "-25 RUSD".
+   * `id` is a short form of `asset`, the token's type script hash.
+   */
+  tokens: Array<{ id: string; asset?: string; standard: "xUDT" | "sUDT"; amount: string; amountText?: string }>;
   nfts: Array<{ kind: "Spore" | "Cluster"; id: string; change: "sent" | "received" | "minted" | "burned" }>;
   dao: Array<{ action: "deposit" | "withdrawal request" | "withdrawal"; amountCkb: string }>;
   recipients: Array<{
@@ -23,7 +26,8 @@ export type TransactionPreview = {
     kind: "wallet" | "contract" | "Fiber channel";
     walletType?: string;
     ckb: string;
-    tokens: Array<{ id: string; amount: string }>;
+    /** Raw units per token; `amountText` for people, such as "25 RUSD". */
+    tokens: Array<{ id: string; amount: string; amountText?: string }>;
     nfts: string[];
   }>;
   /** Type scripts the backend couldn't explain. Always shown, never hidden. */
@@ -79,7 +83,7 @@ export class KeyWaySigner extends KeyWayAccountSigner {
     const base = { purpose: "transaction", transaction, confirmationNonce: reviewed.confirmationNonce };
     const sign = (emailCode?: string) => this.api.signTransaction(this.authToken, { ...base, operation: "sign", ...(emailCode ? { emailCode } : {}) });
     const signed = preview.requiresEmailCode
-      ? await this.withEmailCode("transaction", () => this.api.signTransaction(this.authToken, { ...base, operation: "request-email-code" }).then(() => undefined), sign)
+      ? await this.withEmailCode("transaction", () => this.api.signTransaction(this.authToken, { ...base, operation: "request-email-code" }), sign)
       : await sign();
     const result = signed as { transaction?: ccc.TransactionLike };
     if (!result?.transaction) throw new Error("KeyWay returned an invalid signed transaction");
@@ -113,17 +117,19 @@ export class KeyWaySigner extends KeyWayAccountSigner {
    */
   async setDailyConfirmationAmount(asset: "ckb" | `0x${string}`, amount: bigint | null): Promise<void> {
     const value = amount === null ? null : ccc.numFrom(amount).toString();
-    const set = (extra: Record<string, unknown> = {}) => this.api.signingSettings(this.authToken, { operation: "set-daily-amount", asset, amount: value, ...extra }) as Promise<{ requiresEmailCode?: boolean; confirmationNonce?: string }>;
+    const set = (extra: Record<string, unknown> = {}) => this.api.signingSettings(this.authToken, { operation: "set-daily-amount", asset, amount: value, ...extra }) as Promise<{ requiresEmailCode?: boolean; confirmationNonce?: string; sentTo?: string }>;
     let pending = await set();
     if (!pending.requiresEmailCode) return;
+    // Each resend asks again, which replaces the request (and its code) with a new one.
     await this.withEmailCode(
       "settings",
-      async () => { pending = await set(); },
+      async () => (pending = await set()),
       (emailCode) => set({ confirmationNonce: pending.confirmationNonce, emailCode }),
+      pending,
     );
   }
 
-  private withEmailCode<T>(reason: "transaction" | "settings", send: () => Promise<void>, complete: (code: string) => Promise<T>): Promise<T> {
-    return withEmailCode(this.handlers.requestEmailCode, reason, send, complete);
+  private withEmailCode<T>(reason: "transaction" | "settings", send: () => Promise<unknown>, complete: (code: string) => Promise<T>, sent?: unknown): Promise<T> {
+    return withEmailCode(this.handlers.requestEmailCode, reason, send, complete, sent);
   }
 }

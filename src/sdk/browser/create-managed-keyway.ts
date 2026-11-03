@@ -81,6 +81,7 @@ export function createManagedKeyWay(options: {
     undefined,
     api,
     options.recovery,
+    (error) => options.approvals?.().settled?.("funding", error),
   );
   // The hosted node settles force-closed channels with its own key, so the reserve goes there.
   const feeReserve = createFeeReserve({
@@ -232,7 +233,7 @@ export function createManagedKeyWay(options: {
     const send = (emailCode?: string) => api.managedNode(options.authToken, { ...base, stage: "send", ...(emailCode ? { emailCode } : {}) }, crypto.randomUUID());
     if (!reviewed.requiresEmailCode) return send();
     if (!options.requestEmailCode) throw new Error("This payment needs an email code");
-    return withEmailCode(options.requestEmailCode, "payment", () => api.managedNode(options.authToken, { ...base, stage: "request-email-code" }).then(() => undefined), send);
+    return withEmailCode(options.requestEmailCode, "payment", () => api.managedNode(options.authToken, { ...base, stage: "request-email-code" }), send);
   }
 
   function newInvoice(params: Omit<NewInvoiceParams, "currency"> & { currency?: NewInvoiceParams["currency"] }): Promise<NewInvoiceResult> {

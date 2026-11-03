@@ -124,7 +124,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     });
     if (approved) activationProgress?.("signing");
     return approved;
-  }, undefined, api, options.recovery);
+  }, undefined, api, options.recovery, (error) => options.approvals?.().settled?.("funding", error));
   const resolveCccFunding = createCccExternalFundingResolver({
     signer: fundingSigner,
     knownScripts: FUNDING_LOCK_KNOWN_SCRIPTS,

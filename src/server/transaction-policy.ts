@@ -21,8 +21,11 @@ const CLUSTER_CODE_HASHES = new Set([
   "0x598d793defef36e2eeba54a9b45130e4ca92822e1d193671f490950c3b856080",
 ]);
 
-/** A token's net change for the account: `amount` is signed raw units, `amountText` is for people ("-25 RUSD"). */
-export type TokenEffect = { id: string; standard: "xUDT" | "sUDT"; amount: string; amountText: string };
+/**
+ * A token's net change for the account: `amount` is signed raw units, `amountText` is for people ("-25 RUSD"),
+ * `id` is a short form of `asset`, the token's type script hash.
+ */
+export type TokenEffect = { id: string; asset: string; standard: "xUDT" | "sUDT"; amount: string; amountText: string };
 export type NftEffect = { kind: "Spore" | "Cluster"; id: string; change: "sent" | "received" | "minted" | "burned" };
 export type DaoEffect = { action: "deposit" | "withdrawal request" | "withdrawal"; amountCkb: string };
 export type Recipient = {
@@ -30,7 +33,7 @@ export type Recipient = {
   kind: "wallet" | "contract" | "Fiber channel";
   walletType?: string;
   ckb: string;
-  tokens: Array<{ id: string; amount: string }>;
+  tokens: Array<{ id: string; amount: string; amountText: string }>;
   nfts: string[];
 };
 export type CellSummary = { lock: string; type?: string; capacityCkb: string; dataBytes: number };
@@ -196,7 +199,7 @@ export function describeTransaction(
   ownOutputs.forEach((cell) => addToken(cell, 1n));
   const tokens = [...tokenTotals].filter(([, { delta }]) => delta !== 0n)
     .map(([id, { standard, delta }]) => ({
-      id: shortHash(id), standard, amount: `${delta > 0n ? "+" : ""}${delta}`,
+      id: shortHash(id), asset: id, standard, amount: `${delta > 0n ? "+" : ""}${delta}`,
       amountText: `${delta > 0n ? "+" : "-"}${formatAsset(delta > 0n ? delta : -delta, id)}`,
     }));
 
@@ -258,11 +261,13 @@ export function describeTransaction(
     recipient.ckb = formatCkb(parseCkb(recipient.ckb) + cell.cellOutput.capacity);
     const kind = typeKind(cell.cellOutput.type);
     if (kind === "xUDT" || kind === "sUDT") {
-      const id = shortHash(cell.cellOutput.type!.hash());
+      const asset = cell.cellOutput.type!.hash();
+      const id = shortHash(asset);
       const existing = recipient.tokens.find((token) => token.id === id);
-      const amount = udtAmount(cell.outputData);
-      if (existing) existing.amount = (BigInt(existing.amount) + amount).toString();
-      else recipient.tokens.push({ id, amount: amount.toString() });
+      const amount = udtAmount(cell.outputData) + BigInt(existing?.amount ?? 0);
+      const entry = { id, amount: amount.toString(), amountText: formatAsset(amount, asset) };
+      if (existing) Object.assign(existing, entry);
+      else recipient.tokens.push(entry);
     }
     if (kind === "Spore" || kind === "Cluster") recipient.nfts.push(`${kind} ${shortHash(cell.cellOutput.type!.args)}`);
     recipients.set(key, recipient);
@@ -311,7 +316,7 @@ export function describeTransaction(
 export function previewSummaryLines(preview: TransactionPreview): string[] {
   const lines = [`Send ${preview.sendingCkb} CKB`, `Network fee ${preview.feeCkb} CKB`];
   for (const recipient of preview.recipients) lines.push(`To ${shortAddress(recipient.address)} (${recipient.kind}): ${recipient.ckb} CKB`);
-  for (const token of preview.tokens) lines.push(`Token ${token.id} (${token.standard}): ${token.amount}`);
+  for (const token of preview.tokens) lines.push(`Token ${token.amountText} (${token.standard} ${token.id})`);
   for (const nft of preview.nfts) lines.push(`${nft.kind} ${nft.id}: ${nft.change}`);
   for (const action of preview.dao) lines.push(`Nervos DAO ${action.action}: ${action.amountCkb} CKB`);
   for (const script of preview.unrecognized) lines.push(`Unrecognized script ${script.codeHash} (${script.cells} cells)`);
