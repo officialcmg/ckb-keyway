@@ -31,7 +31,9 @@ icon: Code
 | `onError` | none | Account recovery, Fiber startup and device lease errors. |
 | `onFiberStartup` | none | Each step of starting the Fiber node, with elapsed time. |
 
-Every approval prop returns `true` to go ahead or `false` to cancel, or a promise of either. The emailed-code prompt is always KeyWay's own.
+Every approval prop returns `true` to go ahead or `false` to cancel, or a promise of either. The emailed-code prompt is always KeyWay's own. It shows the address the code went to, checks the code while staying open, and lets the user send a new one.
+
+After the user approves in a built-in dialog, the dialog stays open with a busy button until the next step is ready (the code prompt, or the action finishing), and shows the reason if that step fails. The dialogs keep keyboard focus while open and return it to the element that opened them.
 
 `onFiberStartup` receives `{ stage, at, elapsedMs }`. A browser node goes through `loading_account`, `claiming_device`, `restoring_channels` (only when restoring a backup), `starting_browser_node`, `connecting_peer`, `synchronizing` and `ready`. A hosted node goes through `loading_account`, `starting_hosted_node`, `synchronizing` and `ready`.
 

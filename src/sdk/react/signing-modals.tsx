@@ -228,7 +228,7 @@ export function KeyWayEmailCodeModal({ theme, reason, error, sentTo, resend, ver
               <div style={modalActions}>
                 <button type="button" disabled={busy} style={{ ...modalButton, borderColor: palette.border, color: palette.text, opacity: busy ? 0.5 : 1 }} onClick={() => answer(undefined)}>Cancel</button>
                 <button type="submit" disabled={code.length !== 6 || busy} style={{ ...modalButton, ...modalPrimaryButton, background: palette.primary, color: palette.primaryText, opacity: code.length === 6 || busy ? 1 : 0.6 }}>
-                  {busy ? "Checking…" : "Confirm"}
+                  {phase === "success" ? "Confirmed" : busy ? "Checking…" : "Confirm"}
                 </button>
               </div>
             </>

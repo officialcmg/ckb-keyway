@@ -116,7 +116,7 @@ function loginApi(verify: "ok" | "slow"): KeyWayApiClient {
 const SENT_TO = "ana@acmepay.example";
 const EXPIRED = "This request expired. Start again.";
 const BUSY = { busy: true };
-const FAILED = { failure: "No Fiber route is currently available for this payment." };
+const FAILED = { failure: "The Lit signature service is temporarily unavailable. Try again in a moment." };
 
 function scenes(theme: Theme): Record<string, ReactNode> {
   const common = { theme, appName: "Acme Pay", answer: ignore };
