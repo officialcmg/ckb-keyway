@@ -29,8 +29,8 @@ function shortAddress(value: string): string {
   return value.length <= 24 ? value : `${value.slice(0, 12)}…${value.slice(-6)}`;
 }
 
-/** Escape cancels, except while the dialog is busy with the step the user approved. */
-const escape = (step: ApprovalStep | undefined, answer: (approved: boolean) => void) => step?.busy ? undefined : () => answer(false);
+/** Escape cancels; while the approved step runs it only hides the dialog, like Close. */
+const escape = (_step: ApprovalStep | undefined, answer: (approved: boolean) => void) => () => answer(false);
 
 type ApprovalProps<P> = { theme: Theme; appName: string; preview: P; step?: ApprovalStep; answer: (approved: boolean) => void };
 
@@ -82,7 +82,7 @@ export function KeyWayTransactionModal({ theme, appName, preview, step, answer }
             <Row palette={palette} label="Network" value={preview.network} mono={false} />
           </dl>
           {preview.otherSigners > 0 && <p style={note(palette)}>{preview.otherSigners} input{preview.otherSigners === 1 ? "" : "s"} belong to someone else, who must sign too.</p>}
-          {preview.requiresEmailCode && <p style={note(palette)}>This reaches your email confirmation amount, so we&apos;ll email you a code next.</p>}
+          {preview.requiresEmailCode && !step?.failure && <p style={note(palette)}>This reaches your email confirmation amount, so we&apos;ll email you a code next.</p>}
           <details style={{ ...details, color: palette.muted }}>
             <summary style={{ cursor: "pointer" }}>Details</summary>
             {preview.tokens.map((token) => <p key={`d-${token.id}`} style={detailLine}>Token {token.asset ?? token.id} ({token.standard}) {token.amount}</p>)}
@@ -182,7 +182,8 @@ export function KeyWayEmailCodeModal({ theme, reason, error, sentTo, resend, ver
 
   const busy = phase === "checking" || phase === "success";
   return (
-    <Shell theme={theme} labelId="keyway-code-title" onEscape={busy ? undefined : () => answer(undefined)}>
+    // Closing during a check only hides the prompt: the check that is running still decides the outcome.
+    <Shell theme={theme} labelId="keyway-code-title" onEscape={() => answer(undefined)}>
       {(palette) => (
         <form onSubmit={(event) => { event.preventDefault(); submit(code); }}>
           <p style={{ ...modalEyebrow, color: palette.muted }}>EMAIL CONFIRMATION</p>
@@ -226,7 +227,7 @@ export function KeyWayEmailCodeModal({ theme, reason, error, sentTo, resend, ver
                 }
               }} disabled={busy} prompt="Didn't get it?" />
               <div style={modalActions}>
-                <button type="button" disabled={busy} style={{ ...modalButton, borderColor: palette.border, color: palette.text, opacity: busy ? 0.5 : 1 }} onClick={() => answer(undefined)}>Cancel</button>
+                <button type="button" style={{ ...modalButton, borderColor: palette.border, color: palette.text }} onClick={() => answer(undefined)}>{busy ? "Close" : "Cancel"}</button>
                 <button type="submit" disabled={code.length !== 6 || busy} style={{ ...modalButton, ...modalPrimaryButton, background: palette.primary, color: palette.primaryText, opacity: code.length === 6 || busy ? 1 : 0.6 }}>
                   {phase === "success" ? "Confirmed" : busy ? "Checking…" : "Confirm"}
                 </button>
@@ -371,7 +372,7 @@ export function KeyWayRecoveryModal({ theme, appName, preview, step, answer }: A
           <p role="note" style={errorNote(palette)}>Your address will change because you&apos;re turning on recovery.</p>
           <p style={note(palette)}>
             Your CKB{preview.tokens.length > 0 ? " and tokens" : ""} move to the new address in one transaction. The old address stays yours.
-            {preview.cellsLeft > 0 ? ` ${preview.cellsLeft} cell${preview.cellsLeft === 1 ? "" : "s"} that can't be moved stay${preview.cellsLeft === 1 ? "s" : ""} there.` : ""} We&apos;ll email you a code next.
+            {preview.cellsLeft > 0 ? ` ${preview.cellsLeft} cell${preview.cellsLeft === 1 ? "" : "s"} that can't be moved stay${preview.cellsLeft === 1 ? "s" : ""} there.` : ""} {step?.failure ? "" : "We'll email you a code next."}
           </p>
           <details style={{ ...details, color: palette.muted }}>
             <summary style={{ cursor: "pointer" }}>Details</summary>
@@ -403,7 +404,7 @@ export function KeyWayBackupChangeModal({ theme, appName, preview, step, answer 
             <Row palette={palette} label="Network fee" value={`${preview.feeCkb} CKB`} />
             <Row palette={palette} label="Network" value={preview.network} mono={false} />
           </dl>
-          <p style={note(palette)}>Your address doesn&apos;t change. We&apos;ll email you a code next.</p>
+          <p style={note(palette)}>Your address doesn&apos;t change.{step?.failure ? "" : " We'll email you a code next."}</p>
           <details style={{ ...details, color: palette.muted }}>
             <summary style={{ cursor: "pointer" }}>Details</summary>
             {preview.backups.map((backup) => <p key={`${backup.kind}:${backup.address}`} style={detailLine}>Backup {backup.address}</p>)}

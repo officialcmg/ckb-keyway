@@ -128,26 +128,32 @@ type Approval<P> = ApprovalStep & { preview: P; resolve: (approved: boolean) => 
  * One built-in approval dialog. After the user approves, it stays open and busy until the next step shows
  * (`handOff`, when the code prompt opens) or the action ends (`settle`); a failure stays in it until closed.
  */
-function useApproval<P>() {
+function useApproval<P>(fiber = false) {
   const [request, setRequest] = useState<Approval<P>>();
   const [actions] = useState(() => {
     let current: Approval<P> | undefined;
     const set = (next: Approval<P> | undefined) => { current = next; setRequest(next); };
     return {
+      // A new request replaces the dialog; if the previous one was still busy, its outcome is no longer shown.
       ask: (preview: P) => new Promise<boolean>((resolve) => {
         if (current && !current.busy && current.failure === undefined) current.resolve(false);
         set({ preview, resolve });
       }),
       answer: (approved: boolean) => {
-        if (!current || current.busy) return;
-        if (current.failure !== undefined) return set(undefined);
+        if (!current) return;
+        // Close while busy (or after a failure) only hides the dialog: the approved step keeps running.
+        if (current.busy || current.failure !== undefined) {
+          if (!approved || current.failure !== undefined) set(undefined);
+          return;
+        }
         current.resolve(approved);
         set(approved ? { ...current, busy: true } : undefined);
       },
       settle: (error?: unknown) => {
         if (!current?.busy) return;
         const text = error instanceof Error ? error.message : error === undefined ? "" : String(error);
-        set(text && !/cancelled|not approved/i.test(text) ? { ...current, busy: false, failure: friendlyKeyWayError(text) } : undefined);
+        // Fiber's own wording only fits Fiber actions; signing and recovery show KeyWay's message as it is.
+        set(text && !/cancelled|not approved/i.test(text) ? { ...current, busy: false, failure: fiber ? friendlyKeyWayError(text) : text } : undefined);
       },
       handOff: () => { if (current?.busy) set(undefined); },
       dismiss: () => {
@@ -236,10 +242,10 @@ export function KeyWayProvider({
   const message = useApproval<MessagePreview>();
   const recovery = useApproval<RecoveryPreview>();
   const backupChange = useApproval<BackupChangePreview>();
-  const channelClose = useApproval<FiberChannelClosePreview>();
-  const peer = useApproval<FiberPeerPreview>();
-  const channelSettings = useApproval<FiberChannelSettingsPreview>();
-  const funding = useApproval<FiberChannelOpenPreview>();
+  const channelClose = useApproval<FiberChannelClosePreview>(true);
+  const peer = useApproval<FiberPeerPreview>(true);
+  const channelSettings = useApproval<FiberChannelSettingsPreview>(true);
+  const funding = useApproval<FiberChannelOpenPreview>(true);
   const approvalsRef = useRef({ transaction, message, recovery, backupChange, channelClose, peer, channelSettings, funding });
   approvalsRef.current = { transaction, message, recovery, backupChange, channelClose, peer, channelSettings, funding };
   const [codeRequest, setCodeRequest] = useState<{
