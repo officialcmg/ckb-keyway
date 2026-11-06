@@ -137,7 +137,10 @@ export function withWorkerShim<T>(shim: string, construct: () => T): { value: T;
   const created: string[] = [];
   scope.URL.revokeObjectURL = (url: string) => { held.push(url); };
   scope.Worker = function ShimmedWorker(url: string | URL, options?: WorkerOptions) {
-    if (options?.type === "module") return new NativeWorker(url, options);
+    if (options?.type === "module") {
+      // Module workers can't load the shim with importScripts; the node would then lose every watchtower event.
+      throw new Error("Fiber's workers changed to module workers; the in-page watchtower cannot attach");
+    }
     const source = `${shim}\nimportScripts(${JSON.stringify(String(url))});\n`;
     const wrapped = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
     created.push(wrapped);

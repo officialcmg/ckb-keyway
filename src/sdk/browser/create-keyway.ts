@@ -226,7 +226,9 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   let watchTimer: ReturnType<typeof setInterval> | undefined;
   let watching = false;
   const watchStatus = new Map<string, string>();
-  const DONE = new Set(["settled", "closed cooperatively", "the user's share is already claimed", "the user has no share in this channel"]);
+  // Statuses after which the channel needs nothing more from the watchtower. A cooperative close is left to
+  // Fiber's own remove_watch_channel, so an unexpected closing transaction never drops the data.
+  const DONE = new Set(["settled", "the user's share is already claimed", "the user has no share in this channel"]);
   async function watchNow() {
     if (watching || !node.isRunning || !credential.isUnlocked()) return;
     watching = true;
@@ -239,7 +241,13 @@ export function createKeyWay(options: CreateKeyWayOptions) {
         for (const channel of watched) {
           const raw = channels.find((item) => String(item.channel_id).toLowerCase() === channel.channelId);
           const outpoint = raw?.channel_outpoint ? String(raw.channel_outpoint) : undefined;
-          if (!outpoint) continue;
+          if (!outpoint) {
+            if (watchStatus.get(channel.channelId) !== "missing") {
+              watchStatus.set(channel.channelId, "missing");
+              console.warn(`[keyway] watchtower: channel ${channel.channelId} is not in the node's channel list; it can't be checked until it is`);
+            }
+            continue;
+          }
           try {
             const result = await settleChannel({
               client: fundingSigner.client, network, channel, nodeKey: ccc.hexFrom(key),
@@ -250,7 +258,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
               console.info(`[keyway] watchtower: channel ${channel.channelId}: ${result.status}${result.txHash ? ` ${result.txHash}` : ""}`);
             }
             if (result.txHash) {
-              await fundingSigner.client.waitTransaction(result.txHash, 0, 600_000).catch(() => undefined);
+              await fundingSigner.client.waitTransaction(result.txHash, 0, 120_000).catch(() => undefined);
               await sweepNow().catch((error) => console.warn("[keyway] could not sweep the claimed funds yet", error));
             } else if (DONE.has(result.status)) {
               await watchtower.remove(channel.channelId);
@@ -267,11 +275,15 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     }
   }
 
+  function stopWatching() {
+    if (watchTimer) clearInterval(watchTimer);
+    watchTimer = undefined;
+  }
+
   async function stop() {
     if (sweepTimer) clearInterval(sweepTimer);
     sweepTimer = undefined;
-    if (watchTimer) clearInterval(watchTimer);
-    watchTimer = undefined;
+    stopWatching();
     try {
       await node.stop();
     } finally {
@@ -284,8 +296,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   async function stopForLogout() {
     if (sweepTimer) clearInterval(sweepTimer);
     sweepTimer = undefined;
-    if (watchTimer) clearInterval(watchTimer);
-    watchTimer = undefined;
+    stopWatching();
     if (!deviceLease) {
       await stop();
       return;
@@ -323,6 +334,10 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   }
 
   async function releaseGuards() {
+    // The node has stopped by now, so it sends no more watchtower events.
+    stopWatchtowerBridge?.();
+    stopWatchtowerBridge = undefined;
+    watchtower.close();
     const lease = deviceLease;
     const lock = deviceLock;
     deviceLease = undefined;

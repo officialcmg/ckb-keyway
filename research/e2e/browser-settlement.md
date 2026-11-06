@@ -76,8 +76,9 @@ force-closed balance. The browser node instead gets a watchtower inside the page
 - `src/sdk/browser/fiber-wasm.ts`: injects the config and the shim when the node starts.
 
 Not covered (Fiber's watchtower does these; the upstream issue asks for them): claiming pending TLCs with preimages or
-after expiry, and the revocation transaction that punishes a peer who publishes a revoked commitment. A channel in
-either state is reported in the console and left for a later version.
+after expiry, token (xUDT) channels, and the revocation transaction that punishes a peer who publishes a revoked
+commitment. A channel in any of these states is reported in the console and left for a later version. The revocation
+gap is the one that can lose funds (a cheating peer is not punished); it existed before this change too.
 
 ## Live proof (CKB testnet, production API, fixed SDK)
 
