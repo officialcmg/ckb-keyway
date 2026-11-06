@@ -9,6 +9,7 @@ import {
   planClaim, settleChannel, settlementMessage, signSettlement, XUDT_COMPATIBLE_WITNESS,
 } from "../src/sdk/browser/watchtower-settle.ts";
 import type { WatchedChannel } from "../src/sdk/browser/watchtower-store.ts";
+import { COMMITMENT_LOCK } from "../src/sdk/browser/watchtower-settle.ts";
 
 // The commitment and the peer's settlement from the 2026-10-28 browser force close on CKB testnet.
 const run2 = JSON.parse(readFileSync(new URL("./fixtures/fiber-settlement-run2.json", import.meta.url), "utf8"));
@@ -91,10 +92,14 @@ test("after the delay, the node's own commitment is claimed first: the user's sh
 test("when the peer settled first, the node claims the rest of the cell without waiting", () => {
   const { channel, argsFor } = channelFixture();
   const ours = encodeSettlementWitness(channel.localSettlement, false, channel.localSettlementKey, channel.remoteSettlementKey);
-  assert.ok(argsFor(ours));
   // The peer's settlement witness: unlock count, our witness, then its 0xFF unlock.
   const previous = ccc.bytesConcat(new Uint8Array([1]), ours, new Uint8Array([0xff, 0]), new Uint8Array(65));
-  const decision = planClaim({ channel, cell: { capacity: 49_999_999_544n, args: "0x" + "00".repeat(57) }, previousWitness: previous });
+  // The cell's args name the state after the peer's unlock, not the commitment's own: without the previous witness
+  // the node can't tell what the cell holds, and leaves it alone.
+  const successorArgs = ccc.hexFrom(ccc.bytesConcat(ccc.bytesFrom(argsFor(ours)).slice(0, 36), blake160(encodeWitnessState(applyUnlocks(parseSettlementWitness(previous)!)!)), new Uint8Array([1])));
+  assert.notEqual(successorArgs, argsFor(ours));
+  assert.ok("skip" in planClaim({ channel, cell: { capacity: 49_999_999_544n, args: successorArgs } }));
+  const decision = planClaim({ channel, cell: { capacity: 49_999_999_544n, args: successorArgs }, previousWitness: previous });
   assert.ok("claim" in decision);
   assert.equal(decision.claim.unlockType, 0xfe);
   assert.equal(decision.claim.since, 0n);
@@ -166,4 +171,170 @@ test("token channels are left to Fiber's native watchtower", async () => {
     ref: { channelId: "0x" + "01".repeat(32), fundingOutPoint: { txHash: "0x" + "02".repeat(32), index: 0 } },
   });
   assert.match(result.status, /token channels/);
+});
+
+/**
+ * A chain for settleChannel: the funding transaction, the commitment that spent it, any settlements after it, and
+ * the node's fee reserve, served by a fake client so the chain following, the delay and the claim are checked
+ * without a network.
+ */
+function fakeChain(options: { peerSettledFirst?: boolean; settlementWitness?: (ours: Uint8Array) => Uint8Array; peerTookEverything?: boolean } = {}) {
+  const { channel, argsFor } = channelFixture();
+  const ours = encodeSettlementWitness(channel.localSettlement, false, channel.localSettlementKey, channel.remoteSettlementKey);
+  const nodeKey = hex(secp256k1.utils.randomSecretKey());
+  const plainLock = { codeHash: "0x" + "00".repeat(32), hashType: "data" as const, args: "0x01" };
+  const commitmentLock = (args: ccc.HexLike) => ({ codeHash: COMMITMENT_LOCK.testnet.codeHash, hashType: "type" as const, args });
+  const txs = new Map<string, { tx: ccc.Transaction; blockHash: ccc.Hex; epoch: ccc.EpochLike }>();
+  const live = new Set<string>();
+  const key = (outPoint: ccc.OutPointLike) => `${ccc.hexFrom(ccc.OutPoint.from(outPoint).txHash)}:${Number(ccc.OutPoint.from(outPoint).index)}`;
+  const add = (tx: ccc.Transaction, epoch: ccc.EpochLike = [90, 0, 1]) => {
+    txs.set(tx.hash(), { tx, blockHash: ccc.hexFrom(ccc.hashCkb(tx.hash())), epoch });
+    for (const input of tx.inputs) live.delete(key(input.previousOutput));
+    tx.outputs.forEach((_output, index) => live.add(key({ txHash: tx.hash(), index })));
+    return tx;
+  };
+  const funding = add(ccc.Transaction.from({ outputs: [{ capacity: 751n * CKB, lock: plainLock }], outputsData: ["0x"] }));
+  const commitmentTx = add(ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: funding.hash(), index: 0 } }],
+    outputs: [{ capacity: 750n * CKB, lock: commitmentLock(argsFor(ours)) }],
+    outputsData: ["0x"],
+    witnesses: ["0x"],
+  }), [100, 0, 1]);
+  let liveCell = { txHash: commitmentTx.hash(), index: 0 };
+  if (options.peerSettledFirst || options.settlementWitness || options.peerTookEverything) {
+    const previous = ccc.bytesConcat(new Uint8Array([1]), ours, new Uint8Array([0xff, 0]), new Uint8Array(65));
+    const witness = options.settlementWitness ? options.settlementWitness(ours) : ccc.bytesConcat(XUDT_COMPATIBLE_WITNESS, previous);
+    const after = blake160(encodeWitnessState(applyUnlocks(parseSettlementWitness(previous)!)!));
+    const successorArgs = ccc.bytesConcat(ccc.bytesFrom(argsFor(ours)).slice(0, 36), after, new Uint8Array([1]));
+    const settlement = add(ccc.Transaction.from({
+      inputs: [{ previousOutput: liveCell }],
+      outputs: options.peerTookEverything
+        ? [{ capacity: 750n * CKB, lock: plainLock }]
+        : [{ capacity: 250n * CKB, lock: plainLock }, { capacity: 500n * CKB, lock: commitmentLock(successorArgs) }],
+      outputsData: options.peerTookEverything ? ["0x"] : ["0x", "0x"],
+      witnesses: [ccc.hexFrom(witness)],
+    }), [101, 0, 1]);
+    liveCell = { txHash: settlement.hash(), index: 1 };
+  }
+  let tip: ccc.EpochLike = [100, 0, 1];
+  const sent: ccc.Transaction[] = [];
+  const base = new ccc.ClientPublicTestnet({ url: "http://127.0.0.1:9/" });
+  const signer = new ccc.SignerCkbPrivateKey(base, nodeKey);
+  const ready = (async () => {
+    const nodeLock = (await signer.getRecommendedAddressObj()).script;
+    add(ccc.Transaction.from({ outputs: [{ capacity: 200n * CKB, lock: nodeLock }], outputsData: ["0x"] }));
+    return nodeLock;
+  })();
+  const overrides: Record<string, unknown> = {
+    async getTransaction(hash: ccc.HexLike) {
+      const found = txs.get(ccc.hexFrom(hash));
+      return found && { transaction: found.tx, status: "committed", blockHash: found.blockHash, blockNumber: 1n };
+    },
+    async getCellLive(outPoint: ccc.OutPointLike) {
+      return live.has(key(outPoint)) ? {} : undefined;
+    },
+    async *findTransactions() {
+      for (const [txHash, { tx }] of txs) if (tx.inputs.length) yield { txHash, isInput: true, blockNumber: 1n, txIndex: 0n, cellIndex: 0n };
+    },
+    async getHeaderByHash(hash: ccc.HexLike) {
+      const found = [...txs.values()].find((item) => item.blockHash === ccc.hexFrom(hash));
+      return found && { epoch: ccc.epochFrom(found.epoch) };
+    },
+    async getTipHeader() {
+      return { epoch: ccc.epochFrom(tip) };
+    },
+    async findSingletonCellByType() {
+      return { outPoint: ccc.OutPoint.from({ txHash: "0x" + "33".repeat(32), index: 0 }) };
+    },
+    async *findCellsOnChain() {
+      const nodeLock = await ready;
+      for (const [txHash, { tx }] of txs) {
+        for (let index = 0; index < tx.outputs.length; index++) {
+          if (!tx.outputs[index].lock.eq(nodeLock) || !live.has(key({ txHash, index }))) continue;
+          yield ccc.Cell.from({ outPoint: { txHash, index }, cellOutput: tx.outputs[index], outputData: "0x" });
+        }
+      }
+    },
+    async sendTransaction(tx: ccc.TransactionLike) {
+      const signed = ccc.Transaction.from(tx);
+      sent.push(signed);
+      return signed.hash();
+    },
+  };
+  const client = new Proxy(base, {
+    get: (target, property, receiver) => property in overrides ? overrides[property as string] : Reflect.get(target, property, receiver),
+  }) as ccc.Client;
+  const watched = { ...channel, channelId: "0x" + "01".repeat(32), localFundingPubkey: "", remoteFundingPubkey: "", createdAt: 0, updatedAt: 0 } as WatchedChannel;
+  const settle = (dryRun?: { submit: (tx: ccc.Transaction) => Promise<ccc.Hex> }) => settleChannel({
+    client, network: "testnet", nodeKey, channel: watched,
+    ref: { channelId: watched.channelId, fundingOutPoint: { txHash: funding.hash(), index: 0 } }, ...(dryRun ? { dryRun } : {}),
+  });
+  return {
+    channel, settle, sent, liveCell, ready, funding, commitmentTx,
+    setTip: (epoch: ccc.EpochLike) => { tip = epoch; },
+    reopen: () => live.add(key({ txHash: funding.hash(), index: 0 })),
+  };
+}
+
+test("settleChannel waits out the commitment delay to the epoch, then claims", async () => {
+  const chain = fakeChain();
+  // The commitment confirmed in epoch 100 with a one-epoch delay: not before epoch 101.
+  chain.setTip([100, 999, 1000]);
+  assert.equal((await chain.settle()).status, "waiting for the commitment delay");
+  assert.equal(chain.sent.length, 0);
+  chain.setTip([101, 0, 1000]);
+  const claimed = await chain.settle();
+  assert.equal(claimed.status, "claimed");
+  assert.equal(chain.sent.length, 1);
+  assert.equal(claimed.txHash, chain.sent[0].hash());
+  assert.equal(chain.sent[0].inputs[0].since, 0xa000010000000001n);
+});
+
+test("settleChannel builds the claim fully, then signs the commitment input over the final transaction", async () => {
+  const chain = fakeChain();
+  let built: ccc.Transaction | undefined;
+  // A dry run builds the claim before the delay has passed and hands it over instead of sending it.
+  const result = await chain.settle({ submit: async (tx) => { built = tx; return tx.hash(); } });
+  assert.equal(result.status, "claimed");
+  assert.equal(chain.sent.length, 0);
+  const tx = built!;
+  assert.ok(tx.inputs[0].previousOutput.eq(chain.liveCell));
+  // The peer's 250 CKB stays under the commitment lock; the user's share goes to the node, which pays the fee
+  // from its reserve (the second input) and keeps the change.
+  assert.equal(tx.outputs[0].lock.codeHash, COMMITMENT_LOCK.testnet.codeHash);
+  assert.equal(tx.outputs[0].capacity, 250n * CKB);
+  const nodeLock = await chain.ready;
+  assert.ok(tx.outputs[1].lock.eq(nodeLock));
+  assert.equal(tx.inputs.length, 2);
+  assert.ok(tx.outputs[1].capacity > 500n * CKB && tx.outputs[1].capacity < 700n * CKB);
+  // Witness 0: the xUDT-compatible prefix, one unlock of the user's slot, and a signature by the settlement key over
+  // the transaction as sent (so the fee and change were in place before it signed).
+  const witness = ccc.bytesFrom(tx.witnesses[0]);
+  assert.equal(hex(witness.slice(0, 16)), hex(XUDT_COMPATIBLE_WITNESS));
+  assert.equal(witness[16], 1);
+  const signature = witness.slice(witness.length - 65);
+  const recovered = secp256k1.Signature.fromBytes(signature.slice(0, 64), "compact").addRecoveryBit(signature[64]).recoverPublicKey(ccc.bytesFrom(settlementMessage(tx))).toBytes(true);
+  assert.deepEqual(recovered, secp256k1.getPublicKey(ccc.bytesFrom(chain.channel.localSettlementKey), true));
+  assert.notEqual(tx.witnesses[1] ?? "0x", "0x", "the node did not sign its fee input");
+});
+
+test("settleChannel follows the peer's settlement to the live cell and claims it without waiting", async () => {
+  const chain = fakeChain({ peerSettledFirst: true });
+  chain.setTip([90, 0, 1]);
+  const result = await chain.settle();
+  assert.equal(result.status, "claimed");
+  const tx = chain.sent[0];
+  assert.ok(tx.inputs[0].previousOutput.eq(chain.liveCell));
+  assert.equal(tx.inputs[0].since, 0n);
+  // The peer's slot is already empty, so the claim empties the cell: no successor.
+  assert.notEqual(tx.outputs[0].lock.codeHash, COMMITMENT_LOCK.testnet.codeHash);
+});
+
+test("settleChannel reports an open channel, a settled one and a settlement it can't read", async () => {
+  const open = fakeChain();
+  open.reopen();
+  assert.equal((await open.settle()).status, "open");
+  assert.equal((await fakeChain({ peerTookEverything: true }).settle()).status, "settled");
+  const odd = fakeChain({ settlementWitness: (ours) => ccc.bytesConcat(new Uint8Array(16).fill(9), ours) });
+  assert.equal((await odd.settle()).status, "unexpected settlement witness");
 });
