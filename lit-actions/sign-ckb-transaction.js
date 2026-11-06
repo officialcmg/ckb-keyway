@@ -251,7 +251,7 @@ function parseScript(value, what) {
   if (!value || typeof value !== "object") throw new Error(`${what} is invalid`);
   const codeHash = hexToBytes(value.codeHash ?? value.code_hash, what);
   const hashType = value.hashType ?? value.hash_type;
-  if (codeHash.length !== 32 || !(hashType in HASH_TYPES)) throw new Error(`${what} is invalid`);
+  if (codeHash.length !== 32 || !Object.prototype.hasOwnProperty.call(HASH_TYPES, hashType)) throw new Error(`${what} is invalid`);
   return { codeHash, hashType, args: hexToBytes(value.args, what) };
 }
 
@@ -358,6 +358,9 @@ async function indexerCells(lock, maxCells, typeId = false) {
   const searchKey = {
     script: { code_hash: bytesToHex(lock.codeHash), hash_type: lock.hashType, args: bytesToHex(lock.args) },
     script_type: "lock",
+    // Exact: the indexer's default is prefix, which would also return cells under longer args that no key of this
+    // account can spend, so anyone could plant one to block every check below.
+    script_search_mode: "exact",
     ...(typeId ? { filter: { script: { code_hash: TYPE_ID_CODE_HASH, hash_type: "type", args: "0x" } } } : {}),
   };
   const cells = [];
@@ -389,16 +392,18 @@ async function indexerCells(lock, maxCells, typeId = false) {
 /**
  * The type hashes of the live recovery lists this key made, under its owner-only list lock. Anyone can send a
  * cell to that lock, so a cell only counts if the transaction that created it spent one of the account's own
- * cells, which needs this key's signature. Each cell is checked against that transaction; that it is still live
+ * cells as input 0, which needs this key's signature (an enable spends the secp256k1 cell there, a change the
+ * list itself). Each cell is checked against that transaction; that it is still live
  * is the node's word.
  */
 async function liveLists(account) {
   // Only Type ID cells are asked for, so plain cells sent to the lock can't crowd out the check. Each fake list
   // locks its capacity under this key for good, so blocking with more than 1024 costs an attacker about 129k CKB.
   const objects = (await indexerCells(account.listLock, 1024, true)).filter((object) => isTypeId(object?.output?.type ? parseScript(object.output.type, "cell type") : undefined));
-  // Two batched lookups in all, whatever the number of cells: the creating transactions, then their inputs.
+  // Two batched lookups in all, at most one transaction per cell each: the creating transactions, then the
+  // transactions of their input 0, so a fake list with thousands of inputs costs no more to check than any other.
   const created = await fetchTransactions(objects.map((object) => object?.out_point?.tx_hash));
-  const spentFrom = await fetchTransactions([...created.values()].flatMap(({ tx }) => tx.inputs.map((input) => bytesToHex(input.previousOutput.txHash))));
+  const spentFrom = await fetchTransactions([...created.values()].flatMap(({ tx }) => tx.inputs.slice(0, 1).map((input) => bytesToHex(input.previousOutput.txHash))));
   const hashes = [];
   for (const object of objects) {
     const creation = created.get(object.out_point.tx_hash);
@@ -408,15 +413,13 @@ async function liveLists(account) {
     const tx = creation.tx;
     const output = tx.outputs[Number(num(object.out_point.index, "out point index"))];
     if (!output || !sameScript(output.lock, account.listLock) || !isTypeId(output.type)) throw new Error("CKB RPC returned a cell that isn't under the recovery list lock");
-    // Proof is a spend from the key's own secp256k1 address or its owner-only list lock. An administrator-mode
-    // Omnilock doesn't count: anyone can make one with this key's auth and their own list, and spend it with
+    // Proof is input 0 spent from the key's own secp256k1 address or its owner-only list lock. An administrator-
+    // mode Omnilock doesn't count: anyone can make one with this key's auth and their own list, and spend it with
     // their own backup. A failed lookup fails the whole check rather than leaving a list out.
-    const proven = tx.inputs.some((input) => {
-      const previous = spentFrom.get(bytesToHex(input.previousOutput.txHash)).tx;
-      const cell = previous.outputs[input.previousOutput.index];
-      if (!cell) throw new Error("An input doesn't exist");
-      return ["secp256k1", "list"].includes(lockKind(account, cell.lock));
-    });
+    const first = tx.inputs[0];
+    const cell = first && spentFrom.get(bytesToHex(first.previousOutput.txHash)).tx.outputs[first.previousOutput.index];
+    if (first && !cell) throw new Error("An input doesn't exist");
+    const proven = Boolean(cell) && ["secp256k1", "list"].includes(lockKind(account, cell.lock));
     if (proven) hashes.push(bytesToHex(scriptHash(output.type)));
   }
   return [...new Set(hashes)];
@@ -428,7 +431,7 @@ async function inputCellsOf(tx) {
     const previous = found.get(bytesToHex(input.previousOutput.txHash)).tx;
     const index = input.previousOutput.index;
     if (index >= previous.outputs.length) throw new Error("An input doesn't exist");
-    return { output: previous.outputs[index], data: previous.outputsData[index], createdBy: previous, index };
+    return { output: previous.outputs[index], data: previous.outputsData[index], createdBy: previous, outputIndex: index };
   });
 }
 
@@ -721,6 +724,8 @@ async function analyse(pkpId, params) {
   } else if (listInputs.length === 1) {
     const input = listInputs[0];
     if (listOutputs.length !== 1) throw new Error("A recovery list can't be destroyed");
+    // Input 0, as liveLists proves a list by its creating transaction's input 0.
+    if (input.index !== 0) throw new Error("The recovery list must be input 0");
     const { output, index } = listOutputs[0];
     if (!sameScript(input.output.lock, account.listLock)) throw new Error("This recovery list isn't locked to this account's key");
     if (!isTypeId(input.output.type) || !sameScript(output.type, input.output.type)) throw new Error("A recovery list's Type ID can't change");
@@ -729,7 +734,7 @@ async function analyse(pkpId, params) {
     const after = listMembers(recordAt(tx, index), tx.outputsData[index]);
     // The members before: the record the list's own transaction wrote, or for a list made before records
     // existed, the record the caller supplies; either must hash to the list's current root.
-    const previous = recordAt(input.createdBy, input.index) ?? (typeof params.previousListRecord === "string" ? hexToBytes(params.previousListRecord, "previousListRecord") : undefined);
+    const previous = recordAt(input.createdBy, input.outputIndex) ?? (typeof params.previousListRecord === "string" ? hexToBytes(params.previousListRecord, "previousListRecord") : undefined);
     if (!previous) throw new Error("The recovery list's current backups aren't recorded; previousListRecord is required");
     const before = listMembers(previous, input.data);
     const was = new Set(before.map(bytesToHex));

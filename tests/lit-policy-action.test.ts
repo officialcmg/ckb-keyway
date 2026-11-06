@@ -330,6 +330,49 @@ test("a key with a recovery list can't make a second one, or move funds to an ad
   assert.ok(recovery.litEmailBound);
 });
 
+test("cells under longer lock args (which the indexer's prefix search would return) block neither an enable nor a send", async () => {
+  const { funding, client } = await funded();
+  const env = world([funding]);
+  const action = await loadAction(env);
+  const backups = [evm(31)];
+  const plan = await planRecovery(client, walletFor(), backups, { emailBinding: true });
+  const longer = (lock: ccc.Script) => ccc.Script.from({ ...lock, args: ccc.hexFrom(ccc.bytesConcat(ccc.bytesFrom(lock.args), [0])) });
+  const listLock = plan.transaction.outputs[0].lock;
+  // Unspendable cells an outsider plants: a "plain cell" at the secp256k1 code hash with 21-byte args, and a Type ID
+  // cell under the list lock's args plus one byte.
+  env.add(ccc.Transaction.from({
+    inputs: [],
+    outputs: [{ lock: longer(plan.secp), capacity: 62n * CKB }, { lock: longer(listLock), type: adminListTypeScript({ adminListTypeArgs: `0x${"ab".repeat(32)}` }), capacity: 170n * CKB }],
+    outputsData: ["0x", adminListData(`0x${"cd".repeat(32)}`)],
+  }));
+  const sent = await policySendCode(plan.transaction, wallet, { email: "user@example.com", appName: "Demo", backups, client }, runner(action));
+  setEmailBinding(plan.transaction, sent.binding!);
+  const enable = await policySignTransaction(plan.transaction, [{ script: plan.secp, kind: "secp256k1" }], client, wallet, { emailCode: { code: codeIn(env.emails[0]), ticket: sent.ticket }, backups }, runner(action));
+  env.add(enable);
+  // An ordinary send from the new address, with change to it, still signs.
+  const index = enable.outputs.findIndex((output) => output.lock.eq(plan.omnilock));
+  const spend = ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: enable.hash(), index } }],
+    outputs: [{ lock: plan.omnilock, capacity: enable.outputs[index].capacity - 100_000n }],
+    outputsData: ["0x"],
+    witnesses: [ccc.hexFrom(ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(85)) }).toBytes())],
+  });
+  const result = await action.main({ mode: "transaction", pkpId, transaction: JSON.parse(ccc.stringify(spend)) }) as { operation: string };
+  assert.equal(result.operation, "plain");
+});
+
+test("a backup change must spend the recovery list as input 0", async () => {
+  const backups = [evm(32)];
+  const { funding, signed: enable, recovery, env } = await enableWithPolicy(backups);
+  env.add(enable);
+  const action = await loadAction(env);
+  const client = await offlineClient([funding, enable], [`${funding.hash()}:0`, `${funding.hash()}:1`]);
+  const plan = await planBackupChange(client, walletFor(recovery), { change: "add", backup: evm(33) });
+  const swapped = plan.transaction.clone();
+  swapped.inputs.reverse();
+  await assert.rejects(action.main({ mode: "transaction", pkpId, transaction: JSON.parse(ccc.stringify(swapped)), enableTransactionHash: recovery.enableTransactionHash, backups: await litBackupIds(client, [...backups, evm(33)]) }), /must be input 0/);
+});
+
 test("a cell anyone sends to the list lock doesn't count as a list, and an enable must spend every plain cell", async () => {
   const { funding, client } = await funded();
   const env = world([funding]);
