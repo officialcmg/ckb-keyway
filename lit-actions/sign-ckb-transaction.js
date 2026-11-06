@@ -7,10 +7,15 @@
 // Modes:
 //   identity     signs the fixed KeyWay identity digest, so the server can learn the PKP's public key.
 //   message      signs CKB's "Nervos Message:" hash of a text message it hashes itself.
-//   transaction  { transaction, enableTransactionHash?, emailCode? } signs the account's lock groups.
-//   send-code    { transaction, enableTransactionHash?, email?, emailApiKey, appName } emails a code for a
-//                recovery list change and returns the ticket (and, when turning recovery on, the encrypted
+//   transaction  { transaction, enableTransactionHash?, emailCode?, backups?, previousListRecord? } signs the
+//                account's lock groups.
+//   send-code    { transaction, enableTransactionHash?, email?, backups?, emailApiKey, appName } emails a code for
+//                a recovery list change and returns the ticket (and, when turning recovery on, the encrypted
 //                email binding the transaction must carry).
+// A transaction that creates or changes the recovery list needs `backups`: [{ kind: "evm" | "joyid", id }], the
+// 20-byte id (EVM address, or blake160 of the JoyID passkey's public key) of every backup on the list before and
+// after. The on-chain record holds only salted auths, so the Action rebuilds each auth from its id, the account's
+// salt and KeyWay's verifier, and refuses any listed auth that isn't one of these.
 
 const RPC_URLS = ["https://testnet.ckb.dev/", "https://testnet.ckbapp.dev/"];
 const EMAIL_API_URL = "https://api.resend.com/emails";
@@ -19,15 +24,18 @@ const SECP256K1_CODE_HASH = "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637
 // KeyWay's own testnet Omnilock, by data hash (src/sdk/browser/account-lock.ts KEYWAY_OMNILOCK.testnet).
 const OMNILOCK_CODE_HASH = "0x6b29b6f10346b43c540e53806ba88ba0fe3a0c3a29d7448ef555840c8f8318fa";
 const TYPE_ID_CODE_HASH = "0x00000000000000000000000000000000000000000000000000545950455f4944";
-// KeyWay's backup verifiers (src/sdk/browser/recovery-backups.ts).
-const EVM_VERIFIER = "0x33bd1c699b633d685a6f60f6b0ca16fe8bb896f81323926ca6e0671bf8ab3c88";
-const JOYID_VERIFIER = "0xf1185da23bf04b638010038b40ec64b587654db5cb98eb39f0373ad8919bcd89";
+// KeyWay's backup verifiers, version 3 with salted identities (src/sdk/browser/recovery-backups.ts).
+const EVM_VERIFIER = "0x14715402af1d6cdb6036ac02d10c822e84349c289c938320c2f7e8bb6d54b86f";
+const JOYID_VERIFIER = "0x01ac20c4c1a7e5e073a9369b452382970d7d493ad98169dbfa017df1351e2957";
+const VERIFIERS = { evm: EVM_VERIFIER, joyid: JOYID_VERIFIER };
 const MAX_BACKUPS = 8;
 const SECP_WITNESS_LOCK = 65;
 const OMNILOCK_WITNESS_LOCK = 85;
 const BINDING_MAGIC = "4b574542"; // "KWEB"
 const BINDING_SIZE = 1024;
 const LIST_MAGIC = "4b57524c"; // "KWRL"
+const LIST_VERSION = 3;
+const AUTH_LENGTH = 21;
 const CODE_TTL_MS = 10 * 60_000;
 const MAX_MESSAGE_BYTES = 4096;
 
@@ -468,33 +476,64 @@ function listRoot(data) {
   return data.slice(4, 36);
 }
 
-/** A version 2 list record ("KWRL" ‖ 0x02 ‖ count ‖ entries of 0xFD ‖ 62-byte preimage), as each entry's preimage. */
+/** A version 3 list record ("KWRL" ‖ 0x03 ‖ count ‖ 21-byte auths of 0xFD ‖ blake160(preimage)), as its auths. */
 function parseListRecord(bytes) {
-  if (!bytes || bytes.length < 6 || bytesToHex(bytes.slice(0, 4)) !== `0x${LIST_MAGIC}` || bytes[4] !== 2) throw new Error("The recovery list record is malformed");
+  if (!bytes || bytes.length < 6 || bytesToHex(bytes.slice(0, 4)) !== `0x${LIST_MAGIC}` || bytes[4] !== LIST_VERSION) throw new Error("The recovery list record is malformed");
   const count = bytes[5];
-  if (count < 1 || count > MAX_BACKUPS || bytes.length !== 6 + count * 63) throw new Error("The recovery list record has the wrong number of backups");
-  const entries = [];
-  for (let i = 0; i < count; i++) {
-    const at = 6 + i * 63;
+  if (count < 1 || count > MAX_BACKUPS || bytes.length !== 6 + count * AUTH_LENGTH) throw new Error("The recovery list record has the wrong number of backups");
+  const auths = [];
+  for (let at = 6; at < bytes.length; at += AUTH_LENGTH) {
     if (bytes[at] !== 0xfd) throw new Error("The recovery list record is malformed");
-    const preimage = bytes.slice(at + 1, at + 63);
-    const verifier = bytesToHex(preimage.slice(0, 32));
-    // The verifier by data hash (data1), from cell dep 0 with the whole cell; then the backup's 20-byte id.
-    if ((verifier !== EVM_VERIFIER && verifier !== JOYID_VERIFIER) || preimage[32] !== 0x02 || preimage[33] !== 0x00 || preimage.slice(34, 42).some((b) => b !== 0)) {
-      throw new Error("The recovery list names a backup KeyWay doesn't support");
-    }
-    entries.push(preimage);
+    auths.push(bytes.slice(at, at + AUTH_LENGTH));
   }
-  const keys = entries.map(bytesToHex);
-  if (new Set(keys).size !== keys.length) throw new Error("A backup is listed twice");
-  return entries;
+  if (new Set(auths.map(bytesToHex)).size !== auths.length) throw new Error("A backup is listed twice");
+  return auths;
 }
 
-const authOf = (preimage) => concat([0xfd], ckbHash(preimage).slice(0, 20));
+const blake160 = (...parts) => ckbHash(...parts).slice(0, 20);
 
-function describeBackup(preimage) {
-  const id = bytesToHex(preimage.slice(42));
-  return bytesToHex(preimage.slice(0, 32)) === EVM_VERIFIER ? `EVM wallet ${id}` : `JoyID passkey (key id ${id})`;
+/**
+ * A backup's auth in the account with this salt (its AdminList type hash), as recovery-backups.ts builds it:
+ * 0xFD ‖ blake160(verifier ‖ 0x02 (data1) ‖ 0x00 (cell dep) ‖ 8 zero bytes (whole cell) ‖ blake160(id ‖ salt)).
+ */
+function backupAuth(backup, salt) {
+  const preimage = concat(hexToBytes(VERIFIERS[backup.kind]), [0x02, 0x00], new Uint8Array(8), blake160(backup.id, salt));
+  return concat([0xfd], blake160(preimage));
+}
+
+/** The caller's `backups` param: KeyWay backup kinds with 20-byte ids, no duplicates. */
+function parseBackups(value) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_BACKUPS + 1) throw new Error("backups is required for a recovery list change");
+  const backups = value.map((entry) => {
+    if (!entry || typeof entry !== "object" || (entry.kind !== "evm" && entry.kind !== "joyid")) throw new Error("A backup must be an EVM wallet or a JoyID passkey");
+    const id = hexToBytes(entry.id, "backup id");
+    if (id.length !== 20) throw new Error("A backup's id must be 20 bytes");
+    return { kind: entry.kind, id };
+  });
+  if (new Set(backups.map((backup) => `${backup.kind}:${bytesToHex(backup.id)}`)).size !== backups.length) throw new Error("A backup is listed twice");
+  return backups;
+}
+
+/**
+ * Names every auth in `auths` by the backup whose salted auth it is. An auth no given backup produces (another
+ * salt, an old or foreign verifier, an unknown backup) is refused, and so is a given backup that isn't listed.
+ */
+function resolveBackups(value, auths, salt) {
+  const byAuth = new Map(parseBackups(value).map((backup) => [bytesToHex(backupAuth(backup, salt)), backup]));
+  const wanted = new Set(auths.map(bytesToHex));
+  const resolved = new Map();
+  for (const auth of wanted) {
+    const backup = byAuth.get(auth);
+    if (!backup) throw new Error("The recovery list names a backup KeyWay doesn't support");
+    resolved.set(auth, backup);
+  }
+  for (const auth of byAuth.keys()) if (!wanted.has(auth)) throw new Error("A backup given isn't on the recovery list");
+  return resolved;
+}
+
+function describeBackup(backup) {
+  const id = bytesToHex(backup.id);
+  return backup.kind === "evm" ? `EVM wallet ${id}` : `JoyID passkey (key id ${id})`;
 }
 
 // Sparse Merkle tree root (nervosnetwork/sparse-merkle-tree 0.6.1, as src/sdk/browser/recovery-smt.ts).
@@ -524,13 +563,13 @@ function merge(height, nodeKey, lhs, rhs) {
   return { kind: "value", value: ckbHash(1, height, nodeKey, mergeHash(lhs), mergeHash(rhs)) };
 }
 
-/** The whitelist root for these preimages: each key is the 21-byte auth and 11 zero bytes, each value 0x01 ‖ 31 zeros. */
-function whitelistRoot(preimages) {
+/** The whitelist root for these auths: each key is the 21-byte auth and 11 zero bytes, each value 0x01 ‖ 31 zeros. */
+function whitelistRoot(auths) {
   const branches = new Map();
   const value = concat([0x01], new Uint8Array(31));
   let root = new Uint8Array(32);
-  for (const preimage of preimages) {
-    let currentKey = concat(authOf(preimage), new Uint8Array(11));
+  for (const auth of auths) {
+    let currentKey = concat(auth, new Uint8Array(11));
     let node = { kind: "value", value };
     for (let height = 0; height <= 255; height++) {
       const parentKey = parentPath(currentKey, height);
@@ -547,11 +586,11 @@ function whitelistRoot(preimages) {
   return root;
 }
 
-/** The members a list cell holds, from the record its creating transaction wrote, checked against its root. */
+/** The auths a list cell holds, from the record its creating transaction wrote, checked against its root. */
 function listMembers(record, data) {
-  const entries = parseListRecord(record);
-  if (!equalBytes(whitelistRoot(entries), listRoot(data))) throw new Error("The recorded backups don't match the recovery list's root");
-  return entries;
+  const auths = parseListRecord(record);
+  if (!equalBytes(whitelistRoot(auths), listRoot(data))) throw new Error("The recorded backups don't match the recovery list's root");
+  return auths;
 }
 
 function recordAt(tx, index) {
@@ -674,9 +713,11 @@ async function analyse(pkpId, params) {
       const key = `${cell.out_point?.tx_hash}:${Number(num(cell.out_point?.index, "out point index"))}`;
       if (!spending.has(key)) throw new Error("Turning recovery on must spend every plain cell at this key's address");
     }
-    const members = listMembers(recordAt(tx, 0), tx.outputsData[0]);
+    const auths = listMembers(recordAt(tx, 0), tx.outputsData[0]);
+    // Each listed auth must be a KeyWay backup salted with this list's type hash, the salt the verifiers use.
+    const backups = resolveBackups(params.backups, auths, scriptHash(output.type));
     const witness = parseWitnessArgs(tx.witnesses[0] ?? new Uint8Array(0));
-    op = { kind: "enable", members, binding: witness.inputType };
+    op = { kind: "enable", members: auths.map((auth) => backups.get(bytesToHex(auth))), binding: witness.inputType };
   } else if (listInputs.length === 1) {
     const input = listInputs[0];
     if (listOutputs.length !== 1) throw new Error("A recovery list can't be destroyed");
@@ -693,10 +734,12 @@ async function analyse(pkpId, params) {
     const before = listMembers(previous, input.data);
     const was = new Set(before.map(bytesToHex));
     const now = new Set(after.map(bytesToHex));
-    const added = after.filter((entry) => !was.has(bytesToHex(entry)));
-    const removed = before.filter((entry) => !now.has(bytesToHex(entry)));
+    const added = after.filter((auth) => !was.has(bytesToHex(auth)));
+    const removed = before.filter((auth) => !now.has(bytesToHex(auth)));
     if (added.length + removed.length !== 1) throw new Error("A recovery list change must add or remove exactly one backup");
-    const change = added.length ? { kind: "add", backup: added[0] } : { kind: "remove", backup: removed[0] };
+    // Every auth before and after must be a KeyWay backup under this list's salt; the change names the one that moves.
+    const backups = resolveBackups(params.backups, [...new Map([...before, ...after].map((auth) => [bytesToHex(auth), auth])).values()], scriptHash(input.output.type));
+    const change = added.length ? { kind: "add", backup: backups.get(bytesToHex(added[0])) } : { kind: "remove", backup: backups.get(bytesToHex(removed[0])) };
     const email = await boundEmail(pkpId, account, input.output.type, params.enableTransactionHash);
     op = { ...change, members: after, email };
   }

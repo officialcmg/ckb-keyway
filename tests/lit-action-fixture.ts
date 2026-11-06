@@ -33,7 +33,10 @@ export type SentEmail = { to: string[]; text: string; from: string; key: string 
 export type ActionModule = {
   main: (params: Record<string, unknown>) => Promise<unknown>;
   ckbHash: (...parts: Uint8Array[]) => Uint8Array;
-  whitelistRoot: (preimages: Uint8Array[]) => Uint8Array;
+  whitelistRoot: (auths: Uint8Array[]) => Uint8Array;
+  parseListRecord: (record: Uint8Array) => Uint8Array[];
+  listMembers: (record: Uint8Array, data: Uint8Array) => Uint8Array[];
+  backupAuth: (backup: { kind: string; id: Uint8Array }, salt: Uint8Array) => Uint8Array;
   rawTransactionHash: (tx: unknown) => Uint8Array;
   parseTransaction: (tx: unknown) => unknown;
 };
@@ -101,7 +104,7 @@ export function fakeLit(options: {
   };
   const load = async (): Promise<ActionModule> => {
     const source = await loadLitAction("sign-ckb-transaction");
-    return new Function("Lit", "ethers", "fetch", `${source}\nreturn { main, ckbHash, whitelistRoot, rawTransactionHash, parseTransaction };`)(Lit, fakeEthers, fetch) as ActionModule;
+    return new Function("Lit", "ethers", "fetch", `${source}\nreturn { main, ckbHash, whitelistRoot, rawTransactionHash, parseTransaction, parseListRecord, listMembers, backupAuth, resolveBackups };`)(Lit, fakeEthers, fetch) as ActionModule;
   };
   /** Runs the Action the way `runLitAction` would. */
   const runner = async () => {

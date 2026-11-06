@@ -20,7 +20,8 @@ Replaces `sign-ckb-digest.js`. It never signs a digest it is handed:
 - **transaction:** it fetches every input from CKB testnet, checks each against its transaction hash, derives the
   account's locks from the PKP's own key and computes each sighash itself. It refuses any change to the recovery
   list except creating it when recovery is turned on, or adding or removing exactly one backup with the same lock,
-  Type ID and capacity.
+  Type ID and capacity. Lists use version 3 records of salted auths; the server passes each backup's kind and
+  id, and the Action rebuilds every listed auth with the account's salt and KeyWay's verifiers.
 - **Recovery list changes:** each one needs a code the Action makes, emails and checks itself. The address is bound
   on chain when recovery is turned on.
 - **identity:** signs only the fixed identity digest.
