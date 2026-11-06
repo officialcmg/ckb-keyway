@@ -8,6 +8,11 @@ export type RequestEmailCode = (request: {
   /** The address KeyWay sent the code to, when it reports one. */
   sentTo?: string;
   /**
+   * How many digits the code has: 6, or 8 for a code KeyWay's Lit Action made and emailed itself (recovery
+   * changes), which KeyWay's server never sees.
+   */
+  codeLength?: 6 | 8;
+  /**
    * Checks a code with KeyWay while the prompt stays open. Resolves once the code is accepted and the action
    * has run (then resolve the prompt with that code); rejects with the reason to show otherwise. Prompts that
    * don't use it can resolve with the code as before.
@@ -16,7 +21,7 @@ export type RequestEmailCode = (request: {
 }) => Promise<string | undefined>;
 
 /** Refusals the user can fix in the same prompt: a wrong or malformed code, or one to replace with a new one. */
-const RETRY_CODE = /isn't right|six-digit code|request a new one/i;
+const RETRY_CODE = /isn't right|six-digit code|eight-digit code|request a new one/i;
 const REQUEST_EXPIRED = /request expired/i;
 
 /** Whether the user can try again in the same prompt, by entering another code or sending a new one. */
@@ -30,6 +35,10 @@ export function isRequestExpired(message: string): boolean {
 }
 
 const messageOf = (cause: unknown) => cause instanceof Error ? cause.message : "";
+
+function codeLengthOf(response: unknown): 6 | 8 | undefined {
+  return (response as { codeLength?: unknown } | undefined)?.codeLength === 8 ? 8 : undefined;
+}
 
 function sentAddress(response: unknown): string | undefined {
   const sentTo = (response as { sentTo?: unknown } | undefined)?.sentTo;
@@ -48,7 +57,9 @@ export async function withEmailCode<T>(
   complete: (code: string) => Promise<T>,
   sent?: unknown,
 ): Promise<T> {
-  const sentTo = sentAddress(reason === "settings" ? sent : await send());
+  const first = reason === "settings" ? sent : await send();
+  const sentTo = sentAddress(first);
+  const codeLength = codeLengthOf(first);
   let accepted: { value: T } | undefined;
   let refused: { cause: unknown } | undefined;
   let checking: Promise<void> | undefined;
@@ -71,7 +82,7 @@ export async function withEmailCode<T>(
   };
   let error: string | undefined;
   for (;;) {
-    const code = await requestEmailCode({ reason, error, resend, sentTo, verify });
+    const code = await requestEmailCode({ reason, error, resend, sentTo, verify, ...(codeLength ? { codeLength } : {}) });
     // A check still running when the prompt closes decides the outcome, so an accepted code is never lost.
     await checking?.catch(() => undefined);
     if (accepted) return accepted.value;

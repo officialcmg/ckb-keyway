@@ -10,6 +10,8 @@ import { formatCkbSignature } from "../src/server/funding-transaction.ts";
 import { signingSettings } from "../src/server/general-signing.ts";
 import { issueBackupChallenge, recoveryBackupChange, recoverySetup, settleRecoveryChange, type RecoveryContext } from "../src/server/recovery.ts";
 import { readWallet, saveWallet, type ReadyWallet } from "../src/server/user-wallet.ts";
+import { litPolicyRunner } from "../src/server/lit-policy.ts";
+import { fakeLit, litCodeIn } from "./lit-action-fixture.ts";
 
 const enabled = Boolean(process.env.KEYWAY_AUTH_TEST_DATABASE_URL);
 const CKB = 100_000_000n;
@@ -89,7 +91,7 @@ async function harness() {
     for (const entry of chain.values()) if (entry.status === "pending") entry.status = status;
     return settleRecoveryChange(context(await readWallet(user) as ReadyWallet));
   };
-  return { user, wallet, legacyAddress, publicKey, client, context, emails, broadcasts, proof, sign, settle, chain, addCell, codeFrom: () => /code is (\d{6})/.exec(emails.findLast(({ plaintext }) => /code is \d{6}/.test(plaintext))!.plaintext)![1] };
+  return { privateKey, user, wallet, legacyAddress, publicKey, client, context, emails, broadcasts, proof, sign, settle, chain, addCell, codeFrom: () => /code is (\d{6})/.exec(emails.findLast(({ plaintext }) => /code is \d{6}/.test(plaintext))!.plaintext)![1] };
 }
 
 /** Moves a pending request, and its code, this many minutes into the past, as if that time had gone by. */
@@ -366,4 +368,84 @@ test("adding and removing backups: preview, emailed code, apply", { skip: !enabl
     assert.equal(preview.requiresEmailCode, true);
     await assert.rejects(recoveryBackupChange(h.context(wallet), { operation: "apply", change: "add", backup: proof, confirmationNonce: preview.confirmationNonce }), /expired|six-digit/);
   });
+});
+
+test("with the policy Action: Lit emails the code, binds the email on chain, and checks the code itself", { skip: !enabled }, async (t) => {
+  process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
+  process.env.LIT_USAGE_API_KEY ??= "test-usage-key";
+  process.env.LIT_EMAIL_API_KEY ??= "re_test_sending_key";
+  const previous = { signer: process.env.KEYWAY_LIT_SIGNER, run: litPolicyRunner.run };
+  process.env.KEYWAY_LIT_SIGNER = "policy";
+  t.after(() => {
+    if (previous.signer === undefined) delete process.env.KEYWAY_LIT_SIGNER; else process.env.KEYWAY_LIT_SIGNER = previous.signer;
+    litPolicyRunner.run = previous.run;
+  });
+
+  const h = await harness();
+  const pkpId = ccc.hexFrom(keccak_256(secp256k1.getPublicKey(h.privateKey, false).slice(1)).slice(12));
+  const wallet = { ...h.wallet, litPkpId: pkpId };
+  await saveWallet(h.user, wallet);
+  const lit = fakeLit({ privateKey: h.privateKey, pkpId, lookup: (hash) => {
+    const found = h.chain.get(hash);
+    return found ? { tx: found.transaction, status: found.status } : undefined;
+  } });
+  litPolicyRunner.run = await lit.runner();
+  // No digest signer: everything goes through the Action.
+  const context = (current: ReadyWallet): RecoveryContext => {
+    const { signDigest: _none, ...rest } = h.context(current);
+    return rest;
+  };
+
+  const preview = await recoverySetup(context(wallet), { operation: "preview", backups: [h.proof] }) as Preview;
+  const nonce = preview.confirmationNonce;
+  const sent = await recoverySetup(context(wallet), { operation: "request-email-code", backups: [h.proof], confirmationNonce: nonce }) as { sentTo: string; codeLength: number };
+  assert.equal(sent.codeLength, 8);
+  assert.equal(sent.sentTo, "ana@acmepay.example");
+  assert.equal(h.emails.length, 0, "the server sends nothing itself");
+  assert.equal(lit.emails.length, 1);
+  assert.deepEqual(lit.emails[0].to, ["ana@acmepay.example"]);
+  const code = litCodeIn(lit.emails[0]);
+  // The code never reaches the server: nothing it stored contains it.
+  const sql = await database();
+  const [stored] = await sql<Array<{ summary: unknown; email_code_hash: string | null }>>`select summary, email_code_hash from keyway_v2_signature_requests where nonce = ${nonce}`;
+  assert.equal(stored.email_code_hash, null);
+  assert.ok(!JSON.stringify(stored.summary).includes(code));
+
+  await assert.rejects(recoverySetup(context(wallet), { operation: "enable", backups: [h.proof], confirmationNonce: nonce, emailCode: "123456" }), /eight-digit code/);
+  const wrong = code === "00000000" ? "11111111" : "00000000";
+  await assert.rejects(recoverySetup(context(wallet), { operation: "enable", backups: [h.proof], confirmationNonce: nonce, emailCode: wrong }), /isn't right/);
+  assert.equal(h.broadcasts.length, 0);
+  // A wrong code doesn't use up the request.
+  const result = await recoverySetup(context(wallet), { operation: "enable", backups: [h.proof], confirmationNonce: nonce, emailCode: code }) as { transactionHash: string };
+  assert.equal(result.transactionHash, preview.preview.transactionHash, "the binding doesn't change the transaction hash");
+  assert.equal(h.broadcasts.length, 1);
+  const enable = h.broadcasts[0];
+  assert.equal(ccc.bytesFrom(enable.getWitnessArgsAt(0)!.inputType!).length, 1024);
+  await h.settle();
+  const enabled = await readWallet(h.user) as ReadyWallet;
+  assert.equal(enabled.recovery?.litEmailBound, true);
+
+  // Adding a backup: the code goes to the bound address, through Lit.
+  const live = () => {
+    const transactions = h.broadcasts;
+    const spent = new Set(transactions.flatMap((tx) => tx.inputs.map((input) => input.previousOutput.toBytes().toString())));
+    return transactions.flatMap((tx) => tx.outputs.map((cellOutput, index) => ccc.Cell.from({ outPoint: { txHash: tx.hash(), index }, cellOutput, outputData: tx.outputsData[index] })))
+      .filter((cell) => !spent.has(cell.outPoint.toBytes().toString()));
+  };
+  Object.assign(h.client, {
+    findSingletonCellByType: async (type: ccc.ScriptLike) => live().find((cell) => cell.cellOutput.type?.eq(ccc.Script.from(type))),
+    findCellsByLock: async function* (lock: ccc.ScriptLike) { for (const cell of live()) if (cell.cellOutput.lock.eq(ccc.Script.from(lock))) yield cell; },
+  });
+  await h.client.cache.recordCells(enable.outputs.map((cellOutput, index) => ({ outPoint: { txHash: enable.hash(), index }, cellOutput, outputData: enable.outputsData[index] })));
+  const second = evmWallet();
+  const proof = h.sign(second);
+  const change = await recoveryBackupChange(context(enabled), { operation: "preview", change: "add", backup: proof }) as { confirmationNonce: string };
+  const asked = await recoveryBackupChange(context(enabled), { operation: "request-email-code", change: "add", backup: proof, confirmationNonce: change.confirmationNonce }) as { codeLength: number };
+  assert.equal(asked.codeLength, 8);
+  assert.equal(lit.emails.length, 2);
+  assert.deepEqual(lit.emails[1].to, ["ana@acmepay.example"]);
+  assert.match(lit.emails[1].text, /Add a recovery backup/);
+  const applied = await recoveryBackupChange(context(enabled), { operation: "apply", change: "add", backup: proof, confirmationNonce: change.confirmationNonce, emailCode: litCodeIn(lit.emails[1]) }) as { transactionHash: string };
+  assert.equal(h.broadcasts.at(-1)!.hash(), applied.transactionHash);
+  assert.equal(ccc.bytesFrom(h.broadcasts.at(-1)!.getWitnessArgsAt(0)!.lock!).length, 85);
 });

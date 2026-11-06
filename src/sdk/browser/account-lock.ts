@@ -70,6 +70,11 @@ export type KeyWayRecovery = {
   enabledAt: string;
   /** The backups in the AdminList's whitelist, in order. Its root alone can't rebuild their proofs. */
   backups?: RecoveryBackup[];
+  /**
+   * Recovery was turned on through KeyWay's policy Action, which bound the account's email on chain (witness 0
+   * of the enabling transaction). Every list change then needs a code the Action emails itself.
+   */
+  litEmailBound?: boolean;
 };
 
 export type KeyWayLockKind = "secp256k1" | "omnilock";

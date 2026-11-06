@@ -4,6 +4,7 @@ import { accountLocks, omnilockOwnerWitnessLock, refuseAdminListSpend, refuseFor
 import { isXudtCompatible } from "../sdk/browser/tokens.ts";
 import { loadLitAction } from "./lit-actions.ts";
 import { signCkbDigest } from "./lit.ts";
+import { litPolicyEnabled, policySignTransaction } from "./lit-policy.ts";
 import { recoverPkpPublicKey } from "./pkp-identity.ts";
 import type { ReadyWallet } from "./user-wallet.ts";
 
@@ -153,6 +154,7 @@ export async function signFundingTransaction(
   wallet: ReadyWallet,
   validated: ValidatedFunding,
 ): Promise<ccc.Transaction> {
+  if (litPolicyEnabled()) return policySignTransaction(validated.transaction, validated.groups, validated.signer.client, wallet);
   return signAccountGroups(validated.transaction, validated.groups, validated.signer.client, async (digest) => {
     const signature = await signCkbDigest(digest, wallet.litPkpId, {
       apiKey: requiredEnv("LIT_USAGE_API_KEY"),

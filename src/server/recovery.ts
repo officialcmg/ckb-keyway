@@ -8,8 +8,9 @@ import { addTokenCellDeps } from "../sdk/browser/settlement-sweep.ts";
 import { formatAsset, hasPlainTokenArgs, isXudtCompatible } from "../sdk/browser/tokens.ts";
 import { withUserLock } from "./database.ts";
 import { createRecoveryNoticeEmailTemplate } from "./email-template.ts";
-import { serializeTransaction, signAccountGroups } from "./funding-transaction.ts";
-import { consumeRequest, hashText, issueRequest, limit, loadRequest, REQUEST_EXPIRED, sendCode, sign, verifyCode, type SigningContext } from "./general-signing.ts";
+import { serializeTransaction } from "./funding-transaction.ts";
+import { codeLimit, consumeRequest, countLitCodeAttempt, hashText, issueRequest, limit, loadRequest, recordLitCode, REQUEST_EXPIRED, sendCode, signGroups, verifyCode, type SigningContext } from "./general-signing.ts";
+import { litPolicyEnabled, parseLitEmailCode, policySendCode, setEmailBinding } from "./lit-policy.ts";
 import { feeRateCap, formatCkb } from "./transaction-policy.ts";
 import type { User } from "./auth-user.ts";
 import { readWallet, saveWallet, type PendingRecoveryChange, type ReadyWallet } from "./user-wallet.ts";
@@ -81,6 +82,13 @@ export async function recoverySetup(context: RecoveryContext, body: Record<strin
   if (body.operation === "request-email-code") {
     const plan = await planRecovery(client, context.wallet, backups);
     const request = await loadRequest(context.user, "recovery", nonce, planDigest(plan, backups));
+    if (litPolicyEnabled()) {
+      // The policy Action emails the code and binds this address to the account on chain; the code never comes here.
+      await codeLimit(context);
+      const sent = await policySendCode(plan.transaction, context.wallet, { email: await context.email(), appName: context.appName });
+      await recordLitCode(context.user, "recovery", nonce, { litTicket: sent.ticket, litBinding: sent.binding });
+      return { sent: true, sentTo: sent.sentTo, codeLength: 8 };
+    }
     const sentTo = await sendCode(context, "recovery", nonce, "Turn on account recovery", request.summary.lines ?? []);
     return { sent: true, sentTo };
   }
@@ -94,14 +102,28 @@ export async function recoverySetup(context: RecoveryContext, body: Record<strin
     const plan = await planRecovery(client, wallet, backups);
     // The digest binds the approval to this exact transaction; any change in the account's cells refuses it.
     const digest = planDigest(plan, backups);
-    await loadRequest(context.user, "recovery", nonce, digest).catch((cause) => {
+    const request = await loadRequest(context.user, "recovery", nonce, digest).catch((cause) => {
       throw cause instanceof Error && cause.message === REQUEST_EXPIRED ? cause : new Error("Your account changed since the preview. Review turning on recovery again");
     });
-    await verifyCode(context.user, "recovery", nonce, body.emailCode);
-    await consumeRequest(context.user, "recovery", nonce);
-    await checkRecoveryTransaction(client, plan.transaction, wallet.litPublicKey, backups);
-    await context.recordSigning(context.user.id);
-    const signed = await signAccountGroups(plan.transaction, [{ script: plan.secp, kind: "secp256k1" }], client, (message) => sign({ ...context, wallet }, message));
+    const policy = litPolicyEnabled() && !context.signDigest;
+    let signed: ccc.Transaction;
+    if (policy) {
+      // The Action checks the code it emailed; the request is used up only once it has signed.
+      const emailCode = parseLitEmailCode(body.emailCode, request.summary.litTicket);
+      if (typeof request.summary.litBinding !== "string") throw new Error("The email code has expired. Request a new one");
+      await countLitCodeAttempt(context.user, "recovery", nonce);
+      setEmailBinding(plan.transaction, request.summary.litBinding);
+      await checkRecoveryTransaction(client, plan.transaction, wallet.litPublicKey, backups);
+      await context.recordSigning(context.user.id);
+      signed = await signGroups({ ...context, wallet }, plan.transaction, [{ script: plan.secp, kind: "secp256k1" }], client, { emailCode });
+      await consumeRequest(context.user, "recovery", nonce);
+    } else {
+      await verifyCode(context.user, "recovery", nonce, body.emailCode);
+      await consumeRequest(context.user, "recovery", nonce);
+      await checkRecoveryTransaction(client, plan.transaction, wallet.litPublicKey, backups);
+      await context.recordSigning(context.user.id);
+      signed = await signGroups({ ...context, wallet }, plan.transaction, [{ script: plan.secp, kind: "secp256k1" }], client);
+    }
     const transactionHash = signed.hash();
     const recovery: KeyWayRecovery = {
       omnilockArgs: plan.omnilock.args,
@@ -113,6 +135,7 @@ export async function recoverySetup(context: RecoveryContext, body: Record<strin
       legacyAddress: plan.preview.legacyAddress,
       enabledAt: new Date().toISOString(),
       backups,
+      ...(policy ? { litEmailBound: true } : {}),
     };
     // Recorded before sending, so a crash in between leaves a pending change the chain settles, not a lost one.
     const pending: PendingRecoveryChange = { kind: "enable", transactionHash, recovery, ckbAddress: plan.preview.newAddress, sentAt: new Date().toISOString() };
@@ -251,7 +274,7 @@ const occupied = (output: ccc.CellOutput, data: ccc.HexLike) => ccc.fixedPointFr
  * then each token cell moves as it is, and the rest of the CKB less the fee goes to the new address. Witness 0
  * records the full backup list (`recoveryListRecord`) in its output_type.
  */
-export async function planRecovery(client: ccc.Client, wallet: ReadyWallet, backups: RecoveryBackup[]): Promise<RecoveryPlan> {
+export async function planRecovery(client: ccc.Client, wallet: ReadyWallet, backups: RecoveryBackup[], options: { emailBinding?: boolean } = { emailBinding: litPolicyEnabled() }): Promise<RecoveryPlan> {
   const secp = await secp256k1Lock(client, wallet.litPublicKey);
   const xudt = await client.getKnownScript(ccc.KnownScript.XUdt);
   const cells: ccc.Cell[] = [];
@@ -291,6 +314,9 @@ export async function planRecovery(client: ccc.Client, wallet: ReadyWallet, back
     : "0x");
   // The full list goes on chain beside the AdminList (output 0), so it can be rebuilt without KeyWay.
   setRecoveryListRecord(transaction, 0, await recoveryListRecord(client, backups));
+  // With the policy Action, witness 0 also carries the encrypted email binding, at a fixed size, so the fee
+  // (and the transaction hash the emailed code is for) is the same before and after the binding goes in.
+  if (options.emailBinding) setEmailBinding(transaction);
 
   const totalIn = inputCells.reduce((sum, cell) => sum + cell.cellOutput.capacity, 0n);
   const fee = (BigInt(transaction.toBytes().length + 4) * FEE_RATE + 999n) / 1000n;
@@ -443,6 +469,13 @@ export async function recoveryBackupChange(context: RecoveryContext, body: Recor
   if (body.operation === "request-email-code") {
     const plan = await planBackupChange(client, context.wallet, change);
     const request = await loadRequest(context.user, "recovery", nonce, changeDigest(plan, change));
+    if (litPolicyEnabled() && context.wallet.recovery.litEmailBound) {
+      // The policy Action emails the code to the address bound on chain when recovery was turned on.
+      await codeLimit(context);
+      const sent = await policySendCode(plan.transaction, context.wallet, { enableTransactionHash: context.wallet.recovery.enableTransactionHash, appName: context.appName });
+      await recordLitCode(context.user, "recovery", nonce, { litTicket: sent.ticket });
+      return { sent: true, sentTo: sent.sentTo, codeLength: 8 };
+    }
     const sentTo = await sendCode(context, "recovery", nonce, change.change === "add" ? "Add a recovery backup" : "Remove a recovery backup", request.summary.lines ?? []);
     return { sent: true, sentTo };
   }
@@ -454,15 +487,27 @@ export async function recoveryBackupChange(context: RecoveryContext, body: Recor
     refusePending(wallet);
     if (change.change === "add") await verifyBackups(client, context.user, wallet, [body.backup]);
     const plan = await planBackupChange(client, wallet, change);
-    await loadRequest(context.user, "recovery", nonce, changeDigest(plan, change)).catch((cause) => {
+    const request = await loadRequest(context.user, "recovery", nonce, changeDigest(plan, change)).catch((cause) => {
       throw cause instanceof Error && cause.message === REQUEST_EXPIRED ? cause : new Error("Your account changed since the preview. Review the backup change again");
     });
-    await verifyCode(context.user, "recovery", nonce, body.emailCode);
-    await consumeRequest(context.user, "recovery", nonce);
-    await checkBackupChangeTransaction(client, plan.transaction, wallet.recovery, plan.backups);
-    await context.recordSigning(context.user.id);
     const groups = [{ script: plan.listLock, kind: "omnilock" as const }, { script: plan.omnilock, kind: "omnilock" as const }];
-    const signed = await signAccountGroups(plan.transaction, groups, client, (message) => sign({ ...context, wallet }, message));
+    const enableTransactionHash = wallet.recovery.enableTransactionHash;
+    let signed: ccc.Transaction;
+    if (litPolicyEnabled() && !context.signDigest && wallet.recovery.litEmailBound) {
+      // The Action checks the code it emailed; the request is used up only once it has signed.
+      const emailCode = parseLitEmailCode(body.emailCode, request.summary.litTicket);
+      await countLitCodeAttempt(context.user, "recovery", nonce);
+      await checkBackupChangeTransaction(client, plan.transaction, wallet.recovery, plan.backups);
+      await context.recordSigning(context.user.id);
+      signed = await signGroups({ ...context, wallet }, plan.transaction, groups, client, { enableTransactionHash, emailCode });
+      await consumeRequest(context.user, "recovery", nonce);
+    } else {
+      await verifyCode(context.user, "recovery", nonce, body.emailCode);
+      await consumeRequest(context.user, "recovery", nonce);
+      await checkBackupChangeTransaction(client, plan.transaction, wallet.recovery, plan.backups);
+      await context.recordSigning(context.user.id);
+      signed = await signGroups({ ...context, wallet }, plan.transaction, groups, client, { enableTransactionHash });
+    }
     const transactionHash = signed.hash();
     const recovery: KeyWayRecovery = { ...wallet.recovery, adminListOutPoint: { txHash: transactionHash, index: 0 }, backups: plan.backups };
     const pending: PendingRecoveryChange = { kind: change.change, transactionHash, recovery, ckbAddress: wallet.ckbAddress, sentAt: new Date().toISOString() };

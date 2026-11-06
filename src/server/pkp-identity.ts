@@ -13,12 +13,17 @@ export type PkpIdentity = {
   ckbAddress: string;
 };
 
+/**
+ * Learns the PKP's public key from its signature over KeyWay's fixed identity digest. `signIdentity` is the
+ * policy Action's identity mode once it is in use; otherwise the digest signer signs it.
+ */
 export async function derivePkpIdentity(
   litPkpId: string,
   config: LitRuntimeConfig,
+  signIdentity?: (litPkpId: string) => Promise<LitSignature>,
 ): Promise<PkpIdentity> {
   const digest = toHex(IDENTITY_DIGEST);
-  const signature = await signCkbDigest(digest, litPkpId, {
+  const signature = signIdentity ? await signIdentity(litPkpId) : await signCkbDigest(digest, litPkpId, {
     ...config,
     actionCode: await loadLitAction("sign-ckb-digest"),
   });

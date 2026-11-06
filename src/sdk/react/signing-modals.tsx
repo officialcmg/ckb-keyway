@@ -138,11 +138,12 @@ const CODE_PURPOSE: Record<EmailCodeReason, string> = {
  * Asks for the code KeyWay emailed the user. Always drawn by the SDK, even when an app brings its own approval
  * UI. With `verify`, it stays open while KeyWay checks each code and shows a wrong one in place.
  */
-export function KeyWayEmailCodeModal({ theme, reason, error, sentTo, resend, verify, answer }: {
+export function KeyWayEmailCodeModal({ theme, reason, error, sentTo, codeLength = 6, resend, verify, answer }: {
   theme: Theme;
   reason: EmailCodeReason;
   error?: string;
   sentTo?: string;
+  codeLength?: 6 | 8;
   resend: () => Promise<void>;
   verify?: (code: string) => Promise<void>;
   answer: (code: string | undefined) => void;
@@ -156,7 +157,7 @@ export function KeyWayEmailCodeModal({ theme, reason, error, sentTo, resend, ver
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
 
   const submit = (value: string) => {
-    if (value.length !== 6 || phase !== "idle") return;
+    if (value.length !== codeLength || phase !== "idle") return;
     if (!verify) { answer(value); return; }
     setPhase("checking");
     setMessage(undefined);
@@ -178,7 +179,7 @@ export function KeyWayEmailCodeModal({ theme, reason, error, sentTo, resend, ver
     });
   };
 
-  useEffect(() => { if (code.length === 6) submit(code); }, [code]);
+  useEffect(() => { if (code.length === codeLength) submit(code); }, [code]);
 
   const busy = phase === "checking" || phase === "success";
   return (
@@ -207,6 +208,7 @@ export function KeyWayEmailCodeModal({ theme, reason, error, sentTo, resend, ver
               <CodeInput
                 palette={palette}
                 value={code}
+                length={codeLength}
                 inputRef={inputRef}
                 readOnly={busy}
                 state={phase === "success" ? "success" : message ? "error" : "idle"}
@@ -228,7 +230,7 @@ export function KeyWayEmailCodeModal({ theme, reason, error, sentTo, resend, ver
               }} disabled={busy} prompt="Didn't get it?" />
               <div style={modalActions}>
                 <button type="button" style={{ ...modalButton, borderColor: palette.border, color: palette.text }} onClick={() => answer(undefined)}>{busy ? "Close" : "Cancel"}</button>
-                <button type="submit" disabled={code.length !== 6 || busy} style={{ ...modalButton, ...modalPrimaryButton, background: palette.primary, color: palette.primaryText, opacity: code.length === 6 || busy ? 1 : 0.6 }}>
+                <button type="submit" disabled={code.length !== codeLength || busy} style={{ ...modalButton, ...modalPrimaryButton, background: palette.primary, color: palette.primaryText, opacity: code.length === codeLength || busy ? 1 : 0.6 }}>
                   {phase === "success" ? "Confirmed" : busy ? "Checking…" : "Confirm"}
                 </button>
               </div>
