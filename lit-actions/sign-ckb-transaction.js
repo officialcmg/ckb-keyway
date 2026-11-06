@@ -385,8 +385,11 @@ async function liveLists(account) {
     const tx = created.get(object.out_point.tx_hash).tx;
     const output = tx.outputs[Number(num(object.out_point.index, "out point index"))];
     if (!output || !sameScript(output.lock, account.listLock) || !isTypeId(output.type)) throw new Error("CKB RPC returned a cell that isn't under the recovery list lock");
-    const spent = await inputCellsOf(tx).catch(() => []);
-    if (spent.some((cell) => lockKind(account, cell.output.lock))) hashes.push(bytesToHex(scriptHash(output.type)));
+    // Proof is a spend from the key's own secp256k1 address or its owner-only list lock. An administrator-mode
+    // Omnilock doesn't count: anyone can make one with this key's auth and their own list, and spend it with
+    // their own backup. A failed lookup fails the whole check rather than leaving a list out.
+    const spent = await inputCellsOf(tx);
+    if (spent.some((cell) => ["secp256k1", "list"].includes(lockKind(account, cell.output.lock)))) hashes.push(bytesToHex(scriptHash(output.type)));
   }
   return [...new Set(hashes)];
 }
