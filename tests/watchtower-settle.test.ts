@@ -6,7 +6,7 @@ import { JsonRpcTransformers } from "@ckb-ccc/core/advanced";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import {
   applyUnlocks, blake160, encodeSettlementWitness, encodeWitnessState, parseCommitmentArgs, parseSettlementWitness,
-  planClaim, settlementMessage, signSettlement, XUDT_COMPATIBLE_WITNESS,
+  planClaim, settleChannel, settlementMessage, signSettlement, XUDT_COMPATIBLE_WITNESS,
 } from "../src/sdk/browser/watchtower-settle.ts";
 import type { WatchedChannel } from "../src/sdk/browser/watchtower-store.ts";
 
@@ -148,4 +148,22 @@ test("signs the commitment input with the channel's settlement key", () => {
   const moved = tx.clone();
   moved.cellDeps = [];
   assert.equal(settlementMessage(moved), settlementMessage(tx));
+});
+
+test("a peer remainder too small for its own commitment cell is not claimed (the transaction would be invalid)", () => {
+  const { channel, argsFor } = channelFixture();
+  const ours = encodeSettlementWitness(channel.localSettlement, false, channel.localSettlementKey, channel.remoteSettlementKey);
+  const decision = planClaim({ channel, cell: { capacity: 500n * CKB + 50n * CKB, args: argsFor(ours) } });
+  assert.ok("skip" in decision && /too small/.test(decision.skip));
+});
+
+test("token channels are left to Fiber's native watchtower", async () => {
+  const { channel } = channelFixture();
+  const untouched = new Proxy({}, { get: () => { throw new Error("no chain access expected"); } }) as ccc.Client;
+  const result = await settleChannel({
+    client: untouched, network: "testnet", nodeKey: hex(secp256k1.utils.randomSecretKey()),
+    channel: { ...channel, channelId: "0x" + "01".repeat(32), fundingUdtTypeScript: { code_hash: "0x00", hash_type: "type", args: "0x" }, localFundingPubkey: "", remoteFundingPubkey: "", createdAt: 0, updatedAt: 0 } as WatchedChannel,
+    ref: { channelId: "0x" + "01".repeat(32), fundingOutPoint: { txHash: "0x" + "02".repeat(32), index: 0 } },
+  });
+  assert.match(result.status, /token channels/);
 });

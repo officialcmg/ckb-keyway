@@ -191,6 +191,9 @@ export function planClaim(options: {
   const after = applyUnlocks({ ...state, unlocks: [{ type: unlockType, withPreimage: false }] })!;
   const successorArgs = ccc.hexFrom(concat(args.prefix, blake160(encodeWitnessState(after)), new Uint8Array([1])));
   if (cell.capacity <= mine) return { skip: "the commitment cell holds less than the user's share" };
+  // The peer's part stays in a successor cell, which must hold at least its own occupied capacity (as in Fiber).
+  const occupied = ccc.fixedPointFrom(8 + 32 + 1 + ccc.bytesFrom(successorArgs).length);
+  if (cell.capacity - mine < occupied) return { skip: "the peer's remaining part is too small for a commitment cell" };
   return { claim: { witnessState: encodeWitnessState(state), unlockType, since, successor: { capacity: cell.capacity - mine, args: successorArgs } } };
 }
 
@@ -248,6 +251,7 @@ export async function settleChannel(options: {
 }): Promise<SettleResult> {
   const { client, channel } = options;
   const result = (status: string, txHash?: ccc.Hex): SettleResult => ({ channelId: channel.channelId, status, ...(txHash ? { txHash } : {}) });
+  if (channel.fundingUdtTypeScript) return result("token channels are not settled by the in-page watchtower");
   const funding = ccc.OutPoint.from(options.ref.fundingOutPoint);
   const fundingTx = (await client.getTransaction(funding.txHash))?.transaction;
   const fundingOutput = fundingTx?.outputs[Number(funding.index)];
@@ -257,7 +261,8 @@ export async function settleChannel(options: {
   if (!commitmentTx) return result("funding spent; closing transaction not indexed yet");
   const codeHash = COMMITMENT_LOCK[options.network].codeHash;
   const isCommitment = (output?: ccc.CellOutput) => output?.lock.codeHash === codeHash && output.lock.hashType === "type";
-  if (commitmentTx.outputs.length !== 1 || !isCommitment(commitmentTx.outputs[0])) return result("closed cooperatively");
+  if (!isCommitment(commitmentTx.outputs[0])) return result("closed cooperatively");
+  if (commitmentTx.outputs[0].type) return result("token channels are not settled by the in-page watchtower");
   const prefix = ccc.bytesFrom(commitmentTx.outputs[0].lock.args).slice(0, 36);
 
   // Follow the commitment cell through any settlements to the one that is live now.

@@ -100,3 +100,16 @@ test("malformed watchtower data is rejected rather than stored", () => {
   assert.throws(() => applyWatchtowerCall(undefined, { ...create, params: { ...create.params, local_settlement_key: "0x1234" } }), /settlement key/);
   assert.throws(() => applyWatchtowerCall(undefined, { ...create, params: { ...create.params, settlement_data: { tlcs: [] } } }), /settlement data/);
 });
+
+test("a repeated create_watch_channel keeps the peer's settlement and revocation data", () => {
+  const created = applyWatchtowerCall(undefined, create, 1);
+  assert.ok(created && created !== "remove");
+  const local = { local_amount: "0x1", remote_amount: "0x2", tlcs: [] };
+  const revoked = applyWatchtowerCall(created, { method: "update_revocation", params: { channel_id: create.params.channel_id, revocation_data: { commitment_number: "0x1" }, settlement_data: local } });
+  assert.ok(revoked && revoked !== "remove");
+  const again = applyWatchtowerCall(revoked, create, 3);
+  assert.ok(again && again !== "remove");
+  assert.deepEqual(again.remoteSettlement, local);
+  assert.ok(again.revocation);
+  assert.equal(again.createdAt, 1);
+});

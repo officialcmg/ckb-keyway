@@ -71,6 +71,7 @@ export function applyWatchtowerCall(existing: WatchedChannel | undefined, call: 
   switch (call.method) {
     case "create_watch_channel":
       return {
+        ...existing,
         channelId: hex32(p.channel_id, "channel id"),
         fundingUdtTypeScript: p.funding_udt_type_script ?? null,
         localSettlementKey: hex32(p.local_settlement_key, "settlement key"),
