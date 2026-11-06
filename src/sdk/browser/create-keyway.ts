@@ -113,10 +113,15 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   const watchtower = openWatchtowerStore(databasePrefix);
   let stopWatchtowerBridge: (() => Promise<void>) | undefined;
   /** Once the node has stopped it sends no more events: finish storing the ones already received, then close. */
+  let bridgeDrain: Promise<void> | undefined;
   async function closeWatchtowerBridge() {
-    const stopBridge = stopWatchtowerBridge;
-    stopWatchtowerBridge = undefined;
-    await stopBridge?.();
+    // Overlapping callers (e.g. two logouts) all wait for the same drain before going on to a backup.
+    if (!bridgeDrain && stopWatchtowerBridge) {
+      const stopBridge = stopWatchtowerBridge;
+      stopWatchtowerBridge = undefined;
+      bridgeDrain = stopBridge().finally(() => { bridgeDrain = undefined; });
+    }
+    await bridgeDrain;
   }
   const node = new FiberBrowserNode({
     network,
