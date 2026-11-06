@@ -164,10 +164,14 @@ export function withWorkerShim<T>(shim: string, construct: () => T): { value: T;
 
 /**
  * Listens for the shim's calls and answers each once `handle` has finished (so Fiber logs an error if the data
- * couldn't be stored). Returns a function that stops listening.
+ * couldn't be stored). Returns a function that stops listening and resolves once every call already received
+ * has been handled.
  */
-export function listenForWatchtowerCalls(channelName: string, handle: (call: WatchtowerCall) => Promise<void>): () => void {
+export function listenForWatchtowerCalls(channelName: string, handle: (call: WatchtowerCall) => Promise<void>): () => Promise<void> {
   const channel = new BroadcastChannel(channelName);
+  let closed = false;
+  // After the node stops nobody waits for replies, so a call still being stored is finished without one.
+  const reply = (message: object) => { if (!closed) channel.postMessage(message); };
   // Fiber sends its events one after another and waits for each answer, so they are stored in order.
   let queue = Promise.resolve();
   channel.onmessage = (event: MessageEvent) => {
@@ -178,12 +182,16 @@ export function listenForWatchtowerCalls(channelName: string, handle: (call: Wat
       try {
         if (!(WATCHTOWER_METHODS as readonly string[]).includes(String(message.method))) throw new Error(`Unknown watchtower method ${message.method}`);
         await handle({ method: message.method as WatchtowerMethod, params: message.params ?? {} });
-        channel.postMessage({ kind: "reply", id, ok: true });
+        reply({ kind: "reply", id, ok: true });
       } catch (error) {
         console.error("[keyway] could not store the node's watchtower data", error);
-        channel.postMessage({ kind: "reply", id, ok: false, error: error instanceof Error ? error.message : String(error) });
+        reply({ kind: "reply", id, ok: false, error: error instanceof Error ? error.message : String(error) });
       }
     });
   };
-  return () => channel.close();
+  return async () => {
+    closed = true;
+    channel.close();
+    await queue;
+  };
 }
