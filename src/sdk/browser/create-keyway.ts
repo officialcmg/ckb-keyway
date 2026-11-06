@@ -379,6 +379,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     await stopWatching();
     if (!deviceLease) {
       await stop();
+      remoteWatchtower.stop();
       return;
     }
     const lease = deviceLease;
@@ -397,6 +398,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       }),
       releaseOwnership: releaseGuards,
     });
+    // The session ends with the logout, so nothing more can reach KeyWay's watchtower from this page.
+    remoteWatchtower.stop();
   }
 
   async function restoreClaimedBackup() {
