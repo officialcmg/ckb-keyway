@@ -393,7 +393,11 @@ async function liveLists(account) {
   const spentFrom = await fetchTransactions([...created.values()].flatMap(({ tx }) => tx.inputs.map((input) => bytesToHex(input.previousOutput.txHash))));
   const hashes = [];
   for (const object of objects) {
-    const tx = created.get(object.out_point.tx_hash).tx;
+    const creation = created.get(object.out_point.tx_hash);
+    // After a reorganisation the node may still list a cell whose transaction is back in the pool; refuse until it
+    // settles rather than decide on it either way.
+    if (creation.status !== "committed") throw new Error("A recovery list transaction isn't committed yet. Try again in a minute");
+    const tx = creation.tx;
     const output = tx.outputs[Number(num(object.out_point.index, "out point index"))];
     if (!output || !sameScript(output.lock, account.listLock) || !isTypeId(output.type)) throw new Error("CKB RPC returned a cell that isn't under the recovery list lock");
     // Proof is a spend from the key's own secp256k1 address or its owner-only list lock. An administrator-mode
