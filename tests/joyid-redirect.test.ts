@@ -31,6 +31,7 @@ import {
   resetJoyIdHelperLoad,
   runJoyIdHelper,
   saveJoyIdRecord,
+  startJoyIdBackup,
   stopBrowserNodeForRedirect,
   takeCapturedJoyIdReturn,
   takeJoyIdRecord,
@@ -441,4 +442,41 @@ test("createJoyIdBackup's options are kept with or without a signer", () => {
   assert.deepEqual(joyIdBackupArguments(signer, options), [signer, options]);
   assert.deepEqual(joyIdBackupArguments(signer), [signer, {}]);
   assert.deepEqual(joyIdBackupArguments(), [undefined, {}]);
+});
+
+test("turning recovery on by redirect keeps the other backups through a first connect, to the sign step", async () => {
+  const key = await passkey();
+  const other = { kind: "evm" as const, address: `0x${"11".repeat(20)}`, signature: `0x${"22".repeat(65)}`, challengeNonce: freshNonce() };
+  const assigned: string[] = [];
+  const storage = new MemoryStorage();
+  const globals = globalThis as Record<string, unknown>;
+  const saved = { location: globals.location, sessionStorage: globals.sessionStorage, localStorage: globals.localStorage, window: globals.window };
+  globals.location = { origin: APP, assign: (url: string) => assigned.push(url) };
+  globals.sessionStorage = storage;
+  globals.localStorage = new MemoryStorage();
+  globals.window = { addEventListener: () => undefined, removeEventListener: () => undefined };
+  try {
+    // No JoyID connection is stored, so the page leaves for JoyID's connect step first.
+    void startJoyIdBackup({
+      client, app: { joyIdAppURL: "https://testnet.joyid.dev", name: "Acme", logo: `${APP}/icon.svg` }, userId: "user-1", op: "backup-enable", returnPath: "/app",
+      account: async () => "ckt1account", requestChallenge: async () => freshNonce(), beforeLeaving: async () => undefined, options: { otherBackups: [other] },
+    }, "redirect");
+    for (let tries = 0; assigned.length === 0 && tries < 50; tries++) await new Promise((resolve) => setTimeout(resolve, 1));
+    assert.equal(new URL(assigned[0]).pathname, "/auth");
+    const authId = joyIdStateId((decodeSearch(new URL(assigned[0]).searchParams.get("_data_")!) as Record<string, unknown>).state)!;
+    const auth = takeJoyIdRecord(storage, authId)!;
+    assert.equal(auth.step, "auth");
+    assert.deepEqual(auth.otherProofs, [other]);
+    // JoyID answers the connect step; the sign step it continues to still carries the other backups.
+    const response = deliverByRedirect({ type: "Auth", data: { address: key.address, pubkey: key.pubkey, keyType: "main_key", alg: -7 }, state: { v: 1, id: authId } });
+    const result = await resumeJoyIdRedirect(response, auth, { userId: "user-1", client, requestChallenge: async () => freshNonce() });
+    assert.equal(result.status, "continuing");
+    const signId = joyIdStateId((decodeSearch(new URL(assigned[1]).searchParams.get("_data_")!) as Record<string, unknown>).state)!;
+    const sign = takeJoyIdRecord(storage, signId)!;
+    assert.equal(sign.step, "sign");
+    assert.deepEqual(sign.otherProofs, [other]);
+  } finally {
+    Object.assign(globals, saved);
+    if (saved.window === undefined) delete globals.window;
+  }
 });
