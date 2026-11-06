@@ -112,7 +112,7 @@ Each approval prop replaces KeyWay's dialog with your app's answer. An app that 
 ```tsx
 <KeyWayProvider
   appId="keyway_..."
-  approveCkbTransaction={(preview) => Number(preview.sendingCkb) <= 100 && preview.tokens.length === 0 && preview.nfts.length === 0}
+  approveCkbTransaction={(preview) => Number(preview.sendingCkb) <= 100 && preview.tokens.length === 0 && preview.nfts.length === 0 && preview.unrecognized.length === 0}
   approveCkbMessage={() => true}
 >
   <App />
