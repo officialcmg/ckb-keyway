@@ -4,6 +4,7 @@ import {
   createContext,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -44,6 +45,7 @@ import {
   runJoyIdHelper,
   startJoyIdBackup,
   stopBrowserNodeForRedirect,
+  stripJoyIdAnswerAgain,
   takeCapturedJoyIdReturn,
   takeJoyIdRecord,
   type JoyIdBackupOptions,
@@ -282,6 +284,13 @@ export function KeyWayProvider({
   const joyIdReturnRef = useRef<{ response: JoyIdResponse; record?: JoyIdRequestRecord }>(undefined);
   const joyIdProofRef = useRef<{ op: JoyIdRequestRecord["op"]; proof: RecoveryBackupProof; otherProofs: RecoveryBackupProof[] }>(undefined);
   const fiberOperationsRef = useRef(0);
+  // The SDK took any JoyID answer out of the address bar when it loaded. A router hydrating can put it back, so
+  // it goes again before this provider's (or its children's) first fetch, and once more after the router mounts.
+  useLayoutEffect(() => {
+    stripJoyIdAnswerAgain();
+    const later = setTimeout(() => stripJoyIdAnswerAgain(true), 0);
+    return () => clearTimeout(later);
+  }, []);
   const transaction = useApproval<TransactionPreview>();
   const message = useApproval<MessagePreview>();
   const recovery = useApproval<RecoveryPreview>();
