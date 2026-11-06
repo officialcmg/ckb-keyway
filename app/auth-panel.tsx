@@ -14,7 +14,7 @@ import {
   type KeyWayChannel,
   type FiberStartupEvent,
 } from "@ckb-keyway/react";
-import { DemoView, type DemoBackup, type DemoActions, type DemoActivity, type DemoChannel, type DemoModel, type LifecycleEvent, type NodeMode } from "./app/demo-view";
+import { DemoView, type DemoBackup, type DemoActions, type DemoPendingJoyId, type JoyIdStage, type DemoActivity, type DemoChannel, type DemoModel, type LifecycleEvent, type NodeMode } from "./app/demo-view";
 import { CKB, parseCkb, toHex, type Unit } from "./app/format";
 
 // Tokens the demo names, by type script hash. Stable++ RUSD is the token Fiber's testnet nodes accept.
@@ -59,10 +59,26 @@ type RecoveryApi = {
   backups: DemoBackup[];
   legacyAddress?: string;
   createEvmBackup: () => Promise<unknown>;
+  /** From 0.2.7 it needs no CCC signer and works on this cross-origin isolated page. */
+  createJoyIdBackup?: (signer?: undefined, options?: { onStage?: (stage: JoyIdStage) => void; signal?: AbortSignal }) => Promise<unknown>;
   enable: (backups: unknown[]) => Promise<unknown>;
   addBackup: (backup: unknown) => Promise<unknown>;
   removeBackup: (backup: DemoBackup) => Promise<unknown>;
+  /** From 0.2.7: a JoyID backup the page came back from JoyID with. Its presence marks an SDK whose JoyID backups work here. */
+  pendingJoyIdBackup?: { operation?: "enable" | "add"; status: DemoPendingJoyId["status"]; error?: Error };
+  dismissPendingJoyIdBackup?: () => void;
 };
+
+/** Whether the SDK's JoyID backups work on this page: 0.2.6 and earlier need a JoyID window this page can't keep. */
+function joyIdSupported(recovery: RecoveryApi | undefined): boolean {
+  return Boolean(recovery && typeof recovery.dismissPendingJoyIdBackup === "function" && recovery.createJoyIdBackup);
+}
+
+function requireJoyId(recovery: RecoveryApi | undefined): NonNullable<RecoveryApi["createJoyIdBackup"]> {
+  const current = requireRecovery(recovery);
+  if (!joyIdSupported(current)) throw new Error("This KeyWay SDK can't add a JoyID backup on this page");
+  return current.createJoyIdBackup!;
+}
 
 function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
   nodeMode: NodeMode;
@@ -85,7 +101,7 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
   refreshBalanceRef.current = account.refreshBalance;
   const signerRef = useRef(account.signer);
   signerRef.current = account.signer;
-  const recovery = (account as { recovery?: RecoveryApi }).recovery;
+  const recovery = (account as unknown as { recovery?: RecoveryApi }).recovery;
   const recoveryRef = useRef(recovery);
   recoveryRef.current = recovery;
 
@@ -203,6 +219,18 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
       const current = requireRecovery(recoveryRef.current);
       await current.addBackup(await current.createEvmBackup());
     },
+    // JoyID starts in the click: the SDK opens its window before anything here awaits.
+    enableRecoveryWithJoyId: async (onStage, signal) => {
+      const current = requireRecovery(recoveryRef.current);
+      const proof = await requireJoyId(current)(undefined, { onStage, signal });
+      await current.enable([proof]);
+      await refreshBalanceRef.current().catch(() => undefined);
+    },
+    addJoyIdBackup: async (onStage, signal) => {
+      const current = requireRecovery(recoveryRef.current);
+      await current.addBackup(await requireJoyId(current)(undefined, { onStage, signal }));
+    },
+    dismissPendingJoyId: () => recoveryRef.current?.dismissPendingJoyIdBackup?.(),
     removeBackup: async (backup) => { await requireRecovery(recoveryRef.current).removeBackup(backup); },
     getEmailThreshold: async () => (await requireSigner(signerRef.current).getDailyConfirmationAmounts()).ckb ?? null,
     setEmailThreshold: (shannons) => requireSigner(signerRef.current).setDailyConfirmationAmount("ckb", shannons),
@@ -244,7 +272,17 @@ function LiveWallet({ nodeMode, events, resetEvents, setMode }: {
     failedAt,
     channels,
     activity: [...activity, ...payments],
-    recovery: recovery && { status: recovery.status, backups: recovery.backups, legacyAddress: recovery.legacyAddress },
+    recovery: recovery && {
+      status: recovery.status,
+      backups: recovery.backups,
+      legacyAddress: recovery.legacyAddress,
+      joyId: joyIdSupported(recovery),
+      pendingJoyId: recovery.pendingJoyIdBackup && {
+        operation: recovery.pendingJoyIdBackup.operation,
+        status: recovery.pendingJoyIdBackup.status,
+        error: recovery.pendingJoyIdBackup.error ? readable(recovery.pendingJoyIdBackup.error, "The JoyID backup couldn't be finished.") : undefined,
+      },
+    },
   };
   return <DemoView model={model} actions={actions} />;
 }
