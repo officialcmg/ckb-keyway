@@ -244,6 +244,16 @@ test("a padded funding history only delays the scan: it resumes until it reaches
   } as unknown as ccc.Client;
   const partial = await chainView(flaky).fundingHistory(lock);
   assert.deepEqual(partial, { sawOutput: true, cursor: "400", error: "indexer timeout" });
+  // So does a failing check of the newest page after the forward scan has read pages.
+  const newestFails = {
+    async findTransactionsPaged(_key: unknown, order: string, limit: number, after?: string) {
+      if (order === "desc") throw new Error("indexer timeout");
+      const start = after ? Number(after) : 0;
+      return { transactions: entries.slice(start, start + Number(limit)), lastCursor: String(start + Number(limit)) };
+    },
+  } as unknown as ccc.Client;
+  const kept = await chainView(newestFails, { maxPages: 3 }).fundingHistory(lock);
+  assert.deepEqual(kept, { sawOutput: true, cursor: "600", error: "indexer timeout" });
 });
 
 test("the funding outpoint is the cell the spend consumed, not the first cell under the lock", async () => {
