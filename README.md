@@ -1,6 +1,6 @@
 # CKB KeyWay
 
-> The Better Auth/Resend backend and updated demo are deployed. Use SDK 0.2.0; authentication in 0.1.0 is incompatible with the replacement backend. Real OTP delivery, two-device managed wallet recovery, Lit funding, bidirectional Fiber payments and cooperative test-channel closure passed. Legacy test-data deletion remains blocked by the execution safety reviewer; see [operator status](docs/AUTH_REPLACEMENT.md).
+> KeyWay runs on CKB testnet only.
 
 CKB KeyWay is reusable email-authenticated wallet infrastructure for Fiber Network. It combines Better Auth email OTP and Resend delivery, a Lit Chipotle PKP, CCC transaction construction, and a hosted or browser Fiber node so an application can recover a stable CKB identity and externally fund Fiber channels without exporting the PKP private key.
 
@@ -9,11 +9,11 @@ The repository contains two independent deliverables:
 - The public React SDK under `src/sdk`, including its framework-independent browser client.
 - A standalone Node/Postgres backend and a Next.js reference wallet demonstrating login, recovery, channel activation, invoices, and payments.
 
-Project overview: [ckb-keyway.vercel.app](https://ckbkeyway.dev)
+Project overview: [ckbkeyway.dev](https://ckbkeyway.dev)
 
-Live testnet wallet: [ckb-keyway.vercel.app/app](https://ckbkeyway.dev/app)
+Live testnet wallet: [ckbkeyway.dev/app](https://ckbkeyway.dev/app)
 
-React SDK documentation: [ckb-keyway-docs.vercel.app](https://docs.ckbkeyway.dev)
+React SDK documentation: [docs.ckbkeyway.dev](https://docs.ckbkeyway.dev)
 
 npm package: [@ckb-keyway/react](https://www.npmjs.com/package/@ckb-keyway/react)
 
@@ -52,7 +52,7 @@ Configure Better Auth, Postgres and a verified Resend sender using `.env.example
 
 The public package owns email OTP, the login modal, wallet provisioning, a CCC signer, and the user's Fiber node behind one provider. The node is hosted by KeyWay by default (`fiberNode="hosted"`); a browser node (`fiberNode="browser"`) is an explicit option.
 
-Create an application at [ckb-keyway.vercel.app/dashboard](https://ckbkeyway.dev/dashboard), register its exact development and production origins, and copy its public app ID.
+Create an application at [ckbkeyway.dev/dashboard](https://ckbkeyway.dev/dashboard), register its exact development and production origins, and copy its public app ID.
 
 ```sh
 npm install @ckb-keyway/react
@@ -205,7 +205,7 @@ The production deployment also sends `Cross-Origin-Opener-Policy: same-origin` a
 
 ## Upstream foundations
 
-- `@nervosnetwork/fiber-js` `0.9.0-rc7`
+- `@nervosnetwork/fiber-js` `0.9.1`
 - `@fiber-pay/sdk` `0.2.7`
 - `@ckb-ccc/core` `1.16.1`
 - Better Auth `1.7.7` and Resend `6.32.1` (private backend only)
