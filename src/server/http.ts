@@ -40,6 +40,7 @@ import { recordSigningEvent } from "./security-alerts.ts";
 import { messageSigning, signingSettings, transactionSigning, type SigningContext } from "./general-signing.ts";
 import { recoveryBackupChange, recoverySetup, settleRecoveryChange } from "./recovery.ts";
 import { sweepLegacyAfterSignIn } from "./legacy-sweep.ts";
+import { parseWatchtowerRequest, watchtowerRequest } from "./watchtower.ts";
 
 export async function handleKeyWayRequest(request: Request): Promise<Response> {
   const cors = await corsHeaders(request);
@@ -84,6 +85,7 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
       : path === "/api/keyway/recovery-backups" ? await generalSigningRequest(request, "recovery-backups")
       : path === "/api/keyway/developer/apps" ? await developerAppsRequest(request)
       : path === "/api/keyway/managed-node" ? await managedNodeHttpRequest(request)
+      : path === "/api/keyway/watchtower" ? await watchtowerHttpRequest(request)
       : jsonError("Not found", 404);
     for (const [name, value] of cors) response.headers.set(name, value);
     return response;
@@ -132,6 +134,19 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
   return Response.json(result, {
     headers: { "Cache-Control": "no-store" },
   });
+}
+
+/**
+ * A browser node registers its channels with KeyWay's watchtower and sends the newest revocation after every
+ * payment, so a revoked commitment is punished while the tab is closed. Only the user's own channels are visible.
+ */
+async function watchtowerHttpRequest(request: Request): Promise<Response> {
+  const user = await authenticateUser(request);
+  const parsed = parseWatchtowerRequest(await objectBody(request, "Invalid watchtower request"));
+  // The SDK sends only the newest revocation per channel, so even a busy node stays well under this.
+  const limit = await consumeRateLimit(`watchtower:${user.id}`, { max: parsed.operation === "status" ? 30 : 240, window: 60 });
+  if (!limit.allowed) throw new Error(`Too many watchtower updates. Try again in ${limit.retryAfter ?? 60} seconds`);
+  return Response.json(await watchtowerRequest(user, parsed), { headers: { "Cache-Control": "no-store" } });
 }
 
 /** The user's own CKB lock, in Fiber RPC shape. */

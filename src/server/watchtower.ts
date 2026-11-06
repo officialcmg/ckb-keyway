@@ -1,0 +1,595 @@
+import * as ccc from "@ckb-ccc/core";
+import { secp256k1 } from "@noble/curves/secp256k1.js";
+import { sha256 } from "@noble/hashes/sha2.js";
+import type { User } from "./auth-user.ts";
+import { database, type DatabaseSql } from "./database.ts";
+import { COMMITMENT_LOCK, XUDT_COMPATIBLE_WITNESS, blake160, commitmentLockCellDeps } from "../sdk/browser/watchtower-settle.ts";
+
+/**
+ * KeyWay's watchtower for browser nodes. It punishes a peer that publishes a revoked commitment while the user's
+ * tab is closed, and nothing else.
+ *
+ * A browser node sends it, per channel, only the two funding public keys (to find the channel on-chain) and the
+ * latest revocation data Fiber produces on every RevokeAndAck: a commitment number, the 64-byte MuSig2 signature
+ * both parties made over the revocation output, and that output. The commitment lock's revocation path checks only
+ * that signature over output 0, its data and the lock args (fiber-scripts commitment-lock `auth()`), so the
+ * watchtower can add its own cell to pay the fee but cannot change where the money goes: output 0 pays the whole
+ * channel to the user's own shutdown script. It never receives the node key, the settlement key, TLC keys,
+ * preimages or settlement data; claiming the user's share after an honest force close stays with the in-page
+ * watchtower (watchtower-settle.ts).
+ */
+
+export const NETWORK = "testnet" as const;
+/** Fiber 0.9.1's funding lock (config/testnet/config.yml `FundingLock`). */
+export const FUNDING_LOCK = { codeHash: "0x6c67887fe201ee0c7853f1682c0b77c0e6214044c156c7558269390a8afa6d7c", hashType: "type" } as const;
+/** Fiber's revocation tx fee rate (watchtower/actor.rs `FeeCalculator::new(1000)`), shannons per 1000 bytes. */
+const FEE_RATE = 1000n;
+/** Active (not yet finished) channels one user may have watched; Fiber nodes rarely hold more than a few. */
+export const MAX_WATCHED_CHANNELS = 64;
+const MAX_OUTPUT_BYTES = 512;
+const MAX_OUTPUT_DATA_BYTES = 64;
+const FINISHED_RETENTION_DAYS = 30;
+/** A channel whose funding never appears on-chain (an abandoned open) is dropped after this long. */
+const UNFUNDED_RETENTION_DAYS = 14;
+
+// ---------------------------------------------------------------------------------------------------------------
+// MuSig2 key aggregation (BIP327 KeyAgg, as the `musig2` crate Fiber uses): Fiber's funding and commitment locks
+// commit to blake160 of the aggregated x-only key.
+
+const encoder = new TextEncoder();
+function taggedHash(tag: string, ...parts: Uint8Array[]): Uint8Array {
+  const tagHash = sha256(encoder.encode(tag));
+  return sha256(ccc.bytesConcat(tagHash, tagHash, ...parts));
+}
+const sameBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((byte, i) => byte === b[i]);
+const compareBytes = (a: Uint8Array, b: Uint8Array) => {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) if (a[i] !== b[i]) return a[i] - b[i];
+  return a.length - b.length;
+};
+
+/** The aggregated x-only public key of `keys` (33-byte compressed points), in the given order. */
+export function keyAggXOnly(keys: Uint8Array[]): Uint8Array {
+  const list = taggedHash("KeyAgg list", ...keys);
+  const second = keys.find((key) => !sameBytes(key, keys[0]));
+  let total = secp256k1.Point.ZERO;
+  for (const key of keys) {
+    const coefficient = second && sameBytes(key, second)
+      ? 1n
+      : BigInt(ccc.hexFrom(taggedHash("KeyAgg coefficient", list, key))) % secp256k1.Point.Fn.ORDER;
+    total = total.add(secp256k1.Point.fromBytes(key).multiply(coefficient));
+  }
+  return total.toBytes(true).slice(1);
+}
+
+/** The funding cell's lock args: blake160 of the aggregate of both funding keys, sorted (watchtower/store.rs). */
+export function fundingLockArgs(localFundingPubkey: ccc.HexLike, remoteFundingPubkey: ccc.HexLike): ccc.Hex {
+  const keys = [ccc.bytesFrom(localFundingPubkey), ccc.bytesFrom(remoteFundingPubkey)].sort(compareBytes);
+  return ccc.hexFrom(blake160(keyAggXOnly(keys)));
+}
+
+/**
+ * The key of the commitment lock on the peer's commitments: the aggregate of [local, remote] (channel.rs
+ * `get_commitment_lock_script_xonly(true)`). The node's own commitments use [remote, local].
+ */
+export function peerCommitmentKey(localFundingPubkey: ccc.HexLike, remoteFundingPubkey: ccc.HexLike): ccc.Hex {
+  return ccc.hexFrom(keyAggXOnly([ccc.bytesFrom(localFundingPubkey), ccc.bytesFrom(remoteFundingPubkey)]));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Requests
+
+export type Revocation = {
+  commitmentNumber: bigint;
+  /** 64-byte MuSig2 signature both parties made over the revocation output. */
+  aggregatedSignature: ccc.Hex;
+  /** The revocation output, molecule-encoded CellOutput, as Fiber sends it. */
+  output: ccc.Hex;
+  /** The output's data, raw (Fiber sends it molecule-encoded; the length prefix is removed here). */
+  outputData: ccc.Hex;
+};
+
+export type WatchtowerRequest =
+  | { operation: "watch"; channelId: ccc.Hex; localFundingPubkey: ccc.Hex; remoteFundingPubkey: ccc.Hex; fundingUdtTypeScript: ccc.Script | null }
+  | { operation: "revoke"; channelId: ccc.Hex; revocation: Revocation }
+  | { operation: "unwatch"; channelId: ccc.Hex }
+  | { operation: "status" };
+
+function hexOf(value: unknown, bytes: number | [number, number], name: string): ccc.Hex {
+  const text = typeof value === "string" ? value.replace(/^0x/i, "") : "";
+  const [min, max] = typeof bytes === "number" ? [bytes, bytes] : bytes;
+  if (!/^(?:[0-9a-fA-F]{2})*$/.test(text) || text.length < min * 2 || text.length > max * 2) throw new Error(`Invalid watchtower ${name}`);
+  return `0x${text.toLowerCase()}`;
+}
+function pubkeyOf(value: unknown, name: string): ccc.Hex {
+  const key = hexOf(value, 33, name);
+  try {
+    secp256k1.Point.fromBytes(ccc.bytesFrom(key));
+  } catch {
+    throw new Error(`Invalid watchtower ${name}`);
+  }
+  return key;
+}
+function scriptOf(value: unknown): ccc.Script | null {
+  if (value === null || value === undefined) return null;
+  const script = value as { code_hash?: unknown; hash_type?: unknown; args?: unknown };
+  if (typeof script !== "object" || !["type", "data", "data1", "data2"].includes(String(script.hash_type))) throw new Error("Invalid watchtower token script");
+  return ccc.Script.from({
+    codeHash: hexOf(script.code_hash, 32, "token script"),
+    hashType: script.hash_type as ccc.HashType,
+    args: hexOf(script.args, [0, 256], "token script"),
+  });
+}
+
+/** Reads Fiber's RevocationData JSON (fiber-json-types watchtower.rs), checking every field's shape. */
+export function parseRevocation(value: unknown): Revocation {
+  const data = value as { commitment_number?: unknown; aggregated_signature?: unknown; output?: unknown; output_data?: unknown } | null;
+  if (!data || typeof data !== "object") throw new Error("Invalid watchtower revocation");
+  if (typeof data.commitment_number !== "string" || !/^0x[0-9a-f]{1,16}$/i.test(data.commitment_number)) throw new Error("Invalid watchtower commitment number");
+  const output = hexOf(data.output, [1, MAX_OUTPUT_BYTES], "revocation output");
+  let decoded: ccc.CellOutput;
+  try {
+    decoded = ccc.CellOutput.decode(output);
+  } catch {
+    throw new Error("Invalid watchtower revocation output");
+  }
+  if (decoded.toHex() !== output) throw new Error("Invalid watchtower revocation output");
+  const packedData = ccc.bytesFrom(hexOf(data.output_data, [4, 4 + MAX_OUTPUT_DATA_BYTES], "revocation output data"));
+  const length = new DataView(packedData.buffer, packedData.byteOffset).getUint32(0, true);
+  if (length !== packedData.length - 4) throw new Error("Invalid watchtower revocation output data");
+  return {
+    commitmentNumber: BigInt(data.commitment_number),
+    aggregatedSignature: hexOf(data.aggregated_signature, 64, "revocation signature"),
+    output,
+    outputData: ccc.hexFrom(packedData.slice(4)),
+  };
+}
+
+export function parseWatchtowerRequest(body: Record<string, unknown>): WatchtowerRequest {
+  switch (body.operation) {
+    case "watch":
+      return {
+        operation: "watch",
+        channelId: hexOf(body.channelId, 32, "channel ID"),
+        localFundingPubkey: pubkeyOf(body.localFundingPubkey, "funding key"),
+        remoteFundingPubkey: pubkeyOf(body.remoteFundingPubkey, "funding key"),
+        fundingUdtTypeScript: scriptOf(body.fundingUdtTypeScript),
+      };
+    case "revoke":
+      return { operation: "revoke", channelId: hexOf(body.channelId, 32, "channel ID"), revocation: parseRevocation(body.revocation) };
+    case "unwatch":
+      return { operation: "unwatch", channelId: hexOf(body.channelId, 32, "channel ID") };
+    case "status":
+      return { operation: "status" };
+    default:
+      throw new Error("Unsupported watchtower operation");
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Storage
+
+export type WatchState = "watching" | "penalty-sent" | "penalized" | "closed" | "missed";
+
+type Row = {
+  user_id: string;
+  channel_id: string;
+  local_funding_pubkey: string;
+  remote_funding_pubkey: string;
+  funding_lock_args: string;
+  peer_commitment_key: string;
+  funding_udt_type_script: { codeHash: string; hashType: string; args: string } | null;
+  commitment_number: string | null;
+  aggregated_signature: string | null;
+  revocation_output: string | null;
+  revocation_output_data: string | null;
+  state: WatchState;
+  detail: string | null;
+  funding_out_point: string | null;
+  closing_tx: string | null;
+  penalty_tx: string | null;
+  unwatch_requested_at: Date | null;
+  checked_at: Date | null;
+  created_at: Date;
+  updated_at: Date;
+};
+
+export type WatchedChannelStatus = {
+  channelId: string;
+  state: WatchState;
+  detail: string | null;
+  commitmentNumber: string | null;
+  fundingOutPoint: string | null;
+  closingTransaction: string | null;
+  penaltyTransaction: string | null;
+  checkedAt: string | null;
+  updatedAt: string;
+};
+
+function publicStatus(row: Row): WatchedChannelStatus {
+  return {
+    channelId: row.channel_id,
+    state: row.state,
+    detail: row.detail,
+    commitmentNumber: row.commitment_number === null ? null : `0x${BigInt(row.commitment_number).toString(16)}`,
+    fundingOutPoint: row.funding_out_point,
+    closingTransaction: row.closing_tx,
+    penaltyTransaction: row.penalty_tx,
+    checkedAt: row.checked_at?.toISOString() ?? null,
+    updatedAt: row.updated_at.toISOString(),
+  };
+}
+
+/** Handles one request from a signed-in user's browser node. Each user sees and changes only their own channels. */
+export async function watchtowerRequest(user: User, request: WatchtowerRequest, sql?: DatabaseSql): Promise<unknown> {
+  const db = sql ?? await database();
+  if (request.operation === "status") {
+    const rows = await db<Row[]>`select * from keyway_v2_watchtower_channels where user_id = ${user.id} order by created_at`;
+    return { channels: rows.map(publicStatus) };
+  }
+  if (request.operation === "watch") {
+    const fundingArgs = fundingLockArgs(request.localFundingPubkey, request.remoteFundingPubkey);
+    const peerKey = peerCommitmentKey(request.localFundingPubkey, request.remoteFundingPubkey);
+    const script = request.fundingUdtTypeScript ? { codeHash: request.fundingUdtTypeScript.codeHash, hashType: request.fundingUdtTypeScript.hashType, args: request.fundingUdtTypeScript.args } : null;
+    return db.begin(async (tx) => {
+      await tx`select pg_advisory_xact_lock(hashtextextended(${`watchtower:${user.id}`}, 0))`;
+      const [existing] = await tx<Row[]>`select * from keyway_v2_watchtower_channels where user_id = ${user.id} and channel_id = ${request.channelId}`;
+      if (existing) {
+        // Fiber sends the keys once per channel; they never change. A different pair is a different channel.
+        if (existing.local_funding_pubkey !== request.localFundingPubkey || existing.remote_funding_pubkey !== request.remoteFundingPubkey) {
+          throw new Error("This channel is already watched with other funding keys");
+        }
+        return { channel: publicStatus(existing) };
+      }
+      const [{ count }] = await tx<Array<{ count: string }>>`
+        select count(*) from keyway_v2_watchtower_channels where user_id = ${user.id} and state in ('watching', 'penalty-sent')
+      `;
+      if (Number(count) >= MAX_WATCHED_CHANNELS) throw new Error(`The watchtower already watches ${MAX_WATCHED_CHANNELS} open channels for this account`);
+      const [row] = await tx<Row[]>`
+        insert into keyway_v2_watchtower_channels (
+          user_id, channel_id, local_funding_pubkey, remote_funding_pubkey, funding_lock_args, peer_commitment_key, funding_udt_type_script
+        ) values (
+          ${user.id}, ${request.channelId}, ${request.localFundingPubkey}, ${request.remoteFundingPubkey}, ${fundingArgs}, ${peerKey},
+          ${script ? tx.json(script) : null}
+        ) returning *
+      `;
+      return { channel: publicStatus(row) };
+    });
+  }
+  if (request.operation === "revoke") {
+    const { revocation } = request;
+    return db.begin(async (tx) => {
+      const [existing] = await tx<Row[]>`
+        select * from keyway_v2_watchtower_channels where user_id = ${user.id} and channel_id = ${request.channelId} for update
+      `;
+      if (!existing) throw new Error("This channel is not watched; register it first");
+      // A revocation for a token channel pays the token back; for a CKB channel it has no type script.
+      const output = ccc.CellOutput.decode(revocation.output);
+      const expectedType = existing.funding_udt_type_script;
+      if ((output.type ? 1 : 0) !== (expectedType ? 1 : 0) || (output.type && expectedType && !output.type.eq(ccc.Script.from(expectedType as ccc.ScriptLike)))) {
+        throw new Error("The revocation output does not match the channel's asset");
+      }
+      // Only the newest revocation is kept: the commitment lock accepts it for every older commitment too.
+      if (existing.commitment_number !== null && BigInt(existing.commitment_number) >= revocation.commitmentNumber) {
+        return { channel: publicStatus(existing), stored: false };
+      }
+      const [row] = await tx<Row[]>`
+        update keyway_v2_watchtower_channels set
+          commitment_number = ${revocation.commitmentNumber.toString()},
+          aggregated_signature = ${revocation.aggregatedSignature},
+          revocation_output = ${revocation.output},
+          revocation_output_data = ${revocation.outputData},
+          updated_at = now()
+        where user_id = ${user.id} and channel_id = ${request.channelId}
+        returning *
+      `;
+      return { channel: publicStatus(row), stored: true };
+    });
+  }
+  // Fiber removes a channel when it closes. A revoked commitment can be what closed it, so the watchtower keeps
+  // following the channel until it knows how it closed; only then is the record dropped (see the pass).
+  const [row] = await db<Row[]>`
+    update keyway_v2_watchtower_channels set unwatch_requested_at = coalesce(unwatch_requested_at, now()), updated_at = now()
+    where user_id = ${user.id} and channel_id = ${request.channelId}
+    returning *
+  `;
+  return { channel: row ? publicStatus(row) : null };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Chain
+
+const u64be = (value: bigint) => {
+  const out = new Uint8Array(8);
+  new DataView(out.buffer).setBigUint64(0, value, false);
+  return out;
+};
+
+/** The revocation witness: header ‖ 0x00 (revocation) ‖ commitment number (BE) ‖ x-only key ‖ signature (actor.rs `build_revocation_tx`). */
+export function revocationWitness(revocation: Pick<Revocation, "commitmentNumber" | "aggregatedSignature">, peerKey: ccc.HexLike): ccc.Hex {
+  return ccc.hexFrom(ccc.bytesConcat(
+    XUDT_COMPATIBLE_WITNESS, new Uint8Array([0]), u64be(revocation.commitmentNumber), ccc.bytesFrom(peerKey), ccc.bytesFrom(revocation.aggregatedSignature),
+  ));
+}
+
+/** The commitment lock args' parts: key hash, delay, commitment number (big-endian). */
+export function commitmentArgs(args: ccc.HexLike) {
+  const bytes = ccc.bytesFrom(args);
+  if (bytes.length < 36) return undefined;
+  return { keyHash: ccc.hexFrom(bytes.slice(0, 20)), commitmentNumber: new DataView(bytes.buffer, bytes.byteOffset + 28, 8).getBigUint64(0, false) };
+}
+
+/**
+ * Builds the penalty transaction: the revoked commitment cell in, the revocation output out (the whole channel to
+ * the user's shutdown script), plus the watchtower's own plain cells to pay the fee and their change. The
+ * watchtower never takes anything from the channel: the revocation output must hold at least the commitment
+ * cell's capacity, so the change can only come from the watchtower's own inputs.
+ */
+export async function buildPenaltyTransaction(options: {
+  client: ccc.Client;
+  commitment: { outPoint: ccc.OutPointLike; capacity: bigint };
+  revocation: Revocation;
+  peerKey: ccc.HexLike;
+  feeSigner: ccc.Signer;
+  cellDeps?: ccc.CellDepLike[];
+}): Promise<ccc.Transaction> {
+  const output = ccc.CellOutput.decode(options.revocation.output);
+  if (output.capacity < options.commitment.capacity) throw new Error("The revocation output is smaller than the commitment cell");
+  const feeLock = (await options.feeSigner.getRecommendedAddressObj()).script;
+  const tx = ccc.Transaction.from({
+    cellDeps: options.cellDeps ?? await commitmentLockCellDeps(options.client, NETWORK),
+    inputs: [{ previousOutput: options.commitment.outPoint, since: 0 }],
+    outputs: [output, { capacity: 0, lock: feeLock }],
+    outputsData: [options.revocation.outputData, "0x"],
+    witnesses: [revocationWitness(options.revocation, options.peerKey)],
+  });
+  await tx.addCellDepsOfKnownScripts(options.client, ccc.KnownScript.Secp256k1Blake160);
+  await tx.completeInputsAddOne(options.feeSigner);
+  await tx.completeFeeChangeToOutput(options.feeSigner, 1, FEE_RATE);
+  for (const input of tx.inputs.slice(1)) {
+    await input.completeExtraInfos(options.client);
+    if (!input.cellOutput?.lock.eq(feeLock) || input.cellOutput.type || (input.outputData && input.outputData !== "0x")) throw new Error("The penalty fee must come from plain watchtower cells");
+  }
+  const feeIn = tx.inputs.slice(1).reduce((sum, input) => sum + input.cellOutput!.capacity, 0n);
+  if (tx.outputs[1].capacity > feeIn) throw new Error("The penalty change would take from the channel");
+  return options.feeSigner.signOnlyTransaction(tx);
+}
+
+export type ChainView = {
+  /** Every transaction that touched the funding lock: [txHash, isInput] pairs, oldest first. */
+  fundingHistory(lock: ccc.Script): Promise<Array<{ txHash: ccc.Hex; isInput: boolean; index: number }>>;
+  transaction(hash: ccc.Hex): Promise<{ tx: ccc.Transaction; committed: boolean; status: string } | undefined>;
+  isLive(outPoint: ccc.OutPoint): Promise<boolean>;
+  spender(outPoint: ccc.OutPoint, lock: ccc.Script): Promise<ccc.Hex | undefined>;
+};
+
+export function chainView(client: ccc.Client): ChainView {
+  return {
+    async fundingHistory(lock) {
+      const found: Array<{ txHash: ccc.Hex; isInput: boolean; index: number }> = [];
+      for await (const item of client.findTransactions({ script: lock, scriptType: "lock", scriptSearchMode: "exact" }, "asc", 50)) {
+        found.push({ txHash: item.txHash, isInput: item.isInput, index: Number(item.cellIndex) });
+        if (found.length >= 50) break;
+      }
+      return found;
+    },
+    async transaction(hash) {
+      const response = await client.getTransaction(hash);
+      return response ? { tx: response.transaction, committed: response.status === "committed", status: response.status } : undefined;
+    },
+    async isLive(outPoint) {
+      return Boolean(await client.getCellLive(outPoint, false));
+    },
+    async spender(outPoint, lock) {
+      for await (const item of client.findTransactions({ script: lock, scriptType: "lock", scriptSearchMode: "exact" }, "asc", 50)) {
+        if (!item.isInput) continue;
+        const tx = (await client.getTransaction(item.txHash))?.transaction;
+        if (tx?.inputs.some((input) => input.previousOutput.eq(outPoint))) return item.txHash;
+      }
+      return undefined;
+    },
+  };
+}
+
+export type Assessment =
+  | { state: "watching"; detail: string; fundingOutPoint?: string }
+  | { state: "closed"; detail: string; closingTx: ccc.Hex; fundingOutPoint: string }
+  | { state: "revoked"; closingTx: ccc.Hex; fundingOutPoint: string; commitment: { outPoint: ccc.OutPoint; capacity: bigint; lock: ccc.Script } };
+
+/**
+ * Where a watched channel stands on-chain (the decision Fiber's `run_periodic_check` makes): still open, closed
+ * by a transaction that needs nothing from the watchtower, or closed by a revoked commitment of the peer.
+ */
+export async function assessChannel(chain: ChainView, row: Pick<Row, "funding_lock_args" | "peer_commitment_key" | "commitment_number">): Promise<Assessment> {
+  const fundingLock = ccc.Script.from({ ...FUNDING_LOCK, args: row.funding_lock_args });
+  const history = await chain.fundingHistory(fundingLock);
+  const funded = history.find((item) => !item.isInput);
+  const spent = history.find((item) => item.isInput);
+  const fundingOutPoint = funded ? `${funded.txHash}:${funded.index}` : undefined;
+  if (!spent || !funded) return { state: "watching", detail: funded ? "open" : "funding not on-chain yet", ...(fundingOutPoint ? { fundingOutPoint } : {}) };
+  const closing = await chain.transaction(spent.txHash);
+  if (!closing?.committed) return { state: "watching", detail: "closing transaction not committed yet", fundingOutPoint: fundingOutPoint! };
+  const output = closing.tx.outputs[0];
+  const commitment = COMMITMENT_LOCK[NETWORK];
+  if (closing.tx.outputs.length !== 1 || output.lock.codeHash !== commitment.codeHash || output.lock.hashType !== "type") {
+    return { state: "closed", detail: "closed cooperatively", closingTx: spent.txHash, fundingOutPoint: fundingOutPoint! };
+  }
+  const args = commitmentArgs(output.lock.args);
+  if (!args) return { state: "closed", detail: "unexpected closing transaction", closingTx: spent.txHash, fundingOutPoint: fundingOutPoint! };
+  if (args.keyHash !== ccc.hexFrom(blake160(row.peer_commitment_key))) {
+    return { state: "closed", detail: "the user's node force-closed; the wallet claims the user's share when it next runs", closingTx: spent.txHash, fundingOutPoint: fundingOutPoint! };
+  }
+  if (row.commitment_number === null || BigInt(row.commitment_number) < args.commitmentNumber) {
+    return { state: "closed", detail: "the peer force-closed with the current state; the wallet claims the user's share when it next runs", closingTx: spent.txHash, fundingOutPoint: fundingOutPoint! };
+  }
+  return {
+    state: "revoked",
+    closingTx: spent.txHash,
+    fundingOutPoint: fundingOutPoint!,
+    commitment: { outPoint: ccc.OutPoint.from({ txHash: spent.txHash, index: 0 }), capacity: output.capacity, lock: output.lock },
+  };
+}
+
+export type PassDependencies = {
+  sql: DatabaseSql;
+  chain: ChainView;
+  /** Builds and sends the penalty; returns its hash. */
+  punish(row: Row, commitment: { outPoint: ccc.OutPoint; capacity: bigint }): Promise<ccc.Hex>;
+  log?: (message: string) => void;
+};
+
+/** One pass over every channel still being watched. */
+export async function runWatchtowerPass(deps: PassDependencies): Promise<void> {
+  const { sql, chain } = deps;
+  const log = deps.log ?? ((message: string) => console.info(`[watchtower] ${message}`));
+  await sql`
+    delete from keyway_v2_watchtower_channels
+    where state in ('penalized', 'closed', 'missed') and updated_at < now() - ${`${FINISHED_RETENTION_DAYS} days`}::interval
+  `;
+  const rows = await sql<Row[]>`
+    select * from keyway_v2_watchtower_channels where state in ('watching', 'penalty-sent')
+    order by checked_at asc nulls first limit 500
+  `;
+  for (const row of rows) {
+    try {
+      await checkChannel(deps, row, log);
+    } catch (error) {
+      log(`${row.channel_id}: check failed: ${error instanceof Error ? error.message : String(error)}`);
+      await sql`update keyway_v2_watchtower_channels set checked_at = now() where user_id = ${row.user_id} and channel_id = ${row.channel_id}`;
+    }
+  }
+}
+
+async function checkChannel(deps: PassDependencies, row: Row, log: (message: string) => void) {
+  const { sql, chain } = deps;
+  const save = (fields: Partial<Pick<Row, "state" | "detail" | "funding_out_point" | "closing_tx" | "penalty_tx">>) => sql`
+    update keyway_v2_watchtower_channels set
+      state = ${fields.state ?? row.state},
+      detail = ${fields.detail ?? row.detail},
+      funding_out_point = ${fields.funding_out_point ?? row.funding_out_point},
+      closing_tx = ${fields.closing_tx ?? row.closing_tx},
+      penalty_tx = ${fields.penalty_tx ?? row.penalty_tx},
+      checked_at = now(),
+      updated_at = case when ${fields.state ?? row.state} <> state or ${fields.detail ?? row.detail}::text is distinct from detail then now() else updated_at end
+    where user_id = ${row.user_id} and channel_id = ${row.channel_id}
+  `;
+  const assessment = await assessChannel(chain, row);
+  if (assessment.state === "watching") {
+    const age = Date.now() - row.created_at.getTime();
+    if (!assessment.fundingOutPoint && (row.unwatch_requested_at || age > UNFUNDED_RETENTION_DAYS * 86_400_000)) {
+      await sql`delete from keyway_v2_watchtower_channels where user_id = ${row.user_id} and channel_id = ${row.channel_id}`;
+      log(`${row.channel_id}: never funded; dropped`);
+      return;
+    }
+    if (row.detail !== assessment.detail) log(`${row.channel_id}: ${assessment.detail}`);
+    await save({ detail: assessment.detail, funding_out_point: assessment.fundingOutPoint ?? null });
+    return;
+  }
+  if (assessment.state === "closed") {
+    log(`${row.channel_id}: ${assessment.detail} (${assessment.closingTx})`);
+    await save({ state: "closed", detail: assessment.detail, closing_tx: assessment.closingTx, funding_out_point: assessment.fundingOutPoint });
+    return;
+  }
+  // The peer published a revoked commitment.
+  const { commitment } = assessment;
+  if (row.penalty_tx) {
+    const sent = await chain.transaction(row.penalty_tx as ccc.Hex);
+    if (sent?.committed) {
+      log(`${row.channel_id}: penalty committed (${row.penalty_tx})`);
+      await save({ state: "penalized", detail: "the peer published a revoked commitment; the penalty sent the whole channel to the user", closing_tx: assessment.closingTx });
+      return;
+    }
+    if (sent && sent.status !== "rejected" && sent.status !== "unknown") {
+      await save({ detail: `penalty ${sent.status}` });
+      return;
+    }
+  }
+  if (!(await chain.isLive(commitment.outPoint))) {
+    const by = await chain.spender(commitment.outPoint, commitment.lock);
+    log(`${row.channel_id}: revoked commitment already spent by ${by ?? "an unknown transaction"}`);
+    await save({ state: "missed", detail: "the revoked commitment was spent before the penalty", closing_tx: assessment.closingTx });
+    return;
+  }
+  log(`${row.channel_id}: the peer published revoked commitment ${assessment.closingTx}; sending the penalty`);
+  const hash = await deps.punish(row, commitment);
+  log(`${row.channel_id}: penalty sent ${hash}`);
+  await save({ state: "penalty-sent", detail: "penalty sent", penalty_tx: hash, closing_tx: assessment.closingTx, funding_out_point: assessment.fundingOutPoint });
+}
+
+/** The penalty, built from a stored row and sent with the watchtower's fee key. */
+export function penaltySender(client: ccc.Client, feeSigner: ccc.Signer) {
+  return async (row: Row, commitment: { outPoint: ccc.OutPoint; capacity: bigint }) => {
+    if (row.commitment_number === null || !row.aggregated_signature || !row.revocation_output || row.revocation_output_data === null) {
+      throw new Error("No revocation data");
+    }
+    const tx = await buildPenaltyTransaction({
+      client,
+      commitment,
+      revocation: {
+        commitmentNumber: BigInt(row.commitment_number),
+        aggregatedSignature: row.aggregated_signature as ccc.Hex,
+        output: row.revocation_output as ccc.Hex,
+        outputData: row.revocation_output_data as ccc.Hex,
+      },
+      peerKey: row.peer_commitment_key,
+      feeSigner,
+    });
+    return client.sendTransaction(tx);
+  };
+}
+
+/**
+ * Runs the watchtower inside this process when `KEYWAY_WATCHTOWER_FEE_KEY` is set: a pass every 60 s (as Fiber's
+ * own watchtower), by whichever API instance holds the watchtower's advisory lock, so replicas never race.
+ * Returns a function that stops it.
+ */
+export function startWatchtower(env: NodeJS.ProcessEnv = process.env): () => Promise<void> {
+  const feeKey = env.KEYWAY_WATCHTOWER_FEE_KEY;
+  if (!feeKey) {
+    console.warn("[watchtower] KEYWAY_WATCHTOWER_FEE_KEY is not set; the browser-node watchtower is not running in this process");
+    return async () => undefined;
+  }
+  if (!/^0x[0-9a-fA-F]{64}$/.test(feeKey)) throw new Error("KEYWAY_WATCHTOWER_FEE_KEY must be a 0x-prefixed 32-byte key");
+  const client = env.KEYWAY_WATCHTOWER_CKB_RPC_URL ? new ccc.ClientPublicTestnet({ url: env.KEYWAY_WATCHTOWER_CKB_RPC_URL }) : new ccc.ClientPublicTestnet();
+  const feeSigner = new ccc.SignerCkbPrivateKey(client, feeKey);
+  const interval = Number(env.KEYWAY_WATCHTOWER_INTERVAL_SECONDS ?? 60) * 1000;
+  let stopped = false;
+  let running: Promise<void> | undefined;
+  let lock: Awaited<ReturnType<DatabaseSql["reserve"]>> | undefined;
+  const tick = async () => {
+    const sql = await database();
+    if (!lock) {
+      const connection = await sql.reserve();
+      const [row] = await connection<Array<{ locked: boolean }>>`select pg_try_advisory_lock(hashtext('keyway-watchtower')) as locked`;
+      if (!row?.locked) {
+        connection.release();
+        return;
+      }
+      lock = connection;
+      console.info(`[watchtower] running; fee address ${await feeSigner.getRecommendedAddress()}`);
+    }
+    await runWatchtowerPass({ sql, chain: chainView(client), punish: penaltySender(client, feeSigner) });
+  };
+  const loop = () => {
+    if (stopped) return;
+    running = tick().catch((error) => {
+      console.error("[watchtower] pass failed", error instanceof Error ? error.message : error);
+      // A lost connection also loses the lock; take it again next time.
+      lock?.release();
+      lock = undefined;
+    }).finally(() => {
+      running = undefined;
+      if (!stopped) timer = setTimeout(loop, interval);
+    });
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined = setTimeout(loop, 1000);
+  return async () => {
+    stopped = true;
+    if (timer) clearTimeout(timer);
+    await running;
+    if (lock) {
+      await lock`select pg_advisory_unlock(hashtext('keyway-watchtower'))`.catch(() => undefined);
+      lock.release();
+      lock = undefined;
+    }
+  };
+}
