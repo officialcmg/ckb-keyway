@@ -20,6 +20,7 @@ import {
   checkJoyIdResponse,
   chooseJoyIdTransport,
   isJoyIdRecord,
+  joyIdBackupArguments,
   isReturnPath,
   joyIdRequest,
   JoyIdCancelledError,
@@ -429,4 +430,15 @@ test("JoyID return URLs stay on this site and drop stale JoyID parameters", () =
   } finally {
     globals.location = saved;
   }
+});
+
+test("createJoyIdBackup's options are kept with or without a signer", () => {
+  const signal = new AbortController().signal;
+  const options = { transport: "window" as const, signal, onStage: () => undefined };
+  const signer = { signMessage: async () => undefined } as unknown as ccc.Signer;
+  assert.deepEqual(joyIdBackupArguments(undefined, options), [undefined, options]);
+  assert.deepEqual(joyIdBackupArguments(options), [undefined, options]);
+  assert.deepEqual(joyIdBackupArguments(signer, options), [signer, options]);
+  assert.deepEqual(joyIdBackupArguments(signer), [signer, {}]);
+  assert.deepEqual(joyIdBackupArguments(), [undefined, {}]);
 });

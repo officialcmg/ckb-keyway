@@ -7,10 +7,14 @@
     "window: recovery turned on after preview and emailed code": "ok",
     "window: main tab never reloaded and stayed cross-origin isolated": "ok",
     "window: helper closed itself": "ok",
-    "window: helper stripped _data_ from its address bar": "ok",
+    "window: the SDK reported connecting, then signing": "ok",
+    "window: the helper stripped _data_ after each return from JoyID": "ok",
     "known connection skips connect": "ok",
     "rejection in JoyID is a cancel, nothing previewed": "ok",
     "helper closed after a rejection": "ok",
+    "cancel: the button showed the signing stage while JoyID was open": "ok",
+    "cancel: Cancel ends the wait at once and the card is usable again": "ok",
+    "cancel: nothing was previewed": "ok",
     "redirect: connect and sign as two full-page round trips": "ok",
     "redirect: returns to the same page (browser mode kept)": "ok",
     "redirect: no fetch ran while the answer was in the URL": "ok",
@@ -29,18 +33,21 @@
     "appHeaders": {
       "coop": "same-origin",
       "coep": "require-corp",
-      "csp": "default-src 'self'; script-src 'self' 'nonce-OQnrIbzCR964XkY…"
+      "csp": "default-src 'self'; script-src 'self' 'nonce-NwZCCTYteLvtvg3…"
     },
-    "stageSeen": "Connecting JoyID…",
+    "stagesSeen": [
+      "Connecting JoyID…",
+      "Waiting for JoyID…"
+    ],
     "joyIdVisits": [
       {
         "path": "/auth",
         "type": "redirect",
         "referer": "http://localhost:3100/",
-        "redirectURL": "http://localhost:3100/app?keyway-joyid=e8fecc302a54fad9deeda0c5199a3615&joyid-redirect=true",
+        "redirectURL": "http://localhost:3100/app?keyway-joyid=22479e4c0637293dc1220f886930b52f&joyid-redirect=true",
         "state": {
           "v": 1,
-          "id": "70b95c54535e12ae0293c3ba6704a6e9"
+          "id": "34c0503bc01e7cbd706250249b82a35b"
         },
         "answered": "auth"
       },
@@ -48,29 +55,29 @@
         "path": "/sign-message",
         "type": "redirect",
         "referer": "http://localhost:3100/",
-        "redirectURL": "http://localhost:3100/app?keyway-joyid=e8fecc302a54fad9deeda0c5199a3615&joyid-redirect=true",
+        "redirectURL": "http://localhost:3100/app?keyway-joyid=22479e4c0637293dc1220f886930b52f&joyid-redirect=true",
         "state": {
           "v": 1,
-          "id": "3d2e250c2fcf400f540cc942ed5ef10e"
+          "id": "bda0be5416a9153d636695401a6a9671"
         },
         "answered": "signed",
         "challenge": "KeyWay account recovery…"
       }
     ],
     "helperUrls": [
-      "http://localhost:3100/app?keyway-joyid=e8fecc302a54fad9deeda0c5199a3615",
+      "http://localhost:3100/app?keyway-joyid=22479e4c0637293dc1220f886930b52f",
       "https://testnet.joyid.dev/auth?type=redirect&_data_=…",
-      "http://localhost:3100/app?keyway-joyid=e8fecc302a54fad9deeda0c5199a3615&joyid-redirect=true&_data_=…",
-      "http://localhost:3100/app?keyway-joyid=e8fecc302a54fad9deeda0c5199a3615",
-      "http://localhost:3100/app?keyway-joyid=e8fecc302a54fad9deeda0c5199a3615&joyid-redirect=true&_data_=…",
-      "http://localhost:3100/app?keyway-joyid=e8fecc302a54fad9deeda0c5199a3615",
-      "http://localhost:3100/app?keyway-joyid=e8fecc302a54fad9deeda0c5199a3615",
+      "http://localhost:3100/app?keyway-joyid=22479e4c0637293dc1220f886930b52f&joyid-redirect=true&_data_=…",
+      "http://localhost:3100/app?keyway-joyid=22479e4c0637293dc1220f886930b52f",
+      "http://localhost:3100/app?keyway-joyid=22479e4c0637293dc1220f886930b52f&joyid-redirect=true&_data_=…",
+      "http://localhost:3100/app?keyway-joyid=22479e4c0637293dc1220f886930b52f",
+      "http://localhost:3100/app?keyway-joyid=22479e4c0637293dc1220f886930b52f",
       "https://testnet.joyid.dev/sign-message?type=redirect&_data_=…",
-      "http://localhost:3100/app?keyway-joyid=e8fecc302a54fad9deeda0c5199a3615&joyid-redirect=true&_data_=…",
-      "http://localhost:3100/app?keyway-joyid=e8fecc302a54fad9deeda0c5199a3615",
-      "http://localhost:3100/app?keyway-joyid=e8fecc302a54fad9deeda0c5199a3615&joyid-redirect=true&_data_=…",
-      "http://localhost:3100/app?keyway-joyid=e8fecc302a54fad9deeda0c5199a3615",
-      "http://localhost:3100/app?keyway-joyid=e8fecc302a54fad9deeda0c5199a3615"
+      "http://localhost:3100/app?keyway-joyid=22479e4c0637293dc1220f886930b52f&joyid-redirect=true&_data_=…",
+      "http://localhost:3100/app?keyway-joyid=22479e4c0637293dc1220f886930b52f",
+      "http://localhost:3100/app?keyway-joyid=22479e4c0637293dc1220f886930b52f&joyid-redirect=true&_data_=…",
+      "http://localhost:3100/app?keyway-joyid=22479e4c0637293dc1220f886930b52f",
+      "http://localhost:3100/app?keyway-joyid=22479e4c0637293dc1220f886930b52f"
     ],
     "helperClosed": true,
     "main": {
@@ -87,17 +94,17 @@
       {
         "path": "/recovery",
         "operation": "preview",
-        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq96mycy0pq3unrtpmrnuy9p0x35l5r3hcyrknxrs"
+        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqqy3q5h0cfvalrmq2mfu24qzummk4fmszqu2fesyu"
       },
       {
         "path": "/recovery",
         "operation": "request-email-code",
-        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq96mycy0pq3unrtpmrnuy9p0x35l5r3hcyrknxrs"
+        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqqy3q5h0cfvalrmq2mfu24qzummk4fmszqu2fesyu"
       },
       {
         "path": "/recovery",
         "operation": "enable",
-        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq96mycy0pq3unrtpmrnuy9p0x35l5r3hcyrknxrs"
+        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqqy3q5h0cfvalrmq2mfu24qzummk4fmszqu2fesyu"
       },
       {
         "path": "/recovery",
@@ -113,6 +120,22 @@
       }
     ],
     "helperClosed": true,
+    "apiCalls": [
+      {
+        "path": "/recovery",
+        "operation": "challenge"
+      }
+    ]
+  },
+  "2b. cancel while JoyID is open": {
+    "waiting": true,
+    "idleAgain": true,
+    "joyIdVisits": [
+      {
+        "path": "/sign-message",
+        "answered": "held"
+      }
+    ],
     "apiCalls": [
       {
         "path": "/recovery",
@@ -184,22 +207,22 @@
     "fetchesWithTheAnswerInTheUrl": [],
     "requestsWithTheAnswerInReferer": [
       {
-        "url": "http://localhost:3100/_next/static/media/26aa48c1bdeb5547-s.p.30a_ou6vtcpon.woff",
+        "url": "http://localhost:3100/_next/static/media/916cd8a3bde3edf8-s.p.0oace-s_gkfks.woff",
         "referer": "…_data_=…",
         "type": "font"
       },
       {
-        "url": "http://localhost:3100/_next/static/media/99e609270109b47d-s.p.40sczeszzbjw1.woff",
+        "url": "http://localhost:3100/_next/static/media/b596f47277c1e818-s.p.30a_ou6vtcpon.woff",
         "referer": "…_data_=…",
         "type": "font"
       },
       {
-        "url": "http://localhost:3100/_next/static/media/effe91970fc4db64-s.p.0oace-s_gkfks.woff",
+        "url": "http://localhost:3100/_next/static/media/d6c1ff7e86974212-s.p.40sczeszzbjw1.woff",
         "referer": "…_data_=…",
         "type": "font"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/3un39emc2naih.css",
+        "url": "http://localhost:3100/_next/static/chunks/3lzz1t1nl51az.css",
         "referer": "…_data_=…",
         "type": "stylesheet"
       },
@@ -214,67 +237,67 @@
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/0eo1cde-rr3bs.js",
+        "url": "http://localhost:3100/_next/static/chunks/2whg2n5r_t_s1.js",
         "referer": "…_data_=…",
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/0bma92pht_c97.js",
+        "url": "http://localhost:3100/_next/static/chunks/23e6jep2anmtk.js",
         "referer": "…_data_=…",
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/1gd3h8x2ifg_a.js",
+        "url": "http://localhost:3100/_next/static/chunks/2pdavqnl1f8l_.js",
         "referer": "…_data_=…",
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/turbopack-3jyd33d-ci9l1.js",
+        "url": "http://localhost:3100/_next/static/chunks/turbopack-2u1d16houkiyo.js",
         "referer": "…_data_=…",
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/3fntmmi971322.js",
+        "url": "http://localhost:3100/_next/static/chunks/3qfy96eoyh-ek.js",
         "referer": "…_data_=…",
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/1co04a3o71x4i.js",
+        "url": "http://localhost:3100/_next/static/chunks/2yvaty-w6qa25.js",
         "referer": "…_data_=…",
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/30_x8ohec8exv.js",
+        "url": "http://localhost:3100/_next/static/chunks/3ca9759xq59bk.js",
         "referer": "…_data_=…",
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/2eyltbqi53umb.js",
+        "url": "http://localhost:3100/_next/static/chunks/1atu3wfcjn1jl.js",
         "referer": "…_data_=…",
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/014_zssg_0vku.js",
+        "url": "http://localhost:3100/_next/static/chunks/2m1bn8ycztio5.js",
         "referer": "…_data_=…",
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/media/26aa48c1bdeb5547-s.p.30a_ou6vtcpon.woff",
+        "url": "http://localhost:3100/_next/static/media/916cd8a3bde3edf8-s.p.0oace-s_gkfks.woff",
         "referer": "…_data_=…",
         "type": "font"
       },
       {
-        "url": "http://localhost:3100/_next/static/media/99e609270109b47d-s.p.40sczeszzbjw1.woff",
+        "url": "http://localhost:3100/_next/static/media/b596f47277c1e818-s.p.30a_ou6vtcpon.woff",
         "referer": "…_data_=…",
         "type": "font"
       },
       {
-        "url": "http://localhost:3100/_next/static/media/effe91970fc4db64-s.p.0oace-s_gkfks.woff",
+        "url": "http://localhost:3100/_next/static/media/d6c1ff7e86974212-s.p.40sczeszzbjw1.woff",
         "referer": "…_data_=…",
         "type": "font"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/3un39emc2naih.css",
+        "url": "http://localhost:3100/_next/static/chunks/3lzz1t1nl51az.css",
         "referer": "…_data_=…",
         "type": "stylesheet"
       },
@@ -289,47 +312,47 @@
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/0eo1cde-rr3bs.js",
+        "url": "http://localhost:3100/_next/static/chunks/2whg2n5r_t_s1.js",
         "referer": "…_data_=…",
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/0bma92pht_c97.js",
+        "url": "http://localhost:3100/_next/static/chunks/23e6jep2anmtk.js",
         "referer": "…_data_=…",
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/1gd3h8x2ifg_a.js",
+        "url": "http://localhost:3100/_next/static/chunks/2pdavqnl1f8l_.js",
         "referer": "…_data_=…",
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/turbopack-3jyd33d-ci9l1.js",
+        "url": "http://localhost:3100/_next/static/chunks/turbopack-2u1d16houkiyo.js",
         "referer": "…_data_=…",
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/3fntmmi971322.js",
+        "url": "http://localhost:3100/_next/static/chunks/3qfy96eoyh-ek.js",
         "referer": "…_data_=…",
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/1co04a3o71x4i.js",
+        "url": "http://localhost:3100/_next/static/chunks/2yvaty-w6qa25.js",
         "referer": "…_data_=…",
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/30_x8ohec8exv.js",
+        "url": "http://localhost:3100/_next/static/chunks/3ca9759xq59bk.js",
         "referer": "…_data_=…",
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/2eyltbqi53umb.js",
+        "url": "http://localhost:3100/_next/static/chunks/1atu3wfcjn1jl.js",
         "referer": "…_data_=…",
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/014_zssg_0vku.js",
+        "url": "http://localhost:3100/_next/static/chunks/2m1bn8ycztio5.js",
         "referer": "…_data_=…",
         "type": "script"
       }
@@ -342,17 +365,17 @@
       {
         "path": "/recovery",
         "operation": "preview",
-        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq96mycy0pq3unrtpmrnuy9p0x35l5r3hcyrknxrs"
+        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqqy3q5h0cfvalrmq2mfu24qzummk4fmszqu2fesyu"
       },
       {
         "path": "/recovery",
         "operation": "request-email-code",
-        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq96mycy0pq3unrtpmrnuy9p0x35l5r3hcyrknxrs"
+        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqqy3q5h0cfvalrmq2mfu24qzummk4fmszqu2fesyu"
       },
       {
         "path": "/recovery",
         "operation": "enable",
-        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq96mycy0pq3unrtpmrnuy9p0x35l5r3hcyrknxrs"
+        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqqy3q5h0cfvalrmq2mfu24qzummk4fmszqu2fesyu"
       },
       {
         "path": "/recovery",

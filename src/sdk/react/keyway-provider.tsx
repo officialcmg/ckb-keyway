@@ -37,6 +37,7 @@ import {
   chooseJoyIdTransport,
   isJoyIdHelperWindow,
   isReturnPath,
+  joyIdBackupArguments,
   joyIdAppUrl,
   joyIdRecordClient,
   joyIdStateId,
@@ -678,8 +679,7 @@ export function KeyWayProvider({
   }
 
   function joyIdBackup(signerOrOptions?: ccc.Signer | JoyIdBackupOptions, maybeOptions?: JoyIdBackupOptions): Promise<RecoveryBackupProof> {
-    const joyIdSigner = isSigner(signerOrOptions) ? signerOrOptions : undefined;
-    const options = (joyIdSigner ? maybeOptions : signerOrOptions as JoyIdBackupOptions | undefined) ?? {};
+    const [joyIdSigner, options] = joyIdBackupArguments(signerOrOptions, maybeOptions);
     if (!wallet || !authToken || !user) return Promise.reject(new Error("Recover the CKB account before adding a backup"));
     if (joyIdSigner && joyIdSigner.signType !== ccc.SignerSignType.JoyId) return Promise.reject(new Error("A JoyID backup needs CCC's JoyID signer"));
     const publicKey = wallet.litPublicKey;
@@ -814,9 +814,6 @@ const noSubscription = () => () => undefined;
 // useLayoutEffect warns during server rendering in React 18.
 const useBrowserLayoutEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
 
-function isSigner(value: unknown): value is ccc.Signer {
-  return Boolean(value) && typeof (value as ccc.Signer).signMessage === "function";
-}
 
 function joyIdOperation(record: JoyIdRequestRecord | undefined): PendingJoyIdBackup["operation"] {
   return record?.op === "backup-add" ? "add" : "enable";

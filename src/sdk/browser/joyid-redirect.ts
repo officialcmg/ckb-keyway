@@ -276,6 +276,15 @@ export function rememberJoyIdConnection(joyIdAppURL: string, connection: { addre
   } catch { /* the next backup connects again */ }
 }
 
+/**
+ * `createJoyIdBackup`'s arguments: `(signer, options)`, `(undefined, options)` or `(options)`. A signer is anything
+ * with `signMessage`, as CCC's signers have.
+ */
+export function joyIdBackupArguments(first?: ccc.Signer | JoyIdBackupOptions, second?: JoyIdBackupOptions): [ccc.Signer | undefined, JoyIdBackupOptions] {
+  if (first && typeof (first as ccc.Signer).signMessage === "function") return [first as ccc.Signer, second ?? {}];
+  return [undefined, (first as JoyIdBackupOptions | undefined) ?? second ?? {}];
+}
+
 /** "popup" unless the page is cross-origin isolated; then a window on this site, or a redirect in an installed app. */
 export function chooseJoyIdTransport(transport: JoyIdTransport = "auto", page = joyIdPage()): "popup" | "window" | "redirect" {
   if (transport === "popup" || transport === "redirect") return transport;
