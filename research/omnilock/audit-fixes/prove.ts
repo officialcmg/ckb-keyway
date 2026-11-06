@@ -1,3 +1,5 @@
+// Run on 2026-11-01 against the version 2 (unsalted) verifiers; updated since only to follow the SDK's API, it no
+// longer reproduces those transactions (see research/backup-unlinking for the salted version).
 // Testnet proof of the audit fixes, with throwaway keys (keys.json, gitignored, never printed) and a local
 // Postgres for KeyWay's own records. Each step runs KeyWay's real code: the server's recovery flow (challenge,
 // preview, emailed code, enable/apply, settle once committed), then the rescue page's library for the backups'
@@ -100,7 +102,7 @@ async function change(kind: "add" | "remove") {
 
 async function rescueFor(name: "E1" | "J1", destination: string) {
   const rescue = await openRescueAccount(client, state.address);
-  const entry = name === "E1" ? rescueEntryForEvm(rescue, [evmAddressOf(keys.E1)]) : rescueEntryForJoyId(rescue, await (await joyIdSigner(keys.J1)).getRecommendedAddress());
+  const entry = name === "E1" ? await rescueEntryForEvm(client, rescue, [evmAddressOf(keys.E1)]) : await rescueEntryForJoyId(client, rescue, await (await joyIdSigner(keys.J1)).getRecommendedAddress());
   const plan = await planRescue(client, rescue, entry, destination);
   return { rescue, entry, plan };
 }
@@ -108,7 +110,7 @@ async function rescueFor(name: "E1" | "J1", destination: string) {
 /** Puts `signature` (made over whatever text) into the backup's admin witness of the prepared transaction. */
 async function withSignature(name: "E1" | "J1", destination: string, text: (approval: string, sighash: ccc.Hex) => string) {
   const { rescue, entry, plan } = await rescueFor(name, destination);
-  const spend = { client, lock: rescue.lock, omnilock: rescue.omnilock, list: rescue.entries, entry, adminList: rescue.adminList.outPoint, inputCapacity: rescue.ckb + rescue.tokenCkb };
+  const spend = { client, lock: rescue.lock, omnilock: rescue.omnilock, auths: rescue.auths, entry, adminList: rescue.adminList.outPoint, inputCapacity: rescue.ckb + rescue.tokenCkb };
   const prepared = await prepareRecoverySpend(plan.transaction, spend);
   const signed = text(prepared.text, prepared.sighash);
   const signature = name === "E1"
@@ -163,7 +165,7 @@ async function negative() {
   }
   // A backup trying to spend or move the AdminList, which sits under the Lit key's owner-only lock.
   const rescue = await openRescueAccount(client, state.address);
-  const entry = rescueEntryForEvm(rescue, [evmAddressOf(keys.E1)]);
+  const entry = await rescueEntryForEvm(client, rescue, [evmAddressOf(keys.E1)]);
   const listLock = adminListLock(state.recovery);
   const thief = await secp256k1Lock(client, publicKeyOf(keys.D2));
   const attempts: Array<[string, ccc.CellOutputLike[]]> = [
@@ -172,7 +174,7 @@ async function negative() {
   ];
   for (const [label, outputs] of attempts) {
     const transaction = ccc.Transaction.from({ inputs: [{ previousOutput: rescue.adminList.outPoint }], outputs, outputsData: outputs.map((output) => output.type ? rescue.adminList.outputData : "0x") });
-    const spend = { client, lock: listLock, omnilock: rescue.omnilock, list: rescue.entries, entry, adminList: rescue.adminList.outPoint, inputCapacity: rescue.adminList.cellOutput.capacity };
+    const spend = { client, lock: listLock, omnilock: rescue.omnilock, auths: rescue.auths, entry, adminList: rescue.adminList.outPoint, inputCapacity: rescue.adminList.cellOutput.capacity };
     // The text a backup would sign can't even be built for the moving one (data without a type is fine, a type
     // isn't refused by the shape), so sign the readable text the verifier would rebuild where it can, and the
     // old format otherwise.

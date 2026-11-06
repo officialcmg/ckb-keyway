@@ -9,8 +9,29 @@ lock's result.
 | Crate | What it is |
 |---|---|
 | `keyway-approval` | The readable text a backup signs, and the code that rebuilds it from the transaction (`chain`) |
-| `evm-personal-sign` | EVM wallets: EIP-191 `personal_sign` of that text, recovered with secp256k1 against the 20-byte address |
+| `evm-personal-sign` | EVM wallets: EIP-191 `personal_sign` of that text, recovered with secp256k1 and checked against the salted address |
 | `joyid-webauthn` | JoyID passkeys: a WebAuthn (P-256) assertion whose challenge is that text |
+
+## Salted identities
+
+A backup's identity never holds its own 20-byte ID (EVM address, or blake160 of the passkey's public key). It
+holds `blake160(id ‖ salt)`, where the salt is the account's AdminList type hash:
+
+```
+account lock args (54) = 0x00 ‖ blake160(Lit key) (20) ‖ 0x01 (administrator mode) ‖ AdminList type hash (32)
+salt                   = args[22..54]
+pubkey_hash            = blake160(id ‖ salt)        (the last 20 bytes of the exec preimage)
+```
+
+Omnilock execs the verifier with `ckb_exec_cell` (`c/ckb_identity.h`, `verify_via_exec`), which replaces the
+program but keeps the script group, so `load_script` in the verifier is the account's Omnilock lock, and args[22..54]
+is the `omni_root` Omnilock's `parse_args` (`c/omni_lock.c`) just used to find the AdminList and check the backup's
+SMT proof. `keyway_approval::chain::running_account_salt` reads it; anything but 54 bytes with flags exactly `0x01`
+exits 114. Both verifiers then check `blake160(recovered ID ‖ salt) == pubkey_hash`.
+
+The same backup in two accounts therefore has two unrelated identities, and an identity listed in one account is
+refused (101) in another, even by a list that copies it. The salt is public: whoever already knows a backup's ID
+can test it against an account's list, and a rescue's witness reveals the backup that signed it.
 
 ## The approval text (`keyway-approval`)
 
@@ -60,23 +81,24 @@ and runs both verifiers in CKB-VM on every transaction.
 ## `evm-personal-sign`
 
 ```
-preimage (62 bytes) = verifier code hash (32) ‖ 0x02 (data1) ‖ 0x00 (cell dep) ‖ u32 LE 0 ‖ u32 LE 0 ‖ EVM address (20)
+preimage (62 bytes) = verifier code hash (32) ‖ 0x02 (data1) ‖ 0x00 (cell dep) ‖ u32 LE 0 ‖ u32 LE 0 ‖ blake160(EVM address ‖ salt) (20)
 auth                = 0xFD ‖ blake160(preimage)
 signature (67)      = version 0x01 ‖ network (0 testnet, 1 mainnet) ‖ r ‖ s ‖ v
 ```
 
 `v` may be 27/28 or 0/1; a high `s` is accepted (normalised before recovery, as `ecrecover` does). The binary
-checks keccak256(`"\x19Ethereum Signed Message:\n"` ‖ decimal length ‖ text) recovers to the address
+checks that keccak256(`"\x19Ethereum Signed Message:\n"` ‖ decimal length ‖ text) recovers to an address whose salted hash is `pubkey_hash`
 (RustCrypto `k256` 0.13 without precomputed tables, `sha3` keccak).
 
-Exit codes: 0 success, 100 argument, 101 recovered address isn't the backup's, 102 signature encoding, 109
-signature out of range, 110–113 from the approval (network byte, shape, too long, syscall).
+Exit codes: 0 success, 100 argument, 101 recovered address salted isn't the identity's, 102 signature encoding, 109
+signature out of range, 110–114 from the approval (network byte, shape, too long, syscall, not a KeyWay account's lock).
 
 ## `joyid-webauthn`
 
 ```
 preimage (62 bytes) = verifier code hash (32) ‖ 0x02 (data1) ‖ 0x00 (cell dep) ‖ u32 LE 0 ‖ u32 LE 0 ‖ pubkey_hash (20)
-pubkey_hash         = blake160(64-byte uncompressed P-256 public key X ‖ Y)
+pubkey_hash         = blake160(id ‖ salt)
+id                  = blake160(64-byte uncompressed P-256 public key X ‖ Y)
                     = the JoyID main key's lock args without the 0x0001 prefix
 ```
 
@@ -101,7 +123,7 @@ What it checks:
 
 1. Five argument fields of 32, 1, 20, 32 and at most 1024 bytes, nothing else.
 2. The blob's version, lengths and zero padding.
-3. `blake160(public key) == pubkey_hash`.
+3. `blake160(blake160(public key) ‖ salt) == pubkey_hash`, the salt read from the running Omnilock's args.
 4. authenticatorData is at least 37 bytes and has the user-present flag (`0x01`).
 5. clientDataJSON is valid UTF-8 (a leading byte-order mark is refused) and exactly one JSON object (RFC 8259,
    nothing before or after it, nesting at most 8 deep, at most 32 top-level keys); top-level keys are unique after
@@ -112,7 +134,7 @@ What it checks:
 
 Exit codes: 0 success, 100 argument, 101 public key hash, 102 blob encoding, 103 authenticatorData too short,
 104 no user presence, 105 malformed clientDataJSON, 106 wrong type, 107 wrong challenge, 108 public key not on
-P-256, 109 signature, 110–113 from the approval.
+P-256, 109 signature, 110–114 from the approval.
 
 Not checked, on purpose: user verification (JoyID's page decides whether to ask for it) and rpIdHash/origin (a
 passkey only signs for its own relying party, so the key binding already ties the signature to JoyID).
@@ -131,15 +153,15 @@ nothing.
 
 Each cell's lock is secp256k1-blake160 with 20 zero-byte args, which no key can unlock, so the cells can't be
 spent. Each is referenced by data hash (`data1`), so the code can't change; anyone can redeploy the same bytes.
-Deployed by `research/omnilock/audit-fixes/deploy-verifiers.ts`.
+Deployed by `research/backup-unlinking/deploy-verifiers.ts` (version 3, salted identities).
 
 | Binary | Code hash (`data1`) | Out point | Size |
 |---|---|---|---|
-| `build/evm-personal-sign` | `0x33bd1c699b633d685a6f60f6b0ca16fe8bb896f81323926ca6e0671bf8ab3c88` | `0xff16f2aa117ba8e67aeb8946a8d3cb0c5f4627eab4fd8d7d5ecd938d7fa9014f:0` | 89,768 bytes |
-| `build/joyid-webauthn` | `0xf1185da23bf04b638010038b40ec64b587654db5cb98eb39f0373ad8919bcd89` | `0xb99678308cde0a54f856a00ec1e2ec46a318cdf05ef375cc381933dc00c7fb17:0` | 41,200 bytes |
+| `build/evm-personal-sign` | `0x14715402af1d6cdb6036ac02d10c822e84349c289c938320c2f7e8bb6d54b86f` | `0x1d487850a80c6e75a841e97184d52a6a84bf3405cb8ddc3152b1d03eeed9e089:0` | 99,072 bytes |
+| `build/joyid-webauthn` | `0x01ac20c4c1a7e5e073a9369b452382970d7d493ad98169dbfa017df1351e2957` | `0x2b25815f1a4e130878880b079530646887560fcec104fb09e3fdfdec26be58c6:0` | 41,392 bytes |
 
-The earlier version 1 WebAuthn verifier (`0x24306cbe…9720`, challenge `CKB transaction: 0x…`) is still on chain
-but no longer used.
+The version 2 verifiers (unsalted: `0x33bd1c69…3c88` EVM, `0xf1185da2…cd89` WebAuthn) and the version 1 WebAuthn
+verifier (`0x24306cbe…9720`) are still on chain but no longer used.
 
 KeyWay also deployed its own copy of the official testnet Omnilock binary (139,936 bytes, data hash
 `0x6b29b6f10346b43c540e53806ba88ba0fe3a0c3a29d7448ef555840c8f8318fa`) at
@@ -158,7 +180,7 @@ cargo test --release -- --nocapture                # runs the binaries in CKB-VM
 
 The builds are reproducible: a fresh copy of `contracts/` built in another directory gives the same bytes.
 `tests/tests/verifier.rs` runs the WebAuthn verifier against `tests/tests/rescue.json` (a mock rescue transaction
-for ckb-debugger); `approval.rs` runs both verifiers on the random transactions and 40,000 signature mutations;
+for ckb-debugger); `approval.rs` runs both verifiers on the random transactions and 40,000 signature mutations, and checks the salt (an identity from one account refused in another, 114 for a lock that isn't a KeyWay account's);
 `audit_fable51_parity.rs` checks the clientDataJSON rules against the server's. `p256-check` is a test-only binary
 that runs the P-256 code on `public_key:rs:message`.
 
@@ -168,5 +190,5 @@ that runs the P-256 code on `public_key:rs:message`.
 |---|---|
 | EVM verifier, random rescue transactions | up to 7.9M |
 | WebAuthn verifier, random rescue transactions | up to 7.1M |
-| Whole administrator-path spend on testnet, EVM backup | 8.03M |
-| Whole administrator-path spend on testnet, JoyID-style backup | 7.33M |
+| Whole administrator-path spend on testnet, EVM backup | 8.05M |
+| Whole administrator-path spend on testnet, JoyID-style backup | 7.34M |

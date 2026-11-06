@@ -39,8 +39,12 @@ fn run(name: &str, argument: &str) -> (i64, u64) {
     (code, cycles)
 }
 
-fn blake160(data: &[u8]) -> [u8; 20] {
-    joyid_webauthn::blake160(data)
+/// The AdminList type hash in rescue.json's account lock args (0x00 ‖ 0x22×20 ‖ 0x01 ‖ 0x33×32).
+const SALT: [u8; 32] = [0x33; 32];
+
+/// The identity's pubkey hash for a passkey's public key in rescue.json's account: blake160(blake160(key) ‖ salt).
+fn blake160(public_key: &[u8]) -> [u8; 20] {
+    joyid_webauthn::salted_id(&joyid_webauthn::blake160(public_key), &SALT)
 }
 
 /// The approval text the verifier rebuilds from rescue.json: 10,000 CKB less a 765-shannon fee, to one

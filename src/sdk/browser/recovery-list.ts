@@ -1,82 +1,64 @@
 import * as ccc from "@ckb-ccc/core";
 import { adminListTypeScript, type KeyWayRecovery } from "./account-lock";
-import {
-  backupAuth,
-  EVM_PERSONAL_SIGN_VERIFIER,
-  evmPreimage,
-  execAuth,
-  joyIdLock,
-  joyIdPreimage,
-  joyIdPubkeyHash,
-  JOYID_WEBAUTHN_VERIFIER,
-  OMNILOCK_AUTH_EXEC,
-  type RecoveryBackup,
-} from "./recovery-backups";
+import { backupAuth, backupPreimage, execAuth, OMNILOCK_AUTH_EXEC, type RecoveryBackup, type RecoverySalt } from "./recovery-backups";
 import { adminListData, whitelistTree } from "./recovery-smt";
 
 /**
- * The full backup list, written on chain by every transaction that creates or changes a recovery list, so the
- * list and its proofs can be rebuilt from the chain alone. The AdminList cell keeps only the SMT root; the list
- * goes in the `output_type` field of the WitnessArgs at the AdminList output's index, which Omnilock (it reads
- * only `lock`) and Type ID ignore, and which the transaction's signature covers.
+ * The backup list, written on chain by every transaction that creates or changes a recovery list, so the list's
+ * proofs can be rebuilt from the chain alone. The AdminList cell keeps only the SMT root; the list goes in the
+ * `output_type` field of the WitnessArgs at the AdminList output's index, which Omnilock (it reads only `lock`)
+ * and Type ID ignore, and which the transaction's signature covers.
  *
- * Format, version 2: "KWRL" ‖ 0x02 ‖ count (1 byte) ‖ entries, each 0xFD ‖ the 62-byte exec preimage (verifier
- * code hash, hash type, place, bounds, the backup's 20-byte id); auth = 0xFD ‖ blake160(preimage). The verifier
- * says what kind of backup it is: KeyWay's EVM verifier (the id is the address) or its WebAuthn verifier (the id is
- * blake160 of the passkey's public key; the JoyID address is the main-key lock with args 0x0001 ‖ the id).
+ * Format, version 3: "KWRL" ‖ 0x03 ‖ count (1 byte) ‖ the backups' 21-byte auths (0xFD ‖ blake160(preimage)), in
+ * order. Only salted auths: no address, passkey hash or verifier, so the record can't link the account to the
+ * same backup's other accounts. Whoever holds a backup computes its auth for this account (`backupAuth` with the
+ * account's salt) and finds it in the list (`recoveryListEntry`); its proof comes from the whole list.
  */
 export const RECOVERY_LIST_MAGIC = "0x4b57524c";
-export const RECOVERY_LIST_VERSION = 2;
-const PREIMAGE_LENGTH = 62;
+export const RECOVERY_LIST_VERSION = 3;
+const AUTH_LENGTH = 21;
 
+/** A backup on an account's list: its auth there and the preimage its witness carries. */
 export type RecoveryListEntry = {
   backup: RecoveryBackup;
   auth: ccc.Hex;
-  /** The exec identity's preimage; the backup's witness carries it. */
+  /** The exec identity's preimage (verifier and salted id). */
   preimage: ccc.Hex;
 };
 
-/** The record for these backups, in order. */
-export async function recoveryListRecord(client: ccc.Client, backups: RecoveryBackup[]): Promise<ccc.Hex> {
-  const entries = await Promise.all(backups.map(async (backup) => ccc.bytesConcat([OMNILOCK_AUTH_EXEC], await backupPreimage(client, backup))));
+/** The record for these auths, in order. */
+export function recoveryListRecord(auths: ccc.HexLike[]): ccc.Hex {
+  const entries = auths.map((auth) => ccc.bytesFrom(auth));
   if (entries.length === 0 || entries.length > 255) throw new Error("A recovery list holds 1 to 255 backups");
+  if (entries.some((auth) => auth.length !== AUTH_LENGTH || auth[0] !== OMNILOCK_AUTH_EXEC)) throw new Error("A recovery list holds only exec auths");
   return ccc.hexFrom(ccc.bytesConcat(RECOVERY_LIST_MAGIC, [RECOVERY_LIST_VERSION, entries.length], ...entries));
 }
 
-/** The exec preimage of a backup's identity. */
-export async function backupPreimage(client: ccc.Client, backup: RecoveryBackup): Promise<ccc.Hex> {
-  if (backup.kind === "evm") return evmPreimage(backup.address);
-  return joyIdPreimage(joyIdPubkeyHash(await joyIdLock(client, backup.address)));
-}
-
-/** Reads a record back into its backups and their auths. Throws on anything but a well-formed version 2 record. */
-export async function decodeRecoveryList(client: ccc.Client, record: ccc.HexLike): Promise<RecoveryListEntry[]> {
+/** Reads a record back into its auths. Throws on anything but a well-formed version 3 record. */
+export function decodeRecoveryList(record: ccc.HexLike): ccc.Hex[] {
   const bytes = ccc.bytesFrom(record);
   const invalid = () => new Error("The on-chain recovery list is malformed");
   if (bytes.length < 6 || ccc.hexFrom(bytes.slice(0, 4)) !== RECOVERY_LIST_MAGIC) throw invalid();
   if (bytes[4] !== RECOVERY_LIST_VERSION) throw new Error(`Unknown recovery list version ${bytes[4]}`);
-  const joyId = await client.getKnownScript(ccc.KnownScript.JoyId);
-  const entries: RecoveryListEntry[] = [];
-  let at = 6;
-  for (let index = 0; index < bytes[5]; index++) {
-    if (bytes[at] !== OMNILOCK_AUTH_EXEC || at + 1 + PREIMAGE_LENGTH > bytes.length) throw invalid();
-    const preimage = ccc.hexFrom(bytes.slice(at + 1, at + 1 + PREIMAGE_LENGTH));
-    const codeHash = preimage.slice(0, 66);
-    const id = ccc.bytesFrom(preimage).slice(42);
-    if (codeHash === EVM_PERSONAL_SIGN_VERIFIER.codeHash) {
-      entries.push({ backup: { kind: "evm", address: ccc.hexFrom(id) }, auth: execAuth(preimage), preimage });
-    } else if (codeHash === JOYID_WEBAUTHN_VERIFIER.codeHash) {
-      const lock = ccc.Script.from({ codeHash: joyId.codeHash, hashType: joyId.hashType, args: ccc.bytesConcat("0x0001", id) });
-      entries.push({ backup: { kind: "joyid", address: ccc.Address.fromScript(lock, client).toString() }, auth: execAuth(preimage), preimage });
-    } else {
-      throw invalid();
-    }
-    // The verifiers are named by data hash with the whole cell; anything else isn't a record KeyWay wrote.
-    if (preimage !== (entries.at(-1)!.backup.kind === "evm" ? evmPreimage(ccc.hexFrom(id)) : joyIdPreimage(id))) throw invalid();
-    at += 1 + PREIMAGE_LENGTH;
+  const count = bytes[5];
+  if (count === 0 || bytes.length !== 6 + count * AUTH_LENGTH) throw invalid();
+  const auths: ccc.Hex[] = [];
+  for (let at = 6; at < bytes.length; at += AUTH_LENGTH) {
+    if (bytes[at] !== OMNILOCK_AUTH_EXEC) throw invalid();
+    auths.push(ccc.hexFrom(bytes.slice(at, at + AUTH_LENGTH)));
   }
-  if (at !== bytes.length) throw invalid();
-  return entries;
+  if (new Set(auths).size !== auths.length) throw invalid();
+  return auths;
+}
+
+/**
+ * The entry for `backup` in a list of auths for the account with this salt, or undefined when the backup isn't
+ * on it. The auth is computed from the backup and the salt, so a match means this backup is a member.
+ */
+export async function recoveryListEntry(client: ccc.Client, list: { auths: ccc.Hex[]; salt: RecoverySalt }, backup: RecoveryBackup): Promise<RecoveryListEntry | undefined> {
+  const preimage = await backupPreimage(client, backup, list.salt);
+  const auth = execAuth(preimage);
+  return list.auths.includes(auth) ? { backup, auth, preimage } : undefined;
 }
 
 /** Puts the record in the WitnessArgs at `index` (the AdminList output's), keeping its lock and input_type. */
@@ -98,7 +80,10 @@ export function recoveryListRecordOf(transaction: ccc.Transaction, index: number
 export type OnChainRecoveryList = {
   /** The live AdminList cell. */
   cell: ccc.Cell;
-  entries: RecoveryListEntry[];
+  /** The members' salted auths, in order. */
+  auths: ccc.Hex[];
+  /** The account's salt: the AdminList's type hash. */
+  salt: ccc.Hex;
   root: ccc.Hex;
   /** Each member's compiled SMT proof, by auth. */
   proofs: Record<string, ccc.Hex>;
@@ -130,13 +115,19 @@ export async function recoveryListFrom(client: ccc.Client, outPoint: ccc.OutPoin
   const cell = ccc.Cell.from({ outPoint: { txHash, index }, cellOutput: output, outputData: created.transaction.outputsData[Number(index)] ?? "0x" });
   const record = recoveryListRecordOf(created.transaction, Number(index));
   if (!record) throw new Error("The recovery list's transaction doesn't record its backups");
-  const entries = await decodeRecoveryList(client, record);
-  const { root, proofs } = whitelistTree(entries.map(({ auth }) => auth));
+  const auths = decodeRecoveryList(record);
+  const { root, proofs } = whitelistTree(auths);
   if (adminListData(root) !== ccc.hexFrom(cell.outputData)) throw new Error("The recorded backups don't match the recovery list on chain");
-  return { cell, entries, root, proofs };
+  if (!cell.cellOutput.type) throw new Error("The recovery list isn't on chain");
+  return { cell, auths, salt: cell.cellOutput.type.hash(), root, proofs };
 }
 
-/** The auths of these backups, in order. */
-export async function backupAuths(client: ccc.Client, backups: RecoveryBackup[]): Promise<ccc.Hex[]> {
-  return Promise.all(backups.map((backup) => backupAuth(client, backup)));
+/** The auths of these backups in the account with this salt, in order. */
+export async function backupAuths(client: ccc.Client, backups: RecoveryBackup[], salt: RecoverySalt): Promise<ccc.Hex[]> {
+  return Promise.all(backups.map((backup) => backupAuth(client, backup, salt)));
+}
+
+/** The account's salt: its AdminList type hash. */
+export function recoverySalt(recovery: Pick<KeyWayRecovery, "adminListTypeHash">): ccc.Hex {
+  return ccc.hexFrom(recovery.adminListTypeHash);
 }

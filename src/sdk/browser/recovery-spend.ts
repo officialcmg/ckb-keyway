@@ -2,15 +2,15 @@ import * as ccc from "@ckb-ccc/core";
 import type { OmnilockDeployment } from "./account-lock";
 import type { EthereumProvider } from "./account-recovery";
 import { approvalNetworkByte, recoveryApprovalText, rescueApproval } from "./recovery-approval";
-import { evmApprovalSignature, EVM_APPROVAL_SIGNATURE_LENGTH, evmPersonalSignAddress, joyIdMainKey, normalizeEvmAddress, omnilockAdminWitnessLock, verifierCellDep } from "./recovery-backups";
+import { accountSalt, evmApprovalSignature, EVM_APPROVAL_SIGNATURE_LENGTH, evmPersonalSignAddress, evmPreimage, execAuth, joyIdMainKey, joyIdPreimage, normalizeEvmAddress, omnilockAdminWitnessLock, verifierCellDep } from "./recovery-backups";
 import type { RecoveryListEntry } from "./recovery-list";
 import { whitelistTree } from "./recovery-smt";
 import { MAX_WEBAUTHN_SIGNATURE, parseJoyIdSignature, verifyWebAuthn, webAuthnSignatureBlob, webAuthnSignatureLength } from "./webauthn";
 
 /**
  * Signing an Omnilock administrator-path spend with a backup, without KeyWay: the transaction spends cells of the
- * account's Omnilock `lock`, `list` is the account's backup list (`readRecoveryList`), `entry` the backup that
- * signs. The witness carries the backup's identity and its SMT proof against the list, so the AdminList must be
+ * account's Omnilock `lock`, `auths` is the account's backup list (`readRecoveryList`), `entry` the backup that
+ * signs (`recoveryListEntry`), its identity salted with the account's salt (the AdminList type hash in `lock`). The witness carries the backup's identity and its SMT proof against the list, so the AdminList must be
  * a cell dep (it is added if missing). The backup signs the readable approval (`recoveryApprovalText`), which its
  * verifier rebuilds from the transaction, so the transaction must be a rescue: every output to one address.
  */
@@ -19,7 +19,8 @@ export type RecoverySpend = {
   lock: ccc.ScriptLike;
   /** The Omnilock the account runs, whose deps are added. */
   omnilock: Pick<OmnilockDeployment, "cellDeps">;
-  list: RecoveryListEntry[];
+  /** The members' salted auths, in the list's order. */
+  auths: ccc.Hex[];
   entry: RecoveryListEntry;
   /** The AdminList cell's out point, added as a cell dep. */
   adminList: ccc.OutPointLike;
@@ -59,6 +60,7 @@ export async function prepareRecoverySpend(transactionLike: ccc.TransactionLike,
 export async function signRecoverySpendWithEvm(transaction: ccc.TransactionLike, spend: RecoverySpend, ethereum: EthereumProvider): Promise<ccc.Transaction> {
   if (spend.entry.backup.kind !== "evm") throw new Error("This backup isn't an EVM wallet");
   const address = normalizeEvmAddress(spend.entry.backup.address);
+  if (evmPreimage(address, accountSalt(ccc.Script.from(spend.lock).args)) !== spend.entry.preimage) throw new Error("This EVM wallet isn't the backup on the recovery list");
   return signAdmin(transaction, spend, async (text) => {
     const signature = await ethereum.request({ method: "personal_sign", params: [ccc.hexFrom(new TextEncoder().encode(text)), address] });
     if (typeof signature !== "string" || !/^0x[0-9a-fA-F]{130}$/.test(signature)) throw new Error("The EVM wallet didn't sign");
@@ -78,7 +80,7 @@ export async function signRecoverySpendWithJoyId(transaction: ccc.TransactionLik
   if (!await signer.isConnected()) await signer.connect();
   const publicKey = joyIdMainKey(await signer.getIdentity());
   if (!publicKey) throw new Error("JoyID didn't share its passkey's public key");
-  if (ccc.hexFrom(ccc.hashCkbShort(publicKey)) !== ccc.hexFrom(ccc.bytesFrom(spend.entry.preimage).slice(42))) {
+  if (joyIdPreimage(ccc.hashCkbShort(publicKey), accountSalt(ccc.Script.from(spend.lock).args)) !== spend.entry.preimage) {
     throw new Error("This JoyID passkey isn't the backup on the recovery list");
   }
   return signAdmin(transaction, spend, async (text) => {
@@ -90,9 +92,9 @@ export async function signRecoverySpendWithJoyId(transaction: ccc.TransactionLik
 }
 
 function entryProof(spend: RecoverySpend) {
-  const { proofs } = whitelistTree(spend.list.map(({ auth }) => auth));
+  const { proofs } = whitelistTree(spend.auths);
   const proof = proofs[spend.entry.auth];
-  if (!proof) throw new Error("This backup isn't on the recovery list");
+  if (!proof || execAuth(spend.entry.preimage) !== spend.entry.auth) throw new Error("This backup isn't on the recovery list");
   return { proof, auth: spend.entry.auth, preimage: spend.entry.preimage };
 }
 

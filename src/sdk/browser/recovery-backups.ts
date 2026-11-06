@@ -6,7 +6,12 @@ import { parseJoyIdSignature, verifyWebAuthn } from "./webauthn";
 /**
  * Backup signers for opt-in account recovery. Each backup is an Omnilock exec identity (auth flag 0xFD), 21 bytes:
  * the flag and blake160 of a 62-byte preimage naming one of KeyWay's verifiers (contracts/) by data hash and the
- * backup's own 20-byte id. The AdminList's whitelist holds one SMT key per backup. A backup is accepted only with a
+ * backup's 20-byte id salted with the account's: `blake160(id ‖ salt)`, where the salt is the account's AdminList
+ * type hash (the last 32 bytes of its Omnilock args, which the verifier reads from the lock it unlocks). The same
+ * backup has an unrelated identity in every account, so reading the chain doesn't link one person's accounts in
+ * two apps through a shared backup, and no list names its backups. The salt is public, so someone who already
+ * knows a backup's address can check whether it is on a given account's list, and a rescue's witness reveals the
+ * backup that signed it. The AdminList's whitelist holds one SMT key per backup. A backup is accepted only with a
  * signature over `recoveryBackupChallenge`, proving the user controls it.
  *
  * Both kinds approve a spend by signing the same readable text (`recoveryApprovalText`): where everything goes,
@@ -27,6 +32,9 @@ export type RecoveryBackupProof =
   /** `signature` and `identity` as CCC's JoyID signer returns them from signMessage. */
   | { kind: "joyid"; address: string; signature: string; identity: string; challengeNonce: string };
 
+/** An account's salt: the AdminList type hash, 32 bytes. */
+export type RecoverySalt = ccc.HexLike;
+
 export const OMNILOCK_AUTH_CKB = 0x00;
 /** Omnilock's IdentityFlagsExec: the identity is blake160 of a preimage naming a binary Omnilock execs. */
 export const OMNILOCK_AUTH_EXEC = 0xfd;
@@ -39,23 +47,42 @@ const JOYID_RS256 = -257;
 /**
  * KeyWay's verifiers, referenced by data hash (hash_type data1), so the code a backup's identity names can never
  * change; the testnet cells' locks can't be unlocked, and anyone can redeploy the same bytes (contracts/build) if
- * a cell were ever gone. Deployed by research/omnilock/audit-fixes/deploy-verifiers.ts.
+ * a cell were ever gone. Deployed by research/backup-unlinking/deploy-verifiers.ts (version 3: salted identities).
  */
 export const EVM_PERSONAL_SIGN_VERIFIER = {
-  codeHash: "0x33bd1c699b633d685a6f60f6b0ca16fe8bb896f81323926ca6e0671bf8ab3c88",
+  codeHash: "0x14715402af1d6cdb6036ac02d10c822e84349c289c938320c2f7e8bb6d54b86f",
   hashType: "data1",
-  testnetCellDep: { outPoint: { txHash: "0xff16f2aa117ba8e67aeb8946a8d3cb0c5f4627eab4fd8d7d5ecd938d7fa9014f", index: 0 }, depType: "code" },
+  testnetCellDep: { outPoint: { txHash: "0x1d487850a80c6e75a841e97184d52a6a84bf3405cb8ddc3152b1d03eeed9e089", index: 0 }, depType: "code" },
 } as const;
 export const JOYID_WEBAUTHN_VERIFIER = {
-  codeHash: "0xf1185da23bf04b638010038b40ec64b587654db5cb98eb39f0373ad8919bcd89",
+  codeHash: "0x01ac20c4c1a7e5e073a9369b452382970d7d493ad98169dbfa017df1351e2957",
   hashType: "data1",
-  testnetCellDep: { outPoint: { txHash: "0xb99678308cde0a54f856a00ec1e2ec46a318cdf05ef375cc381933dc00c7fb17", index: 0 }, depType: "code" },
+  testnetCellDep: { outPoint: { txHash: "0x2b25815f1a4e130878880b079530646887560fcec104fb09e3fdfdec26be58c6", index: 0 }, depType: "code" },
 } as const;
 
 /** The verifier a backup of this kind needs as a cell dep. They are deployed on testnet only so far. */
 export function verifierCellDep(client: ccc.Client, kind: RecoveryBackup["kind"]): ccc.CellDepLike {
   if (client.addressPrefix !== "ckt") throw new Error("Recovery backups are only available on CKB testnet");
   return (kind === "evm" ? EVM_PERSONAL_SIGN_VERIFIER : JOYID_WEBAUTHN_VERIFIER).testnetCellDep;
+}
+
+/**
+ * The salt of the account whose Omnilock args these are: `auth (21) ‖ 0x01 (administrator mode) ‖ AdminList type
+ * hash (32)`, as the verifiers read it (`keyway_approval::account_salt`). Anything else is refused.
+ */
+export function accountSalt(omnilockArgs: ccc.HexLike): ccc.Hex {
+  const args = ccc.bytesFrom(omnilockArgs);
+  if (args.length !== 54 || args[21] !== 0x01) throw new Error("That isn't a KeyWay recovery account's lock");
+  return ccc.hexFrom(args.slice(22));
+}
+
+/** `blake160(id ‖ salt)`: the 20 bytes an account's identity for a backup commits to. */
+export function saltedBackupId(id: ccc.BytesLike, salt: RecoverySalt): ccc.Hex {
+  const bytes = ccc.bytesFrom(id);
+  const saltBytes = ccc.bytesFrom(salt);
+  if (bytes.length !== 20) throw new Error("A backup's id must be 20 bytes");
+  if (saltBytes.length !== 32) throw new Error("An account's salt must be 32 bytes");
+  return ccc.hexFrom(ccc.hashCkbShort(ccc.bytesConcat(bytes, saltBytes)));
 }
 
 /** Exec preimage hash type byte for data1 (Omnilock looks the binary up by data hash for anything but 1). */
@@ -69,32 +96,32 @@ const auth = (flag: number, id: ccc.BytesLike): ccc.Hex => {
 
 /**
  * An exec identity's preimage, 62 bytes: verifier code hash ‖ hash type (data1) ‖ place 0 (cell dep) ‖ length 0 ‖
- * offset 0 (the whole cell, u32 LE each) ‖ the backup's 20-byte id.
+ * offset 0 (the whole cell, u32 LE each) ‖ the 20-byte pubkey hash the verifier is given, `saltedBackupId`.
  */
-export function execPreimage(codeHash: ccc.HexLike, id: ccc.BytesLike): ccc.Hex {
-  const bytes = ccc.bytesFrom(id);
+export function execPreimage(codeHash: ccc.HexLike, pubkeyHash: ccc.BytesLike): ccc.Hex {
+  const bytes = ccc.bytesFrom(pubkeyHash);
   if (bytes.length !== 20) throw new Error("A backup's id must be 20 bytes");
   return ccc.hexFrom(ccc.bytesConcat(codeHash, [DATA1, 0x00], new Uint8Array(8), bytes));
 }
 
-/** The EVM verifier's preimage for an address. */
-export function evmPreimage(address: string): ccc.Hex {
-  return execPreimage(EVM_PERSONAL_SIGN_VERIFIER.codeHash, normalizeEvmAddress(address));
+/** The EVM verifier's preimage for an address in the account with this salt. */
+export function evmPreimage(address: string, salt: RecoverySalt): ccc.Hex {
+  return execPreimage(EVM_PERSONAL_SIGN_VERIFIER.codeHash, saltedBackupId(normalizeEvmAddress(address), salt));
 }
 
-/** 0xFD ‖ blake160(preimage) for an EVM address. */
-export function evmBackupAuth(address: string): ccc.Hex {
-  return execAuth(evmPreimage(address));
+/** 0xFD ‖ blake160(preimage) for an EVM address in the account with this salt. */
+export function evmBackupAuth(address: string, salt: RecoverySalt): ccc.Hex {
+  return execAuth(evmPreimage(address, salt));
 }
 
-/** The WebAuthn verifier's preimage for blake160 of a passkey's public key. */
-export function joyIdPreimage(pubkeyHash: ccc.BytesLike, codeHash: ccc.HexLike = JOYID_WEBAUTHN_VERIFIER.codeHash): ccc.Hex {
-  return execPreimage(codeHash, pubkeyHash);
+/** The WebAuthn verifier's preimage for blake160 of a passkey's public key, in the account with this salt. */
+export function joyIdPreimage(pubkeyHash: ccc.BytesLike, salt: RecoverySalt, codeHash: ccc.HexLike = JOYID_WEBAUTHN_VERIFIER.codeHash): ccc.Hex {
+  return execPreimage(codeHash, saltedBackupId(pubkeyHash, salt));
 }
 
-/** 0xFD ‖ blake160(preimage) for a JoyID main-key lock. */
-export function joyIdBackupAuth(lock: ccc.ScriptLike): ccc.Hex {
-  return execAuth(joyIdPreimage(joyIdPubkeyHash(lock)));
+/** 0xFD ‖ blake160(preimage) for a JoyID main-key lock in the account with this salt. */
+export function joyIdBackupAuth(lock: ccc.ScriptLike, salt: RecoverySalt): ccc.Hex {
+  return execAuth(joyIdPreimage(joyIdPubkeyHash(lock), salt));
 }
 
 export function execAuth(preimage: ccc.HexLike): ccc.Hex {
@@ -112,10 +139,18 @@ export function ckbSecp256k1Auth(publicKey: ccc.HexLike): ccc.Hex {
   return auth(OMNILOCK_AUTH_CKB, ccc.hashCkbShort(publicKey));
 }
 
-/** The backup's Omnilock auth. JoyID addresses must be JoyID main-key locks on the client's network. */
-export async function backupAuth(client: ccc.Client, backup: RecoveryBackup): Promise<ccc.Hex> {
-  if (backup.kind === "evm") return evmBackupAuth(backup.address);
-  return joyIdBackupAuth(await joyIdLock(client, backup.address));
+/**
+ * The backup's Omnilock auth in the account with this salt (its AdminList type hash). JoyID addresses must be
+ * JoyID main-key locks on the client's network.
+ */
+export async function backupAuth(client: ccc.Client, backup: RecoveryBackup, salt: RecoverySalt): Promise<ccc.Hex> {
+  return execAuth(await backupPreimage(client, backup, salt));
+}
+
+/** The exec preimage of a backup's identity in the account with this salt; the backup's witness carries it. */
+export async function backupPreimage(client: ccc.Client, backup: RecoveryBackup, salt: RecoverySalt): Promise<ccc.Hex> {
+  if (backup.kind === "evm") return evmPreimage(backup.address, salt);
+  return joyIdPreimage(joyIdPubkeyHash(await joyIdLock(client, backup.address)), salt);
 }
 
 export async function joyIdLock(client: ccc.Client, address: string): Promise<ccc.Script> {

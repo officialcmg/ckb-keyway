@@ -38,8 +38,11 @@ for (let index = 0; index < 400; index++) {
 writeFileSync(new URL("../tests/fixtures/approval-text-cases.json", import.meta.url), JSON.stringify(cases, null, 1) + "\n");
 console.log(cases.length, "text cases,", cases.filter((value) => value.text === null).length, "too long");
 
-// The account's lock in the tests' mock transactions runs a stand-in binary whose data is 0x00 (data1).
-const account = ccc.Script.from({ codeHash: ccc.hashCkb("0x00"), hashType: "data1", args: bytes(54) });
+// The account's lock in the tests' mock transactions runs a stand-in binary whose data is 0x00 (data1). Its args
+// have a KeyWay account's shape, auth ‖ 0x01 (administrator mode) ‖ AdminList type hash (the verifiers' salt).
+const accountArgs = bytes(54);
+accountArgs[21] = 0x01;
+const account = ccc.Script.from({ codeHash: ccc.hashCkb("0x00"), hashType: "data1", args: accountArgs });
 const randomScript = (argsLength = Math.floor(random() * 60)) => ccc.Script.from({ codeHash: bytes(32), hashType: pick(Object.keys(hashTypes) as ccc.HashType[]), args: bytes(argsLength) });
 const json = (script: ccc.Script) => ({ codeHash: script.codeHash, hashType: script.hashType, args: script.args });
 const transactions = [];

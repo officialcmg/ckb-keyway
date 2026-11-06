@@ -34,7 +34,7 @@ async function realInputs(transaction: ccc.Transaction): Promise<bigint> {
 for (const [label, node] of [["control (honest node)", client], ["malicious node"]] as Array<[string, ccc.Client?]>) {
   const rpc = node ?? lyingNode();
   const account = await openRescueAccount(rpc, state.newAddress);
-  const entry = await connectEvmBackup(account, evmProvider(keys.E1));
+  const entry = await connectEvmBackup(rpc, account, evmProvider(keys.E1));
   const plan = await planRescue(rpc, account, entry, destination);
   let shown = "";
   const signed = await signRescueWithEvm(rpc, account, plan, evmProvider(keys.E1, (text) => { shown = text; }));

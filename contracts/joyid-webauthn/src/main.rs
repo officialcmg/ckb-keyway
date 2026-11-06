@@ -33,7 +33,8 @@ fn program_entry() -> i8 {
         let network = joyid_webauthn::signature_network(argument.signature())?;
         let mut text = [0u8; joyid_webauthn::MAX_TEXT];
         let length = keyway_approval::chain::rescue_text(network, &argument.msg, &mut text)?;
-        joyid_webauthn::verify(&argument.pubkey_hash, &text[..length], argument.signature())
+        let salt = keyway_approval::chain::running_account_salt()?;
+        joyid_webauthn::verify(&argument.pubkey_hash, &salt, &text[..length], argument.signature())
     };
     match run() {
         Ok(()) => 0,
