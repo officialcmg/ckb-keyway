@@ -126,8 +126,9 @@ These always appear, whatever your app returns:
 - Sign-in, and the emailed sign-in code.
 - The emailed code once what leaves the account in 24 hours reaches the user's daily amount, if they set one.
 - The emailed code for turning recovery on, adding a backup and removing one.
+- The emailed code for loosening email confirmation, such as raising or removing a daily amount.
 
-Silent signing moves the user's confirmation into your app. Your app becomes responsible for showing the user what they approve, so only do it for flows the user has already agreed to, such as a purchase they just confirmed in your own interface, and prefer checking the preview over returning `true` unconditionally. KeyWay's server still applies its own checks: fee and rate limits, the daily amounts and the emailed code. See [Silent signing](/ccc-signer#silent-signing).
+Silent signing moves the user's confirmation into your app. Your app becomes responsible for showing the user what they approve, so only do it for flows the user has already agreed to, such as a purchase they just confirmed in your own interface, and prefer checking the preview over returning `true` unconditionally. KeyWay's server still applies its own checks: fee and rate limits, the daily amounts and the emailed code.
 
 ## Other exports
 
