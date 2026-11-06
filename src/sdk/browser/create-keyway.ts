@@ -172,8 +172,12 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   const paymentLog = createPaymentLog(databasePrefix);
   let restoreRequired = options.restoreRequired ?? false;
 
+  /** Bumped by every stop, so a start that a stop overtook (e.g. while the key was loading) can undo itself. */
+  let stopGeneration = 0;
+
   async function start() {
     if (node.isRunning) return node.nodeInfo();
+    const generation = stopGeneration;
     if (typeof window !== "undefined" && window.crossOriginIsolated !== true) {
       throw toKeyWayError(new Error("Cross-origin isolated browser context is required"));
     }
@@ -194,6 +198,12 @@ export function createKeyWay(options: CreateKeyWayOptions) {
         console.info(`[keyway] watchtower: stored ${call.method}`);
       });
       const info = await node.start();
+      if (generation !== stopGeneration) {
+        // @fiber-pay/sdk's stop() doesn't cancel a start that is still unlocking the key, so the node can come up
+        // after stop() returned. Stop it again rather than leave it (and its timers) running without a lease.
+        await node.stop().catch(() => undefined);
+        throw toKeyWayError(new Error("The Fiber node was stopped while it was starting"));
+      }
       startSweeping();
       return info;
     } catch (error) {
@@ -308,6 +318,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   }
 
   async function stop() {
+    stopGeneration++;
     if (sweepTimer) clearInterval(sweepTimer);
     sweepTimer = undefined;
     await stopWatching();
@@ -321,6 +332,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   }
 
   async function stopForLogout() {
+    stopGeneration++;
     if (sweepTimer) clearInterval(sweepTimer);
     sweepTimer = undefined;
     await stopWatching();
