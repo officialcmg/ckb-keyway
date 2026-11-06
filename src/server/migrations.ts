@@ -325,4 +325,9 @@ export const migrations: Array<{
       )`;
     },
   },
+  {
+    // Created empty by version 8 (`like` copies no rows); no code has ever read or written it.
+    version: 18, name: "drop-managed-confirmations",
+    up: (sql) => sql`drop table if exists keyway_v2_managed_confirmations`,
+  },
 ];
