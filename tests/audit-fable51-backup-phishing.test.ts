@@ -12,8 +12,8 @@ import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { KEYWAY_OMNILOCK, omnilockArgsFor, omnilockScript } from "../src/sdk/browser/account-lock.ts";
 import { recoveryApprovalText, rescueApproval } from "../src/sdk/browser/recovery-approval.ts";
-import { backupAuth, evmPersonalSignAddress, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
-import { decodeRecoveryList, readRecoveryList, recoveryListRecord, recoveryListRecordOf, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
+import { evmPersonalSignAddress, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
+import { backupAuths, decodeRecoveryList, recoveryListEntry, readRecoveryList, recoveryListRecord, recoveryListRecordOf, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
 import { adminListData, whitelistTree } from "../src/sdk/browser/recovery-smt.ts";
 import { signRecoverySpendWithEvm } from "../src/sdk/browser/recovery-spend.ts";
 
@@ -46,20 +46,24 @@ test("M3 fixed: the backup's wallet shows where everything goes and how much, an
   const backups: RecoveryBackup[] = [{ kind: "evm", address: backupAddress }];
   const adminType = ccc.Script.from({ codeHash: TYPE_ID, hashType: "type", args: ccc.hexFrom(new Uint8Array(32).fill(0x42)) });
   const lock = omnilockScript({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: omnilockArgsFor(publicKey, adminType.hash()) });
-  const { root } = whitelistTree(await Promise.all(backups.map((backup) => backupAuth(base, backup))));
+  const auths = await backupAuths(base, backups, adminType.hash());
+  const { root } = whitelistTree(auths);
   const enable = ccc.Transaction.from({ outputs: [{ lock, type: adminType, capacity: 197n * CKB }], outputsData: [adminListData(root)] });
-  setRecoveryListRecord(enable, 0, await recoveryListRecord(base, backups));
+  setRecoveryListRecord(enable, 0, recoveryListRecord(auths));
   const adminList = ccc.Cell.from({ outPoint: { txHash: enable.hash(), index: 0 }, cellOutput: enable.outputs[0], outputData: enable.outputsData[0] });
   const funds = ccc.Cell.from({ outPoint: { txHash: `0x${"01".repeat(32)}`, index: 0 }, cellOutput: { lock, capacity: 10_000n * CKB }, outputData: "0x" });
   const client = await offlineClient([adminList, funds], [enable]);
 
-  // 1. The thief learns which EVM wallets are backups of which accounts by reading enable transactions.
+  // 1. The enable transaction no longer names the backup: the record holds only its auth salted with this
+  // account's AdminList type hash. A thief who already knows the wallet (here, the one it phishes) can still
+  // check it against this account's list.
   const record = recoveryListRecordOf(enable, 0)!;
-  const listed = await decodeRecoveryList(client, record);
-  assert.deepEqual(listed.map(({ backup }) => backup), [{ kind: "evm", address: backupAddress }]);
+  assert.deepEqual(decodeRecoveryList(record), auths);
+  assert.ok(!record.includes(backupAddress.slice(2)));
 
   // 2. The thief rebuilds the list and the proof from the chain, as the rescue page does, and builds a drain.
   const list = await readRecoveryList(client, { adminListTypeArgs: adminType.args });
+  const entry = (await recoveryListEntry(client, list, backups[0]))!;
   const drain = ccc.Transaction.from({ inputs: [{ previousOutput: funds.outPoint }], outputs: [{ lock: thiefLock, capacity: 9_999n * CKB }], outputsData: ["0x"] });
 
   // 3. The backup wallet, on the thief's page, is asked to sign this and only this.
@@ -74,7 +78,7 @@ test("M3 fixed: the backup's wallet shows where everything goes and how much, an
       return ccc.hexFrom(ccc.bytesConcat(raw.slice(1), [raw[0] + 27]));
     },
   };
-  const signed = await signRecoverySpendWithEvm(drain, { client, lock, omnilock: KEYWAY_OMNILOCK.testnet, list: list.entries, entry: list.entries[0], adminList: adminList.outPoint, inputCapacity: 10_000n * CKB }, wallet);
+  const signed = await signRecoverySpendWithEvm(drain, { client, lock, omnilock: KEYWAY_OMNILOCK.testnet, auths: list.auths, entry, adminList: adminList.outPoint, inputCapacity: 10_000n * CKB }, wallet);
 
   assert.equal(requests.length, 1);
   const thief = ccc.Address.fromScript(thiefLock, client).toString();

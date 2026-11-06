@@ -1,8 +1,8 @@
 import * as ccc from "@ckb-ccc/core";
 import { knownOmnilock, keywayOmnilock, type OmnilockDeployment } from "../sdk/browser/account-lock";
 import type { EthereumProvider } from "../sdk/browser/account-recovery";
-import { describeBackup, normalizeEvmAddress } from "../sdk/browser/recovery-backups";
-import { recoveryListFrom, type RecoveryListEntry } from "../sdk/browser/recovery-list";
+import { normalizeEvmAddress, type RecoveryBackup } from "../sdk/browser/recovery-backups";
+import { recoveryListEntry, recoveryListFrom, type RecoveryListEntry } from "../sdk/browser/recovery-list";
 import { prepareRecoverySpend, prepareRecoveryWitness, signRecoverySpendWithEvm, signRecoverySpendWithJoyId, type RecoverySpend } from "../sdk/browser/recovery-spend";
 import { addTokenCellDeps } from "../sdk/browser/settlement-sweep";
 import { formatAsset, hasPlainTokenArgs, isXudtCompatible } from "../sdk/browser/tokens";
@@ -11,8 +11,9 @@ import { formatAsset, hasPlainTokenArgs, isXudtCompatible } from "../sdk/browser
  * The rescue: moving everything out of a KeyWay account with recovery on, signed by one of its backups, with
  * nothing but a public CKB node. No KeyWay API, database, Lit or secret is involved, so it works if KeyWay is
  * gone. Everything it needs is on chain: the address names the AdminList by its type hash, the AdminList cell
- * holds the list's SMT root, and the transaction that last wrote the list records its members, which rebuild the
- * backup's proof.
+ * holds the list's SMT root, and the transaction that last wrote the list records its members' salted auths,
+ * which rebuild the backup's proof. The list doesn't name its backups: the connected backup's auth is computed
+ * with the account's salt (its AdminList type hash) and looked up in it.
  *
  * The node is trusted only for which cells exist (a dead cell just makes the transaction fail): every cell is
  * read from the transaction that created it, after checking that transaction's hash against the cell's out point,
@@ -101,7 +102,8 @@ export type RescueToken = { typeHash: ccc.Hex; amount: bigint; amountText: strin
 export type RescueAccount = KeyWayAddress & {
   /** The live AdminList cell, read from the transaction that created it. It stays where it is. */
   adminList: ccc.Cell;
-  entries: RecoveryListEntry[];
+  /** The members' salted auths, in the list's order. The list doesn't say which backups they are. */
+  auths: ccc.Hex[];
   /** Each member's SMT proof against the list's root, by auth. */
   proofs: Record<string, ccc.Hex>;
   /** Plain CKB and token cells a rescue moves, oldest first, each read from the transaction that created it. */
@@ -176,6 +178,7 @@ export async function openRescueAccount(client: ccc.Client, input: string, exclu
   } catch (error) {
     throw new RescueError("list-missing", `The recovery list couldn't be read from the chain: ${error instanceof Error ? error.message : "unknown error"}`);
   }
+  if (list.salt !== account.adminListTypeHash) throw new RescueError("list-missing", "The recovery list on chain isn't this address's");
   cells.sort((a, b) => outPointKey(a).localeCompare(outPointKey(b)));
   const kinds = cells.map((cell) => rescueCellKind(cell, xudt, sudt));
   const allMovable = cells.filter((_, index) => kinds[index] !== "other");
@@ -194,7 +197,7 @@ export async function openRescueAccount(client: ccc.Client, input: string, exclu
   return {
     ...account,
     adminList: list.cell,
-    entries: list.entries,
+    auths: list.auths,
     proofs: list.proofs,
     movable,
     ckb: sum(movable.filter((cell) => !cell.cellOutput.type)),
@@ -216,34 +219,50 @@ export function rescueCellKind(cell: { cellOutput: ccc.CellOutput; outputData: c
   return (matches(xudt) || matches(sudt) || isXudtCompatible(type)) && hasPlainTokenArgs(type) && ccc.bytesFrom(cell.outputData).length >= 16 ? "token" : "other";
 }
 
-/** The list entry for an EVM wallet's accounts, or a refusal naming the backups that are on the list. */
-export function rescueEntryForEvm(account: Pick<RescueAccount, "entries">, addresses: string[]): RecoveryListEntry {
-  const wanted = new Set(addresses.map((address) => normalizeEvmAddress(address)));
-  const entry = account.entries.find(({ backup }) => backup.kind === "evm" && wanted.has(normalizeEvmAddress(backup.address)));
-  if (!entry) throw notBackup(account, addresses.length === 1 ? `EVM wallet ${addresses[0]}` : "None of this EVM wallet's accounts");
-  return entry;
+type ListedAccount = Pick<RescueAccount, "auths" | "adminListTypeHash">;
+
+/** The connected backup's entry, if its auth with this account's salt is on the list. */
+async function entryFor(client: ccc.Client, account: ListedAccount, backup: RecoveryBackup): Promise<RecoveryListEntry | undefined> {
+  return recoveryListEntry(client, { auths: account.auths, salt: account.adminListTypeHash }, backup);
+}
+
+/** The list entry for an EVM wallet's accounts, or a refusal. */
+export async function rescueEntryForEvm(client: ccc.Client, account: ListedAccount, addresses: string[]): Promise<RecoveryListEntry> {
+  for (const address of addresses) {
+    const entry = await entryFor(client, account, { kind: "evm", address: normalizeEvmAddress(address) });
+    if (entry) return entry;
+  }
+  throw notBackup(account, addresses.length === 1 ? `EVM wallet ${addresses[0]}` : "None of this EVM wallet's accounts");
 }
 
 /** The list entry for a JoyID address, or a refusal. */
-export function rescueEntryForJoyId(account: Pick<RescueAccount, "entries">, address: string): RecoveryListEntry {
-  const entry = account.entries.find(({ backup }) => backup.kind === "joyid" && backup.address === address);
+export async function rescueEntryForJoyId(client: ccc.Client, account: ListedAccount, address: string): Promise<RecoveryListEntry> {
+  let entry: RecoveryListEntry | undefined;
+  try {
+    entry = await entryFor(client, account, { kind: "joyid", address });
+  } catch (error) {
+    if (error instanceof Error && /JoyID address|JoyID passkey \(main key\)/.test(error.message)) {
+      throw new RescueError("not-backup", `JoyID ${address} isn't a JoyID passkey (main key) on this network, so it can't be a backup`);
+    }
+    throw new RescueError("rpc", `The CKB node didn't answer: ${error instanceof Error ? error.message.slice(0, 120) : "unknown error"}`);
+  }
   if (!entry) throw notBackup(account, `JoyID ${address}`);
   return entry;
 }
 
-function notBackup(account: Pick<RescueAccount, "entries">, who: string): RescueError {
-  const listed = account.entries.map(({ backup }) => describeBackup(backup)).join(", ");
-  return new RescueError("not-backup", `${who} isn't a backup of this account. Its backups are: ${listed}`);
+function notBackup(account: ListedAccount, who: string): RescueError {
+  const count = account.auths.length;
+  return new RescueError("not-backup", `${who} isn't a backup of this account. It has ${count} backup${count === 1 ? "" : "s"}; connect one of them`);
 }
 
 /** Asks an EIP-1193 wallet for its accounts and returns the one on the list. */
-export async function connectEvmBackup(account: Pick<RescueAccount, "entries">, ethereum: EthereumProvider | undefined): Promise<RecoveryListEntry> {
+export async function connectEvmBackup(client: ccc.Client, account: ListedAccount, ethereum: EthereumProvider | undefined): Promise<RecoveryListEntry> {
   if (!ethereum) throw new RescueError("no-wallet", "No EVM wallet found in this browser. Open this page in a browser with your EVM wallet, or in the wallet's own browser");
   const accounts = await ethereum.request({ method: "eth_requestAccounts" });
-  if (!Array.isArray(accounts) || accounts.length === 0 || accounts.some((value) => typeof value !== "string")) {
+  if (!Array.isArray(accounts) || accounts.length === 0 || accounts.some((value) => typeof value !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(value))) {
     throw new RescueError("no-wallet", "The EVM wallet didn't share an account");
   }
-  return rescueEntryForEvm(account, accounts as string[]);
+  return rescueEntryForEvm(client, account, accounts as string[]);
 }
 
 /** The one transaction a rescue sends, what it moves, and the text the backup signs. */
@@ -281,7 +300,7 @@ export async function planRescue(client: ccc.Client, account: RescueAccount, ent
   if (lock.eq(account.lock)) throw new RescueError("destination", "That's this KeyWay address. Send to an address you control with another wallet");
   await checkDestinationLock(client, lock);
   if (account.movable.length === 0) throw new RescueError("empty", "There's nothing to move from this address");
-  if (!account.entries.includes(entry)) throw new RescueError("not-backup", "This backup isn't on the account's recovery list");
+  if (!account.auths.includes(entry.auth)) throw new RescueError("not-backup", "This backup isn't on the account's recovery list");
 
   const tokenCells = account.movable.filter((cell) => cell.cellOutput.type);
   const attempt = async (withPlain: boolean) => {
@@ -363,7 +382,7 @@ async function addRescueTokenCellDeps(client: ccc.Client, transaction: ccc.Trans
 
 /** The backup's spend over the account's movable cells, whose capacities were checked against their creating transactions. */
 function rescueSpend(client: ccc.Client, account: RescueAccount, entry: RecoveryListEntry): RecoverySpend {
-  return { client, lock: account.lock, omnilock: account.omnilock, list: account.entries, entry, adminList: account.adminList.outPoint, inputCapacity: account.ckb + account.tokenCkb };
+  return { client, lock: account.lock, omnilock: account.omnilock, auths: account.auths, entry, adminList: account.adminList.outPoint, inputCapacity: account.ckb + account.tokenCkb };
 }
 
 /**

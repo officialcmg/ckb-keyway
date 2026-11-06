@@ -1,0 +1,12 @@
+A: salt 0x5f92bd4e873b09d97f689d6ba87da79f90545adefecb79d260ca786b620b35b9
+  E1 auth 0xfd74d929da39f79d3c15d7f6f28a25d463cda20110
+  J1 auth 0xfd6e8472fcfb4109ce447fcc144074615e4734f06e
+  record 0x4b57524c0302fd74d929da39f79d3c15d7f6f28a25d463cda20110fd6e8472fcfb4109ce447fcc144074615e4734f06e
+  record names E1's address: false, J1's key hash: false
+B: salt 0xe7548568930880dcd9f2c082f1c2ae6811c919e635147648874c73545502fac5
+  E1 auth 0xfd15266353601f62504ee1e69daf00c27dc2fc716c
+  J1 auth 0xfd0ec3ac3669295e06bd2e19e48ee900a4078297bb
+  record 0x4b57524c0302fd15266353601f62504ee1e69daf00c27dc2fc716cfd0ec3ac3669295e06bd2e19e48ee900a4078297bb
+  record names E1's address: false, J1's key hash: false
+E1's auths differ between A and B: true J1's: true no auth shared: true
+C copies A's auths: true C's own salt for E1: 0xfdf5413c96a6274fc68ec902baf7e047774f900a63 on C's list: false

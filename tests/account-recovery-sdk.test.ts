@@ -219,9 +219,11 @@ async function recoveryFixture() {
   const joyId = await client.getKnownScript(ccc.KnownScript.JoyId);
   const joyLock = ccc.Script.from({ codeHash: joyId.codeHash, hashType: joyId.hashType, args: ccc.bytesConcat("0x0001", ccc.hashCkbShort(joyPublicKey)) });
   const evm = injectedWallet();
+  // The account's salt: the AdminList type hash at the end of its Omnilock args below.
+  const salt = ccc.hexFrom(new Uint8Array(32).fill(2));
   const list = [
-    { backup: { kind: "evm" as const, address: evm.address }, auth: evmBackupAuth(evm.address), preimage: evmPreimage(evm.address) },
-    { backup: { kind: "joyid" as const, address: ccc.Address.fromScript(joyLock, client).toString() }, auth: joyIdBackupAuth(joyLock), preimage: joyIdPreimage(ccc.hashCkbShort(joyPublicKey)) },
+    { backup: { kind: "evm" as const, address: evm.address }, auth: evmBackupAuth(evm.address, salt), preimage: evmPreimage(evm.address, salt) },
+    { backup: { kind: "joyid" as const, address: ccc.Address.fromScript(joyLock, client).toString() }, auth: joyIdBackupAuth(joyLock, salt), preimage: joyIdPreimage(ccc.hashCkbShort(joyPublicKey), salt) },
   ];
   const lock = omnilockScript({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: ccc.hexFrom(ccc.bytesConcat([0], new Uint8Array(20).fill(1), [1], new Uint8Array(32).fill(2))) });
   const destination = await ccc.Script.fromKnownScript(client, ccc.KnownScript.Secp256k1Blake160, `0x${"77".repeat(20)}`);
@@ -242,14 +244,14 @@ async function recoveryFixture() {
       return JSON.stringify({ alg: -7, signature: Buffer.from(der).toString("base64url"), message: Buffer.from(ccc.bytesConcat(authData, clientData)).toString("base64url") });
     },
   } as unknown as ccc.Signer;
-  const spend = (entry: (typeof list)[number]) => ({ client, lock, omnilock: KEYWAY_OMNILOCK.testnet, list, entry, adminList: { txHash: `0x${"ad".repeat(32)}`, index: 0 }, inputCapacity: 1000n * 100_000_000n });
-  return { tx, lock, destination, list, evm, joySigner, signs, spend };
+  const spend = (entry: (typeof list)[number]) => ({ client, lock, omnilock: KEYWAY_OMNILOCK.testnet, auths: list.map(({ auth }) => auth), entry, adminList: { txHash: `0x${"ad".repeat(32)}`, index: 0 }, inputCapacity: 1000n * 100_000_000n });
+  return { tx, lock, destination, list, evm, joySigner, signs, spend, salt };
 }
 
 const hasDep = (transaction: ccc.Transaction, dep: { outPoint: { txHash: string } }) => transaction.cellDeps.some(({ outPoint }) => outPoint.txHash === dep.outPoint.txHash);
 
 test("signs a recovery spend with a JoyID backup: the verifier's blob over the readable approval", async () => {
-  const { tx, list, joySigner, signs, spend, destination } = await recoveryFixture();
+  const { tx, list, joySigner, signs, spend, destination, salt } = await recoveryFixture();
   const { text } = await prepareRecoverySpend(tx, spend(list[1]));
   const signed = await signRecoverySpendWithJoyId(tx, spend(list[1]), joySigner);
   const witness = ccc.bytesFrom(signed.getWitnessArgsAt(0)!.lock!);
@@ -269,7 +271,10 @@ test("signs a recovery spend with a JoyID backup: the verifier's blob over the r
   // The proof is against the whole list.
   assert.ok(ccc.hexFrom(witness).includes(whitelistTree(list.map(({ auth }) => auth)).proofs[list[1].auth].slice(2)));
   // Another passkey, or the EVM entry, is refused before anything is signed.
-  await assert.rejects(signRecoverySpendWithJoyId(tx, { ...spend(list[1]), entry: { ...list[1], preimage: joyIdPreimage(new Uint8Array(20)) } }, joySigner), /isn't the backup on the recovery list/);
+  await assert.rejects(signRecoverySpendWithJoyId(tx, { ...spend(list[1]), entry: { ...list[1], preimage: joyIdPreimage(new Uint8Array(20), salt) } }, joySigner), /isn't the backup on the recovery list/);
+  // The same passkey's entry for another account (salt) doesn't match this account's lock.
+  const elsewhere = joyIdPreimage(ccc.hashCkbShort(JSON.parse(await joySigner.getIdentity()).publicKey.replace(/^/, "0x")), new Uint8Array(32).fill(3));
+  await assert.rejects(signRecoverySpendWithJoyId(tx, { ...spend(list[1]), entry: { ...list[1], preimage: elsewhere } }, joySigner), /isn't the backup on the recovery list/);
   await assert.rejects(signRecoverySpendWithJoyId(tx, spend(list[0]), joySigner), /isn't a JoyID passkey/);
 });
 
@@ -285,7 +290,9 @@ test("signs a recovery spend with an EVM backup: personal_sign of the readable a
   assert.equal(ccc.hexFrom(witness.slice(-62)), list[0].preimage);
   assert.ok(hasDep(signed, EVM_PERSONAL_SIGN_VERIFIER.testnetCellDep), "the EVM verifier is a cell dep");
   assert.ok(!hasDep(signed, JOYID_WEBAUTHN_VERIFIER.testnetCellDep), "no WebAuthn verifier for an EVM backup");
-  await assert.rejects(signRecoverySpendWithEvm(tx, { ...spend(list[0]), list: [list[1]] }, evm.provider), /isn't on the recovery list/);
+  await assert.rejects(signRecoverySpendWithEvm(tx, { ...spend(list[0]), auths: [list[1].auth] }, evm.provider), /isn't on the recovery list/);
+  // The wallet's entry for another account (salt) isn't this account's backup.
+  await assert.rejects(signRecoverySpendWithEvm(tx, { ...spend(list[0]), entry: { ...list[0], preimage: evmPreimage(evm.address, new Uint8Array(32).fill(3)) } }, evm.provider), /isn't the backup on the recovery list/);
   // A transaction that isn't a rescue to one address has no approval text, so nothing is signed.
   const split = tx.clone();
   split.outputs.push(ccc.CellOutput.from({ lock, capacity: 100n * 100_000_000n }));

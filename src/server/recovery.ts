@@ -1,8 +1,8 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import * as ccc from "@ckb-ccc/core";
 import { adminListLock, adminListTypeScript, keywayOmnilock, omnilockArgsFor, omnilockScript, secp256k1Lock, verifyRecoveryAnchor, OMNILOCK_OWNER_WITNESS_LOCK_LENGTH, type KeyWayRecovery } from "../sdk/browser/account-lock.ts";
-import { BACKUP_CHALLENGE_TTL_MS, backupAuth, backupChallengeExpiry, describeBackup, MAX_RECOVERY_BACKUPS, parseBackup, parseBackups, verifyBackupOwnership, type RecoveryBackup } from "../sdk/browser/recovery-backups.ts";
-import { readRecoveryList, recoveryListRecord, recoveryListRecordOf, setRecoveryListRecord } from "../sdk/browser/recovery-list.ts";
+import { BACKUP_CHALLENGE_TTL_MS, backupChallengeExpiry, describeBackup, MAX_RECOVERY_BACKUPS, parseBackup, parseBackups, verifyBackupOwnership, type RecoveryBackup } from "../sdk/browser/recovery-backups.ts";
+import { backupAuths, readRecoveryList, recoveryListRecord, recoveryListRecordOf, recoverySalt, setRecoveryListRecord } from "../sdk/browser/recovery-list.ts";
 import { adminListData, whitelistTree } from "../sdk/browser/recovery-smt.ts";
 import { addTokenCellDeps } from "../sdk/browser/settlement-sweep.ts";
 import { formatAsset, hasPlainTokenArgs, isXudtCompatible } from "../sdk/browser/tokens.ts";
@@ -287,7 +287,7 @@ const occupied = (output: ccc.CellOutput, data: ccc.HexLike) => ccc.fixedPointFr
  * (Type ID, locked by the Lit key's owner-only Omnilock so no backup can touch it, RCRule data with the backups'
  * root, at its exact occupied capacity),
  * then each token cell moves as it is, and the rest of the CKB less the fee goes to the new address. Witness 0
- * records the full backup list (`recoveryListRecord`) in its output_type.
+ * records the backups' salted auths (`recoveryListRecord`) in its output_type.
  */
 export async function planRecovery(client: ccc.Client, wallet: ReadyWallet, backups: RecoveryBackup[], options: { emailBinding?: boolean } = { emailBinding: litPolicyEnabled() }): Promise<RecoveryPlan> {
   const secp = await secp256k1Lock(client, wallet.litPublicKey);
@@ -306,7 +306,9 @@ export async function planRecovery(client: ccc.Client, wallet: ReadyWallet, back
   const adminListType = adminListTypeScript({ adminListTypeArgs: ccc.hashTypeId(input0, 0) });
   const deployment = keywayOmnilock(client);
   const omnilock = omnilockScript({ omnilock: deployment, omnilockArgs: omnilockArgsFor(wallet.litPublicKey, adminListType.hash()) });
-  const { root } = whitelistTree(await Promise.all(backups.map((backup) => backupAuth(client, backup))));
+  // Each backup's identity is salted with this account's AdminList type hash, so it differs in every account.
+  const auths = await backupAuths(client, backups, adminListType.hash());
+  const { root } = whitelistTree(auths);
   const data = adminListData(root);
 
   const adminList = ccc.CellOutput.from({ lock: adminListLock({ omnilock: deployment, omnilockArgs: omnilock.args }), type: adminListType, capacity: 0n });
@@ -327,8 +329,8 @@ export async function planRecovery(client: ccc.Client, wallet: ReadyWallet, back
   transaction.witnesses = inputCells.map((_, index) => index === 0
     ? ccc.hexFrom(ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(SECP_WITNESS_LOCK_LENGTH)) }).toBytes())
     : "0x");
-  // The full list goes on chain beside the AdminList (output 0), so it can be rebuilt without KeyWay.
-  setRecoveryListRecord(transaction, 0, await recoveryListRecord(client, backups));
+  // The list's salted auths go on chain beside the AdminList (output 0), so its proofs can be rebuilt without KeyWay.
+  setRecoveryListRecord(transaction, 0, recoveryListRecord(auths));
   // With the policy Action, witness 0 also carries the encrypted email binding, at a fixed size, so the fee
   // (and the transaction hash the emailed code is for) is the same before and after the binding goes in.
   if (options.emailBinding) setEmailBinding(transaction);
@@ -384,14 +386,15 @@ export async function checkRecoveryTransaction(client: ccc.Client, transaction: 
   const adminListType = adminListTypeScript({ adminListTypeArgs: ccc.hashTypeId(transaction.inputs[0], 0) });
   const deployment = keywayOmnilock(client);
   const omnilock = omnilockScript({ omnilock: deployment, omnilockArgs: omnilockArgsFor(publicKey, adminListType.hash()) });
-  const { root } = whitelistTree(await Promise.all(backups.map((backup) => backupAuth(client, backup))));
+  const auths = await backupAuths(client, backups, adminListType.hash());
+  const { root } = whitelistTree(auths);
   const [adminList, ...rest] = transaction.outputs;
   if (!adminList || !adminList.type?.eq(adminListType)) refuse("output 0 isn't the account's recovery list");
   if (!adminList.lock.eq(adminListLock({ omnilock: deployment, omnilockArgs: omnilock.args }))) refuse("the recovery list isn't locked to your key alone");
   const data = ccc.hexFrom(transaction.outputsData[0] ?? "0x");
   if (data !== adminListData(root)) refuse("the recovery list doesn't hold exactly these backups");
   if (adminList.capacity !== occupied(adminList, data)) refuse("the recovery list's capacity is wrong");
-  if (recoveryListRecordOf(transaction, 0) !== await recoveryListRecord(client, backups)) refuse("the recorded backup list isn't exactly these backups");
+  if (recoveryListRecordOf(transaction, 0) !== recoveryListRecord(auths)) refuse("the recorded backup list isn't exactly these backups");
   if (rest.length === 0) refuse("nothing moves to the new address");
   rest.forEach((output, index) => {
     if (!output.lock.eq(omnilock)) refuse(`output ${index + 1} goes somewhere other than your new address`);
@@ -456,7 +459,7 @@ export type BackupChangePlan = {
   listLock: ccc.Script;
   adminList: ccc.Cell;
   backups: RecoveryBackup[];
-  /** The list's on-chain record before the change, for the policy Action to check against the list's root. */
+  /** The list's record before the change (salted auths), for the policy Action to check against the list's root. */
   previousRecord: ccc.Hex;
   preview: BackupChangePreview;
 };
@@ -548,16 +551,23 @@ function changeDigest(plan: BackupChangePlan, change: BackupChange): string {
   return hashText(JSON.stringify({ transaction: serializeTransaction(plan.transaction), change }));
 }
 
-/** The list as it is on chain: its record, or for a list without one, the stored list if it matches the root. */
+/**
+ * The list as it is on chain, by its members: the record holds only salted auths, so the members are KeyWay's
+ * stored list, which must give exactly the recorded auths (or, for a list without a record, the cell's root).
+ */
 async function currentBackups(client: ccc.Client, recovery: KeyWayRecovery): Promise<{ adminList: ccc.Cell; backups: RecoveryBackup[] }> {
+  const mismatch = () => new Error("KeyWay's copy of your backups doesn't match the recovery list on chain");
+  if (!recovery.backups) throw mismatch();
+  const auths = await backupAuths(client, recovery.backups, recoverySalt(recovery));
   try {
     const list = await readRecoveryList(client, recovery);
-    return { adminList: list.cell, backups: list.entries.map(({ backup }) => backup) };
+    if (list.auths.length !== auths.length || list.auths.some((auth, index) => auth !== auths[index])) throw mismatch();
+    return { adminList: list.cell, backups: recovery.backups };
   } catch (error) {
-    if (!(error instanceof Error) || !/doesn't record its backups/.test(error.message) || !recovery.backups) throw error;
+    if (!(error instanceof Error) || !/doesn't record its backups/.test(error.message)) throw error;
     const adminList = await client.findSingletonCellByType(adminListTypeScript(recovery), true);
-    const { root } = whitelistTree(await Promise.all(recovery.backups.map((backup) => backupAuth(client, backup))));
-    if (!adminList || ccc.hexFrom(adminList.outputData) !== adminListData(root)) throw new Error("KeyWay's copy of your backups doesn't match the recovery list on chain");
+    const { root } = whitelistTree(auths);
+    if (!adminList || ccc.hexFrom(adminList.outputData) !== adminListData(root)) throw mismatch();
     return { adminList, backups: recovery.backups };
   }
 }
@@ -587,7 +597,8 @@ export async function planBackupChange(client: ccc.Client, wallet: ReadyWallet, 
     if (current.length === 1) throw new Error("Keep at least one backup. Add another backup before removing this one");
     backups = current.filter((backup) => backupKey(backup) !== backupKey(change.backup));
   }
-  const { root } = whitelistTree(await Promise.all(backups.map((backup) => backupAuth(client, backup))));
+  const auths = await backupAuths(client, backups, recoverySalt(recovery));
+  const { root } = whitelistTree(auths);
   const data = adminListData(root);
 
   const plain: ccc.Cell[] = [];
@@ -608,7 +619,7 @@ export async function planBackupChange(client: ccc.Client, wallet: ReadyWallet, 
     funded += cell.cellOutput.capacity;
     // Witness 0 is the list group's and witness 1 the account group's first witness, each at its final length.
     transaction.witnesses = [ownerWitness, ownerWitness];
-    setRecoveryListRecord(transaction, 0, await recoveryListRecord(client, backups));
+    setRecoveryListRecord(transaction, 0, recoveryListRecord(auths));
     fee = (BigInt(transaction.toBytes().length + 4) * FEE_RATE + 999n) / 1000n;
     if (funded >= minimum + fee) break;
     if (transaction.inputs.length > MAX_CELLS) break;
@@ -617,7 +628,7 @@ export async function planBackupChange(client: ccc.Client, wallet: ReadyWallet, 
   transaction.outputs[1].capacity = funded - fee;
   const label = (backup: RecoveryBackup) => ({ ...backup, label: describeBackup(backup) });
   return {
-    transaction, omnilock, listLock, adminList, backups, previousRecord: await recoveryListRecord(client, current),
+    transaction, omnilock, listLock, adminList, backups, previousRecord: recoveryListRecord(await backupAuths(client, current, recoverySalt(recovery))),
     preview: {
       network: "CKB testnet",
       change: change.change,
@@ -648,9 +659,10 @@ export async function checkBackupChangeTransaction(client: ccc.Client, transacti
   if (inputCells.slice(1).some(({ cellOutput, outputData }) => cellOutput.type || outputData !== "0x")) refuse("an input isn't plain CKB");
   const [adminList, ...rest] = transaction.outputs;
   if (!adminList || !adminList.lock.eq(listLock) || !adminList.type?.eq(type) || adminList.capacity !== inputCells[0].cellOutput.capacity) refuse("output 0 doesn't recreate the recovery list");
-  const { root } = whitelistTree(await Promise.all(backups.map((backup) => backupAuth(client, backup))));
+  const auths = await backupAuths(client, backups, recoverySalt(recovery));
+  const { root } = whitelistTree(auths);
   if (ccc.hexFrom(transaction.outputsData[0] ?? "0x") !== adminListData(root)) refuse("the recovery list doesn't hold exactly these backups");
-  if (recoveryListRecordOf(transaction, 0) !== await recoveryListRecord(client, backups)) refuse("the recorded backup list isn't exactly these backups");
+  if (recoveryListRecordOf(transaction, 0) !== recoveryListRecord(auths)) refuse("the recorded backup list isn't exactly these backups");
   if (rest.length === 0) refuse("nothing returns to your address");
   rest.forEach((output, index) => {
     if (!output.lock.eq(omnilock) || output.type || ccc.hexFrom(transaction.outputsData[index + 1] ?? "0x") !== "0x") refuse(`output ${index + 1} isn't plain CKB at your address`);

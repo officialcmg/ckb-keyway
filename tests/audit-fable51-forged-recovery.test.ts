@@ -21,8 +21,8 @@ import {
   type KeyWayRecovery,
 } from "../src/sdk/browser/account-lock.ts";
 import { checkWalletRecovery } from "../src/sdk/browser/bootstrap.ts";
-import { backupAuth, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
-import { readRecoveryList, recoveryListRecord, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
+import { type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
+import { backupAuths, readRecoveryList, recoveryListEntry, recoveryListRecord, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
 import { adminListData, whitelistTree } from "../src/sdk/browser/recovery-smt.ts";
 import { signRecoverySpendWithEvm } from "../src/sdk/browser/recovery-spend.ts";
 import { formatCkbSignature, signAccountGroups } from "../src/server/funding-transaction.ts";
@@ -80,7 +80,8 @@ async function attackerMintsList(base: ccc.Client) {
   const omnilock = omnilockScript({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: omnilockArgsFor(victimPublicKey, adminType.hash()) });
   const listLock = adminListLock({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: omnilock.args });
   const backups: RecoveryBackup[] = [{ kind: "evm", address: attackerEvm }];
-  const { root } = whitelistTree(await Promise.all(backups.map((backup) => backupAuth(base, backup))));
+  const auths = await backupAuths(base, backups, adminType.hash());
+  const { root } = whitelistTree(auths);
   const mint = ccc.Transaction.from({
     inputs: [input0],
     outputs: [{ lock: listLock, type: adminType, capacity: 165n * CKB }, { lock: attackerSecp, capacity: 334n * CKB }],
@@ -88,7 +89,7 @@ async function attackerMintsList(base: ccc.Client) {
   });
   await mint.addCellDepsOfKnownScripts(base, ccc.KnownScript.Secp256k1Blake160);
   mint.witnesses = [ccc.hexFrom(ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(65)) }).toBytes())];
-  setRecoveryListRecord(mint, 0, await recoveryListRecord(base, backups));
+  setRecoveryListRecord(mint, 0, recoveryListRecord(auths));
   await offlineClient([funding]).then((client) => signAccountGroups(mint, [{ script: attackerSecp, kind: "secp256k1" }], client, sign(attackerKey)));
   const adminList = ccc.Cell.from({ outPoint: { txHash: mint.hash(), index: 0 }, cellOutput: mint.outputs[0], outputData: mint.outputsData[0] });
   const forged: KeyWayRecovery = {
@@ -172,6 +173,6 @@ test("even with funds at a forged address, the attacker's backup must sign a tex
       return ccc.hexFrom(ccc.bytesConcat(raw.slice(1), [raw[0] + 27]));
     },
   };
-  await signRecoverySpendWithEvm(drain, { client: after, lock: omnilock, omnilock: forged.omnilock, list: list.entries, entry: list.entries[0], adminList: adminList.outPoint, inputCapacity: 5_000n * CKB }, wallet);
+  await signRecoverySpendWithEvm(drain, { client: after, lock: omnilock, omnilock: forged.omnilock, auths: list.auths, entry: (await recoveryListEntry(after, list, { kind: "evm", address: attackerEvm }))!, adminList: adminList.outPoint, inputCapacity: 5_000n * CKB }, wallet);
   assert.match(shown, new RegExp(`^KeyWay recovery\nMove everything to ${ccc.Address.fromScript(attackerSecp, after).toString()}\nCKB: 4,999\nTokens: none\nFee: 1 CKB\nTransaction: 0x[0-9a-f]{64}$`));
 });

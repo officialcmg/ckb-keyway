@@ -1,0 +1,5 @@
+2026-11-06 19:08:13 node -> page: create_watch_channel {channel_id,funding_udt_type_script,local_funding_pubkey,local_settlement_key,remote_funding_pubkey,remote_settlement_key,settlement_data}  -> KeyWay watch {channelId,fundingUdtTypeScript,localFundingPubkey,remoteFundingPubkey} channel=0xa609458f7e3d82b3e6dad70e6f388aa19fdabd9de544456cb3e1741a1fc98be7 commitment=-
+2026-11-06 19:10:03 node -> page: update_revocation {channel_id,revocation_data,settlement_data}  -> KeyWay revoke {channelId,revocation} channel=0xa609458f7e3d82b3e6dad70e6f388aa19fdabd9de544456cb3e1741a1fc98be7 commitment=0x1
+2026-11-06 19:10:03 node -> page: update_revocation {channel_id,revocation_data,settlement_data}  -> KeyWay revoke {channelId,revocation} channel=0xa609458f7e3d82b3e6dad70e6f388aa19fdabd9de544456cb3e1741a1fc98be7 commitment=0x2
+2026-11-06 19:10:27 run 2: V stopped (tab closed)
+2026-11-06 19:10:33 run 2: C force-closed 0xa609… with its old (revoked) state
