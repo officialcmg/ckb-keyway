@@ -119,10 +119,12 @@ test("stopping the listener waits for calls it already received", async () => {
   let finish!: () => void;
   const slow = new Promise<void>((resolve) => { finish = resolve; });
   let stored = false;
-  const stop = listenForWatchtowerCalls(name, async () => { await slow; stored = true; });
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const stop = listenForWatchtowerCalls(name, async () => { markStarted(); await slow; stored = true; });
   const sender = new BroadcastChannel(name);
   sender.postMessage({ kind: "call", id: 1, method: "remove_preimage", params: {} });
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  await started;
   const stopped = stop().then(() => stored);
   setTimeout(finish, 20);
   assert.equal(await stopped, true);
