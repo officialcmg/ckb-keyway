@@ -58,7 +58,7 @@ test("Fiber's JSON-RPC calls to the watchtower reach the page and are answered a
     assert.match(unknown.error.message, /Unknown watchtower method/);
     socket.close();
   } finally {
-    stop();
+    await stop();
   }
 });
 
@@ -112,4 +112,19 @@ test("a repeated create_watch_channel keeps the peer's settlement and revocation
   assert.deepEqual(again.remoteSettlement, local);
   assert.ok(again.revocation);
   assert.equal(again.createdAt, 1);
+});
+
+test("stopping the listener waits for calls it already received", async () => {
+  const name = `test-${Math.random()}`;
+  let finish!: () => void;
+  const slow = new Promise<void>((resolve) => { finish = resolve; });
+  let stored = false;
+  const stop = listenForWatchtowerCalls(name, async () => { await slow; stored = true; });
+  const sender = new BroadcastChannel(name);
+  sender.postMessage({ kind: "call", id: 1, method: "remove_preimage", params: {} });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const stopped = stop().then(() => stored);
+  setTimeout(finish, 20);
+  assert.equal(await stopped, true);
+  sender.close();
 });
