@@ -286,10 +286,11 @@ export function KeyWayProvider({
   const fiberOperationsRef = useRef(0);
   // The SDK took any JoyID answer out of the address bar when it loaded. A router hydrating can put it back, so
   // it goes again before this provider's (or its children's) first fetch, and once more after the router mounts.
-  useLayoutEffect(() => {
+  useBrowserLayoutEffect(() => {
     stripJoyIdAnswerAgain();
-    const later = setTimeout(() => stripJoyIdAnswerAgain(true), 0);
-    return () => clearTimeout(later);
+    // Twice, in case the router's own effect that hooks history hasn't run by the first.
+    const timers = [setTimeout(() => stripJoyIdAnswerAgain(true), 0), setTimeout(() => stripJoyIdAnswerAgain(true), 300)];
+    return () => timers.forEach(clearTimeout);
   }, []);
   const transaction = useApproval<TransactionPreview>();
   const message = useApproval<MessagePreview>();
@@ -323,6 +324,7 @@ export function KeyWayProvider({
   };
 
   async function connect() {
+    if (isJoyIdHelperWindow()) throw new Error("The JoyID window doesn't run Fiber");
     if (!authToken) throw new Error("Log in before connecting KeyWay");
     const run = ++runRef.current;
     setStatus("connecting");
@@ -612,7 +614,8 @@ export function KeyWayProvider({
       const failure = cause instanceof Error ? cause : new Error("The JoyID backup couldn't be finished");
       setPendingJoyIdBackup({ operation, status: failure instanceof JoyIdCancelledError ? "cancelled" : "failed", error: failure });
       setJoyIdHold(false);
-      if (!(failure instanceof JoyIdCancelledError)) callbacksRef.current.onError?.(failure);
+      // A crafted link with no request behind it isn't the app's error to report.
+      if (!(failure instanceof JoyIdCancelledError) && record) callbacksRef.current.onError?.(failure);
     });
   }, [ready]);
 
@@ -699,7 +702,7 @@ export function KeyWayProvider({
         userId: user.id,
         appId,
         op: (options.afterRedirect ?? (wallet.recovery ? "add" : "enable")) === "add" ? "backup-add" : "backup-enable",
-        returnPath: joyIdReturnPath ?? `${location.pathname}${location.search}`,
+        returnPath: joyIdReturnPath ?? `${location.pathname}${location.search}${location.hash}`,
         account,
         requestChallenge: backupChallenge,
         beforeLeaving: leaveForJoyId,
@@ -808,6 +811,8 @@ export function KeyWayProvider({
 }
 
 const noSubscription = () => () => undefined;
+// useLayoutEffect warns during server rendering in React 18.
+const useBrowserLayoutEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
 
 function isSigner(value: unknown): value is ccc.Signer {
   return Boolean(value) && typeof (value as ccc.Signer).signMessage === "function";

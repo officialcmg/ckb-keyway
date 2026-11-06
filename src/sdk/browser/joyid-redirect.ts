@@ -94,6 +94,8 @@ const AUTH_TTL_MS = 10 * 60_000;
 /** How long the window may take to load before KeyWay gives up on it. */
 const HELPER_LOAD_MS = 30_000;
 const ID_PATTERN = /^[0-9a-f]{32}$/;
+/** The JoyID apps a request may go to: mainnet and testnet, as CCC's JoyID signer picks them. */
+const JOYID_APPS = ["https://app.joy.id", "https://testnet.joyid.dev"];
 
 export class JoyIdCancelledError extends Error {
   constructor(message = "JoyID was cancelled. Nothing changed") {
@@ -168,7 +170,9 @@ export function isJoyIdRecord(value: unknown): value is JoyIdRequestRecord {
     && (record.op === "backup-enable" || record.op === "backup-add")
     && (record.step === "auth" || record.step === "sign")
     && typeof record.userId === "string" && typeof record.account === "string"
-    && typeof record.joyIdAppURL === "string" && /^https?:\/\//.test(record.joyIdAppURL)
+    && typeof record.joyIdAppURL === "string" && JOYID_APPS.includes(record.joyIdAppURL)
+    && (record.appId === null || typeof record.appId === "string")
+    && (record.otherProofs === undefined || Array.isArray(record.otherProofs))
     && typeof record.name === "string" && typeof record.logo === "string"
     && typeof record.expiresAt === "number" && isReturnPath(record.returnPath)
     && record.account.length > 0
@@ -343,12 +347,10 @@ export async function checkJoyIdResponse(
 ): Promise<{ step: "auth"; address: string; publicKey: string; keyType: string } | { step: "sign"; proof: RecoveryBackupProof }> {
   const now = context.now ?? new Date();
   if (joyIdStateId(response.state) !== record.id) throw invalidAnswer();
+  if (response.error !== undefined && response.error !== null && /reject|cancel/i.test(String(response.error))) throw new JoyIdCancelledError();
   if (context.userId === undefined) throw new Error("Sign in again, then add the JoyID backup again. Nothing changed");
   if (context.userId !== record.userId) throw new Error("This JoyID answer was for a different sign-in. Nothing changed; try again");
-  if (response.error !== undefined && response.error !== null) {
-    if (/reject|cancel/i.test(String(response.error))) throw new JoyIdCancelledError();
-    throw new Error(`JoyID couldn't finish: ${String(response.error).slice(0, 120)}`);
-  }
+  if (response.error !== undefined && response.error !== null) throw new Error(`JoyID couldn't finish: ${String(response.error).slice(0, 120)}`);
   if (now.getTime() >= record.expiresAt) throw new Error("The JoyID request expired. Nothing changed; try again");
   if (response.type !== (record.step === "auth" ? "Auth" : "SignMessage")) throw invalidAnswer();
   if (record.step === "auth") return { step: "auth", ...await checkJoyIdAuth(response.data, context.client) };
@@ -393,6 +395,7 @@ export type JoyIdBackupRun = {
 
 type HelperMessage =
   | { kind: "ready"; helper: string }
+  | { kind: "gone"; helper: string }
   | { kind: "response"; helper: string; response: JoyIdResponse }
   | { kind: "go"; helper: string; record: JoyIdRequestRecord }
   | { kind: "close"; helper: string };
@@ -406,7 +409,10 @@ export function startJoyIdBackup(run: JoyIdBackupRun, transport: "popup" | "wind
   const stage = (next: JoyIdBackupStage) => { try { run.options.onStage?.(next); } catch { /* the app's callback */ } };
   if (run.options.signal?.aborted) return Promise.reject(new JoyIdCancelledError());
   const known = knownJoyIdAddress(run.app.joyIdAppURL);
-  if (transport === "popup") return joyIdBackupByPopup(run, known, stage);
+  if (transport === "popup") {
+    if (joyIdPage().isolated) return Promise.reject(new Error("JoyID's own window can't answer this page, because it is cross-origin isolated. Use the \"window\" or \"redirect\" transport"));
+    return joyIdBackupByPopup(run, known, stage);
+  }
   if (transport === "window") {
     const helper = openJoyIdHelper(run.returnPath);
     if (helper) return joyIdBackupByWindow(run, known, helper, stage);
@@ -493,7 +499,7 @@ function openJoyIdHelper(returnPath: string): { id: string; window: Window; chan
   const listeners = new Set<() => void>();
   channel.onmessage = (event: MessageEvent) => {
     const message = event.data as HelperMessage | undefined;
-    if (!message || typeof message !== "object" || message.helper !== id || (message.kind !== "ready" && message.kind !== "response")) return;
+    if (!message || typeof message !== "object" || message.helper !== id || (message.kind !== "ready" && message.kind !== "response" && message.kind !== "gone")) return;
     messages.push(message);
     for (const listener of listeners) listener();
   };
@@ -531,6 +537,14 @@ function joyIdBackupByWindow(
     let poll: ReturnType<typeof setInterval> | undefined;
     const done = () => { helper.listeners.delete(check); clearTimeout(timer); clearInterval(poll); };
     const check = () => {
+      // The window was closed on this site, or reloaded (Back from JoyID's page) while an answer was due.
+      const lost = helper.messages.findIndex((message) => message.kind === "gone" || (kind === "response" && message.kind === "ready"));
+      if (lost >= 0) {
+        helper.messages.splice(lost, 1);
+        done();
+        reject(new JoyIdCancelledError("The JoyID window was closed. Nothing changed"));
+        return;
+      }
       const index = helper.messages.findIndex((message) => message.kind === kind);
       if (index < 0) return;
       const [message] = helper.messages.splice(index, 1);
@@ -586,8 +600,16 @@ async function joyIdBackupByRedirect(run: JoyIdBackupRun, known: string | undefi
   await run.beforeLeaving();
   leaveForJoyId(record);
   stage("leaving");
-  // The page is leaving; the provider finishes the backup when JoyID sends the user back.
-  return new Promise<never>(() => undefined);
+  // The page is leaving; the provider finishes the backup when JoyID sends the user back. If the browser brings
+  // this page back from its cache instead (Back on JoyID's page), the request is over.
+  return new Promise<never>((_, reject) => {
+    const back = (event: PageTransitionEvent) => {
+      if (!event.persisted) return;
+      window.removeEventListener("pageshow", back);
+      reject(new JoyIdCancelledError());
+    };
+    window.addEventListener("pageshow", back);
+  });
 }
 
 /**
@@ -654,6 +676,10 @@ export function runJoyIdHelper(onStatus: (status: JoyIdHelperStatus) => void): (
   }
   const channel = new BroadcastChannel(CHANNEL_NAME);
   let idle: ReturnType<typeof setTimeout> | undefined;
+  let toJoyId = false;
+  // Closing this window (or leaving it for anything but JoyID) tells the tab that opened it to stop waiting.
+  const gone = () => { if (!toJoyId) channel.postMessage({ kind: "gone", helper: helperId } satisfies HelperMessage); };
+  window.addEventListener("pagehide", gone);
   const finish = () => { onStatus("done"); window.close(); };
   const waitForOpener = () => {
     clearTimeout(idle);
@@ -662,10 +688,11 @@ export function runJoyIdHelper(onStatus: (status: JoyIdHelperStatus) => void): (
   channel.onmessage = (event: MessageEvent) => {
     const message = event.data as HelperMessage | undefined;
     if (!message || message.helper !== helperId) return;
-    if (message.kind === "close") return finish();
+    if (message.kind === "close") { toJoyId = true; return finish(); }
     if (message.kind !== "go" || !isJoyIdRecord(message.record) || message.record.transport !== "window") return;
     clearTimeout(idle);
     saveJoyIdRecord(sessionStorage, message.record);
+    toJoyId = true;
     onStatus("opening");
     location.assign(joyIdRedirectUrl(message.record, joyIdReturnUrl(message.record.returnPath, helperId)));
   };
@@ -684,5 +711,5 @@ export function runJoyIdHelper(onStatus: (status: JoyIdHelperStatus) => void): (
     channel.postMessage({ kind: "ready", helper: helperId } satisfies HelperMessage);
     waitForOpener();
   }
-  return () => { clearTimeout(idle); channel.close(); };
+  return () => { clearTimeout(idle); window.removeEventListener("pagehide", gone); channel.close(); };
 }
