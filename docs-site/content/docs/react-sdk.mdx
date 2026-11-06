@@ -19,6 +19,7 @@ icon: Code
 | `theme` | `light` | Light or dark dialogs. |
 | `fiberNode` | `hosted` | Where the user's Fiber node runs: `hosted` on KeyWay's servers, or `browser` in this page. |
 | `autoStartFiber` | `false` | Start Fiber as soon as the user signs in. Account recovery is always automatic. |
+| `joyIdReturnPath` | the current page | Where JoyID returns on a cross-origin isolated page ([JoyID backups](/account-recovery#joyid-on-a-cross-origin-isolated-page)). A path on your site that renders `KeyWayProvider`. |
 | `approveFiberChannelOpen` | built-in dialog | Your own approval for opening a channel. Receives `FiberChannelOpenPreview`. |
 | `approveFiberChannelClose` | built-in dialog | Your own approval for closing a channel. Receives `FiberChannelClosePreview`. |
 | `approveFiberPeerConnect` | built-in dialog | Your own approval for connecting to or disconnecting from a peer. Receives `FiberPeerPreview`. |

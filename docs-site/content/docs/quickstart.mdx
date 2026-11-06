@@ -112,6 +112,10 @@ export default {
 
 For Vite, configure the same headers under `server.headers` for local development and on your production host. Verify `window.crossOriginIsolated === true` before startup. Browser state moves between devices only after a successful explicit logout backup. Browser and hosted nodes are separate nodes, so switching between them doesn't move channels.
 
+<Callout type="warn" title="Cross-origin wallet windows stop working">
+  `Cross-Origin-Opener-Policy: same-origin` cuts the link between your page and any window it opens on another site. JoyID, EVM wallet sites, and sign-in or payment windows from other sites can't send their result back, and your page sees the window as closed at once. KeyWay's own JoyID backups handle this: on a cross-origin isolated page they switch to a window on your site, or a full-page redirect, by themselves ([Account recovery](/account-recovery#joyid-on-a-cross-origin-isolated-page)). Anything else of yours that opens such a window needs its own redirect flow, or a page without these headers.
+</Callout>
+
 <Card title="Next: Fiber payments" icon="arrow-right" href="/fiber-payments">
   Open a channel and make the account ready to send and receive.
 </Card>
