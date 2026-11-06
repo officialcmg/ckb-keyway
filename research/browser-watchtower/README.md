@@ -153,7 +153,8 @@ browser tab (fiber-wasm)                          KeyWay API (Railway)          
   one is due), 8 at a time, before anything else. Channels never seen funded can't have been closed; at most 500 of
   them are checked per pass, taken from each account in turn, so registrations can't slow the funded channels'
   checks and one account's registrations only delay its own channels' first checks. Only then do the channels still catching up on a backlog share a 2-minute catch-up
-  budget equally; catch-up reads only the backlog, since the recent scan already ran. Passes start every 60 s (one
+  budget equally; catch-up reads only the backlog, since the recent scan already ran. Every indexer page request is cut off after 15 s, so one slow page can't use up
+  the others' share (the scan resumes from its saved position). Passes start every 60 s (one
   that runs longer is followed at once).
 - So, for a funded channel:
   - a spend made while it is watched is acted on in the first pass after the spend is committed, whatever the other

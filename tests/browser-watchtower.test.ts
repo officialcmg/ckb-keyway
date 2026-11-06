@@ -286,6 +286,22 @@ test("a recent range longer than a pass can read is resumed, and a fresh spend s
   assert.deepEqual(orders, ["asc"]);
 });
 
+test("a slow indexer page is cut off, keeping the progress before it", async () => {
+  const lock = ccc.Script.from({ ...FUNDING_LOCK, args: `0x${"00".repeat(20)}` });
+  const entries = padding(1, 9_000);
+  const fast = fakeIndexer(() => entries);
+  const slow = {
+    async findTransactionsPaged(...args: Parameters<typeof fast.findTransactionsPaged>) {
+      if (args[1] === "asc" && Number(args[3]) >= 399) await new Promise((resolve) => setTimeout(resolve, 1_000));
+      return fast.findTransactionsPaged(...args);
+    },
+  } as unknown as ccc.Client;
+  const started = Date.now();
+  const result = await chainView(slow, { pageTimeoutMs: 50 }).fundingHistory(lock, { recent: { from: "9000", seenTo: "9000" } }, { backlogBudgetMs: 60_000, recentScan: false });
+  assert.ok(Date.now() - started < 900, "the slow page didn't hold the scan");
+  assert.deepEqual({ cursor: result.cursor, error: result.error }, { cursor: "399", error: "indexer page timed out after 50 ms" });
+});
+
 test("a reorganization that moves a spend into blocks already read doesn't hide it", async () => {
   const closingHash = `0x${"c4".repeat(32)}` as ccc.Hex;
   const lock = ccc.Script.from({ ...FUNDING_LOCK, args: `0x${"00".repeat(20)}` });
