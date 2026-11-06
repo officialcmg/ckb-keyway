@@ -47,6 +47,8 @@ const CHANGE_RESERVE = ccc.fixedPointFrom(62);
  * pass can read after it, at 61 CKB a cell), and no channel's backlog delays another's check.
  */
 const RECENT_BUDGET_MS = 20_000;
+/** Blocks the recent scan reads again each pass, since a reorganization can replace them (CKB's are a few deep). */
+const REORG_DEPTH = 24n;
 const CATCH_UP_BUDGET_MS = 120_000;
 /** Channels whose recent history is checked at the same time in a pass. */
 const CHECK_CONCURRENCY = 8;
@@ -426,7 +428,9 @@ export type ChainView = {
 /**
  * Where the two scans of a funding lock's history stand. `cursor` is the backlog scan's position (oldest first).
  * `recent` covers everything after block `from` (the newest block when the channel was first checked): entries up
- * to block `seenTo` have been read; a range in progress reads `(seenTo, top]` newest first from `cursor`.
+ * to block `seenTo` have been read; a range in progress reads `(seenTo - REORG_DEPTH, top]` newest first from
+ * `cursor`. Each range re-reads the last `REORG_DEPTH` blocks before `seenTo`, so a spend that a reorganization moved
+ * into blocks already read is still found.
  */
 export type HistoryScan = { cursor?: string; recent?: RecentScan };
 export type RecentScan = { from: string; seenTo: string; top?: string; cursor?: string };
@@ -485,7 +489,7 @@ export function chainView(client: ccc.Client, options: { recentBudgetMs?: number
           if (recent.cursor) {
             // A range is still being read: look at the newest page first, so a spend made now isn't kept waiting.
             const newest = await page(lock, "desc");
-            const spend = newest.transactions.find((item) => item.isInput && BigInt(item.blockNumber) > BigInt(recent!.seenTo));
+            const spend = newest.transactions.find((item) => item.isInput && BigInt(item.blockNumber) > BigInt(recent!.seenTo) - REORG_DEPTH);
             if (spend) return progress({ spend: spendOf(spend) });
           }
           const started = Date.now();
@@ -493,7 +497,7 @@ export function chainView(client: ccc.Client, options: { recentBudgetMs?: number
             const result = await page(lock, "desc", recent.cursor);
             let done = result.transactions.length < HISTORY_PAGE_SIZE;
             for (const item of result.transactions) {
-              if (BigInt(item.blockNumber) <= BigInt(recent.seenTo)) {
+              if (BigInt(item.blockNumber) <= BigInt(recent.seenTo) - REORG_DEPTH) {
                 done = true;
                 break;
               }
@@ -502,7 +506,8 @@ export function chainView(client: ccc.Client, options: { recentBudgetMs?: number
               if (item.isInput) return progress({ spend: spendOf(item) });
             }
             if (done) {
-              recent = { from: recent.from, seenTo: recent.top ?? recent.seenTo };
+              const top = recent.top !== undefined && BigInt(recent.top) > BigInt(recent.seenTo) ? recent.top : recent.seenTo;
+              recent = { from: recent.from, seenTo: top };
               break;
             }
             recent.cursor = result.lastCursor;
@@ -599,7 +604,14 @@ export async function assessChannel(
   const [spendHash, spendIndex] = scan.funding_spend.split(":");
   const spent = { txHash: spendHash as ccc.Hex, index: Number(spendIndex) };
   const closing = await chain.transaction(spent.txHash);
-  if (!closing?.committed) return { scan, state: "watching", detail: "closing transaction not committed yet" };
+  if (!closing || closing.status === "rejected" || closing.status === "unknown") {
+    // Dropped (e.g. by a reorganization): forget it, and the recent scan, which re-reads the last blocks, finds
+    // whatever spends the funding cell instead.
+    scan.funding_spend = null;
+    await saveScan?.(scan);
+    return { scan, state: "watching", detail: "the closing transaction left the chain; looking again" };
+  }
+  if (!closing.committed) return { scan, state: "watching", detail: "closing transaction not committed yet" };
   // The funding cell is the one this 2-of-2 spend consumed; outputs under the lock can be anyone's.
   const consumed = closing.tx.inputs[spent.index]?.previousOutput;
   if (!consumed) throw new Error(`the closing transaction ${spent.txHash} has no input ${spent.index}`);

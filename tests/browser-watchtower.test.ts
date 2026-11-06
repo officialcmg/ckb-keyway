@@ -280,6 +280,31 @@ test("a recent range longer than a pass can read is resumed, and a fresh spend s
   assert.deepEqual(midRange.spend, { txHash: closingHash, index: 0 });
 });
 
+test("a reorganization that moves a spend into blocks already read doesn't hide it", async () => {
+  const closingHash = `0x${"c4".repeat(32)}` as ccc.Hex;
+  const lock = ccc.Script.from({ ...FUNDING_LOCK, args: `0x${"00".repeat(20)}` });
+  let entries = padding(1, 9_050);
+  const view = chainView(fakeIndexer(() => entries));
+  const read = await view.fundingHistory(lock, { recent: { from: "9000", seenTo: "9000" } });
+  assert.deepEqual(read.recent, { from: "9000", seenTo: "9050" });
+  // Blocks from 9041 are replaced, and the replacement chain carries the spend in block 9041 (already read).
+  entries = [...padding(1, 9_040), { txHash: closingHash, blockNumber: 9_041n, isInput: true, cellIndex: 0n }, ...padding(9_042, 5)];
+  const after = await view.fundingHistory(lock, read);
+  assert.deepEqual(after.spend, { txHash: closingHash, index: 0 });
+  // A spend that was found and then left the chain is forgotten, so the scan looks again.
+  const dropped: ChainView = {
+    fundingHistory: async () => { throw new Error("not read while a spend is saved"); },
+    transaction: async () => undefined,
+    isLive: async () => false,
+    spender: async () => undefined,
+  };
+  const row = { funding_lock_args: `0x${"00".repeat(20)}`, peer_commitment_key: `0x${"11".repeat(32)}`, commitment_number: null, funding_seen: true, funding_spend: `${closingHash}:0` };
+  const saved: unknown[] = [];
+  const assessment = await assessChannel(dropped, row, async (scan) => saved.push(scan.funding_spend));
+  assert.equal(assessment.state, "watching");
+  assert.deepEqual(saved, [null]);
+});
+
 test("a failing read keeps the progress made before it", async () => {
   const lock = ccc.Script.from({ ...FUNDING_LOCK, args: `0x${"00".repeat(20)}` });
   const entries = padding(1, 9_000);
