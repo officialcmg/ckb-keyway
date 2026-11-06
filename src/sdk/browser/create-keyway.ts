@@ -198,7 +198,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   function warnBeforeUnload(event: BeforeUnloadEvent) {
     if (remoteWatchtower.pending() === 0) return;
     event.preventDefault();
-    event.returnValue = "";
+    // Some browsers only ask when returnValue is a non-empty string; none show the text.
+    event.returnValue = "Fiber channel updates have not reached KeyWay's watchtower yet.";
   }
 
   /** Bumped by every stop, so a start that a stop overtook (e.g. while the key was loading) can undo itself. */
