@@ -325,4 +325,9 @@ export const migrations: Array<{
       )`;
     },
   },
+  {
+    // Copied by version 8 from the Stytch-era hosted-node confirmations; no code reads or writes it.
+    version: 18, name: "drop-managed-confirmations",
+    up: (sql) => sql`drop table if exists keyway_v2_managed_confirmations`,
+  },
 ];
