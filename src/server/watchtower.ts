@@ -50,6 +50,8 @@ const RECENT_BUDGET_MS = 20_000;
 /** Blocks the recent scan reads again each pass, since a reorganization can replace them (CKB's are a few deep). */
 const REORG_DEPTH = 24n;
 const CATCH_UP_BUDGET_MS = 120_000;
+/** The longest one indexer page request may take. */
+const PAGE_TIMEOUT_MS = 15_000;
 /** Channels never seen funded that are checked per pass (see `runWatchtowerPass`). */
 const UNFUNDED_PER_PASS = 500;
 /** How long after a close or penalty the watchtower confirms it is still on-chain (24 blocks are about 4 minutes). */
@@ -439,10 +441,23 @@ export type ChainView = {
 export type HistoryScan = { cursor?: string; recent?: RecentScan };
 export type RecentScan = { from: string; seenTo: string; top?: string; cursor?: string };
 
-export function chainView(client: ccc.Client, options: { recentBudgetMs?: number; maxPages?: number } = {}): ChainView {
+export function chainView(client: ccc.Client, options: { recentBudgetMs?: number; maxPages?: number; pageTimeoutMs?: number } = {}): ChainView {
   const recentBudget = options.recentBudgetMs ?? RECENT_BUDGET_MS;
   const key = (lock: ccc.Script) => ({ script: lock, scriptType: "lock" as const, scriptSearchMode: "exact" as const });
-  const page = (lock: ccc.Script, order: "asc" | "desc", after?: string) => client.findTransactionsPaged(key(lock), order, HISTORY_PAGE_SIZE, after);
+  const pageTimeout = options.pageTimeoutMs ?? PAGE_TIMEOUT_MS;
+  // Every page request is bounded, so a slow indexer can't hold one channel's check (or another's share of the
+  // catch-up time) for long: a page that times out is an error, and the scan resumes from its saved position.
+  const page = async (lock: ccc.Script, order: "asc" | "desc", after?: string) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        client.findTransactionsPaged(key(lock), order, HISTORY_PAGE_SIZE, after),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`indexer page timed out after ${pageTimeout} ms`)), pageTimeout); }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
   const spendOf = (item: { txHash: ccc.Hex; cellIndex: ccc.Num }) => ({ txHash: item.txHash, index: Number(item.cellIndex) });
   const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
   return {
