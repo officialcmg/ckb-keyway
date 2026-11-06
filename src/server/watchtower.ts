@@ -51,7 +51,7 @@ const RECENT_BUDGET_MS = 20_000;
 const REORG_DEPTH = 24n;
 const CATCH_UP_BUDGET_MS = 120_000;
 /** Channels never seen funded that are checked per pass (see `runWatchtowerPass`). */
-const UNFUNDED_PER_PASS = 200;
+const UNFUNDED_PER_PASS = 500;
 /** How long after a close or penalty the watchtower confirms it is still on-chain (24 blocks are about 4 minutes). */
 const REORG_RECHECK_MINUTES = 30;
 /** Channels whose recent history is checked at the same time in a pass. */
@@ -661,6 +661,8 @@ export type PassDependencies = {
   concurrency?: number;
   /** Time shared by the channels still catching up on a backlog, per pass (default `CATCH_UP_BUDGET_MS`). */
   catchUpBudgetMs?: number;
+  /** Channels never seen funded checked per pass (default `UNFUNDED_PER_PASS`). */
+  unfundedPerPass?: number;
 };
 
 /**
@@ -676,15 +678,22 @@ export async function runWatchtowerPass(deps: PassDependencies): Promise<void> {
     where state in ('penalized', 'closed', 'missed', 'invalid') and updated_at < now() - ${`${FINISHED_RETENTION_DAYS} days`}::interval
   `;
   // Channels whose funding is on-chain are all checked, every pass, first. Ones never seen funded can't have been
-  // closed yet; at most UNFUNDED_PER_PASS of them are checked per pass (least recently first), so registrations from
-  // many accounts can't slow down the funded channels' checks.
+  // closed yet; at most UNFUNDED_PER_PASS of them are checked per pass, so registrations can't slow down the funded
+  // channels' checks.
   const funded = await sql<Row[]>`
     select * from keyway_v2_watchtower_channels where state in ('watching', 'penalty-sent') and (funding_seen or funding_spend is not null)
     order by checked_at asc nulls first
   `;
+  // Taken from each account in turn (every account's least recently checked first), so one account's
+  // registrations only delay its own channels.
   const unfunded = await sql<Row[]>`
-    select * from keyway_v2_watchtower_channels where state in ('watching', 'penalty-sent') and not funding_seen and funding_spend is null
-    order by checked_at asc nulls first limit ${UNFUNDED_PER_PASS}
+    select * from (
+      select *, row_number() over (partition by user_id order by checked_at asc nulls first, created_at asc) as turn
+      from keyway_v2_watchtower_channels
+      where state in ('watching', 'penalty-sent') and not funding_seen and funding_spend is null
+    ) waiting
+    order by turn, checked_at asc nulls first, created_at asc
+    limit ${deps.unfundedPerPass ?? UNFUNDED_PER_PASS}
   `;
   // Closes and penalties resolved in the last REORG_RECHECK_MINUTES are confirmed again: a reorganization can drop them.
   const recent = await sql<Row[]>`

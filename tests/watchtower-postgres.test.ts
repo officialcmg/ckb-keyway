@@ -235,6 +235,20 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     assert.deepEqual({ state: byId[closedId].state, funding_spend: byId[closedId].funding_spend }, { state: "watching", funding_spend: null });
   });
 
+  await t.test("unfunded channels are checked from each account in turn", async () => {
+    await sql`delete from keyway_v2_watchtower_channels`;
+    const flooder = { id: crypto.randomUUID() };
+    const honest = { id: crypto.randomUUID() };
+    for (let i = 0; i < 5; i++) await watchtowerRequest(flooder, watch(channelId()));
+    const honestId = channelId();
+    await watchtowerRequest(honest, watch(honestId));
+    const chain: ChainView = { fundingHistory: async () => ({ sawOutput: false }), transaction: async () => undefined, isLive: async () => false, spender: async () => undefined };
+    await runWatchtowerPass({ sql, chain, unfundedPerPass: 2, punish: async () => { throw new Error("no"); }, log: () => undefined });
+    const checked = await sql<Array<{ user_id: string; channel_id: string }>>`select user_id, channel_id from keyway_v2_watchtower_channels where checked_at is not null`;
+    assert.equal(checked.length, 2);
+    assert.ok(checked.some((row) => row.channel_id === honestId), "the other account's channel is checked in the first pass");
+  });
+
   await t.test("a channel that was never funded and was removed is dropped", async () => {
     const user = { id: crypto.randomUUID() };
     const id = channelId();
