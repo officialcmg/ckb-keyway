@@ -76,9 +76,10 @@ export function createNodeLifecycle<Info>(parts: NodeLifecycleParts<Info>) {
     const startedAt = generation;
     const before = Promise.all([starting?.settled, stopping]);
     const result = before.then(() => run(startedAt));
-    const entry = { generation: startedAt, result, settled: result.then(() => undefined, () => undefined) };
+    // Cleared by handlers on `result` itself, so a caller that retries as soon as it sees the outcome starts afresh.
+    const clear = () => { if (starting === entry) starting = undefined; };
+    const entry: { generation: number; result: Promise<Info>; settled: Promise<void> } = { generation: startedAt, result, settled: result.then(clear, clear) };
     starting = entry;
-    void entry.settled.then(() => { if (starting === entry) starting = undefined; });
     return result;
   }
 
@@ -97,9 +98,9 @@ export function createNodeLifecycle<Info>(parts: NodeLifecycleParts<Info>) {
       await previous;
       return work(overtakenStart);
     })();
-    const settled = done.then(() => undefined, () => undefined);
+    const clear = () => { if (stopping === settled) stopping = undefined; };
+    const settled: Promise<void> = done.then(clear, clear);
     stopping = settled;
-    void settled.then(() => { if (stopping === settled) stopping = undefined; });
     return done;
   }
 

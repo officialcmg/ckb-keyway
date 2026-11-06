@@ -535,6 +535,8 @@ export function KeyWayProvider({
 
   useEffect(() => {
     if (!authenticated) {
+      // A JoyID proof held for this session's wallet must not apply to the next sign-in's.
+      if (joyIdProof.holding) joyIdProof.dismiss();
       setConnection(undefined);
       setError(undefined);
       setWallet(undefined);
