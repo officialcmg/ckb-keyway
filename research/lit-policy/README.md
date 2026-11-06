@@ -74,6 +74,8 @@ It also enforces these invariants on the recovery list:
   secp256k1 address or its list lock. An administrator-mode Omnilock doesn't count, because anyone can make one
   with this key's auth and their own list. Anyone can send a cell to the list lock, so this stops outsiders
   blocking an account with fake lists. A failed lookup refuses the request rather than leaving a list out.
+  Only Type ID cells are fetched, up to 1024. Every fake list locks its capacity under this key for good, so
+  blocking an account that way costs an attacker more than 1024 such cells, about 129k CKB.
 - An enable must spend every live plain cell at the key's secp256k1 address. Two enables signed before either is
   indexed then spend the same cells, so at most one can commit.
 - A change to a list made before on-chain records existed needs the previous record from the server. That record
@@ -199,7 +201,9 @@ first error, and never pays twice. A repeat that arrives while the first send is
 seconds for its outcome.
 
 If a payment succeeds but its result can't be stored, the record stays "running" and is never marked failed.
-A repeat then never reports a failure for a payment that went through. Not handled: the server crashing after Fiber accepted a payment but before the result was stored. A retry then
+A repeat then never reports a failure for a payment that went through. It reports "still in progress", then,
+after 24 hours, that the record expired. Neither means the payment failed: check the payment's status before
+retrying it with a new key. Not handled: the server crashing after Fiber accepted a payment but before the result was stored. A retry then
 says "still in progress" until the key expires in 24 hours. It never pays twice, but checking the outcome with
 Fiber's `get_payment` is left for later. The SDK already retries once with the same key on network errors and 5xx
 (`api-client.ts`).
