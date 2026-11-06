@@ -424,7 +424,14 @@ export function chainView(client: ccc.Client, options: { historyBudgetMs?: numbe
       let sawOutput = false;
       const started = Date.now();
       for (let page = 0; page < (options.maxPages ?? Infinity); page++) {
-        const result = await client.findTransactionsPaged(key(lock), "asc", HISTORY_PAGE_SIZE, cursor);
+        let result: Awaited<ReturnType<typeof client.findTransactionsPaged>>;
+        try {
+          result = await client.findTransactionsPaged(key(lock), "asc", HISTORY_PAGE_SIZE, cursor);
+        } catch (error) {
+          // Keep the pages already read: the caller saves this progress and the next pass resumes after it.
+          if (page === 0) throw error;
+          return { sawOutput, ...(cursor ? { cursor } : {}), error: error instanceof Error ? error.message : String(error) };
+        }
         for (const item of result.transactions) {
           if (item.isInput) return { sawOutput, spend: { txHash: item.txHash, index: Number(item.cellIndex) }, cursor: result.lastCursor };
           sawOutput = true;
@@ -459,7 +466,7 @@ export function chainView(client: ccc.Client, options: { historyBudgetMs?: numbe
   };
 }
 
-export type HistoryProgress = { sawOutput: boolean; spend?: { txHash: ccc.Hex; index: number }; cursor?: string };
+export type HistoryProgress = { sawOutput: boolean; spend?: { txHash: ccc.Hex; index: number }; cursor?: string; error?: string };
 
 /** What the scan of the funding lock's history has established so far, saved with the channel between passes. */
 export type ScanState = Pick<Row, "history_cursor" | "funding_seen" | "funding_spend">;
@@ -479,6 +486,8 @@ export type Commitment = { outPoint: ccc.OutPoint; capacity: bigint; lock: ccc.S
 export async function assessChannel(
   chain: ChainView,
   row: Pick<Row, "funding_lock_args" | "peer_commitment_key" | "commitment_number"> & Partial<ScanState>,
+  /** Called with the scan's progress before anything else can fail, so a failing check never loses it. */
+  saveScan?: (scan: ScanState) => Promise<unknown>,
 ): Promise<Assessment> {
   const scan: ScanState = { history_cursor: row.history_cursor ?? null, funding_seen: row.funding_seen ?? false, funding_spend: row.funding_spend ?? null };
   if (!scan.funding_spend) {
@@ -487,6 +496,8 @@ export async function assessChannel(
     scan.funding_seen ||= progress.sawOutput;
     scan.history_cursor = progress.cursor ?? scan.history_cursor;
     if (progress.spend) scan.funding_spend = `${progress.spend.txHash}:${progress.spend.index}`;
+    await saveScan?.(scan);
+    if (progress.error && !scan.funding_spend) throw new Error(progress.error);
   }
   if (!scan.funding_spend) return { scan, state: "watching", detail: scan.funding_seen ? "open" : "funding not on-chain yet" };
   const [spendHash, spendIndex] = scan.funding_spend.split(":");
@@ -564,15 +575,16 @@ async function checkChannel(deps: PassDependencies, row: Row, log: (message: str
       updated_at = case when ${fields.state ?? row.state} <> state or ${fields.detail ?? row.detail}::text is distinct from detail then now() else updated_at end
     where user_id = ${row.user_id} and channel_id = ${row.channel_id}
   `;
-  const assessment = await assessChannel(chain, row);
-  // Keep the scan's progress whatever the outcome, so the next pass resumes instead of starting over.
-  const { scan } = assessment;
-  if (scan.history_cursor !== row.history_cursor || scan.funding_seen !== row.funding_seen || scan.funding_spend !== row.funding_spend) {
+  // The scan's progress is saved as soon as it is known, so a check that fails afterwards (or partway through
+  // the history) resumes where it got to instead of starting over.
+  const assessment = await assessChannel(chain, row, async (scan) => {
+    if (scan.history_cursor === row.history_cursor && scan.funding_seen === row.funding_seen && scan.funding_spend === row.funding_spend) return;
     await sql`
       update keyway_v2_watchtower_channels set history_cursor = ${scan.history_cursor}, funding_seen = ${scan.funding_seen}, funding_spend = ${scan.funding_spend}
       where user_id = ${row.user_id} and channel_id = ${row.channel_id}
     `;
-  }
+  });
+  const { scan } = assessment;
   if (assessment.state === "watching") {
     const age = Date.now() - row.created_at.getTime();
     if (!scan.funding_seen && (row.unwatch_requested_at || age > UNFUNDED_RETENTION_DAYS * 86_400_000)) {
