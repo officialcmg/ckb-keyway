@@ -215,6 +215,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   function startSweeping() {
     void sweepNow().catch(() => undefined);
     sweepTimer ??= setInterval(() => void sweepNow().catch(() => undefined), 10 * 60_000);
+    watchStopped = false;
     void watchNow().catch(() => undefined);
     watchTimer ??= setInterval(() => void watchNow().catch(() => undefined), WATCH_INTERVAL);
   }
@@ -224,21 +225,35 @@ export function createKeyWay(options: CreateKeyWayOptions) {
    * user's share once a force-close commitment's delay has passed, then sweep it to the user's address.
    */
   let watchTimer: ReturnType<typeof setInterval> | undefined;
-  let watching = false;
+  let watchPass: Promise<void> | undefined;
+  let watchStopped = false;
+  /** Claims sent but not yet swept: the sweep follows once the claim is on-chain, on a later pass. */
+  const claimsToSweep = new Set<ccc.Hex>();
   const watchStatus = new Map<string, string>();
   // Statuses after which the channel needs nothing more from the watchtower. A cooperative close is left to
   // Fiber's own remove_watch_channel, so an unexpected closing transaction never drops the data.
   const DONE = new Set(["settled", "the user's share is already claimed", "the user has no share in this channel"]);
-  async function watchNow() {
-    if (watching || !node.isRunning || !credential.isUnlocked()) return;
-    watching = true;
-    try {
+  function watchNow(): Promise<void> {
+    if (watchPass || watchStopped || !node.isRunning || !credential.isUnlocked()) return watchPass ?? Promise.resolve();
+    watchPass = watchOnce().finally(() => { watchPass = undefined; });
+    return watchPass;
+  }
+  async function watchOnce() {
+    {
+      // The 10-minute sweep (and the one at start) also picks up claims whose follow-up sweep was missed.
+      for (const txHash of [...claimsToSweep]) {
+        const status = (await fundingSigner.client.getTransaction(txHash).catch(() => undefined))?.status;
+        if (status !== "committed") continue;
+        claimsToSweep.delete(txHash);
+        await sweepNow().catch((error) => console.warn("[keyway] could not sweep the claimed funds yet", error));
+      }
       const watched = await watchtower.list();
       if (watched.length === 0) return;
       const { channels } = await node.listChannels({ include_closed: true });
       const key = await credential.getCkbSecretKey();
       try {
         for (const channel of watched) {
+          if (watchStopped) break;
           const raw = channels.find((item) => String(item.channel_id).toLowerCase() === channel.channelId);
           const outpoint = raw?.channel_outpoint ? String(raw.channel_outpoint) : undefined;
           if (!outpoint) {
@@ -258,8 +273,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
               console.info(`[keyway] watchtower: channel ${channel.channelId}: ${result.status}${result.txHash ? ` ${result.txHash}` : ""}`);
             }
             if (result.txHash) {
-              await fundingSigner.client.waitTransaction(result.txHash, 0, 120_000).catch(() => undefined);
-              await sweepNow().catch((error) => console.warn("[keyway] could not sweep the claimed funds yet", error));
+              claimsToSweep.add(result.txHash);
             } else if (DONE.has(result.status)) {
               await watchtower.remove(channel.channelId);
             }
@@ -270,20 +284,21 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       } finally {
         key.fill(0);
       }
-    } finally {
-      watching = false;
     }
   }
 
-  function stopWatching() {
+  /** Stops the watchtower passes and waits for one in progress, so none runs after the node stops. */
+  async function stopWatching() {
     if (watchTimer) clearInterval(watchTimer);
     watchTimer = undefined;
+    watchStopped = true;
+    await watchPass?.catch(() => undefined);
   }
 
   async function stop() {
     if (sweepTimer) clearInterval(sweepTimer);
     sweepTimer = undefined;
-    stopWatching();
+    await stopWatching();
     try {
       await node.stop();
     } finally {
@@ -296,7 +311,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   async function stopForLogout() {
     if (sweepTimer) clearInterval(sweepTimer);
     sweepTimer = undefined;
-    stopWatching();
+    await stopWatching();
     if (!deviceLease) {
       await stop();
       return;

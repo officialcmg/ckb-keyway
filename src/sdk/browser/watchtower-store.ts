@@ -101,15 +101,21 @@ export function applyWatchtowerCall(existing: WatchedChannel | undefined, call: 
  */
 export function openWatchtowerStore(databasePrefix: string): WatchtowerStore {
   let opened: Promise<IDBDatabase> | undefined;
-  const db = () => opened ??= new Promise((resolve, reject) => {
-    const req = indexedDB.open(`${databasePrefix}-keyway-watchtower`, 1);
-    req.onupgradeneeded = () => {
-      req.result.createObjectStore(STORE, { keyPath: "channelId" });
-      req.result.createObjectStore(PREIMAGES, { keyPath: "paymentHash" });
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
+  const db = () => {
+    if (opened) return opened;
+    const opening: Promise<IDBDatabase> = new Promise((resolve, reject) => {
+      const req = indexedDB.open(`${databasePrefix}-keyway-watchtower`, 1);
+      req.onupgradeneeded = () => {
+        req.result.createObjectStore(STORE, { keyPath: "channelId" });
+        req.result.createObjectStore(PREIMAGES, { keyPath: "paymentHash" });
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    // A failed open is retried by the next call (unless a newer open has replaced it).
+    opening.catch(() => { if (opened === opening) opened = undefined; });
+    return opened = opening;
+  };
   async function get(channelId: string) {
     const tx = (await db()).transaction(STORE, "readonly");
     return await request(tx.objectStore(STORE).get(channelId.toLowerCase())) as WatchedChannel | undefined;
@@ -145,7 +151,7 @@ export function openWatchtowerStore(databasePrefix: string): WatchtowerStore {
       await new Promise<void>((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); });
     },
     close() {
-      void opened?.then((database) => database.close());
+      void opened?.then((database) => database.close(), () => undefined);
       opened = undefined;
     },
   };
