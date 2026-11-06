@@ -325,4 +325,35 @@ export const migrations: Array<{
       )`;
     },
   },
+  {
+    version: 18, name: "browser-node-watchtower",
+    up: async (sql) => {
+      // KeyWay's watchtower for browser nodes: per channel, the funding keys and the newest revocation only
+      // (never a private key). Kept until the channel's close is resolved, then 30 days for the user's history.
+      await sql`create table keyway_v2_watchtower_channels (
+        user_id uuid not null,
+        channel_id text not null check (channel_id ~ '^0x[0-9a-f]{64}$'),
+        local_funding_pubkey text not null check (local_funding_pubkey ~ '^0x[0-9a-f]{66}$'),
+        remote_funding_pubkey text not null check (remote_funding_pubkey ~ '^0x[0-9a-f]{66}$'),
+        funding_lock_args text not null check (funding_lock_args ~ '^0x[0-9a-f]{40}$'),
+        peer_commitment_key text not null check (peer_commitment_key ~ '^0x[0-9a-f]{64}$'),
+        funding_udt_type_script jsonb,
+        commitment_number numeric(20, 0),
+        aggregated_signature text check (aggregated_signature ~ '^0x[0-9a-f]{128}$'),
+        revocation_output text,
+        revocation_output_data text,
+        state text not null default 'watching' check (state in ('watching', 'penalty-sent', 'penalized', 'closed', 'missed')),
+        detail text,
+        funding_out_point text,
+        closing_tx text,
+        penalty_tx text,
+        unwatch_requested_at timestamptz,
+        checked_at timestamptz,
+        created_at timestamptz not null default now(),
+        updated_at timestamptz not null default now(),
+        primary key (user_id, channel_id)
+      )`;
+      await sql`create index keyway_v2_watchtower_channels_active on keyway_v2_watchtower_channels (state, checked_at)`;
+    },
+  },
 ];
