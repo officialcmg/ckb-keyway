@@ -144,7 +144,9 @@ async function watchtowerHttpRequest(request: Request): Promise<Response> {
   const user = await authenticateUser(request);
   const parsed = parseWatchtowerRequest(await objectBody(request, "Invalid watchtower request"));
   // The SDK sends only the newest revocation per channel, so even a busy node stays well under this.
-  const limit = await consumeRateLimit(`watchtower:${user.id}`, { max: parsed.operation === "status" ? 30 : 240, window: 60 });
+  const limit = parsed.operation === "status"
+    ? await consumeRateLimit(`watchtower-status:${user.id}`, { max: 30, window: 60 })
+    : await consumeRateLimit(`watchtower:${user.id}`, { max: 240, window: 60 });
   if (!limit.allowed) throw new Error(`Too many watchtower updates. Try again in ${limit.retryAfter ?? 60} seconds`);
   return Response.json(await watchtowerRequest(user, parsed), { headers: { "Cache-Control": "no-store" } });
 }

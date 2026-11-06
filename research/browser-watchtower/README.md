@@ -19,7 +19,8 @@ installed by `npm ci`. Builds on PR #4 (`browser-settlement`), which gave browse
 - **Proven on testnet** (below): a real fiber-wasm node in Chromium registered its channel and revocations through the
   SDK, the tab was closed, and the watchtower kept following the channel; and with two FNN nodes, a peer that
   published a revoked commitment while the victim was offline was punished 43 s later, the whole 1,098.99999544 CKB
-  going to the victim's own address and 0.00000711 CKB of fee paid by the watchtower.
+  going to the victim's own address and 0.00000711 CKB of fee paid by the watchtower. After an independent review
+  the run was repeated with the fixed code (65 s, same result).
 
 ## 1. What Fiber 0.9.1 offers
 
@@ -98,20 +99,23 @@ browser tab (fiber-wasm)                          KeyWay API (Railway)          
   script), `revoke` (commitment number, aggregated signature, output, output data), `unwatch` (channel ID).
   `update_local_settlement`, `update_pending_remote_settlement`, preimages and every private key stay in the page
   (tests assert no key reaches a request).
-- A per-channel queue keeps only the newest revocation, sends watch → revoke → unwatch in order, retries every 15 s,
-  and re-registers a channel KeyWay doesn't know (from the in-page store). At each start the page resends every stored
+- A per-channel queue keeps only the newest revocation and sends watch → revoke → unwatch in order. A channel whose
+  update fails waits for a retry (15 s, doubling to 5 min) without holding up the others; an update KeyWay refuses
+  for good (4xx other than 401/429, e.g. a token channel) is dropped, with the channel's later updates; a channel
+  KeyWay doesn't know is re-registered from the in-page store. At each start the page resends every stored
   channel (idempotent), which also registers channels opened before this version.
 - While anything is unsent, `beforeunload` asks before the tab closes; `watchtowerPending()` and
   `watchtowerStatus()` expose the queue and KeyWay's view to apps. Stopping the node waits up to 10 s for the queue.
 
 **API** (`src/server/watchtower.ts`, route in `http.ts`, migration 18)
-- Session-authenticated like every wallet route (`authenticateUser`); rate limit 240 updates/min (30 status reads/min)
-  per user; at most 64 unresolved channels per user; strict hex/point/molecule validation; a channel's funding keys
-  can't be replaced; a revocation must match the channel's asset (type script) and is stored only if newer.
+- Session-authenticated like every wallet route (`authenticateUser`); rate limits per user of 240 updates/min and,
+  separately, 30 status reads/min; at most 64 unresolved channels per user; strict hex/point/molecule validation; a
+  channel's funding keys can't be replaced; a revocation is stored only if newer. Token (UDT) channels are refused for
+  now: their penalty needs the token's cell deps and was not tested live.
 - Each user sees and changes only their own rows (primary key `(user_id, channel_id)`).
-- Stored per channel: the two funding pubkeys, the derived funding lock args and peer commitment key, token script,
-  newest revocation, state (`watching`, `penalty-sent`, `penalized`, `closed`, `missed`), and the closing/penalty
-  transactions. No private key, settlement data or preimage.
+- Stored per channel: the two funding pubkeys, the derived funding lock args and peer commitment key, newest
+  revocation, state (`watching`, `penalty-sent`, `penalized`, `closed`, `missed`, `invalid`), attempts, and the
+  closing/penalty transactions. No private key, settlement data or preimage.
 - `unwatch` (Fiber's `remove_watch_channel` on close) only marks the row: the record stays until the watchtower has
   seen how the channel closed, because a revoked commitment can itself be what closed it. Rows that are resolved are
   deleted after 30 days; channels never funded after 14 days (or at once after `unwatch`).
@@ -121,10 +125,17 @@ browser tab (fiber-wasm)                          KeyWay API (Railway)          
   500 unresolved channels, oldest check first: funding cell (by lock) live → `open`; spent by an uncommitted tx →
   wait; by anything other than a single commitment-lock output → `closed cooperatively`; by the user's own commitment
   or the peer's current one → `closed` (the in-page watchtower claims the user's share whenever the wallet next runs;
-  there is no deadline); by a peer commitment whose number ≤ the newest revocation → build and send the penalty, then
-  follow it to `penalized`. If the revoked commitment was already spent by something else: `missed`.
-- The penalty builder refuses unless the revocation output is at least the commitment cell's capacity and every fee
-  input is a plain cell of the fee key, so the watchtower's change can only come from its own inputs.
+  there is no deadline); by a peer commitment whose number ≤ the newest revocation → verify the revocation signature
+  exactly as the lock will (BIP340 by the peer-commitment key over blake2b(output ‖ u32le(len) ‖ data ‖ on-chain
+  args[0..28] ‖ number)); if it doesn't verify → `invalid`, never sent; else build and send the penalty and follow it
+  to `penalized`. A failed build/send is retried after 1, 2, 4 … minutes (at most every 5 min). If the revoked
+  commitment was already spent by something else: `missed`.
+- The penalty builder requires the revocation output to equal the commitment cell's capacity (Fiber makes them
+  equal), takes fee cells only from the fee key's plain cells with at least 62 CKB to spare, and checks that its change
+  equals its own inputs less a fee of at most 0.001 CKB: the watchtower can't take from the channel or be made to pay
+  more than a fee.
+- The advisory lock is re-asked every pass (re-entrant for the holder), so an instance whose connection was replaced
+  stops when another holds it; on any error the instance unlocks and releases the connection.
 
 **What the watchtower can and can't do**
 - Can: broadcast the penalty (pays the user), learn the user's channels, their capacity, commitment count and the
@@ -132,13 +143,16 @@ browser tab (fiber-wasm)                          KeyWay API (Railway)          
 - Can't: move the user's funds anywhere else, claim the user's share, settle TLCs, or act for another user. A leaked
   database gives an attacker the same powers (publish penalties that pay users). A stolen session can `unwatch` a
   channel only in the sense above (the record stays until the close is resolved) or register junk under its own
-  account (bounded by the limits; a bad signature makes `send_transaction` fail, which costs no fee).
+  account (bounded by the limits; a revocation whose signature doesn't verify is never sent, and one that would
+  move more than a fee is refused).
 - If KeyWay's watchtower is down: nothing is lost unless a peer cheats *and* the outage outlasts the commitment delay
   (1 epoch, about 4 h). Monitor the `[watchtower]` log and the fee key balance; a second API replica takes over the
   advisory lock if the first dies.
 
-**Not covered** (same as PR #4): TLCs that expire while the tab is closed (claiming them needs preimages or TLC keys,
-which stay on the device), and token-channel settlement. Browser mode still needs the user to open the wallet to
+**Not covered**: TLCs that expire while the tab is closed (claiming them needs preimages or TLC keys, which stay on
+the device), token channels (neither penalised by KeyWay nor settled in the page), and force-closed channels stay in
+the in-page store, so each start re-registers them (the API keeps their resolved row 30 days; afterwards one pass
+marks them closed again). Browser mode still needs the user to open the wallet to
 claim their share after an honest force close; the docs and SDK say so.
 
 ## 3. Live proof (CKB testnet, 2026-11-06)
@@ -178,8 +192,19 @@ same calls fiber-wasm sends to the page (same `forward_event_to_client`); each c
    - out 1: 9,999.99999289 CKB change to the fee key (fee 711 shannons).
    The row moved `watching → penalty-sent → penalized`. V's node was never restarted.
 
+### C. Repeated after the review, with the fixed code
+Same setup, new channel `0xa609458f…8be7` (C paid V 700 CKB; revocations 1 and 2 stored; V stopped; C restored and
+force-closed): revoked commitment `0x75000a9c71b2f4ee242a6263ebbe270b3da90085185caea520e45ed234dec35c` (commitment
+number 1), block 22985878, 19:11:11; penalty `0x6c1aa0bfb54edab72b885ed32fc2a3a12ac425c753298a58c6312c68f180169a`,
+block 22985882, 19:12:16: 1,098.99999544 CKB to V's lock `0x18f0c6ee…ab0b`, change 9,999.99998578 CKB to the fee key
+(fee 711 shannons). Logs: `evidence/*-run2.txt`. (A first attempt at this run lost the channel's events because the
+proof database's old table had been renamed without its index, so migration 18 failed; Fiber logs a failed forward
+and doesn't retry it. In the browser the in-page store keeps the data and the SDK queue retries, so this only
+affects the native harness.)
+
 `tests/fixtures/watchtower-testnet-proof.json` keeps the public data of both channels; a test checks that the
-watchtower's key derivation reproduces their on-chain funding and commitment locks (in both channels the local key
+watchtower's key derivation reproduces their on-chain funding and commitment locks, and that the real revocation
+signature verifies against the revoked commitment's on-chain args (and not against anything else) (in both channels the local key
 happened to sort first, so the funding and peer-commitment hashes coincide; unit tests cover the other order).
 
 Reproduce: `PROOF=<dir with C/ckb/key, V/ckb/key, keys.json>`, `FNN`, `CONFIG` (FNN 0.9.1 testnet config),
@@ -205,7 +230,28 @@ No managed-host (Railway `managed-host`) change: hosted nodes keep Fiber's built
 7. Watch: `[watchtower]` log lines, the fee key's balance, and `select state, count(*) from
    keyway_v2_watchtower_channels group by 1`.
 
-## 5. Upstream issue text (nervosnetwork/fiber)
+## 5. Independent review (Fable) and what changed
+
+The reviewer read the diff and the Fiber/fiber-scripts sources without these conclusions. Fixed:
+- **High: fee key drain.** A user controlling both sides of a channel could sign a revocation output larger than the
+  commitment cell and make the watchtower pay the difference. Now the output must equal the commitment cell and the
+  change must equal the watchtower's inputs less a small fee.
+- **High: bogus revocations retried forever.** Signatures are now verified before anything is built (`invalid`
+  state), and failures back off.
+- **High: token-channel penalties lacked the token's cell dep.** Token channels are refused until supported.
+- **Medium:** advisory lock left held on a pooled connection after an error, and not re-checked after a reconnect;
+  browser queue head-of-line blocking and an endless `beforeunload` prompt for refused updates; a flush on stop that
+  did nothing while a retry was waiting (the new test found that a flush during a pass in progress also returned
+  early); change cell possibly below 61 CKB.
+- **Low:** connection leak if the lock query throws, `NaN` interval, shared rate limit for status and updates, empty
+  `returnValue`.
+- Tests added: penalty builder with a stub client (change = inputs − fee; inflated, shrunk and too-small-fee cases),
+  signature verification against the live revocation, queue isolation/refusal/flush, invalid and backoff passes.
+
+Left as is: the remote queue stays stopped after logout (each sign-in makes a new client); re-registration churn of
+resolved channels described above.
+
+## 6. Upstream issue text (nervosnetwork/fiber)
 
 > **Watchtower: a revocation-only registration so third-party watchtowers don't need settlement or TLC private keys**
 >

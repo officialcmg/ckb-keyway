@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFile } from "node:fs/promises";
 import * as ccc from "@ckb-ccc/core";
 import { database } from "../src/server/database.ts";
 import {
@@ -58,17 +59,27 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     await assert.rejects(watchtowerRequest(user, watch(channelId())), /already watches/);
   });
 
-  await t.test("a pass punishes a revoked commitment once and follows it to the end", async () => {
+  // The 2026-11-06 testnet run: real funding keys, the real signed revocation (number 2) and the on-chain lock
+  // args of the revoked commitment (number 1) that the watchtower punished.
+  const proof = JSON.parse(await readFile(new URL("./fixtures/watchtower-testnet-proof.json", import.meta.url), "utf8")).penalty;
+  async function revokedChannel(signature: string) {
     const user = { id: crypto.randomUUID() };
     const id = channelId();
     await sql`delete from keyway_v2_watchtower_channels where state in ('watching', 'penalty-sent')`;
-    await watchtowerRequest(user, watch(id));
-    await watchtowerRequest(user, revoke(id, 4));
-    const peerHash = blake160(peerCommitmentKey(K1, K2));
+    await watchtowerRequest(user, parseWatchtowerRequest({ operation: "watch", channelId: id, localFundingPubkey: proof.localFundingPubkey, remoteFundingPubkey: proof.remoteFundingPubkey, fundingUdtTypeScript: null }));
+    await watchtowerRequest(user, parseWatchtowerRequest({
+      operation: "revoke", channelId: id,
+      revocation: { commitment_number: `0x${BigInt(proof.revocationCommitmentNumber).toString(16)}`, aggregated_signature: signature, output: proof.revocationOutput, output_data: "0x00000000" },
+    }));
     const closing = ccc.Transaction.from({
-      outputs: [{ capacity: 1000n, lock: { codeHash: COMMITMENT_LOCK.testnet.codeHash, hashType: "type", args: ccc.hexFrom(ccc.bytesConcat(peerHash, new Uint8Array(8), ccc.numBeToBytes(2n, 8), new Uint8Array(21))) } }],
+      outputs: [{ capacity: ccc.CellOutput.decode(proof.revocationOutput).capacity, lock: { codeHash: COMMITMENT_LOCK.testnet.codeHash, hashType: "type", args: ccc.hexFrom(ccc.bytesConcat(ccc.bytesFrom(proof.onChainCommitmentArgs), new Uint8Array(21))) } }],
       outputsData: ["0x"],
     });
+    return { user, id, closing };
+  }
+
+  await t.test("a pass punishes a revoked commitment once and follows it to the end", async () => {
+    const { user, id, closing } = await revokedChannel(proof.revocationSignature);
     const penalty = `0x${"cd".repeat(32)}` as ccc.Hex;
     let spent = false;
     let penaltyStatus = "pending";
@@ -100,6 +111,36 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     penaltyStatus = "committed";
     await pass();
     assert.equal((await state()).state, "penalized");
+  });
+
+  await t.test("a revocation that doesn't unlock the commitment is never sent", async () => {
+    const forged = `0x${"5a".repeat(64)}`;
+    const { id, closing } = await revokedChannel(forged);
+    const chain: ChainView = {
+      fundingHistory: async () => [{ txHash: `0x${"f0".repeat(32)}`, isInput: false, index: 0 }, { txHash: closing.hash(), isInput: true, index: 0 }],
+      transaction: async (hash) => (hash === closing.hash() ? { tx: closing, committed: true, status: "committed" } : undefined),
+      isLive: async () => true,
+      spender: async () => undefined,
+    };
+    let punished = 0;
+    for (let i = 0; i < 2; i++) await runWatchtowerPass({ sql, chain, punish: async () => { punished++; return `0x${"cd".repeat(32)}`; }, log: () => undefined });
+    assert.equal(punished, 0);
+    assert.equal((await sql<Array<{ state: string }>>`select state from keyway_v2_watchtower_channels where channel_id = ${id}`)[0].state, "invalid");
+  });
+
+  await t.test("a failing penalty is retried with backoff", async () => {
+    const { id, closing } = await revokedChannel(proof.revocationSignature);
+    const chain: ChainView = {
+      fundingHistory: async () => [{ txHash: `0x${"f0".repeat(32)}`, isInput: false, index: 0 }, { txHash: closing.hash(), isInput: true, index: 0 }],
+      transaction: async (hash) => (hash === closing.hash() ? { tx: closing, committed: true, status: "committed" } : undefined),
+      isLive: async () => true,
+      spender: async () => undefined,
+    };
+    let tries = 0;
+    for (let i = 0; i < 3; i++) await runWatchtowerPass({ sql, chain, punish: async () => { tries++; throw new Error("fee key empty"); }, log: () => undefined });
+    assert.equal(tries, 1, "the second and third pass wait for the backoff");
+    const [row] = await sql<Array<{ state: string; attempts: number }>>`select state, attempts from keyway_v2_watchtower_channels where channel_id = ${id}`;
+    assert.deepEqual({ ...row }, { state: "watching", attempts: 1 });
   });
 
   await t.test("a channel that was never funded and was removed is dropped", async () => {

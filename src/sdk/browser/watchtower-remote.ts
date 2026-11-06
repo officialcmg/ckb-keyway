@@ -84,7 +84,7 @@ export function updatesForStoredChannel(channel: WatchedChannel): RemoteWatchUpd
   return updates;
 }
 
-type ChannelQueue = { watch?: RemoteWatchUpdate; revoke?: RemoteWatchUpdate; unwatch?: RemoteWatchUpdate };
+type ChannelQueue = { watch?: RemoteWatchUpdate; revoke?: RemoteWatchUpdate; unwatch?: RemoteWatchUpdate; reregistered?: boolean };
 
 const commitmentNumber = (update?: RemoteWatchUpdate) => {
   if (update?.operation !== "revoke") return -1n;
@@ -116,9 +116,10 @@ export function createRemoteWatchtower(options: {
   let flushing: Promise<void> | undefined;
   let retry: ReturnType<typeof setTimeout> | undefined;
   let stopped = false;
+  let attempt = 0;
 
   function enqueue(update: RemoteWatchUpdate | undefined) {
-    if (!update || !/^0x[0-9a-f]{64}$/.test(update.channelId)) return;
+    if (!update || !/^0x[0-9a-f]{64}$/.test(update.channelId) || rejectedChannels.has(update.channelId)) return;
     const queue = queues.get(update.channelId) ?? {};
     if (update.operation === "revoke") {
       // Only the newest revocation is worth sending.
@@ -127,12 +128,27 @@ export function createRemoteWatchtower(options: {
       queue[update.operation] = update;
     }
     queues.set(update.channelId, queue);
-    void flush();
+    void run(false);
   }
 
+  /** A request KeyWay refused for good (4xx other than 429): resending it can't succeed. */
+  const refused = (error: unknown) => {
+    const status = (error as { status?: unknown })?.status;
+    return typeof status === "number" && status >= 400 && status < 500 && status !== 401 && status !== 429;
+  };
+  /** Channels KeyWay won't watch (e.g. token channels): their later updates are dropped too. */
+  const rejectedChannels = new Set<string>();
+
   async function flushOnce() {
+    let failed = false;
     for (const [channelId, queue] of [...queues]) {
-      // In order: the watchtower needs the channel before its revocations, and the close comes last.
+      if (stopped) return;
+      if (rejectedChannels.has(channelId)) {
+        queues.delete(channelId);
+        continue;
+      }
+      // In order: the watchtower needs the channel before its revocations, and the close comes last. A channel
+      // whose update fails waits for the retry; the other channels still go now.
       for (const kind of ["watch", "revoke", "unwatch"] as const) {
         const update = queue[kind];
         if (!update || stopped) continue;
@@ -140,42 +156,65 @@ export function createRemoteWatchtower(options: {
           await options.send(update);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          if (kind === "revoke" && /not watched/i.test(message) && !queue.watch) {
+          if (kind === "revoke" && /not watched/i.test(message) && !queue.watch && !queue.reregistered) {
             // KeyWay doesn't know this channel (e.g. it was opened before this SDK version): register it first.
             const registration = await options.registration?.(channelId).catch(() => undefined);
-            if (registration?.operation === "watch") queue.watch = registration;
+            if (registration?.operation === "watch") {
+              queue.watch = registration;
+              queue.reregistered = true;
+            }
+          } else if (refused(error)) {
+            log.warn(`[keyway] watchtower: KeyWay refused ${kind} for channel ${channelId}`, message);
+            if (kind === "watch") rejectedChannels.add(channelId);
+            if (queue[kind] === update) delete queue[kind];
+            if (kind === "watch") break;
+            continue;
           }
           log.warn(`[keyway] watchtower: could not update KeyWay's watchtower for channel ${channelId}; retrying`, message);
-          scheduleRetry();
-          return;
+          failed = true;
+          break;
         }
         // A newer update may have replaced this one while it was being sent.
         if (queue[kind] === update) delete queue[kind];
       }
-      if (!queue.watch && !queue.revoke && !queue.unwatch && queues.get(channelId) === queue) queues.delete(channelId);
+      if (rejectedChannels.has(channelId) || (!queue.watch && !queue.revoke && !queue.unwatch && queues.get(channelId) === queue)) queues.delete(channelId);
     }
+    if (failed) scheduleRetry();
   }
 
   function scheduleRetry() {
     if (retry || stopped) return;
+    attempt += 1;
     retry = setTimeout(() => {
       retry = undefined;
-      void flush();
-    }, options.retryMs ?? 15_000);
+      void run(false);
+    }, Math.min(5 * 60_000, (options.retryMs ?? 15_000) * 2 ** Math.min(attempt - 1, 5)));
   }
 
-  function flush(): Promise<void> {
-    if (flushing || stopped) return flushing ?? Promise.resolve();
+  /**
+   * Sends what is queued. New updates (`force` false) go out at once unless a retry is waiting; `flush()` (e.g. when
+   * the node stops) also cancels a waiting retry and runs after a pass already in progress.
+   */
+  function run(force: boolean): Promise<void> {
+    if (stopped) return Promise.resolve();
+    if (flushing) return force ? flushing.then(() => run(true)) : flushing;
+    if (retry) {
+      if (!force) return Promise.resolve();
+      clearTimeout(retry);
+      retry = undefined;
+    }
     flushing = (async () => {
       try {
-        // Each pass sends something or schedules a retry, so this ends; updates arriving meanwhile go out too.
+        // Each pass sends something, drops a refused update or schedules a retry, so this ends.
         while (!retry && !stopped && pending() > 0) await flushOnce();
+        if (!retry) attempt = 0;
       } finally {
         flushing = undefined;
       }
     })();
     return flushing;
   }
+  const flush = () => run(true);
 
   function pending() {
     return [...queues.values()].filter((queue) => queue.watch || queue.revoke || queue.unwatch).length;

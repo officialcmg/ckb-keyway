@@ -1,5 +1,5 @@
 import * as ccc from "@ckb-ccc/core";
-import { secp256k1 } from "@noble/curves/secp256k1.js";
+import { schnorr, secp256k1 } from "@noble/curves/secp256k1.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import type { User } from "./auth-user.ts";
 import { database, type DatabaseSql } from "./database.ts";
@@ -29,6 +29,11 @@ export const MAX_WATCHED_CHANNELS = 64;
 const MAX_OUTPUT_BYTES = 512;
 const MAX_OUTPUT_DATA_BYTES = 64;
 const FINISHED_RETENTION_DAYS = 30;
+/** A penalty that fails to build or send is retried after 1, 2, 4 … minutes, at most every 5 minutes. */
+const MAX_RETRY_MS = 5 * 60_000;
+/** The most a penalty may cost the watchtower (Fiber's fee is about 0.00001 CKB). */
+const MAX_PENALTY_FEE = 100_000n;
+const CHANGE_RESERVE = ccc.fixedPointFrom(62);
 /** A channel whose funding never appears on-chain (an abandoned open) is dropped after this long. */
 const UNFUNDED_RETENTION_DAYS = 14;
 
@@ -147,6 +152,8 @@ export function parseRevocation(value: unknown): Revocation {
 export function parseWatchtowerRequest(body: Record<string, unknown>): WatchtowerRequest {
   switch (body.operation) {
     case "watch":
+      // Token channels need the token's cell deps and an amount check this watchtower doesn't do yet.
+      if (body.fundingUdtTypeScript !== null && body.fundingUdtTypeScript !== undefined) throw new Error("Token channels are not watched yet");
       return {
         operation: "watch",
         channelId: hexOf(body.channelId, 32, "channel ID"),
@@ -168,7 +175,7 @@ export function parseWatchtowerRequest(body: Record<string, unknown>): Watchtowe
 // ---------------------------------------------------------------------------------------------------------------
 // Storage
 
-export type WatchState = "watching" | "penalty-sent" | "penalized" | "closed" | "missed";
+export type WatchState = "watching" | "penalty-sent" | "penalized" | "closed" | "missed" | "invalid";
 
 type Row = {
   user_id: string;
@@ -189,6 +196,7 @@ type Row = {
   penalty_tx: string | null;
   unwatch_requested_at: Date | null;
   checked_at: Date | null;
+  attempts: number;
   created_at: Date;
   updated_at: Date;
 };
@@ -319,6 +327,25 @@ export function commitmentArgs(args: ccc.HexLike) {
 }
 
 /**
+ * Checks the revocation's signature the way the commitment lock will (fiber-scripts commitment-lock `auth()`):
+ * BIP340 Schnorr by the peer-commitment key over blake2b(output ‖ u32le(data length) ‖ data ‖ args[0..28] ‖ number).
+ */
+export function revocationSignatureValid(revocation: Revocation, peerKey: ccc.HexLike, commitmentLockArgs: ccc.HexLike): boolean {
+  const args = ccc.bytesFrom(commitmentLockArgs);
+  const data = ccc.bytesFrom(revocation.outputData);
+  const length = new Uint8Array(4);
+  new DataView(length.buffer).setUint32(0, data.length, true);
+  const message = ccc.bytesFrom(ccc.hashCkb(ccc.bytesConcat(
+    ccc.bytesFrom(revocation.output), length, data, args.slice(0, 28), u64be(revocation.commitmentNumber),
+  )));
+  try {
+    return schnorr.verify(ccc.bytesFrom(revocation.aggregatedSignature), message, ccc.bytesFrom(peerKey));
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Builds the penalty transaction: the revoked commitment cell in, the revocation output out (the whole channel to
  * the user's shutdown script), plus the watchtower's own plain cells to pay the fee and their change. The
  * watchtower never takes anything from the channel: the revocation output must hold at least the commitment
@@ -333,7 +360,10 @@ export async function buildPenaltyTransaction(options: {
   cellDeps?: ccc.CellDepLike[];
 }): Promise<ccc.Transaction> {
   const output = ccc.CellOutput.decode(options.revocation.output);
-  if (output.capacity < options.commitment.capacity) throw new Error("The revocation output is smaller than the commitment cell");
+  // Fiber's revocation output is exactly the commitment cell (both are the channel minus the commitment fee). A
+  // larger one would make the watchtower pay the difference; a smaller one would hand part of the channel to it.
+  if (output.capacity !== options.commitment.capacity) throw new Error("The revocation output does not match the commitment cell");
+  if (output.type) throw new Error("Token channels are not watched yet");
   const feeLock = (await options.feeSigner.getRecommendedAddressObj()).script;
   const tx = ccc.Transaction.from({
     cellDeps: options.cellDeps ?? await commitmentLockCellDeps(options.client, NETWORK),
@@ -343,14 +373,19 @@ export async function buildPenaltyTransaction(options: {
     witnesses: [revocationWitness(options.revocation, options.peerKey)],
   });
   await tx.addCellDepsOfKnownScripts(options.client, ccc.KnownScript.Secp256k1Blake160);
-  await tx.completeInputsAddOne(options.feeSigner);
+  // Enough of the watchtower's own capacity for a change cell (61 CKB) and the fee, as Fiber's min_total_capacity.
+  await tx.completeInputsByCapacity(options.feeSigner, CHANGE_RESERVE);
   await tx.completeFeeChangeToOutput(options.feeSigner, 1, FEE_RATE);
   for (const input of tx.inputs.slice(1)) {
     await input.completeExtraInfos(options.client);
     if (!input.cellOutput?.lock.eq(feeLock) || input.cellOutput.type || (input.outputData && input.outputData !== "0x")) throw new Error("The penalty fee must come from plain watchtower cells");
   }
   const feeIn = tx.inputs.slice(1).reduce((sum, input) => sum + input.cellOutput!.capacity, 0n);
-  if (tx.outputs[1].capacity > feeIn) throw new Error("The penalty change would take from the channel");
+  // Everything the watchtower put in comes back as change, less the fee: it neither takes from the channel nor pays
+  // more than a fee.
+  const spent = feeIn - tx.outputs[1].capacity;
+  if (spent < 0n || spent > MAX_PENALTY_FEE) throw new Error("The penalty would move more than its fee between the channel and the watchtower");
+  if (tx.outputs[1].capacity < ccc.fixedPointFrom(61)) throw new Error("The penalty change cell is too small");
   return options.feeSigner.signOnlyTransaction(tx);
 }
 
@@ -393,7 +428,9 @@ export function chainView(client: ccc.Client): ChainView {
 export type Assessment =
   | { state: "watching"; detail: string; fundingOutPoint?: string }
   | { state: "closed"; detail: string; closingTx: ccc.Hex; fundingOutPoint: string }
-  | { state: "revoked"; closingTx: ccc.Hex; fundingOutPoint: string; commitment: { outPoint: ccc.OutPoint; capacity: bigint; lock: ccc.Script } };
+  | { state: "revoked"; closingTx: ccc.Hex; fundingOutPoint: string; commitment: Commitment };
+
+export type Commitment = { outPoint: ccc.OutPoint; capacity: bigint; lock: ccc.Script };
 
 /**
  * Where a watched channel stands on-chain (the decision Fiber's `run_periodic_check` makes): still open, closed
@@ -433,7 +470,7 @@ export type PassDependencies = {
   sql: DatabaseSql;
   chain: ChainView;
   /** Builds and sends the penalty; returns its hash. */
-  punish(row: Row, commitment: { outPoint: ccc.OutPoint; capacity: bigint }): Promise<ccc.Hex>;
+  punish(row: Row, commitment: Commitment): Promise<ccc.Hex>;
   log?: (message: string) => void;
 };
 
@@ -443,7 +480,7 @@ export async function runWatchtowerPass(deps: PassDependencies): Promise<void> {
   const log = deps.log ?? ((message: string) => console.info(`[watchtower] ${message}`));
   await sql`
     delete from keyway_v2_watchtower_channels
-    where state in ('penalized', 'closed', 'missed') and updated_at < now() - ${`${FINISHED_RETENTION_DAYS} days`}::interval
+    where state in ('penalized', 'closed', 'missed', 'invalid') and updated_at < now() - ${`${FINISHED_RETENTION_DAYS} days`}::interval
   `;
   const rows = await sql<Row[]>`
     select * from keyway_v2_watchtower_channels where state in ('watching', 'penalty-sent')
@@ -509,30 +546,43 @@ async function checkChannel(deps: PassDependencies, row: Row, log: (message: str
     await save({ state: "missed", detail: "the revoked commitment was spent before the penalty", closing_tx: assessment.closingTx });
     return;
   }
+  const revocation = storedRevocation(row);
+  if (!revocation || !revocationSignatureValid(revocation, row.peer_commitment_key, commitment.lock.args)) {
+    // The lock would reject it: never spend on it, never retry it.
+    log(`${row.channel_id}: the revoked commitment ${assessment.closingTx} can't be punished with the stored revocation (bad signature)`);
+    await save({ state: "invalid", detail: "the stored revocation does not unlock this commitment", closing_tx: assessment.closingTx });
+    return;
+  }
+  if (row.attempts > 0 && row.checked_at && Date.now() - row.checked_at.getTime() < Math.min(MAX_RETRY_MS, 60_000 * 2 ** (row.attempts - 1))) return;
   log(`${row.channel_id}: the peer published revoked commitment ${assessment.closingTx}; sending the penalty`);
-  const hash = await deps.punish(row, commitment);
+  let hash: ccc.Hex;
+  try {
+    hash = await deps.punish(row, commitment);
+  } catch (error) {
+    await sql`update keyway_v2_watchtower_channels set attempts = attempts + 1, checked_at = now() where user_id = ${row.user_id} and channel_id = ${row.channel_id}`;
+    throw error;
+  }
   log(`${row.channel_id}: penalty sent ${hash}`);
+  await sql`update keyway_v2_watchtower_channels set attempts = attempts + 1 where user_id = ${row.user_id} and channel_id = ${row.channel_id}`;
   await save({ state: "penalty-sent", detail: "penalty sent", penalty_tx: hash, closing_tx: assessment.closingTx, funding_out_point: assessment.fundingOutPoint });
+}
+
+function storedRevocation(row: Row): Revocation | undefined {
+  if (row.commitment_number === null || !row.aggregated_signature || !row.revocation_output || row.revocation_output_data === null) return undefined;
+  return {
+    commitmentNumber: BigInt(row.commitment_number),
+    aggregatedSignature: row.aggregated_signature as ccc.Hex,
+    output: row.revocation_output as ccc.Hex,
+    outputData: row.revocation_output_data as ccc.Hex,
+  };
 }
 
 /** The penalty, built from a stored row and sent with the watchtower's fee key. */
 export function penaltySender(client: ccc.Client, feeSigner: ccc.Signer) {
-  return async (row: Row, commitment: { outPoint: ccc.OutPoint; capacity: bigint }) => {
-    if (row.commitment_number === null || !row.aggregated_signature || !row.revocation_output || row.revocation_output_data === null) {
-      throw new Error("No revocation data");
-    }
-    const tx = await buildPenaltyTransaction({
-      client,
-      commitment,
-      revocation: {
-        commitmentNumber: BigInt(row.commitment_number),
-        aggregatedSignature: row.aggregated_signature as ccc.Hex,
-        output: row.revocation_output as ccc.Hex,
-        outputData: row.revocation_output_data as ccc.Hex,
-      },
-      peerKey: row.peer_commitment_key,
-      feeSigner,
-    });
+  return async (row: Row, commitment: Commitment) => {
+    const revocation = storedRevocation(row);
+    if (!revocation) throw new Error("No revocation data");
+    const tx = await buildPenaltyTransaction({ client, commitment, revocation, peerKey: row.peer_commitment_key, feeSigner });
     return client.sendTransaction(tx);
   };
 }
@@ -551,31 +601,38 @@ export function startWatchtower(env: NodeJS.ProcessEnv = process.env): () => Pro
   if (!/^0x[0-9a-fA-F]{64}$/.test(feeKey)) throw new Error("KEYWAY_WATCHTOWER_FEE_KEY must be a 0x-prefixed 32-byte key");
   const client = env.KEYWAY_WATCHTOWER_CKB_RPC_URL ? new ccc.ClientPublicTestnet({ url: env.KEYWAY_WATCHTOWER_CKB_RPC_URL }) : new ccc.ClientPublicTestnet();
   const feeSigner = new ccc.SignerCkbPrivateKey(client, feeKey);
-  const interval = Number(env.KEYWAY_WATCHTOWER_INTERVAL_SECONDS ?? 60) * 1000;
+  const seconds = Number(env.KEYWAY_WATCHTOWER_INTERVAL_SECONDS ?? 60);
+  const interval = (Number.isFinite(seconds) && seconds >= 5 ? seconds : 60) * 1000;
   let stopped = false;
   let running: Promise<void> | undefined;
   let lock: Awaited<ReturnType<DatabaseSql["reserve"]>> | undefined;
   const tick = async () => {
     const sql = await database();
-    if (!lock) {
-      const connection = await sql.reserve();
-      const [row] = await connection<Array<{ locked: boolean }>>`select pg_try_advisory_lock(hashtext('keyway-watchtower')) as locked`;
-      if (!row?.locked) {
+    const connection = lock ?? await sql.reserve();
+    let locked = false;
+    try {
+      // Asked every pass (it is re-entrant for the holder), so a connection that was lost and replaced can't keep
+      // running while another instance has taken the lock.
+      [{ locked }] = await connection<Array<{ locked: boolean }>>`select pg_try_advisory_lock(hashtext('keyway-watchtower')) as locked`;
+    } finally {
+      if (!locked) {
         connection.release();
-        return;
+        if (lock === connection) lock = undefined;
       }
-      lock = connection;
-      console.info(`[watchtower] running; fee address ${await feeSigner.getRecommendedAddress()}`);
     }
+    if (!locked) return;
+    if (!lock) console.info(`[watchtower] running; fee address ${await feeSigner.getRecommendedAddress()}`);
+    lock = connection;
     await runWatchtowerPass({ sql, chain: chainView(client), punish: penaltySender(client, feeSigner) });
   };
   const loop = () => {
     if (stopped) return;
     running = tick().catch((error) => {
       console.error("[watchtower] pass failed", error instanceof Error ? error.message : error);
-      // A lost connection also loses the lock; take it again next time.
-      lock?.release();
+      // Give the lock up (a broken connection has lost it anyway) and take it again next time.
+      const held = lock;
       lock = undefined;
+      if (held) return held`select pg_advisory_unlock_all()`.then(() => undefined, () => undefined).finally(() => held.release());
     }).finally(() => {
       running = undefined;
       if (!stopped) timer = setTimeout(loop, interval);
@@ -587,7 +644,7 @@ export function startWatchtower(env: NodeJS.ProcessEnv = process.env): () => Pro
     if (timer) clearTimeout(timer);
     await running;
     if (lock) {
-      await lock`select pg_advisory_unlock(hashtext('keyway-watchtower'))`.catch(() => undefined);
+      await lock`select pg_advisory_unlock_all()`.catch(() => undefined);
       lock.release();
       lock = undefined;
     }

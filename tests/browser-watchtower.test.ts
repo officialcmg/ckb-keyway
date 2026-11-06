@@ -5,7 +5,7 @@ import { createRemoteWatchtower, remoteWatchUpdate, updatesForStoredChannel, typ
 import type { WatchedChannel } from "../src/sdk/browser/watchtower-store.ts";
 import {
   FUNDING_LOCK, assessChannel, buildPenaltyTransaction, commitmentArgs, fundingLockArgs, keyAggXOnly, parseRevocation,
-  parseWatchtowerRequest, peerCommitmentKey, revocationWitness, type ChainView,
+  parseWatchtowerRequest, peerCommitmentKey, revocationSignatureValid, revocationWitness, type ChainView,
 } from "../src/server/watchtower.ts";
 import { COMMITMENT_LOCK, blake160 } from "../src/sdk/browser/watchtower-settle.ts";
 
@@ -128,6 +128,39 @@ test("a revocation KeyWay doesn't know the channel for brings the registration a
   remote.stop();
 });
 
+test("one channel's failing update doesn't hold up another's, and a refused one is dropped", async () => {
+  const OTHER = `0x${"cd".repeat(32)}`;
+  const sent: string[] = [];
+  let down = true;
+  const remote = createRemoteWatchtower({
+    send: async (update) => {
+      if (update.channelId === CHANNEL && down) throw new Error("offline");
+      if (update.channelId === OTHER && update.operation === "watch") throw Object.assign(new Error("Token channels are not watched yet"), { status: 400 });
+      sent.push(`${update.operation} ${update.channelId.slice(0, 4)}`);
+    },
+    retryMs: 60_000,
+    log: { info: () => undefined, warn: () => undefined },
+  });
+  const third = `0x${"ef".repeat(32)}`;
+  remote.enqueue({ operation: "revoke", channelId: CHANNEL, revocation: revocationJson(1n) });
+  remote.enqueue({ operation: "watch", channelId: OTHER, localFundingPubkey: `0x${K1}`, remoteFundingPubkey: `0x${K2}`, fundingUdtTypeScript: null });
+  remote.enqueue({ operation: "unwatch", channelId: third });
+  try {
+  await remote.flush();
+  assert.deepEqual(sent, ["unwatch 0xef"], "the healthy channel went out; the refused one is gone");
+  assert.equal(remote.pending(), 1, "only the failing channel waits");
+  remote.enqueue({ operation: "revoke", channelId: OTHER, revocation: revocationJson(1n) });
+  assert.equal(remote.pending(), 1, "updates for a refused channel are dropped");
+  // A flush (e.g. on stop) doesn't wait for the scheduled retry.
+  down = false;
+  await remote.flush();
+  assert.deepEqual(sent, ["unwatch 0xef", "revoke 0xab"]);
+  assert.equal(remote.pending(), 0);
+  } finally {
+    remote.stop();
+  }
+});
+
 test("the API accepts only well-formed watch data", () => {
   const watch = { operation: "watch", channelId: CHANNEL, localFundingPubkey: `0x${K1}`, remoteFundingPubkey: `0x${K2}`, fundingUdtTypeScript: null, localSettlementKey: SECRET };
   const parsed = parseWatchtowerRequest(watch);
@@ -135,6 +168,7 @@ test("the API accepts only well-formed watch data", () => {
   assert.throws(() => parseWatchtowerRequest({ ...watch, localFundingPubkey: `0x02${"00".repeat(32)}` }), /funding key/);
   assert.throws(() => parseWatchtowerRequest({ ...watch, channelId: "0x12" }), /channel ID/);
   assert.throws(() => parseWatchtowerRequest({ operation: "drop-everything" }), /Unsupported/);
+  assert.throws(() => parseWatchtowerRequest({ ...watch, fundingUdtTypeScript: { code_hash: `0x${"aa".repeat(32)}`, hash_type: "type", args: "0x" } }), /Token channels/);
   const revocation = parseRevocation(revocationJson(9n));
   assert.equal(revocation.commitmentNumber, 9n);
   assert.equal(revocation.outputData, "0x");
@@ -154,13 +188,47 @@ test("the penalty witness is Fiber's revocation unlock", () => {
   assert.equal(ccc.hexFrom(witness.slice(25, 57)), peerKey);
 });
 
-test("the watchtower never pays itself from the channel", async () => {
-  const revocation = parseRevocation(revocationJson(2n, 500n));
-  await assert.rejects(buildPenaltyTransaction({
-    client: {} as ccc.Client,
-    commitment: { outPoint: { txHash: `0x${"01".repeat(32)}`, index: 0 }, capacity: 501n },
-    revocation, peerKey: `0x${"77".repeat(32)}`, feeSigner: {} as ccc.Signer, cellDeps: [],
-  }), /smaller than the commitment cell/);
+async function penalty(options: { outputCapacity: bigint; commitmentCapacity: bigint; feeCell: bigint }) {
+  const client = new ccc.ClientPublicTestnet();
+  const feeSigner = new ccc.SignerCkbPrivateKey(client, `0x${"42".repeat(32)}`);
+  const feeLock = (await feeSigner.getRecommendedAddressObj()).script;
+  const commitmentOutPoint = ccc.OutPoint.from({ txHash: `0x${"01".repeat(32)}`, index: 0 });
+  const commitmentCell = ccc.Cell.from({
+    outPoint: commitmentOutPoint,
+    cellOutput: { capacity: options.commitmentCapacity, lock: { codeHash: COMMITMENT_LOCK.testnet.codeHash, hashType: "type", args: `0x${"00".repeat(57)}` } },
+    outputData: "0x",
+  });
+  const feeCell = ccc.Cell.from({ outPoint: { txHash: `0x${"0f".repeat(32)}`, index: 0 }, cellOutput: { capacity: options.feeCell, lock: feeLock }, outputData: "0x" });
+  // No network: the indexer knows the fee key's one plain cell, and cells resolve to these two.
+  Object.assign(client, {
+    findCellsPagedNoCache: async (key: { scriptSearchMode?: string }) => ({ cells: key.scriptSearchMode === "exact" ? [feeCell] : [], lastCursor: "" }),
+    getCell: async (outPoint: ccc.OutPointLike) => (ccc.OutPoint.from(outPoint).eq(commitmentOutPoint) ? commitmentCell : feeCell),
+  });
+  const revocation = parseRevocation(revocationJson(2n, options.outputCapacity));
+  const tx = await buildPenaltyTransaction({
+    client, commitment: { outPoint: commitmentOutPoint, capacity: options.commitmentCapacity },
+    revocation, peerKey: `0x${"77".repeat(32)}`, feeSigner, cellDeps: [],
+  });
+  return { tx, feeIn: options.feeCell };
+}
+
+test("the penalty pays the user and returns the watchtower's own capacity less the fee", async () => {
+  const CKB = 100_000_000n;
+  const { tx, feeIn } = await penalty({ outputCapacity: 1000n * CKB, commitmentCapacity: 1000n * CKB, feeCell: 10_000n * CKB });
+  assert.equal(tx.outputs[0].capacity, 1000n * CKB, "the whole commitment goes to the user's output");
+  assert.equal(tx.outputs[0].lock.args, userLock.args);
+  const fee = feeIn - tx.outputs[1].capacity;
+  assert.ok(fee > 0n && fee < 10_000n, `fee ${fee}`);
+  assert.equal(tx.inputs.length, 2);
+});
+
+test("the watchtower refuses revocations that would move capacity between it and the channel", async () => {
+  const CKB = 100_000_000n;
+  // A self-dealt revocation larger than the commitment would make the watchtower pay the difference.
+  await assert.rejects(penalty({ outputCapacity: 1_000_000n * CKB, commitmentCapacity: 1000n * CKB, feeCell: 2_000_000n * CKB }), /does not match the commitment cell/);
+  await assert.rejects(penalty({ outputCapacity: 999n * CKB, commitmentCapacity: 1000n * CKB, feeCell: 10_000n * CKB }), /does not match the commitment cell/);
+  // A fee cell too small for a change cell is not used.
+  await assert.rejects(penalty({ outputCapacity: 1000n * CKB, commitmentCapacity: 1000n * CKB, feeCell: 61n * CKB }));
 });
 
 function fakeChain(options: { funded?: boolean; closing?: ccc.Transaction; committed?: boolean }): ChainView {
@@ -218,6 +286,12 @@ test("keys from the testnet proof give the on-chain funding and commitment locks
   }
   assert.ok(BigInt(fixture.penalty.revocationCommitmentNumber) >= commitmentArgs(fixture.penalty.onChainCommitmentArgs)!.commitmentNumber, "revoked");
   assert.ok(BigInt(fixture.browser.revocationCommitmentNumber) < commitmentArgs(fixture.browser.onChainCommitmentArgs)!.commitmentNumber, "current");
+  // The stored signature unlocks the revoked commitment the way the lock checks it, and nothing else.
+  const revocation = { commitmentNumber: BigInt(fixture.penalty.revocationCommitmentNumber), aggregatedSignature: fixture.penalty.revocationSignature, output: fixture.penalty.revocationOutput, outputData: "0x" as const };
+  const key = peerCommitmentKey(fixture.penalty.localFundingPubkey, fixture.penalty.remoteFundingPubkey);
+  assert.equal(revocationSignatureValid(revocation, key, fixture.penalty.onChainCommitmentArgs), true);
+  assert.equal(revocationSignatureValid({ ...revocation, commitmentNumber: revocation.commitmentNumber + 1n }, key, fixture.penalty.onChainCommitmentArgs), false);
+  assert.equal(revocationSignatureValid(revocation, key, fixture.browser.onChainCommitmentArgs), false);
   // The revocation output pays the victim's own lock: that is all the watchtower can do with it.
   assert.equal(ccc.CellOutput.decode(fixture.penalty.revocationOutput).lock.args, fixture.penalty.victimLockArgs);
 });
