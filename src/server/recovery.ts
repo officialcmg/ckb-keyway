@@ -92,7 +92,7 @@ export async function recoverySetup(context: RecoveryContext, body: Record<strin
     if (policy) {
       // The policy Action emails the code and binds this address to the account on chain; the code never comes here.
       await codeLimit(context);
-      const sent = await policySendCode(planned.transaction, context.wallet, { email: await context.email(), appName: context.appName });
+      const sent = await policySendCode(planned.transaction, context.wallet, { email: await context.email(), appName: context.appName, backups, client });
       await recordLitCode(context.user, "recovery", nonce, { litTicket: sent.ticket, litBinding: sent.binding });
       return { sent: true, sentTo: sent.sentTo, codeLength: 8 };
     }
@@ -122,7 +122,7 @@ export async function recoverySetup(context: RecoveryContext, body: Record<strin
       await checkRecoveryTransaction(client, planned.transaction, wallet.litPublicKey, backups);
       await countLitCodeAttempt(context.user, "recovery", nonce);
       await context.recordSigning(context.user.id);
-      signed = await signGroups({ ...context, wallet }, planned.transaction, [{ script: planned.secp, kind: "secp256k1" }], client, { emailCode });
+      signed = await signGroups({ ...context, wallet }, planned.transaction, [{ script: planned.secp, kind: "secp256k1" }], client, { emailCode, backups });
       await consumeRequest(context.user, "recovery", nonce);
     } else {
       await verifyCode(context.user, "recovery", nonce, body.emailCode);
@@ -459,12 +459,17 @@ export type BackupChangePlan = {
   listLock: ccc.Script;
   adminList: ccc.Cell;
   backups: RecoveryBackup[];
+  /** The list before the change. */
+  previousBackups: RecoveryBackup[];
   /** The list's record before the change (salted auths), for the policy Action to check against the list's root. */
   previousRecord: ccc.Hex;
   preview: BackupChangePreview;
 };
 
 const backupKey = (backup: RecoveryBackup) => `${backup.kind}:${backup.address}`;
+
+/** Every backup on the list before or after a change: the policy Action salts each and matches the records. */
+const litBackups = (plan: BackupChangePlan) => [...plan.previousBackups, ...plan.backups.filter((backup) => !plan.previousBackups.some((old) => backupKey(old) === backupKey(backup)))];
 
 /**
  * Adding or removing a backup: challenge, preview, request-email-code, apply, status. The emailed code is always
@@ -495,7 +500,7 @@ export async function recoveryBackupChange(context: RecoveryContext, body: Recor
     if (mode === "policy") {
       // The policy Action emails the code to the address bound on chain when recovery was turned on.
       await codeLimit(context);
-      const sent = await policySendCode(plan.transaction, context.wallet, { enableTransactionHash: context.wallet.recovery.enableTransactionHash, appName: context.appName });
+      const sent = await policySendCode(plan.transaction, context.wallet, { enableTransactionHash: context.wallet.recovery.enableTransactionHash, appName: context.appName, backups: litBackups(plan), client });
       await recordLitCode(context.user, "recovery", nonce, { litTicket: sent.ticket });
       return { sent: true, sentTo: sent.sentTo, codeLength: 8 };
     }
@@ -524,14 +529,14 @@ export async function recoveryBackupChange(context: RecoveryContext, body: Recor
       await checkBackupChangeTransaction(client, plan.transaction, wallet.recovery, plan.backups);
       await countLitCodeAttempt(context.user, "recovery", nonce);
       await context.recordSigning(context.user.id);
-      signed = await signGroups({ ...context, wallet }, plan.transaction, groups, client, { enableTransactionHash, emailCode, previousListRecord: plan.previousRecord });
+      signed = await signGroups({ ...context, wallet }, plan.transaction, groups, client, { enableTransactionHash, emailCode, previousListRecord: plan.previousRecord, backups: litBackups(plan) });
       await consumeRequest(context.user, "recovery", nonce);
     } else {
       await verifyCode(context.user, "recovery", nonce, body.emailCode);
       await consumeRequest(context.user, "recovery", nonce);
       await checkBackupChangeTransaction(client, plan.transaction, wallet.recovery, plan.backups);
       await context.recordSigning(context.user.id);
-      signed = await signGroups({ ...context, wallet }, plan.transaction, groups, client, { enableTransactionHash, previousListRecord: plan.previousRecord });
+      signed = await signGroups({ ...context, wallet }, plan.transaction, groups, client, { enableTransactionHash, previousListRecord: plan.previousRecord, backups: litBackups(plan) });
     }
     const transactionHash = signed.hash();
     const recovery: KeyWayRecovery = { ...wallet.recovery, adminListOutPoint: { txHash: transactionHash, index: 0 }, backups: plan.backups };
@@ -628,7 +633,8 @@ export async function planBackupChange(client: ccc.Client, wallet: ReadyWallet, 
   transaction.outputs[1].capacity = funded - fee;
   const label = (backup: RecoveryBackup) => ({ ...backup, label: describeBackup(backup) });
   return {
-    transaction, omnilock, listLock, adminList, backups, previousRecord: recoveryListRecord(await backupAuths(client, current, recoverySalt(recovery))),
+    transaction, omnilock, listLock, adminList, backups, previousBackups: current,
+    previousRecord: recoveryListRecord(await backupAuths(client, current, recoverySalt(recovery))),
     preview: {
       network: "CKB testnet",
       change: change.change,

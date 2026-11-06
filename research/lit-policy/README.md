@@ -65,8 +65,15 @@ It also enforces these invariants on the recovery list:
 - A list can't be destroyed.
 - A list's lock, Type ID and capacity never change.
 - A change adds or removes exactly one backup. It compares the members recorded on chain before and after, each
-  checked against its SMT root.
-- At most 8 backups, and only KeyWay's two verifiers.
+  checked against its SMT root. Records are version 3 (`"KWRL" ‖ 0x03 ‖ count ‖ 21-byte auths`, see
+  `research/backup-unlinking/README.md`); the Action accepts no other version.
+- At most 8 backups, each one of KeyWay's two version 3 verifiers (salted identities) for this account. The record
+  holds only salted auths, so the server passes `backups`: the kind and 20-byte id (EVM address, or blake160 of the
+  JoyID passkey's public key) of every backup on the list before and after. The Action rebuilds each auth as
+  `0xFD ‖ blake160(verifier ‖ 0x02 ‖ 0x00 ‖ 8 zero bytes ‖ blake160(id ‖ salt))`, where the salt is the list's
+  Type ID type hash, and refuses any listed auth it can't rebuild that way: another account's salt, an unsalted
+  id, the old verifiers, or anything else. It also refuses an id that isn't on the list. The emailed code names
+  backups by these ids.
 - A new list must be output 0, under the owner-only lock, with its Type ID from input 0, which must be the
   account's own secp256k1 cell. Every administrator-mode output must name that list.
 - First wins: a new list is refused if the indexer shows any live list under the key's owner-only lock already.
@@ -78,7 +85,7 @@ It also enforces these invariants on the recovery list:
   blocking an account that way costs an attacker more than 1024 such cells, about 129k CKB.
 - An enable must spend every live plain cell at the key's secp256k1 address. Two enables signed before either is
   indexed then spend the same cells, so at most one can commit.
-- A change to a list made before on-chain records existed needs the previous record from the server. That record
+- A change to a list without an on-chain record needs the previous record (version 3) from the server. That record
   must hash to the list's root, and the one-backup rule applies as usual.
 - Outside turning recovery on, every output to an administrator-mode Omnilock of the key must name the key's one
   live list. Without this, a server could make a second list with its own backup and email, then move the funds
@@ -252,8 +259,9 @@ You run these locally. The server has no Lit account credentials.
    actions to groups.
 3. **Register the policy Action.**
    1. In the Chipotle dashboard, open **Action Runner** and paste `lit-actions/sign-ckb-transaction.js` exactly.
-   2. Click **Get Lit Action IPFS CID**. It must equal `LIT_POLICY_ACTION_CID` in `.env.example`
-      (`POLICY_ACTION_CID` in `src/server/lit-policy.ts`).
+   2. Click **Get Lit Action IPFS CID**. It must be `QmUAH57DReSYogkZ3ktLDrtBG88naoBZ3AJpvqHqtGCCas`, the same as
+      `LIT_POLICY_ACTION_CID` in `.env.example` and `POLICY_ACTION_CID` in `src/server/lit-policy.ts`. Any other
+      CID means the pasted source differs from this branch.
    3. Under **IPFS Actions**, register the CID as `keyway-ckb-policy-signer`.
    4. Add the CID to group 1, `CKB Keyway`. The PKPs are already in that group.
 4. **Smoke test on staging.**
@@ -285,9 +293,12 @@ their list changes use the server's 6-digit code again, as before. Nothing in th
   - plain signing from chain cells;
   - turning recovery on: wrong code, a binding for another address, a changed transaction, and expired tickets;
   - a bound backup change, where the server can't redirect the code;
-  - every list invariant;
-  - accounts that turned recovery on before this Action.
-- `tests/recovery-postgres.test.ts` runs the whole flow through Postgres and the Action: turning recovery on and
-  adding a backup.
+  - every list invariant, including adds under another salt or the old verifiers;
+  - accounts that turned recovery on before this Action, and lists without a record.
+- `tests/lit-policy-v3-parity.test.ts` checks the Action against KeyWay's own encoders: the testnet proof's
+  version 3 records and salted auths, an enable with an EVM wallet and a JoyID passkey built by the server, and
+  refusals for the wrong salt, an extra or missing auth, the old verifier hashes and a version 2 record.
+- `tests/recovery-postgres.test.ts` runs the whole flow through Postgres and the Action: turning recovery on,
+  adding an EVM wallet and a JoyID passkey, and removing a backup, checking the on-chain record each time.
 - `tests/general-signing-postgres.test.ts` covers the Lit-code request bookkeeping.
 - `tests/fiber-payments-postgres.test.ts` covers idempotent payment retries.

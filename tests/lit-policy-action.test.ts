@@ -7,12 +7,11 @@ import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { adminListLock, adminListTypeScript, KEYWAY_OMNILOCK, secp256k1Lock, type KeyWayRecovery } from "../src/sdk/browser/account-lock.ts";
-import type { RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
-import { recoveryListRecord, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
+import { execAuth, execPreimage, saltedBackupId, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
+import { backupAuths, recoveryListRecord, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
 import { adminListData, whitelistTree } from "../src/sdk/browser/recovery-smt.ts";
-import { backupAuth } from "../src/sdk/browser/recovery-backups.ts";
 import { fakeLit, litCodeIn, type ActionModule } from "./lit-action-fixture.ts";
-import { policyIdentitySignature, policySendCode, policySignMessage, policySignTransaction, setEmailBinding } from "../src/server/lit-policy.ts";
+import { litBackupIds, policyIdentitySignature, policySendCode, policySignMessage, policySignTransaction, setEmailBinding } from "../src/server/lit-policy.ts";
 import { planBackupChange, planRecovery } from "../src/server/recovery.ts";
 import type { ReadyWallet } from "../src/server/user-wallet.ts";
 import { recoverPkpPublicKey } from "../src/server/pkp-identity.ts";
@@ -87,9 +86,9 @@ async function enableWithPolicy(backups: RecoveryBackup[], email = "user@example
   const env = world([funding]);
   const action = await loadAction(env);
   const plan = await planRecovery(client, walletFor(), backups, { emailBinding: true });
-  const sent = await policySendCode(plan.transaction, wallet, { email, appName: "Demo" }, runner(action));
+  const sent = await policySendCode(plan.transaction, wallet, { email, appName: "Demo", backups, client }, runner(action));
   setEmailBinding(plan.transaction, sent.binding!);
-  const signed = await policySignTransaction(plan.transaction, [{ script: plan.secp, kind: "secp256k1" }], client, wallet, { emailCode: { code: codeIn(env.emails[0]), ticket: sent.ticket } }, runner(action));
+  const signed = await policySignTransaction(plan.transaction, [{ script: plan.secp, kind: "secp256k1" }], client, wallet, { emailCode: { code: codeIn(env.emails[0]), ticket: sent.ticket }, backups }, runner(action));
   const recovery: KeyWayRecovery = {
     omnilockArgs: plan.omnilock.args, omnilock: KEYWAY_OMNILOCK.testnet, adminListTypeArgs: plan.adminListType.args, adminListTypeHash: plan.adminListType.hash(),
     adminListOutPoint: { txHash: signed.hash(), index: 0 }, enableTransactionHash: signed.hash(), legacyAddress: plan.preview.legacyAddress,
@@ -115,10 +114,10 @@ test("the Action's blake2b, transaction hash and SMT root match CCC and the SDK"
   assert.equal(hex(action.rawTransactionHash(action.parseTransaction(JSON.parse(ccc.stringify(tx))))), tx.hash());
   const backups = [evm(1), evm(2), evm(3)];
   const client = await offlineClient([]);
-  const record = ccc.bytesFrom(await recoveryListRecord(client, backups));
-  const preimages = backups.map((_, i) => record.slice(6 + i * 63 + 1, 6 + (i + 1) * 63));
-  const { root } = whitelistTree(await Promise.all(backups.map((backup) => backupAuth(client, backup))));
-  assert.equal(hex(action.whitelistRoot(preimages)), root);
+  const salt = `0x${"5a".repeat(32)}`;
+  const auths = await backupAuths(client, backups, salt);
+  const { root } = whitelistTree(auths);
+  assert.equal(hex(action.whitelistRoot(action.parseListRecord(ccc.bytesFrom(recoveryListRecord(auths))))), root);
 });
 
 test("identity and message modes sign only what the Action hashes itself; there is no raw digest mode", async () => {
@@ -167,7 +166,7 @@ test("turning recovery on needs the code the Action emailed, to the address boun
   const plan = await planRecovery(client, walletFor(), backups, { emailBinding: true });
   const groups = [{ script: plan.secp, kind: "secp256k1" as const }];
   const sign = (transaction: ccc.Transaction, emailCode?: { code: string; ticket: string }) =>
-    policySignTransaction(transaction.clone(), groups, client, wallet, emailCode ? { emailCode } : {}, runner(action));
+    policySignTransaction(transaction.clone(), groups, client, wallet, { backups, ...(emailCode ? { emailCode } : {}) }, runner(action));
 
   // Without a binding (only its zero placeholder) or a code it refuses.
   await assert.rejects(sign(plan.transaction), /email binding is malformed/);
@@ -176,7 +175,7 @@ test("turning recovery on needs the code the Action emailed, to the address boun
   w0.inputType = undefined;
   unbound.setWitnessArgsAt(0, w0);
   await assert.rejects(sign(unbound), /must bind the account's email/);
-  const sent = await policySendCode(plan.transaction, wallet, { email: "user@example.com", appName: "Demo" }, runner(action));
+  const sent = await policySendCode(plan.transaction, wallet, { email: "user@example.com", appName: "Demo", backups, client }, runner(action));
   assert.equal(env.emails.length, 1);
   assert.deepEqual(env.emails[0].to, ["user@example.com"]);
   assert.equal(env.emails[0].from, "CKB KeyWay <security@auth.ckbkeyway.dev>");
@@ -187,7 +186,7 @@ test("turning recovery on needs the code the Action emailed, to the address boun
   await assert.rejects(sign(bound), /eight-digit code/);
   await assert.rejects(sign(bound, { code: code === "00000000" ? "00000001" : "00000000", ticket: sent.ticket }), /isn't right/);
   // A binding for another address doesn't take this address's code, and the code is for this transaction only.
-  const other = await policySendCode(plan.transaction, wallet, { email: "attacker@example.com", appName: "Demo" }, runner(action));
+  const other = await policySendCode(plan.transaction, wallet, { email: "attacker@example.com", appName: "Demo", backups, client }, runner(action));
   const swapped = plan.transaction.clone();
   setEmailBinding(swapped, other.binding!);
   await assert.rejects(sign(swapped, { code, ticket: sent.ticket }), /isn't right/);
@@ -209,14 +208,15 @@ test("a bound account's backup change needs the Action's code, sent to the bound
   const client = await offlineClient([funding, enable], [`${funding.hash()}:0`, `${funding.hash()}:1`]);
   const plan = await planBackupChange(client, walletFor(recovery), { change: "add", backup: evm(6) });
   const groups = [{ script: plan.listLock, kind: "omnilock" as const }, { script: plan.omnilock, kind: "omnilock" as const }];
+  const all = [...backups, evm(6)];
   const sign = (transaction: ccc.Transaction, emailCode?: { code: string; ticket: string }, enableTransactionHash = recovery.enableTransactionHash) =>
-    policySignTransaction(transaction.clone(), groups, client, wallet, { enableTransactionHash, ...(emailCode ? { emailCode } : {}) }, runner(action));
+    policySignTransaction(transaction.clone(), groups, client, wallet, { enableTransactionHash, backups: all, ...(emailCode ? { emailCode } : {}) }, runner(action));
 
   await assert.rejects(sign(plan.transaction), /eight-digit code/);
   await assert.rejects(sign(plan.transaction, undefined, funding.hash()), /isn't the transaction that made this recovery list/);
   const before = env.emails.length;
   // The server can't redirect the code: the address comes from the chain, whatever email it passes.
-  const sent = await policySendCode(plan.transaction, wallet, { enableTransactionHash: recovery.enableTransactionHash, email: "attacker@example.com", appName: "Demo" }, runner(action));
+  const sent = await policySendCode(plan.transaction, wallet, { enableTransactionHash: recovery.enableTransactionHash, email: "attacker@example.com", appName: "Demo", backups: all, client }, runner(action));
   assert.equal(sent.sentTo, "user@example.com");
   const email = env.emails[before];
   assert.deepEqual(email.to, ["user@example.com"]);
@@ -231,10 +231,11 @@ test("the Action refuses moving, retyping, destroying or rewriting the recovery 
   const action = await loadAction(env);
   const client = await offlineClient([funding, enable], [`${funding.hash()}:0`, `${funding.hash()}:1`]);
   const plan = await planBackupChange(client, walletFor(recovery), { change: "add", backup: evm(9) });
+  const ids = await litBackupIds(client, [evm(7), evm(8), evm(9), evm(10)]);
   const attempt = (mutate: (tx: ccc.Transaction) => void | Promise<void>) => async () => {
     const tx = plan.transaction.clone();
     await mutate(tx);
-    return action.main({ mode: "transaction", pkpId, transaction: JSON.parse(ccc.stringify(tx)), enableTransactionHash: recovery.enableTransactionHash });
+    return action.main({ mode: "transaction", pkpId, transaction: JSON.parse(ccc.stringify(tx)), enableTransactionHash: recovery.enableTransactionHash, backups: ids });
   };
   await assert.rejects(attempt((tx) => { tx.outputs[0].lock = enablePlan.secp; }), /lock can't change/);
   await assert.rejects(attempt((tx) => { tx.outputs[0].type = adminListTypeScript({ adminListTypeArgs: `0x${"12".repeat(32)}` }); }), /Type ID can't change|can't be destroyed/);
@@ -242,10 +243,9 @@ test("the Action refuses moving, retyping, destroying or rewriting the recovery 
   await assert.rejects(attempt((tx) => { tx.outputs[0].capacity -= CKB; tx.outputs[1].capacity += CKB; }), /capacity can't change/);
   await assert.rejects(attempt(async (tx) => {
     // Two new backups at once.
-    const list = [evm(7), evm(8), evm(9), evm(10)];
-    const { root } = whitelistTree(await Promise.all(list.map((backup) => backupAuth(client, backup))));
-    tx.outputsData[0] = adminListData(root);
-    setRecoveryListRecord(tx, 0, await recoveryListRecord(client, list));
+    const auths = await backupAuths(client, [evm(7), evm(8), evm(9), evm(10)], recovery.adminListTypeHash);
+    tx.outputsData[0] = adminListData(whitelistTree(auths).root);
+    setRecoveryListRecord(tx, 0, recoveryListRecord(auths));
   }), /exactly one backup/);
   await assert.rejects(attempt((tx) => {
     // A second list output under the owner-only lock.
@@ -253,6 +253,19 @@ test("the Action refuses moving, retyping, destroying or rewriting the recovery 
     tx.outputsData.push(tx.outputsData[0]);
   }), /only one recovery list/);
   await assert.rejects(attempt((tx) => { tx.outputsData[0] = adminListData(`0x${"34".repeat(32)}`); }), /don't match the recovery list's root/);
+  // Adding one auth that isn't a KeyWay backup of this account: the new backup under another salt, or under the
+  // verifier from before backup unlinking.
+  const current = await backupAuths(client, [evm(7), evm(8)], recovery.adminListTypeHash);
+  const added = (auth: ccc.Hex) => (tx: ccc.Transaction) => {
+    tx.outputsData[0] = adminListData(whitelistTree([...current, auth]).root);
+    setRecoveryListRecord(tx, 0, recoveryListRecord([...current, auth]));
+  };
+  const [otherSalt] = await backupAuths(client, [evm(9)], `0x${"66".repeat(32)}`);
+  await assert.rejects(attempt(added(otherSalt)), /names a backup KeyWay doesn't support/);
+  const oldVerifier = execAuth(execPreimage("0x33bd1c699b633d685a6f60f6b0ca16fe8bb896f81323926ca6e0671bf8ab3c88", saltedBackupId(evm(9).address, recovery.adminListTypeHash)));
+  await assert.rejects(attempt(added(oldVerifier)), /names a backup KeyWay doesn't support/);
+  // The true change, but the caller leaves out the backup being added.
+  await assert.rejects(action.main({ mode: "transaction", pkpId, transaction: JSON.parse(ccc.stringify(plan.transaction)), enableTransactionHash: recovery.enableTransactionHash, backups: ids.slice(0, 2) }), /names a backup KeyWay doesn't support/);
 });
 
 test("an account that turned recovery on before the policy Action keeps its server checks and the list rules, no code", async () => {
@@ -276,9 +289,10 @@ test("an account that turned recovery on before the policy Action keeps its serv
   const listClient = await offlineClient([funding, signed], [`${funding.hash()}:0`, `${funding.hash()}:1`]);
   const change = await planBackupChange(listClient, walletFor(recovery), { change: "add", backup: evm(12) });
   const groups = [{ script: change.listLock, kind: "omnilock" as const }, { script: change.omnilock, kind: "omnilock" as const }];
-  const result = await policySignTransaction(change.transaction.clone(), groups, listClient, wallet, { enableTransactionHash: recovery.enableTransactionHash }, runner(action));
+  const all = [...backups, evm(12)];
+  const result = await policySignTransaction(change.transaction.clone(), groups, listClient, wallet, { enableTransactionHash: recovery.enableTransactionHash, backups: all }, runner(action));
   assert.equal(result.hash(), change.transaction.hash());
-  await assert.rejects(action.main({ mode: "send-code", pkpId, transaction: JSON.parse(ccc.stringify(change.transaction)), enableTransactionHash: recovery.enableTransactionHash, emailApiKey: "re_test_sending_key" }), /doesn't need an email code/);
+  await assert.rejects(action.main({ mode: "send-code", pkpId, transaction: JSON.parse(ccc.stringify(change.transaction)), enableTransactionHash: recovery.enableTransactionHash, backups: await litBackupIds(listClient, all), emailApiKey: "re_test_sending_key" }), /doesn't need an email code/);
 });
 
 test("a key with a recovery list can't make a second one, or move funds to an address naming another list", async () => {
@@ -295,7 +309,7 @@ test("a key with a recovery list can't make a second one, or move funds to an ad
   env.add(refund);
   const client = await offlineClient([funding, enable, refund], [`${funding.hash()}:0`, `${funding.hash()}:1`]);
   const second = await planRecovery(client, walletFor(), [evm(14)], { emailBinding: true });
-  await assert.rejects(policySendCode(second.transaction, wallet, { email: "attacker@example.com", appName: "Demo" }, runner(action)), /already on for this key/);
+  await assert.rejects(policySendCode(second.transaction, wallet, { email: "attacker@example.com", appName: "Demo", backups: [evm(14)], client }, runner(action)), /already on for this key/);
 
   // Moving the account's funds to an Omnilock of the same key that names another list is refused; to its own
   // address it is fine.
@@ -342,12 +356,12 @@ test("a cell anyone sends to the list lock doesn't count as a list, and an enabl
   }));
   // Plain cells sent to the list lock aren't even looked at, however many there are.
   env.add(ccc.Transaction.from({ inputs: [], outputs: Array.from({ length: 300 }, () => ({ lock: plan.transaction.outputs[0].lock, capacity: 70n * CKB })), outputsData: Array.from({ length: 300 }, () => "0x") }));
-  const sent = await policySendCode(plan.transaction, wallet, { email: "user@example.com", appName: "Demo" }, runner(action));
+  const sent = await policySendCode(plan.transaction, wallet, { email: "user@example.com", appName: "Demo", backups: [evm(15)], client }, runner(action));
   assert.ok(sent.ticket);
   // A new plain cell at the secp256k1 address that the enable leaves out: refused.
   const extra = ccc.Transaction.from({ inputs: [], outputs: [{ lock: plan.secp, capacity: 100n * CKB }], outputsData: ["0x"] });
   env.add(extra);
-  await assert.rejects(policySendCode(plan.transaction, wallet, { email: "user@example.com", appName: "Demo" }, runner(action)), /spend every plain cell/);
+  await assert.rejects(policySendCode(plan.transaction, wallet, { email: "user@example.com", appName: "Demo", backups: [evm(15)], client }, runner(action)), /spend every plain cell/);
 });
 
 test("a list made before on-chain records changes by one backup only, checked against the record the server supplies", async () => {
@@ -373,16 +387,20 @@ test("a list made before on-chain records changes by one backup only, checked ag
   const listClient = await offlineClient([funding, signed], [`${funding.hash()}:0`, `${funding.hash()}:1`]);
   const change = await planBackupChange(listClient, walletFor(recovery), { change: "add", backup: evm(18) });
   const groups = [{ script: change.listLock, kind: "omnilock" as const }, { script: change.omnilock, kind: "omnilock" as const }];
-  const sign = (previousListRecord?: ccc.Hex) => policySignTransaction(change.transaction.clone(), groups, listClient, wallet, { enableTransactionHash: recovery.enableTransactionHash, ...(previousListRecord ? { previousListRecord } : {}) }, runner(action));
+  const all = [...backups, evm(18)];
+  const sign = (previousListRecord?: ccc.Hex) => policySignTransaction(change.transaction.clone(), groups, listClient, wallet, { enableTransactionHash: recovery.enableTransactionHash, backups: all, ...(previousListRecord ? { previousListRecord } : {}) }, runner(action));
   await assert.rejects(sign(), /previousListRecord is required/);
-  await assert.rejects(sign(await recoveryListRecord(listClient, [evm(19), evm(20)])), /don't match the recovery list's root/);
+  const salt = recovery.adminListTypeHash;
+  await assert.rejects(sign(recoveryListRecord(await backupAuths(listClient, [evm(19), evm(20)], salt))), /don't match the recovery list's root/);
+  // The true list, unsalted or under another account's salt, doesn't hash to the root either.
+  await assert.rejects(sign(recoveryListRecord(await backupAuths(listClient, backups, `0x${"77".repeat(32)}`))), /don't match the recovery list's root/);
   // Replacing every backup at once, with the true previous record: refused.
   const replaced = change.transaction.clone();
   const list = [evm(21), evm(22), evm(23)];
-  const { root } = whitelistTree(await Promise.all(list.map((backup) => backupAuth(listClient, backup))));
-  replaced.outputsData[0] = adminListData(root);
-  setRecoveryListRecord(replaced, 0, await recoveryListRecord(listClient, list));
-  await assert.rejects(action.main({ mode: "transaction", pkpId, transaction: JSON.parse(ccc.stringify(replaced)), enableTransactionHash: recovery.enableTransactionHash, previousListRecord: change.previousRecord }), /exactly one backup/);
+  const auths = await backupAuths(listClient, list, salt);
+  replaced.outputsData[0] = adminListData(whitelistTree(auths).root);
+  setRecoveryListRecord(replaced, 0, recoveryListRecord(auths));
+  await assert.rejects(action.main({ mode: "transaction", pkpId, transaction: JSON.parse(ccc.stringify(replaced)), enableTransactionHash: recovery.enableTransactionHash, backups: await litBackupIds(listClient, [...backups, ...list]), previousListRecord: change.previousRecord }), /exactly one backup/);
   const result = await sign(change.previousRecord);
   assert.equal(result.hash(), change.transaction.hash());
 });

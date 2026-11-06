@@ -1,5 +1,6 @@
 import * as ccc from "@ckb-ccc/core";
 import { omnilockOwnerWitnessLock, witnessLockLength } from "../sdk/browser/account-lock.ts";
+import { joyIdLock, joyIdPubkeyHash, normalizeEvmAddress, type RecoveryBackup } from "../sdk/browser/recovery-backups.ts";
 import type { SigningGroup } from "./funding-transaction.ts";
 import { loadLitAction } from "./lit-actions.ts";
 import { runLitAction, type LitRuntimeConfig, type LitSignature } from "./lit.ts";
@@ -11,7 +12,7 @@ import { recoverPkpPublicKey } from "./pkp-identity.ts";
  * the recovery list's rules and checks the code it emailed for every list change. The pinned CID below is the
  * hash of that source (tests/lit-action-packaging.test.ts); the founder registers it in the Lit group.
  */
-export const POLICY_ACTION_CID = "QmRraGGtcp5D2qJM9UMXuzfEDcscE5X9bVraU74LNUjHLZ";
+export const POLICY_ACTION_CID = "QmUAH57DReSYogkZ3ktLDrtBG88naoBZ3AJpvqHqtGCCas";
 
 /** Set KEYWAY_LIT_SIGNER=policy once the policy Action's CID is in the Lit group; until then the digest signer is used. */
 export function litPolicyEnabled(): boolean {
@@ -30,6 +31,21 @@ async function policyConfig(): Promise<LitRuntimeConfig> {
 }
 
 type WalletKeys = { litPkpId: string; litPublicKey: string };
+
+/** A backup as the policy Action takes it: its kind and 20-byte id, which the Action salts and checks itself. */
+export type LitBackupId = { kind: RecoveryBackup["kind"]; id: ccc.Hex };
+
+/**
+ * The ids of these backups (the EVM address, or blake160 of the JoyID passkey's public key), without duplicates.
+ * The on-chain record holds only salted auths, so the Action is told each backup on the list before and after a
+ * change and rebuilds its auth with the account's salt and KeyWay's verifier.
+ */
+export async function litBackupIds(client: ccc.Client, backups: RecoveryBackup[]): Promise<LitBackupId[]> {
+  const ids = await Promise.all(backups.map(async (backup): Promise<LitBackupId> => backup.kind === "evm"
+    ? { kind: "evm", id: normalizeEvmAddress(backup.address) }
+    : { kind: "joyid", id: ccc.hexFrom(joyIdPubkeyHash(await joyIdLock(client, backup.address))) }));
+  return ids.filter((entry, index) => ids.findIndex((other) => other.kind === entry.kind && other.id === entry.id) === index);
+}
 
 type Runner = (config: LitRuntimeConfig, params: Record<string, unknown>) => Promise<unknown>;
 
@@ -77,7 +93,7 @@ export async function policySignTransaction(
   groups: SigningGroup[],
   client: ccc.Client,
   wallet: WalletKeys,
-  options: { enableTransactionHash?: string; emailCode?: LitEmailCode; previousListRecord?: ccc.Hex } = {},
+  options: { enableTransactionHash?: string; emailCode?: LitEmailCode; previousListRecord?: ccc.Hex; backups?: RecoveryBackup[] } = {},
   run = defaultRun,
 ): Promise<ccc.Transaction> {
   if (groups.length === 0) throw new Error("Transaction has no KeyWay signing group");
@@ -94,6 +110,7 @@ export async function policySignTransaction(
     ...(options.enableTransactionHash ? { enableTransactionHash: options.enableTransactionHash } : {}),
     ...(options.emailCode ? { emailCode: options.emailCode } : {}),
     ...(options.previousListRecord ? { previousListRecord: options.previousListRecord } : {}),
+    ...(options.backups ? { backups: await litBackupIds(client, options.backups) } : {}),
   }) as { transactionHash?: unknown; signatures?: unknown } | undefined;
   if (response?.transactionHash !== transaction.hash()) throw new Error("Lit Action signed a different transaction");
   if (!Array.isArray(response.signatures)) throw new Error("Lit Action returned no signatures");
@@ -119,9 +136,10 @@ export type LitCodeSent = { ticket: string; sentTo: string; binding?: ccc.Hex };
 export async function policySendCode(
   transaction: ccc.Transaction,
   wallet: WalletKeys,
-  options: { enableTransactionHash?: string; email?: string; appName: string },
+  options: { enableTransactionHash?: string; email?: string; appName: string; backups?: RecoveryBackup[]; client?: ccc.Client },
   run = defaultRun,
 ): Promise<LitCodeSent> {
+  const backups = options.backups ? await litBackupIds(options.client ?? new ccc.ClientPublicTestnet(), options.backups) : undefined;
   const emailApiKey = process.env.LIT_EMAIL_API_KEY;
   if (!emailApiKey) throw new Error("Missing server configuration: LIT_EMAIL_API_KEY");
   const response = await run(await policyConfig(), {
@@ -132,6 +150,7 @@ export async function policySendCode(
     appName: options.appName.replace(/[^A-Za-z0-9 .'-]/g, "").slice(0, 40) || "CKB KeyWay",
     ...(options.enableTransactionHash ? { enableTransactionHash: options.enableTransactionHash } : {}),
     ...(options.email ? { email: options.email } : {}),
+    ...(backups ? { backups } : {}),
   }) as Record<string, unknown> | undefined;
   if (typeof response?.ticket !== "string" || !/^v1\.\d{13}\.[0-9a-f]{32}$/.test(response.ticket)) throw new Error("Lit Action returned an invalid code ticket");
   if (response.transactionHash !== transaction.hash()) throw new Error("Lit Action sent a code for a different transaction");

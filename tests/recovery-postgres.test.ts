@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
+import { p256 } from "@noble/curves/nist.js";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
+import { sha256 } from "@noble/hashes/sha2.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { secp256k1Lock } from "../src/sdk/browser/account-lock.ts";
-import { recoveryBackupChallenge } from "../src/sdk/browser/recovery-backups.ts";
+import { backupAuth, recoveryBackupChallenge } from "../src/sdk/browser/recovery-backups.ts";
+import { decodeRecoveryList, recoveryListRecordOf } from "../src/sdk/browser/recovery-list.ts";
 import { database } from "../src/server/database.ts";
 import { formatCkbSignature } from "../src/server/funding-transaction.ts";
 import { signingSettings } from "../src/server/general-signing.ts";
@@ -26,6 +29,26 @@ function evmWallet() {
     return ccc.hexFrom(ccc.bytesConcat(raw.slice(1), [raw[0] + 27]));
   };
   return { address, personalSign };
+}
+
+/** A JoyID passkey stand-in: a P-256 key whose WebAuthn assertion has the shape JoyID's signMessage returns. */
+async function joyIdWallet(client: ccc.Client) {
+  const privateKey = p256.utils.randomSecretKey();
+  const publicKey = ccc.hexFrom(p256.getPublicKey(privateKey, false).slice(1));
+  const joyId = await client.getKnownScript(ccc.KnownScript.JoyId);
+  const lock = ccc.Script.from({ codeHash: joyId.codeHash, hashType: joyId.hashType, args: ccc.bytesConcat("0x0001", ccc.hashCkbShort(publicKey)) });
+  const address = ccc.Address.fromScript(lock, client).toString();
+  const base64url = (bytes: Uint8Array) => Buffer.from(bytes).toString("base64url");
+  const sign = (challenge: string) => {
+    const authData = new Uint8Array(37).fill(7);
+    const clientData = new TextEncoder().encode(JSON.stringify({ type: "webauthn.get", challenge: base64url(new TextEncoder().encode(challenge)), origin: "https://testnet.joyid.dev" }));
+    const der = p256.sign(ccc.bytesConcat(authData, sha256(clientData)), privateKey, { format: "der" });
+    return {
+      signature: JSON.stringify({ alg: -7, signature: base64url(der), message: base64url(ccc.bytesConcat(authData, clientData)) }),
+      identity: JSON.stringify({ keyType: "main_key", publicKey: publicKey.slice(2) }),
+    };
+  };
+  return { address, publicKey, sign };
 }
 
 let nextCell = 1;
@@ -448,11 +471,50 @@ test("with the policy Action: Lit emails the code, binds the email on chain, and
   const applied = await recoveryBackupChange(context(enabled), { operation: "apply", change: "add", backup: proof, confirmationNonce: change.confirmationNonce, emailCode: litCodeIn(lit.emails[1]) }) as { transactionHash: string };
   assert.equal(h.broadcasts.at(-1)!.hash(), applied.transactionHash);
   assert.equal(ccc.bytesFrom(h.broadcasts.at(-1)!.getWitnessArgsAt(0)!.lock!).length, 85);
+  const recordLatest = async () => h.client.cache.recordCells(h.broadcasts.at(-1)!.outputs.map((cellOutput, index) => ({ outPoint: { txHash: h.broadcasts.at(-1)!.hash(), index }, cellOutput, outputData: h.broadcasts.at(-1)!.outputsData[index] })));
+  /** Runs a backup change through preview, the Action's code and apply, and returns the code email. */
+  const changeThroughLit = async (current: ReadyWallet, body: Record<string, unknown>) => {
+    const opened = await recoveryBackupChange(context(current), { operation: "preview", ...body }) as { confirmationNonce: string };
+    await recoveryBackupChange(context(current), { operation: "request-email-code", ...body, confirmationNonce: opened.confirmationNonce });
+    const email = lit.emails.at(-1)!;
+    await recoveryBackupChange(context(current), { operation: "apply", ...body, confirmationNonce: opened.confirmationNonce, emailCode: litCodeIn(email) });
+    await h.settle();
+    await recordLatest();
+    return { email, wallet: await readWallet(h.user) as ReadyWallet };
+  };
+  // The record on chain holds only the salted auths of exactly the stored backups.
+  const onChainAuths = () => decodeRecoveryList(recoveryListRecordOf(h.broadcasts.at(-1)!, 0)!);
+  const saltedAuths = async (current: ReadyWallet) => Promise.all(current.recovery!.backups!.map((backup) => backupAuth(h.client, backup, current.recovery!.adminListTypeHash)));
+  await h.settle();
+  await recordLatest();
+  let current = await readWallet(h.user) as ReadyWallet;
+  assert.deepEqual(onChainAuths(), await saltedAuths(current));
+
+  // A JoyID passkey (the proof the cross-origin-isolated popup or redirect returns) is added through the Action too,
+  // which names it by its key id; the record names neither backup.
+  const joy = await joyIdWallet(h.client);
+  const joyBackup = { kind: "joyid" as const, address: joy.address };
+  const { challengeNonce } = issueBackupChallenge(h.user);
+  const joyProof = { ...joyBackup, challengeNonce, ...joy.sign(recoveryBackupChallenge(h.legacyAddress, joyBackup, challengeNonce)) };
+  const added = await changeThroughLit(current, { change: "add", backup: joyProof });
+  assert.match(added.email.text, new RegExp(`Adding: JoyID passkey \\(key id ${ccc.hexFrom(ccc.hashCkbShort(joy.publicKey))}\\)`));
+  assert.match(added.email.text, /Backups after this change: 3/);
+  current = added.wallet;
+  assert.equal(current.recovery!.backups!.length, 3);
+  assert.deepEqual(onChainAuths(), await saltedAuths(current));
+  assert.ok(!ccc.hexFrom(recoveryListRecordOf(h.broadcasts.at(-1)!, 0)!).includes(ccc.hexFrom(ccc.hashCkbShort(joy.publicKey)).slice(2)));
+
+  // Removing a backup also needs the Action's code, sent to the bound address.
+  const removed = await changeThroughLit(current, { change: "remove", backup: { kind: "evm", address: second.address } });
+  assert.deepEqual(removed.email.to, ["ana@acmepay.example"]);
+  assert.match(removed.email.text, new RegExp(`Removing: EVM wallet ${second.address}`));
+  assert.match(removed.email.text, /Backups after this change: 2/);
+  current = removed.wallet;
+  assert.deepEqual(current.recovery!.backups!.map((backup) => backup.kind), ["evm", "joyid"]);
+  assert.deepEqual(onChainAuths(), await saltedAuths(current));
 
   // A request opened under one signer can't be finished under the other: the user is asked to start again.
-  await h.settle();
-  const updated = await readWallet(h.user) as ReadyWallet;
-  await h.client.cache.recordCells(h.broadcasts.at(-1)!.outputs.map((cellOutput, index) => ({ outPoint: { txHash: h.broadcasts.at(-1)!.hash(), index }, cellOutput, outputData: h.broadcasts.at(-1)!.outputsData[index] })));
+  const updated = current;
   const third = h.sign(evmWallet());
   delete process.env.KEYWAY_LIT_SIGNER;
   const opened = await recoveryBackupChange(context(updated), { operation: "preview", change: "add", backup: third }) as { confirmationNonce: string };
