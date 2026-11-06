@@ -203,17 +203,51 @@ test("a revocation for a channel the device has no record of stops being retried
   }
 });
 
-test("cells padded under the funding lock don't hide the spend", async () => {
+test("a padded funding history only delays the scan: it resumes until it reaches the spend", async () => {
   const closingHash = `0x${"c1".repeat(32)}` as ccc.Hex;
-  const padding = Array.from({ length: 300 }, (_, i) => ({ txHash: ccc.hexFrom(ccc.numBeToBytes(BigInt(i + 1), 32)), isInput: false, cellIndex: 0n }));
+  // More padded cells than one pass reads (25 pages of 200), then the spend.
+  const entries = [
+    ...Array.from({ length: 9_000 }, (_, i) => ({ txHash: ccc.hexFrom(ccc.numBeToBytes(BigInt(i + 1), 32)), isInput: false, cellIndex: 0n })),
+    { txHash: closingHash, isInput: true, cellIndex: 1n },
+  ];
   const client = {
-    async *findTransactions() {
-      yield* padding;
-      yield { txHash: closingHash, isInput: true, cellIndex: 1n };
+    async findTransactionsPaged(_key: unknown, _order: string, limit: number, after?: string) {
+      const start = after ? Number(after) : 0;
+      const page = entries.slice(start, start + Number(limit));
+      return { transactions: page, lastCursor: String(start + page.length) };
     },
   } as unknown as ccc.Client;
-  const history = await chainView(client).fundingHistory(ccc.Script.from({ ...FUNDING_LOCK, args: `0x${"00".repeat(20)}` }));
-  assert.deepEqual(history.map((item) => [item.txHash, item.isInput, item.index]), [[padding[0].txHash, false, 0], [closingHash, true, 1]]);
+  const lock = ccc.Script.from({ ...FUNDING_LOCK, args: `0x${"00".repeat(20)}` });
+  const first = await chainView(client).fundingHistory(lock);
+  assert.equal(first.spend, undefined);
+  assert.equal(first.sawOutput, true);
+  assert.equal(first.cursor, "5000");
+  const second = await chainView(client).fundingHistory(lock, first.cursor);
+  assert.deepEqual(second.spend, { txHash: closingHash, index: 1 });
+});
+
+test("the funding outpoint is the cell the spend consumed, not the first cell under the lock", async () => {
+  const local = `0x${K1}`;
+  const remote = `0x${K2}`;
+  const realFunding = { txHash: `0x${"ee".repeat(32)}` as ccc.Hex, index: 3 };
+  const closing = ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: `0x${"aa".repeat(32)}`, index: 0 } }, { previousOutput: realFunding }],
+    outputs: [{ capacity: 1n, lock: userLock }, { capacity: 1n, lock: userLock }],
+    outputsData: ["0x", "0x"],
+  });
+  const chain: ChainView = {
+    // An unrelated cell came first under the lock; the spend is the closing transaction's input 1.
+    fundingHistory: async () => ({ sawOutput: true, spend: { txHash: closing.hash(), index: 1 } }),
+    transaction: async () => ({ tx: closing, committed: true, status: "committed" }),
+    isLive: async () => true,
+    spender: async () => undefined,
+  };
+  const assessment = await assessChannel(chain, { funding_lock_args: fundingLockArgs(local, remote), peer_commitment_key: peerCommitmentKey(local, remote), commitment_number: null });
+  assert.equal(assessment.state, "closed");
+  assert.equal((assessment as { fundingOutPoint: string }).fundingOutPoint, `${realFunding.txHash}:3`);
+  // While the channel is open nothing is reported as its funding outpoint.
+  const open = await assessChannel({ ...chain, fundingHistory: async () => ({ sawOutput: true }) }, { funding_lock_args: fundingLockArgs(local, remote), peer_commitment_key: peerCommitmentKey(local, remote), commitment_number: null });
+  assert.deepEqual({ state: open.state, fundingOutPoint: (open as { fundingOutPoint?: string }).fundingOutPoint }, { state: "watching", fundingOutPoint: undefined });
 });
 
 test("the API accepts only well-formed watch data", () => {
@@ -287,14 +321,10 @@ test("the watchtower refuses revocations that would move capacity between it and
 });
 
 function fakeChain(options: { funded?: boolean; closing?: ccc.Transaction; committed?: boolean }): ChainView {
-  const fundingTx = `0x${"f0".repeat(32)}` as ccc.Hex;
   const closingHash = options.closing?.hash();
   return {
     async fundingHistory() {
-      return [
-        ...(options.funded ? [{ txHash: fundingTx, isInput: false, index: 0 }] : []),
-        ...(options.closing ? [{ txHash: closingHash!, isInput: true, index: 0 }] : []),
-      ];
+      return { sawOutput: Boolean(options.funded), ...(options.closing ? { spend: { txHash: closingHash!, index: 0 } } : {}) };
     },
     async transaction(hash) {
       return hash === closingHash && options.closing ? { tx: options.closing, committed: options.committed ?? true, status: options.committed === false ? "pending" : "committed" } : undefined;
@@ -318,7 +348,7 @@ test("the watchtower tells a revoked commitment of the peer from every other clo
   assert.deepEqual((await assessChannel(fakeChain({}), row)).state, "watching");
   assert.equal((await assessChannel(fakeChain({ funded: true }), row) as { detail: string }).detail, "open");
   assert.equal((await assessChannel(fakeChain({ funded: true, closing: commitmentTx(peerHash, 3n), committed: false }), row)).state, "watching");
-  const cooperative = ccc.Transaction.from({ outputs: [{ capacity: 1n, lock: userLock }, { capacity: 1n, lock: userLock }], outputsData: ["0x", "0x"] });
+  const cooperative = ccc.Transaction.from({ inputs: [{ previousOutput: { txHash: `0x${"f0".repeat(32)}`, index: 0 } }], outputs: [{ capacity: 1n, lock: userLock }, { capacity: 1n, lock: userLock }], outputsData: ["0x", "0x"] });
   assert.match((await assessChannel(fakeChain({ funded: true, closing: cooperative }), row) as { detail: string }).detail, /cooperatively/);
   assert.match((await assessChannel(fakeChain({ funded: true, closing: commitmentTx(ownHash, 3n) }), row) as { detail: string }).detail, /user's node force-closed/);
   assert.match((await assessChannel(fakeChain({ funded: true, closing: commitmentTx(peerHash, 6n) }), row) as { detail: string }).detail, /current state/);

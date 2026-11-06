@@ -351,6 +351,10 @@ export const migrations: Array<{
         attempts integer not null default 0,
         detail text,
         funding_out_point text,
+        -- The scan of the funding lock's history: where to resume, whether any cell was seen, and the first spend.
+        history_cursor text,
+        funding_seen boolean not null default false,
+        funding_spend text,
         closing_tx text,
         penalty_tx text,
         unwatch_requested_at timestamptz,

@@ -134,6 +134,11 @@ browser tab (fiber-wasm)                          KeyWay API (Railway)          
   equal), takes fee cells only from the fee key's plain cells with at least 62 CKB to spare, and checks that its change
   equals its own inputs less a fee of at most 0.001 CKB: the watchtower can't take from the channel or be made to pay
   more than a fee.
+- The funding lock's history is read oldest first from a cursor saved with the channel, at most 25 pages of 200
+  entries per pass. Anyone can create cells under the funding lock (only spending needs both parties), so a padded
+  history only delays the scan, by one pass per 5,000 entries, and each padded cell locks 61 CKB for good. The scan
+  stops at the first spend, which only the 2-of-2 can make; the funding outpoint reported is the cell that spend
+  consumed, never a guess from the outputs.
 - The advisory lock is re-asked every pass (re-entrant for the holder), so an instance whose connection was replaced
   stops when another holds it; on any error the instance unlocks and releases the connection.
 

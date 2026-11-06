@@ -34,8 +34,12 @@ const MAX_RETRY_MS = 5 * 60_000;
 /** The most a penalty may cost the watchtower (Fiber's fee is about 0.00001 CKB). */
 const MAX_PENALTY_FEE = 100_000n;
 const CHANGE_RESERVE = ccc.fixedPointFrom(62);
-/** How many transactions under one funding lock the watchtower reads (a padded history costs 61 CKB per entry). */
-const MAX_FUNDING_HISTORY = 20_000;
+/**
+ * Indexer pages of the funding lock's history read per channel per pass. The scan resumes from a saved cursor, so a
+ * history padded with cells (anyone can create them; each locks 61 CKB for good) only delays it, never stops it.
+ */
+const HISTORY_PAGES_PER_PASS = 25;
+const HISTORY_PAGE_SIZE = 200;
 /** A channel whose funding never appears on-chain (an abandoned open) is dropped after this long. */
 const UNFUNDED_RETENTION_DAYS = 14;
 
@@ -194,6 +198,9 @@ type Row = {
   state: WatchState;
   detail: string | null;
   funding_out_point: string | null;
+  history_cursor: string | null;
+  funding_seen: boolean;
+  funding_spend: string | null;
   closing_tx: string | null;
   penalty_tx: string | null;
   unwatch_requested_at: Date | null;
@@ -392,8 +399,11 @@ export async function buildPenaltyTransaction(options: {
 }
 
 export type ChainView = {
-  /** The first output created under the funding lock and the first spend of a cell under it, oldest first. */
-  fundingHistory(lock: ccc.Script): Promise<Array<{ txHash: ccc.Hex; isInput: boolean; index: number }>>;
+  /**
+   * Reads the funding lock's history oldest first from `after` (a cursor from an earlier call), up to a bounded
+   * number of pages: whether any output was seen, the first spend found, and where to resume.
+   */
+  fundingHistory(lock: ccc.Script, after?: string): Promise<HistoryProgress>;
   transaction(hash: ccc.Hex): Promise<{ tx: ccc.Transaction; committed: boolean; status: string } | undefined>;
   isLive(outPoint: ccc.OutPoint): Promise<boolean>;
   spender(outPoint: ccc.OutPoint, lock: ccc.Script): Promise<ccc.Hex | undefined>;
@@ -401,21 +411,23 @@ export type ChainView = {
 
 export function chainView(client: ccc.Client): ChainView {
   return {
-    async fundingHistory(lock) {
+    async fundingHistory(lock, after) {
       // Anyone can create cells under the funding lock (only spending needs both parties), so a peer could pad the
-      // history before publishing a revoked commitment. Read all of it, up to a bound that padding can't reach
-      // cheaply (each cell locks at least 61 CKB for good), and keep the first output and the first spend.
-      const found: Array<{ txHash: ccc.Hex; isInput: boolean; index: number }> = [];
-      let seen = 0;
-      for await (const item of client.findTransactions({ script: lock, scriptType: "lock", scriptSearchMode: "exact" }, "asc", 200)) {
-        if (++seen > MAX_FUNDING_HISTORY) throw new Error(`more than ${MAX_FUNDING_HISTORY} transactions under the funding lock`);
-        if (item.isInput) {
-          found.push({ txHash: item.txHash, isInput: true, index: Number(item.cellIndex) });
-          break;
+      // history before publishing a revoked commitment. Nothing is skipped: each pass reads the next pages and the
+      // caller keeps the cursor, so every entry is read once and the spend is reached however long the history is.
+      let cursor = after;
+      let sawOutput = false;
+      for (let page = 0; page < HISTORY_PAGES_PER_PASS; page++) {
+        const result = await client.findTransactionsPaged({ script: lock, scriptType: "lock", scriptSearchMode: "exact" }, "asc", HISTORY_PAGE_SIZE, cursor);
+        for (const item of result.transactions) {
+          if (item.isInput) return { sawOutput, spend: { txHash: item.txHash, index: Number(item.cellIndex) }, cursor: result.lastCursor };
+          sawOutput = true;
         }
-        if (!found.length) found.push({ txHash: item.txHash, isInput: false, index: Number(item.cellIndex) });
+        if (result.transactions.length === 0) break;
+        cursor = result.lastCursor;
+        if (result.transactions.length < HISTORY_PAGE_SIZE) break;
       }
-      return found;
+      return { sawOutput, ...(cursor ? { cursor } : {}) };
     },
     async transaction(hash) {
       const response = await client.getTransaction(hash);
@@ -435,10 +447,16 @@ export function chainView(client: ccc.Client): ChainView {
   };
 }
 
-export type Assessment =
-  | { state: "watching"; detail: string; fundingOutPoint?: string }
+export type HistoryProgress = { sawOutput: boolean; spend?: { txHash: ccc.Hex; index: number }; cursor?: string };
+
+/** What the scan of the funding lock's history has established so far, saved with the channel between passes. */
+export type ScanState = Pick<Row, "history_cursor" | "funding_seen" | "funding_spend">;
+
+export type Assessment = { scan: ScanState } & (
+  | { state: "watching"; detail: string }
   | { state: "closed"; detail: string; closingTx: ccc.Hex; fundingOutPoint: string }
-  | { state: "revoked"; closingTx: ccc.Hex; fundingOutPoint: string; commitment: Commitment };
+  | { state: "revoked"; closingTx: ccc.Hex; fundingOutPoint: string; commitment: Commitment }
+);
 
 export type Commitment = { outPoint: ccc.OutPoint; capacity: bigint; lock: ccc.Script };
 
@@ -446,35 +464,44 @@ export type Commitment = { outPoint: ccc.OutPoint; capacity: bigint; lock: ccc.S
  * Where a watched channel stands on-chain (the decision Fiber's `run_periodic_check` makes): still open, closed
  * by a transaction that needs nothing from the watchtower, or closed by a revoked commitment of the peer.
  */
-export async function assessChannel(chain: ChainView, row: Pick<Row, "funding_lock_args" | "peer_commitment_key" | "commitment_number">): Promise<Assessment> {
-  const fundingLock = ccc.Script.from({ ...FUNDING_LOCK, args: row.funding_lock_args });
-  const history = await chain.fundingHistory(fundingLock);
-  const funded = history.find((item) => !item.isInput);
-  const spent = history.find((item) => item.isInput);
-  let fundingOutPoint = funded ? `${funded.txHash}:${funded.index}` : undefined;
-  if (!spent || !funded) return { state: "watching", detail: funded ? "open" : "funding not on-chain yet", ...(fundingOutPoint ? { fundingOutPoint } : {}) };
+export async function assessChannel(
+  chain: ChainView,
+  row: Pick<Row, "funding_lock_args" | "peer_commitment_key" | "commitment_number"> & Partial<ScanState>,
+): Promise<Assessment> {
+  const scan: ScanState = { history_cursor: row.history_cursor ?? null, funding_seen: row.funding_seen ?? false, funding_spend: row.funding_spend ?? null };
+  if (!scan.funding_spend) {
+    const fundingLock = ccc.Script.from({ ...FUNDING_LOCK, args: row.funding_lock_args });
+    const progress = await chain.fundingHistory(fundingLock, scan.history_cursor ?? undefined);
+    scan.funding_seen ||= progress.sawOutput;
+    scan.history_cursor = progress.cursor ?? scan.history_cursor;
+    if (progress.spend) scan.funding_spend = `${progress.spend.txHash}:${progress.spend.index}`;
+  }
+  if (!scan.funding_spend) return { scan, state: "watching", detail: scan.funding_seen ? "open" : "funding not on-chain yet" };
+  const [spendHash, spendIndex] = scan.funding_spend.split(":");
+  const spent = { txHash: spendHash as ccc.Hex, index: Number(spendIndex) };
   const closing = await chain.transaction(spent.txHash);
-  if (!closing?.committed) return { state: "watching", detail: "closing transaction not committed yet", fundingOutPoint: fundingOutPoint! };
-  // The funding cell is the one this spend consumed (the first output under the lock could be someone else's).
+  if (!closing?.committed) return { scan, state: "watching", detail: "closing transaction not committed yet" };
+  // The funding cell is the one this 2-of-2 spend consumed; outputs under the lock can be anyone's.
   const consumed = closing.tx.inputs[spent.index]?.previousOutput;
-  if (consumed) fundingOutPoint = `${consumed.txHash}:${Number(consumed.index)}`;
+  if (!consumed) throw new Error(`the closing transaction ${spent.txHash} has no input ${spent.index}`);
+  const fundingOutPoint = `${consumed.txHash}:${Number(consumed.index)}`;
+  const base = { scan, closingTx: spent.txHash, fundingOutPoint };
   const output = closing.tx.outputs[0];
   const commitment = COMMITMENT_LOCK[NETWORK];
   if (closing.tx.outputs.length !== 1 || output.lock.codeHash !== commitment.codeHash || output.lock.hashType !== "type") {
-    return { state: "closed", detail: "closed cooperatively", closingTx: spent.txHash, fundingOutPoint: fundingOutPoint! };
+    return { ...base, state: "closed", detail: "closed cooperatively" };
   }
   const args = commitmentArgs(output.lock.args);
-  if (!args) return { state: "closed", detail: "unexpected closing transaction", closingTx: spent.txHash, fundingOutPoint: fundingOutPoint! };
+  if (!args) return { ...base, state: "closed", detail: "unexpected closing transaction" };
   if (args.keyHash !== ccc.hexFrom(blake160(row.peer_commitment_key))) {
-    return { state: "closed", detail: "the user's node force-closed; the wallet claims the user's share when it next runs", closingTx: spent.txHash, fundingOutPoint: fundingOutPoint! };
+    return { ...base, state: "closed", detail: "the user's node force-closed; the wallet claims the user's share when it next runs" };
   }
   if (row.commitment_number === null || BigInt(row.commitment_number) < args.commitmentNumber) {
-    return { state: "closed", detail: "the peer force-closed with the current state; the wallet claims the user's share when it next runs", closingTx: spent.txHash, fundingOutPoint: fundingOutPoint! };
+    return { ...base, state: "closed", detail: "the peer force-closed with the current state; the wallet claims the user's share when it next runs" };
   }
   return {
+    ...base,
     state: "revoked",
-    closingTx: spent.txHash,
-    fundingOutPoint: fundingOutPoint!,
     commitment: { outPoint: ccc.OutPoint.from({ txHash: spent.txHash, index: 0 }), capacity: output.capacity, lock: output.lock },
   };
 }
@@ -523,15 +550,23 @@ async function checkChannel(deps: PassDependencies, row: Row, log: (message: str
     where user_id = ${row.user_id} and channel_id = ${row.channel_id}
   `;
   const assessment = await assessChannel(chain, row);
+  // Keep the scan's progress whatever the outcome, so the next pass resumes instead of starting over.
+  const { scan } = assessment;
+  if (scan.history_cursor !== row.history_cursor || scan.funding_seen !== row.funding_seen || scan.funding_spend !== row.funding_spend) {
+    await sql`
+      update keyway_v2_watchtower_channels set history_cursor = ${scan.history_cursor}, funding_seen = ${scan.funding_seen}, funding_spend = ${scan.funding_spend}
+      where user_id = ${row.user_id} and channel_id = ${row.channel_id}
+    `;
+  }
   if (assessment.state === "watching") {
     const age = Date.now() - row.created_at.getTime();
-    if (!assessment.fundingOutPoint && (row.unwatch_requested_at || age > UNFUNDED_RETENTION_DAYS * 86_400_000)) {
+    if (!scan.funding_seen && (row.unwatch_requested_at || age > UNFUNDED_RETENTION_DAYS * 86_400_000)) {
       await sql`delete from keyway_v2_watchtower_channels where user_id = ${row.user_id} and channel_id = ${row.channel_id}`;
       log(`${row.channel_id}: never funded; dropped`);
       return;
     }
     if (row.detail !== assessment.detail) log(`${row.channel_id}: ${assessment.detail}`);
-    await save({ detail: assessment.detail, funding_out_point: assessment.fundingOutPoint ?? null });
+    await save({ detail: assessment.detail });
     return;
   }
   if (assessment.state === "closed") {

@@ -72,6 +72,7 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
       revocation: { commitment_number: `0x${BigInt(proof.revocationCommitmentNumber).toString(16)}`, aggregated_signature: signature, output: proof.revocationOutput, output_data: "0x00000000" },
     }));
     const closing = ccc.Transaction.from({
+      inputs: [{ previousOutput: { txHash: `0x${"f0".repeat(32)}`, index: 0 } }],
       outputs: [{ capacity: ccc.CellOutput.decode(proof.revocationOutput).capacity, lock: { codeHash: COMMITMENT_LOCK.testnet.codeHash, hashType: "type", args: ccc.hexFrom(ccc.bytesConcat(ccc.bytesFrom(proof.onChainCommitmentArgs), new Uint8Array(21))) } }],
       outputsData: ["0x"],
     });
@@ -85,7 +86,7 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     let penaltyStatus = "pending";
     const chain: ChainView = {
       async fundingHistory() {
-        return [{ txHash: `0x${"f0".repeat(32)}`, isInput: false, index: 0 }, ...(spent ? [{ txHash: closing.hash(), isInput: true, index: 0 }] : [])];
+        return { sawOutput: true, ...(spent ? { spend: { txHash: closing.hash(), index: 0 } } : {}) };
       },
       async transaction(hash) {
         if (hash === closing.hash()) return { tx: closing, committed: true, status: "committed" };
@@ -117,7 +118,7 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     const forged = `0x${"5a".repeat(64)}`;
     const { id, closing } = await revokedChannel(forged);
     const chain: ChainView = {
-      fundingHistory: async () => [{ txHash: `0x${"f0".repeat(32)}`, isInput: false, index: 0 }, { txHash: closing.hash(), isInput: true, index: 0 }],
+      fundingHistory: async () => ({ sawOutput: true, spend: { txHash: closing.hash(), index: 0 } }),
       transaction: async (hash) => (hash === closing.hash() ? { tx: closing, committed: true, status: "committed" } : undefined),
       isLive: async () => true,
       spender: async () => undefined,
@@ -131,7 +132,7 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
   await t.test("a failing penalty is retried with backoff", async () => {
     const { id, closing } = await revokedChannel(proof.revocationSignature);
     const chain: ChainView = {
-      fundingHistory: async () => [{ txHash: `0x${"f0".repeat(32)}`, isInput: false, index: 0 }, { txHash: closing.hash(), isInput: true, index: 0 }],
+      fundingHistory: async () => ({ sawOutput: true, spend: { txHash: closing.hash(), index: 0 } }),
       transaction: async (hash) => (hash === closing.hash() ? { tx: closing, committed: true, status: "committed" } : undefined),
       isLive: async () => true,
       spender: async () => undefined,
@@ -148,7 +149,7 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     const id = channelId();
     await watchtowerRequest(user, watch(id));
     await watchtowerRequest(user, { operation: "unwatch", channelId: id });
-    const chain: ChainView = { fundingHistory: async () => [], transaction: async () => undefined, isLive: async () => false, spender: async () => undefined };
+    const chain: ChainView = { fundingHistory: async () => ({ sawOutput: false }), transaction: async () => undefined, isLive: async () => false, spender: async () => undefined };
     await runWatchtowerPass({ sql, chain, punish: async () => { throw new Error("no"); }, log: () => undefined });
     assert.equal((await sql`select 1 from keyway_v2_watchtower_channels where channel_id = ${id}`).length, 0);
   });
