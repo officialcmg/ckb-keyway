@@ -143,7 +143,7 @@ claim their share after an honest force close; the docs and SDK say so.
 
 ## 3. Live proof (CKB testnet, 2026-11-06)
 
-Throwaway keys, faucet CKB, local Postgres, harness in this folder; logs in `evidence/` (field names, hashes and
+Throwaway keys, faucet CKB, local Postgres, harness in this folder; logs in `evidence/*.txt` (field names, hashes and
 public addresses only). The runner was the shipped `startWatchtower` with a 20 s interval.
 
 ### A. Real browser node registers, the tab closes, the watchtower follows (`browser-proof.ts`)
