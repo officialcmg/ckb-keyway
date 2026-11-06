@@ -210,20 +210,30 @@ test("a padded funding history only delays the scan: it resumes until it reaches
     ...Array.from({ length: 9_000 }, (_, i) => ({ txHash: ccc.hexFrom(ccc.numBeToBytes(BigInt(i + 1), 32)), isInput: false, cellIndex: 0n })),
     { txHash: closingHash, isInput: true, cellIndex: 1n },
   ];
+  let tail = entries;
   const client = {
-    async findTransactionsPaged(_key: unknown, _order: string, limit: number, after?: string) {
+    async findTransactionsPaged(_key: unknown, order: string, limit: number, after?: string) {
+      if (order === "desc") return { transactions: [...tail].reverse().slice(0, Number(limit)), lastCursor: "" };
       const start = after ? Number(after) : 0;
       const page = entries.slice(start, start + Number(limit));
       return { transactions: page, lastCursor: String(start + page.length) };
     },
   } as unknown as ccc.Client;
   const lock = ccc.Script.from({ ...FUNDING_LOCK, args: `0x${"00".repeat(20)}` });
-  const first = await chainView(client).fundingHistory(lock);
+  // A pass that can't reach the spend (here: a 25-page budget) and where the spend is buried under later padding too.
+  tail = [...entries, ...Array.from({ length: 300 }, (_, i) => ({ txHash: ccc.hexFrom(ccc.numBeToBytes(BigInt(100_000 + i), 32)), isInput: false, cellIndex: 0n }))];
+  const view = chainView(client, { maxPages: 25 });
+  const first = await view.fundingHistory(lock);
   assert.equal(first.spend, undefined);
   assert.equal(first.sawOutput, true);
   assert.equal(first.cursor, "5000");
-  const second = await chainView(client).fundingHistory(lock, first.cursor);
-  assert.deepEqual(second.spend, { txHash: closingHash, index: 1 });
+  const second = await view.fundingHistory(lock, first.cursor);
+  assert.deepEqual(second.spend, { txHash: closingHash, index: 1 }, "the next pass resumes and reaches it");
+  // A recent spend is caught from the newest page in the same pass, whatever the backlog.
+  tail = entries;
+  const recent = await view.fundingHistory(lock);
+  assert.deepEqual(recent.spend, { txHash: closingHash, index: 1 });
+  assert.equal(recent.cursor, "5000", "the backlog scan keeps its place");
 });
 
 test("the funding outpoint is the cell the spend consumed, not the first cell under the lock", async () => {

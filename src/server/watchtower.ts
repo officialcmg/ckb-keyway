@@ -35,10 +35,12 @@ const MAX_RETRY_MS = 5 * 60_000;
 const MAX_PENALTY_FEE = 100_000n;
 const CHANGE_RESERVE = ccc.fixedPointFrom(62);
 /**
- * Indexer pages of the funding lock's history read per channel per pass. The scan resumes from a saved cursor, so a
- * history padded with cells (anyone can create them; each locks 61 CKB for good) only delays it, never stops it.
+ * How long one pass may spend catching up on one channel's funding-lock history. The scan resumes from a saved
+ * cursor, so a history padded with cells (anyone can create them; each locks 61 CKB for good) only delays it; with
+ * this budget even a backlog of a million entries clears in minutes, far inside the commitment delay (about 4 h). A
+ * recent spend is also caught at once from the newest page (see `fundingHistory`).
  */
-const HISTORY_PAGES_PER_PASS = 25;
+const HISTORY_BUDGET_MS = 120_000;
 const HISTORY_PAGE_SIZE = 200;
 /** A channel whose funding never appears on-chain (an abandoned open) is dropped after this long. */
 const UNFUNDED_RETENTION_DAYS = 14;
@@ -409,25 +411,35 @@ export type ChainView = {
   spender(outPoint: ccc.OutPoint, lock: ccc.Script): Promise<ccc.Hex | undefined>;
 };
 
-export function chainView(client: ccc.Client): ChainView {
+export function chainView(client: ccc.Client, options: { historyBudgetMs?: number; maxPages?: number } = {}): ChainView {
+  const budget = options.historyBudgetMs ?? HISTORY_BUDGET_MS;
+  const key = (lock: ccc.Script) => ({ script: lock, scriptType: "lock" as const, scriptSearchMode: "exact" as const });
   return {
     async fundingHistory(lock, after) {
       // Anyone can create cells under the funding lock (only spending needs both parties), so a peer could pad the
-      // history before publishing a revoked commitment. Nothing is skipped: each pass reads the next pages and the
-      // caller keeps the cursor, so every entry is read once and the spend is reached however long the history is.
+      // history before publishing a revoked commitment. Nothing is skipped: the scan reads forward from the saved
+      // cursor (for up to `budget` per pass), so every entry is read once and the spend is reached however long the
+      // history is.
       let cursor = after;
       let sawOutput = false;
-      for (let page = 0; page < HISTORY_PAGES_PER_PASS; page++) {
-        const result = await client.findTransactionsPaged({ script: lock, scriptType: "lock", scriptSearchMode: "exact" }, "asc", HISTORY_PAGE_SIZE, cursor);
+      const started = Date.now();
+      for (let page = 0; page < (options.maxPages ?? Infinity); page++) {
+        const result = await client.findTransactionsPaged(key(lock), "asc", HISTORY_PAGE_SIZE, cursor);
         for (const item of result.transactions) {
           if (item.isInput) return { sawOutput, spend: { txHash: item.txHash, index: Number(item.cellIndex) }, cursor: result.lastCursor };
           sawOutput = true;
         }
         if (result.transactions.length === 0) break;
         cursor = result.lastCursor;
-        if (result.transactions.length < HISTORY_PAGE_SIZE) break;
+        if (result.transactions.length < HISTORY_PAGE_SIZE) return { sawOutput, cursor };
+        if (Date.now() - started >= budget) break;
       }
-      return { sawOutput, ...(cursor ? { cursor } : {}) };
+      // Still catching up on a long history: look at the newest entries too, so a spend made now isn't left
+      // waiting behind the backlog. Only both parties together can spend a cell under this lock.
+      const newest = await client.findTransactionsPaged(key(lock), "desc", HISTORY_PAGE_SIZE);
+      const recent = newest.transactions.find((item) => item.isInput);
+      if (recent) return { sawOutput: true, spend: { txHash: recent.txHash, index: Number(recent.cellIndex) }, ...(cursor ? { cursor } : {}) };
+      return { sawOutput: sawOutput || newest.transactions.length > 0, ...(cursor ? { cursor } : {}) };
     },
     async transaction(hash) {
       const response = await client.getTransaction(hash);
