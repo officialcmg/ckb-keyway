@@ -342,38 +342,53 @@ async function fetchTransactions(hashes) {
   throw lastError ?? new Error("CKB RPC is unavailable");
 }
 
+/** Live cells under a lock, from the indexer, a page of 64 at a time; refuses more than `maxCells`. */
+async function indexerCells(lock, maxCells) {
+  const searchKey = { script: { code_hash: bytesToHex(lock.codeHash), hash_type: lock.hashType, args: bytesToHex(lock.args) }, script_type: "lock" };
+  const cells = [];
+  let cursor = null;
+  for (;;) {
+    const body = JSON.stringify({ id: 0, jsonrpc: "2.0", method: "get_cells", params: [searchKey, "asc", "0x40", ...(cursor ? [cursor] : [])] });
+    let result;
+    let lastError;
+    for (const url of RPC_URLS) {
+      try {
+        const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body, redirect: "error" });
+        if (!response.ok) throw new Error(`CKB RPC returned HTTP ${response.status}`);
+        result = (await response.json())?.result;
+        if (!result || !Array.isArray(result.objects)) throw new Error("CKB RPC returned an invalid cell list");
+        break;
+      } catch (error) {
+        result = undefined;
+        lastError = error;
+      }
+    }
+    if (!result) throw lastError ?? new Error("CKB RPC is unavailable");
+    cells.push(...result.objects);
+    if (cells.length > maxCells) throw new Error("This account has too many cells to check");
+    if (result.objects.length < 0x40 || !result.last_cursor) return cells;
+    cursor = result.last_cursor;
+  }
+}
+
 /**
- * The type hashes of the live recovery lists under this account's owner-only list lock, from the indexer. Each
- * cell is checked against the transaction that created it; that it is still live is the node's word.
+ * The type hashes of the live recovery lists this key made, under its owner-only list lock. Anyone can send a
+ * cell to that lock, so a cell only counts if the transaction that created it spent one of the account's own
+ * cells, which needs this key's signature. Each cell is checked against that transaction; that it is still live
+ * is the node's word.
  */
 async function liveLists(account) {
-  const searchKey = { script: { code_hash: OMNILOCK_CODE_HASH, hash_type: "data1", args: bytesToHex(account.listLock.args) }, script_type: "lock" };
-  const body = JSON.stringify({ id: 0, jsonrpc: "2.0", method: "get_cells", params: [searchKey, "asc", "0x20"] });
-  let objects;
-  let lastError;
-  for (const url of RPC_URLS) {
-    try {
-      const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body, redirect: "error" });
-      if (!response.ok) throw new Error(`CKB RPC returned HTTP ${response.status}`);
-      const result = (await response.json())?.result;
-      if (!result || !Array.isArray(result.objects)) throw new Error("CKB RPC returned an invalid cell list");
-      objects = result.objects;
-      break;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  if (!objects) throw lastError ?? new Error("CKB RPC is unavailable");
-  if (objects.length >= 0x20) throw new Error("Too many cells under this account's recovery list lock");
+  const objects = (await indexerCells(account.listLock, 256)).filter((object) => isTypeId(object?.output?.type ? parseScript(object.output.type, "cell type") : undefined));
   const created = await fetchTransactions(objects.map((object) => object?.out_point?.tx_hash));
   const hashes = [];
   for (const object of objects) {
     const tx = created.get(object.out_point.tx_hash).tx;
     const output = tx.outputs[Number(num(object.out_point.index, "out point index"))];
-    if (!output || !sameScript(output.lock, account.listLock)) throw new Error("CKB RPC returned a cell that isn't under the recovery list lock");
-    if (isTypeId(output.type)) hashes.push(bytesToHex(scriptHash(output.type)));
+    if (!output || !sameScript(output.lock, account.listLock) || !isTypeId(output.type)) throw new Error("CKB RPC returned a cell that isn't under the recovery list lock");
+    const spent = await inputCellsOf(tx).catch(() => []);
+    if (spent.some((cell) => lockKind(account, cell.output.lock))) hashes.push(bytesToHex(scriptHash(output.type)));
   }
-  return hashes;
+  return [...new Set(hashes)];
 }
 
 async function inputCellsOf(tx) {
@@ -628,6 +643,14 @@ async function analyse(pkpId, params) {
     for (const ref of refs) if (ref !== typeHash) throw new Error("An output goes to an address with another recovery list");
     // First wins: a key that already has a recovery list can never make a second one (and an address with it).
     if ((await liveLists(account)).length > 0) throw new Error("Recovery is already on for this key");
+    // Every live plain cell at the key's secp256k1 address must be spent, so two enables signed before either is
+    // indexed spend the same cells and at most one can ever commit.
+    const spending = new Set(tx.inputs.map((input) => `${bytesToHex(input.previousOutput.txHash)}:${input.previousOutput.index}`));
+    for (const cell of await indexerCells(account.secp, 256)) {
+      if (cell?.output?.type || (cell?.output_data ?? "0x") !== "0x") continue;
+      const key = `${cell.out_point?.tx_hash}:${Number(num(cell.out_point?.index, "out point index"))}`;
+      if (!spending.has(key)) throw new Error("Turning recovery on must spend every plain cell at this key's address");
+    }
     const members = listMembers(recordAt(tx, 0), tx.outputsData[0]);
     const witness = parseWitnessArgs(tx.witnesses[0] ?? new Uint8Array(0));
     op = { kind: "enable", members, binding: witness.inputType };
@@ -640,19 +663,17 @@ async function analyse(pkpId, params) {
     if (!sameScript(output.lock, input.output.lock)) throw new Error("A recovery list's lock can't change");
     if (output.capacity !== input.output.capacity) throw new Error("A recovery list's capacity can't change");
     const after = listMembers(recordAt(tx, index), tx.outputsData[index]);
-    const before = (() => {
-      const record = recordAt(input.createdBy, input.index);
-      return record ? listMembers(record, input.data) : undefined;
-    })();
-    let change = { kind: "update" };
-    if (before) {
-      const was = new Set(before.map(bytesToHex));
-      const now = new Set(after.map(bytesToHex));
-      const added = after.filter((entry) => !was.has(bytesToHex(entry)));
-      const removed = before.filter((entry) => !now.has(bytesToHex(entry)));
-      if (added.length + removed.length !== 1) throw new Error("A recovery list change must add or remove exactly one backup");
-      change = added.length ? { kind: "add", backup: added[0] } : { kind: "remove", backup: removed[0] };
-    }
+    // The members before: the record the list's own transaction wrote, or for a list made before records
+    // existed, the record the caller supplies; either must hash to the list's current root.
+    const previous = recordAt(input.createdBy, input.index) ?? (typeof params.previousListRecord === "string" ? hexToBytes(params.previousListRecord, "previousListRecord") : undefined);
+    if (!previous) throw new Error("The recovery list's current backups aren't recorded; previousListRecord is required");
+    const before = listMembers(previous, input.data);
+    const was = new Set(before.map(bytesToHex));
+    const now = new Set(after.map(bytesToHex));
+    const added = after.filter((entry) => !was.has(bytesToHex(entry)));
+    const removed = before.filter((entry) => !now.has(bytesToHex(entry)));
+    if (added.length + removed.length !== 1) throw new Error("A recovery list change must add or remove exactly one backup");
+    const change = added.length ? { kind: "add", backup: added[0] } : { kind: "remove", backup: removed[0] };
     const email = await boundEmail(pkpId, account, input.output.type, params.enableTransactionHash);
     op = { ...change, members: after, email };
   }
@@ -710,8 +731,7 @@ function emailLines(op) {
     return ["Turn on account recovery", ...op.members.map((entry) => `Backup: ${describeBackup(entry)}`), "Each backup will be able to move everything in your account without KeyWay."];
   }
   if (op.kind === "add") return ["Add a recovery backup", `Adding: ${describeBackup(op.backup)}`, "This backup will be able to move everything in your account without KeyWay.", `Backups after this change: ${op.members.length}`];
-  if (op.kind === "remove") return ["Remove a recovery backup", `Removing: ${describeBackup(op.backup)}`, `Backups after this change: ${op.members.length}`];
-  return ["Change your recovery backups", ...op.members.map((entry) => `Backup after this change: ${describeBackup(entry)}`)];
+  return ["Remove a recovery backup", `Removing: ${describeBackup(op.backup)}`, `Backups after this change: ${op.members.length}`];
 }
 
 function escapeHtml(value) {

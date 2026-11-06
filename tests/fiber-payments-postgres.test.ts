@@ -167,6 +167,24 @@ test("hosted Fiber payments: daily amount, email codes and overlapping approvals
     assert.equal(calls, 1);
   });
 
+  await t.test("a repeat that arrives while the first send runs waits for it and returns the same result", async () => {
+    const h = harness(10n * CKB);
+    const preview = await pay(h, { stage: "preview" });
+    const body = { method: "sendPayment", params: { invoice: "fibt1test" }, stage: "send", confirmationNonce: preview.confirmationNonce };
+    let calls = 0;
+    const slow = { call: async <T>(method: string, params?: unknown[]): Promise<T> => {
+      if (method === "send_payment") { calls++; await new Promise((resolve) => setTimeout(resolve, 600)); }
+      return h.node.call<T>(method, params as never);
+    } };
+    const key = `retry-${crypto.randomUUID()}`;
+    const [first, again] = await Promise.all([
+      fiberPayment(h.context, slow, body, key),
+      new Promise((resolve) => setTimeout(resolve, 100)).then(() => fiberPayment(h.context, slow, body, key)),
+    ]);
+    assert.deepEqual(again, first);
+    assert.equal(calls, 1);
+  });
+
   await t.test("refuses payments with neither an invoice nor a keysend target", async () => {
     const h = harness(1n * CKB);
     await assert.rejects(() => fiberPayment(h.context, h.node, { method: "sendPayment", stage: "preview", params: { amount: "0x1" } }), /keysend/);

@@ -11,7 +11,7 @@ import { recoverPkpPublicKey } from "./pkp-identity.ts";
  * the recovery list's rules and checks the code it emailed for every list change. The pinned CID below is the
  * hash of that source (tests/lit-action-packaging.test.ts); the founder registers it in the Lit group.
  */
-export const POLICY_ACTION_CID = "QmcLtDADGxeECvngHzPiJeD77tExT5KBPL9G6Ym5NbXtHe";
+export const POLICY_ACTION_CID = "QmdnCSAeEXhfZoS898WaL5HNojrEYCshnQ5ThhiLcycmEZ";
 
 /** Set KEYWAY_LIT_SIGNER=policy once the policy Action's CID is in the Lit group; until then the digest signer is used. */
 export function litPolicyEnabled(): boolean {
@@ -77,7 +77,7 @@ export async function policySignTransaction(
   groups: SigningGroup[],
   client: ccc.Client,
   wallet: WalletKeys,
-  options: { enableTransactionHash?: string; emailCode?: LitEmailCode } = {},
+  options: { enableTransactionHash?: string; emailCode?: LitEmailCode; previousListRecord?: ccc.Hex } = {},
   run = defaultRun,
 ): Promise<ccc.Transaction> {
   if (groups.length === 0) throw new Error("Transaction has no KeyWay signing group");
@@ -93,6 +93,7 @@ export async function policySignTransaction(
     transaction: JSON.parse(ccc.stringify(transaction)),
     ...(options.enableTransactionHash ? { enableTransactionHash: options.enableTransactionHash } : {}),
     ...(options.emailCode ? { emailCode: options.emailCode } : {}),
+    ...(options.previousListRecord ? { previousListRecord: options.previousListRecord } : {}),
   }) as { transactionHash?: unknown; signatures?: unknown } | undefined;
   if (response?.transactionHash !== transaction.hash()) throw new Error("Lit Action signed a different transaction");
   if (!Array.isArray(response.signatures)) throw new Error("Lit Action returned no signatures");
