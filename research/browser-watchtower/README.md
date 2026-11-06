@@ -121,8 +121,8 @@ browser tab (fiber-wasm)                          KeyWay API (Railway)          
   deleted after 30 days; channels never funded after 14 days (or at once after `unwatch`).
 
 **Runner** (`startWatchtower`, started by `server/index.ts` when `KEYWAY_WATCHTOWER_FEE_KEY` is set)
-- Every 60 s (like Fiber's), whichever API instance holds `pg_try_advisory_lock('keyway-watchtower')` checks up to
-  500 unresolved channels, oldest check first: funding cell (by lock) live → `open`; spent by an uncommitted tx →
+- Every 60 s (like Fiber's), whichever API instance holds `pg_try_advisory_lock('keyway-watchtower')` checks every
+  unresolved channel whose funding has been seen, and up to 500 not yet seen funded (see below): funding cell (by lock) live → `open`; spent by an uncommitted tx →
   wait; by anything other than a single commitment-lock output → `closed cooperatively`; by the user's own commitment
   or the peer's current one → `closed` (the in-page watchtower claims the user's share whenever the wallet next runs;
   there is no deadline); by a peer commitment whose number ≤ the newest revocation → verify the revocation signature
