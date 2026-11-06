@@ -21,6 +21,13 @@ Then verify `window.crossOriginIsolated === true`. Browser extensions or third-p
 
 This requirement applies only to `fiberNode="browser"`. The hosted node, the default, does not load Fiber WebAssembly in the page.
 
+## A wallet window closes at once or never returns
+
+The page sends `Cross-Origin-Opener-Policy: same-origin` (the browser node needs it), and the window belongs to another site: JoyID, an EVM wallet site, a sign-in or payment window. The browser cuts the link between the two, so the window can't send its result back and your page sees it as closed straight away. Check `window.crossOriginIsolated` in the console: `true` means this is the cause.
+
+- KeyWay's JoyID backups switch transport by themselves: a window on your own site that hands the result back, or a full-page redirect when the browser blocks that window. Force one with `createJoyIdBackup(undefined, { transport: "window" })` or `"redirect"`. If you pass `joyIdReturnPath` to the provider, that page must render `KeyWayProvider`.
+- For other wallets, use their redirect flow, or move that step to a page without the isolation headers, as KeyWay's [rescue page](/account-recovery#the-rescue-page) does.
+
 ## `An active device lease is required`
 
 With a browser node, the account's Fiber lease expired or another device took it. Call `start()` from `useFiber()` again. Avoid running the same account's channels concurrently in multiple browser profiles.
