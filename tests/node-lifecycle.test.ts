@@ -16,10 +16,12 @@ function harness() {
   let running = false;
   let finishStart: (() => void) | undefined;
   let claimFails: Error | undefined;
+  let startFails: Error | undefined;
   const node = {
     get isRunning() { return running; },
     start() {
       log.push("node.start");
+      if (startFails) return Promise.reject(startFails);
       return new Promise<string>((resolve) => {
         finishStart = () => { running = true; log.push("node.up"); resolve("info"); };
       });
@@ -54,6 +56,7 @@ function harness() {
     finishStart: () => finishStart!(),
     startPending: () => finishStart !== undefined,
     failClaim: (error: Error) => { claimFails = error; },
+    failStart: (error: Error) => { startFails = error; },
   };
 }
 
@@ -141,9 +144,24 @@ test("starts don't race: a second call joins the first, and a start after a stop
   assert.equal(await again, "info");
 });
 
-test("a start that fails on its own lets go of the device after draining the bridge", async () => {
+test("a start that fails on its own lets go of the device, after draining the bridge once it was open", async () => {
+  const claimed = harness();
+  claimed.failClaim(new Error("lease refused"));
+  await assert.rejects(claimed.lifecycle.start(), /lease refused/);
+  assert.deepEqual(claimed.log, ["claim", "release"]);
+
+  const started = harness();
+  started.failStart(new Error("wasm failed"));
+  await assert.rejects(started.lifecycle.start(), /wasm failed/);
+  assert.deepEqual(started.log, ["claim", "bridge.open", "node.start", "bridge.drained", "release"]);
+});
+
+test("a start retried as soon as the last one failed starts again", async () => {
   const h = harness();
   h.failClaim(new Error("lease refused"));
-  await assert.rejects(h.lifecycle.start(), /lease refused/);
-  assert.deepEqual(h.log, ["claim", "release"]);
+  const retried = h.lifecycle.start().catch(() => { h.failClaim(undefined as unknown as Error); return h.lifecycle.start(); });
+  await until(h.startPending);
+  h.finishStart();
+  assert.equal(await retried, "info");
+  assert.equal(h.log.filter((entry) => entry === "claim").length, 2);
 });
