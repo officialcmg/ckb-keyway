@@ -358,6 +358,8 @@ export const migrations: Array<{
         funding_spend text,
         closing_tx text,
         penalty_tx text,
+        -- A close or penalty is final only once a check made REORG_RECHECK_MINUTES after it still finds it on-chain.
+        resolution_confirmed boolean not null default false,
         unwatch_requested_at timestamptz,
         checked_at timestamptz,
         created_at timestamptz not null default now(),

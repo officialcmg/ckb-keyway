@@ -145,7 +145,8 @@ browser tab (fiber-wasm)                          KeyWay API (Railway)          
     those blocks doesn't hide it.
   - The backlog scan reads what was there before, oldest first.
 - Reorganizations: a saved spend whose transaction leaves the chain is forgotten and the scan looks again. A
-  channel resolved as `closed` or `penalized` in the last 30 minutes is confirmed again every pass; if its closing
+  channel resolved as `closed` or `penalized` is confirmed again every pass until a check made at least 30 minutes
+  after the resolution still finds it on-chain (so a watchtower that was down meanwhile still checks); if its closing
   transaction (or penalty) has left the chain, it goes back to `watching` (or `penalty-sent`, so the penalty is
   sent again if needed). Assumption: reorganizations are at most 24 blocks deep and settle within 30 minutes
   (CKB's are typically one or two blocks); a deeper one could hide a spend that the scans had already passed.

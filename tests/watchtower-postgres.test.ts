@@ -262,6 +262,29 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     assert.deepEqual(punished, [id]);
   });
 
+  await t.test("a close is confirmed only by a check after the window, even after an outage", async () => {
+    await sql`delete from keyway_v2_watchtower_channels`;
+    const user = { id: crypto.randomUUID() };
+    const [kept, dropped] = [channelId(), channelId()];
+    for (const id of [kept, dropped]) await watchtowerRequest(user, watch(id));
+    const keptClose = `0x${"7a".repeat(32)}`;
+    const droppedClose = `0x${"7b".repeat(32)}`;
+    // Both closed two hours ago, while the watchtower was down; one close was then reorganized away.
+    await sql`update keyway_v2_watchtower_channels set state = 'closed', funding_seen = true, closing_tx = ${keptClose}, funding_spend = ${`${keptClose}:0`}, updated_at = now() - interval '2 hours' where channel_id = ${kept}`;
+    await sql`update keyway_v2_watchtower_channels set state = 'closed', funding_seen = true, closing_tx = ${droppedClose}, funding_spend = ${`${droppedClose}:0`}, updated_at = now() - interval '2 hours' where channel_id = ${dropped}`;
+    const chain: ChainView = {
+      fundingHistory: async () => ({ sawOutput: true }),
+      transaction: async (hash) => (hash === keptClose ? { tx: ccc.Transaction.from({}), committed: true, status: "committed" } : undefined),
+      isLive: async () => false,
+      spender: async () => undefined,
+    };
+    await runWatchtowerPass({ sql, chain, punish: async () => { throw new Error("no"); }, log: () => undefined });
+    const rows = await sql<Array<{ channel_id: string; state: string; resolution_confirmed: boolean }>>`select channel_id, state, resolution_confirmed from keyway_v2_watchtower_channels`;
+    const byId = Object.fromEntries(rows.map((row) => [row.channel_id, { state: row.state, confirmed: row.resolution_confirmed }]));
+    assert.deepEqual(byId[kept], { state: "closed", confirmed: true });
+    assert.deepEqual(byId[dropped], { state: "watching", confirmed: false });
+  });
+
   await t.test("unfunded channels are checked from each account in turn", async () => {
     await sql`delete from keyway_v2_watchtower_channels`;
     const flooder = { id: crypto.randomUUID() };

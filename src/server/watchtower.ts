@@ -54,7 +54,7 @@ const CATCH_UP_BUDGET_MS = 120_000;
 const PAGE_TIMEOUT_MS = 15_000;
 /** Channels never seen funded that are checked per pass (see `runWatchtowerPass`). */
 const UNFUNDED_PER_PASS = 500;
-/** How long after a close or penalty the watchtower confirms it is still on-chain (24 blocks are about 4 minutes). */
+/** How long a close or penalty must stay on-chain before it is final (24 blocks are about 4 minutes). */
 const REORG_RECHECK_MINUTES = 30;
 /** Channels whose recent history is checked at the same time in a pass. */
 const CHECK_CONCURRENCY = 8;
@@ -224,6 +224,7 @@ type Row = {
   funding_spend: string | null;
   closing_tx: string | null;
   penalty_tx: string | null;
+  resolution_confirmed: boolean;
   unwatch_requested_at: Date | null;
   checked_at: Date | null;
   attempts: number;
@@ -710,10 +711,10 @@ export async function runWatchtowerPass(deps: PassDependencies): Promise<void> {
     order by turn, checked_at asc nulls first, created_at asc
     limit ${deps.unfundedPerPass ?? UNFUNDED_PER_PASS}
   `;
-  // Closes and penalties resolved in the last REORG_RECHECK_MINUTES are confirmed again: a reorganization can drop them.
+  // Closes and penalties are confirmed again every pass until a check made REORG_RECHECK_MINUTES after them still
+  // finds them on-chain: a reorganization can drop them, and a watchtower that was down meanwhile still checks.
   const recent = await sql<Row[]>`
-    select * from keyway_v2_watchtower_channels
-    where state in ('closed', 'penalized') and updated_at > now() - ${`${REORG_RECHECK_MINUTES} minutes`}::interval
+    select * from keyway_v2_watchtower_channels where state in ('closed', 'penalized') and not resolution_confirmed
   `;
   const rows = [...funded, ...unfunded];
   // Penalties are sent one at a time, so two never pick the same fee cells.
@@ -768,7 +769,15 @@ async function confirmResolution(deps: PassDependencies, row: Row, log: (message
   const hash = row.state === "penalized" ? row.penalty_tx : row.closing_tx;
   if (!hash) return;
   const found = await deps.chain.transaction(hash as ccc.Hex);
-  if (found?.committed) return;
+  if (found?.committed) {
+    // Final once it has stayed on-chain through the window.
+    await deps.sql`
+      update keyway_v2_watchtower_channels set resolution_confirmed = true
+      where user_id = ${row.user_id} and channel_id = ${row.channel_id} and state = ${row.state}
+        and updated_at < now() - ${`${REORG_RECHECK_MINUTES} minutes`}::interval
+    `;
+    return;
+  }
   if (row.state === "penalized") {
     // The revoked commitment is checked again next pass, and the penalty sent again if it is gone.
     log(`${row.channel_id}: the penalty ${hash} left the chain; checking the commitment again`);
