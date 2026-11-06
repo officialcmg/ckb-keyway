@@ -663,7 +663,7 @@ export async function runWatchtowerPass(deps: PassDependencies): Promise<void> {
   `;
   const rows = await sql<Row[]>`
     select * from keyway_v2_watchtower_channels where state in ('watching', 'penalty-sent')
-    order by checked_at asc nulls first limit 500
+    order by checked_at asc nulls first
   `;
   // Penalties are sent one at a time, so two never pick the same fee cells.
   let sending: Promise<unknown> = Promise.resolve();
