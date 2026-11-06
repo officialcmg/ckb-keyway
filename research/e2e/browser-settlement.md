@@ -78,8 +78,8 @@ force-closed balance. The browser node instead gets a watchtower inside the page
 Not covered by the in-page watchtower (Fiber's watchtower does these; the upstream issue asks for them): claiming
 pending TLCs with preimages or after expiry, token (xUDT) channels, and the revocation transaction that punishes a peer
 who publishes a revoked commitment. A channel in any of these states is reported in the console and left for a later
-version of the in-page watchtower. Punishing revoked commitments of CKB channels is now done by KeyWay's own
-watchtower, once it is configured and the SDK has sent it the channel's revocation data: see
+version of the in-page watchtower. Punishing revoked commitments of CKB channels (CKB testnet only) is now done by
+KeyWay's own watchtower, once it is configured and the SDK has sent it the channel's revocation data: see
 [`research/browser-watchtower`](../browser-watchtower/README.md).
 
 ## Live proof (CKB testnet, production API, fixed SDK)
