@@ -139,7 +139,9 @@ browser tab (fiber-wasm)                          KeyWay API (Railway)          
   saved with the channel, and stops at the first spend, which only the 2-of-2 can make; the funding outpoint reported
   is the cell that spend consumed, never a guess from the outputs.
   - The recent scan reads everything added since the channel was first checked, newest first (up to 20 s per channel
-    per pass; a longer range resumes next pass, after a look at the newest page).
+    per pass; a longer range resumes next pass, after a look at the newest page). Each range also re-reads the last
+    24 blocks it had already read, so a reorganization that puts a spend into those blocks doesn't hide it; a saved
+    spend whose transaction leaves the chain is forgotten and the scan looks again.
   - The backlog scan reads what was there before, oldest first.
 - Each pass first checks every channel (recent scan, one backlog page, and the penalty if one is due), 8 at a time;
   only then do the channels still catching up share a 2-minute catch-up budget equally. Passes start every 60 s
