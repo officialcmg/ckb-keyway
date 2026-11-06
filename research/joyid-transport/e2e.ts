@@ -123,6 +123,8 @@ async function fakeApi(route: Route) {
 type JoyIdVisit = { path: string; type: string | null; referer?: string; redirectURL: string; state: unknown; challenge?: unknown; answered: string };
 const joyIdVisits: JoyIdVisit[] = [];
 let rejectNext = false;
+/** JoyID's page waits forever, as if the user hadn't decided yet. */
+let holdNext = false;
 
 function signMessage(challengeText: string) {
   const challenge = b64u(new TextEncoder().encode(challengeText));
@@ -140,6 +142,11 @@ async function fakeJoyId(route: Route) {
   const auth = url.pathname === "/auth";
   let message: Record<string, unknown>;
   let answered: string;
+  if (holdNext) {
+    holdNext = false;
+    joyIdVisits.push({ path: url.pathname, type: url.searchParams.get("type"), referer: request.headers().referer, redirectURL: sent.redirectURL as string, state: sent.state, challenge: sent.challenge, answered: "held" });
+    return route.fulfill({ status: 200, headers: { "content-type": "text/html" }, body: "<!doctype html><title>JoyID (stand-in)</title><body>Waiting for the passkey" });
+  }
   if (rejectNext) {
     rejectNext = false;
     message = { error: "User Rejected", type: auth ? "Auth" : "SignMessage", state: sent.state };
@@ -202,6 +209,15 @@ async function newContext(browser: Browser, options: { blockWindows?: boolean } 
       return original.call(this, input, init);
     } as typeof fetch;
     if (blockWindows) window.open = () => null;
+    // Every label a JoyID button shows, to prove the SDK reported each stage.
+    const labels: string[] = [];
+    (window as unknown as { __joyIdLabels: string[] }).__joyIdLabels = labels;
+    new MutationObserver(() => {
+      for (const button of document.querySelectorAll("button")) {
+        const text = button.textContent ?? "";
+        if (/JoyID…$/.test(text) && labels.at(-1) !== text) labels.push(text);
+      }
+    }).observe(document, { subtree: true, childList: true, characterData: true });
   }, { app: APP, blockWindows: Boolean(options.blockWindows) });
   return context;
 }
@@ -253,14 +269,15 @@ try {
     await page.getByRole("button", { name: "Turn on with JoyID" }).click();
     const helper = await opened;
     helper.on("framenavigated", (frame) => { if (frame === helper.mainFrame()) helperUrls.push(frame.url()); });
-    const stageSeen = await page.getByRole("button", { name: /Connecting JoyID…|Waiting for JoyID…/ }).textContent({ timeout: 10_000 }).catch(() => null);
+
     await approveAndEnterCode(page);
     await helper.waitForEvent("close", { timeout: 30_000 }).catch(() => undefined);
     const state = await pageState(page);
     const verified = apiCalls.filter((call) => call.verified);
+    const stagesSeen = await page.evaluate(() => (window as unknown as { __joyIdLabels: string[] }).__joyIdLabels);
     results["1. window transport"] = {
       appHeaders: { coop: responseHeaders["cross-origin-opener-policy"], coep: responseHeaders["cross-origin-embedder-policy"], csp: responseHeaders["content-security-policy"]?.slice(0, 60) + "…" },
-      stageSeen,
+      stagesSeen,
       joyIdVisits: joyIdVisits.map(({ challenge, ...visit }) => ({ ...visit, challenge: typeof challenge === "string" ? `${challenge.split("\n")[0]}…` : challenge })),
       helperUrls: helperUrls.map((url) => url.replace(/_data_=[^&]+/, "_data_=…")),
       helperClosed: helper.isClosed(),
@@ -274,7 +291,14 @@ try {
     check("window: recovery turned on after preview and emailed code", apiCalls.some((call) => call.operation === "enable" && !call.refused));
     check("window: main tab never reloaded and stayed cross-origin isolated", state.marker === 1 && state.crossOriginIsolated === true);
     check("window: helper closed itself", helper.isClosed());
-    check("window: helper stripped _data_ from its address bar", helperUrls.some((url) => url.includes("_data_")) ? helperUrls.at(-1)?.includes("_data_") === false || helper.isClosed() : true, helperUrls);
+    check("window: the SDK reported connecting, then signing", stagesSeen.join(",") === "Connecting JoyID…,Waiting for JoyID…", stagesSeen);
+    // Each time the helper comes back from JoyID its URL ends up clean (Next.js may restore it once in between),
+    // and it is clean when the helper closes.
+    const onApp = helperUrls.filter((url) => url.startsWith(APP));
+    const clean = (url: string) => !url.includes("_data_") && !url.includes("joyid-redirect");
+    const joyIdLegs = helperUrls.filter((url) => url.startsWith(JOYID)).length;
+    const legsCleaned = helperUrls.every((url, index) => !url.startsWith(JOYID) || helperUrls.slice(index + 1).some((next) => next.startsWith(APP) && clean(next)));
+    check("window: the helper stripped _data_ after each return from JoyID", joyIdLegs === 2 && legsCleaned && clean(onApp.at(-1) ?? ""), helperUrls);
     await context.close();
   }
 
@@ -295,6 +319,28 @@ try {
     check("known connection skips connect", joyIdVisits.length === 1 && joyIdVisits[0].path === "/sign-message");
     check("rejection in JoyID is a cancel, nothing previewed", !apiCalls.some((call) => call.operation === "preview"));
     check("helper closed after a rejection", helper.isClosed());
+    await context.close();
+  }
+
+  // 2b. Cancel while JoyID's page is still open: the SDK stops waiting, nothing is sent.
+  {
+    apiCalls.length = 0; joyIdVisits.length = 0; holdNext = true;
+    const context = await newContext(browser);
+    const page = await context.newPage();
+    await page.goto(`${APP}/app`);
+    await page.evaluate((address) => localStorage.setItem("ccc-joy-id-signer", JSON.stringify([[{ uri: "https://testnet.joyid.dev", addressType: "ckb" }, { address, publicKey: "0x00", keyType: "main_key" }]])), joyIdAddress);
+    const opened = context.waitForEvent("page");
+    await page.getByRole("button", { name: "Turn on with JoyID" }).click();
+    const helper = await opened;
+    await helper.waitForURL(/testnet\.joyid\.dev/, { timeout: 60_000 });
+    const waiting = await page.getByRole("button", { name: "Waiting for JoyID…" }).isVisible();
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await page.getByText("Cancelled. Nothing changed.").waitFor({ timeout: 10_000 });
+    const idleAgain = await page.getByRole("button", { name: "Turn on with JoyID" }).isEnabled();
+    results["2b. cancel while JoyID is open"] = { waiting, idleAgain, joyIdVisits: joyIdVisits.map(({ path, answered }) => ({ path, answered })), apiCalls: apiCalls.filter((call) => call.path === "/recovery") };
+    check("cancel: the button showed the signing stage while JoyID was open", waiting);
+    check("cancel: Cancel ends the wait at once and the card is usable again", idleAgain);
+    check("cancel: nothing was previewed", !apiCalls.some((call) => call.operation === "preview"));
     await context.close();
   }
 

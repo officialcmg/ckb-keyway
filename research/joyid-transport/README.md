@@ -64,12 +64,14 @@ the research, and the independent review.
 - `e2e.ts` → `e2e.output.txt` (Playwright, Chromium 153): `next build` with the local SDK, `next start` with the
   real `next.config.ts` headers and `proxy.ts` CSP; a fake KeyWay API (routes `keyway-api-production…`, issues
   nonces and runs `verifyBackupOwnership` on every proof) and a fake JoyID origin (routes `testnet.joyid.dev`;
-  referrer guard, real P-256 assertions, `_data_` in the query, `location.replace`). 22 checks:
+  referrer guard, real P-256 assertions, `_data_` in the query, `location.replace`). 26 checks, also run against
+  `next dev` with React StrictMode (`KEYWAY_E2E_DEV=1`, `e2e-dev.output.txt`):
   1. window transport, first use: Auth then sign in one helper window; JoyID saw the app's origin as referrer; the
-     server verified the proof; preview + emailed code turned recovery on; the main tab never reloaded and stayed
+     server verified the proof; preview + emailed code turned recovery on; the button showed "Connecting JoyID…" then
+     "Waiting for JoyID…"; the main tab never reloaded and stayed
      cross-origin isolated; the helper stripped `_data_` and closed itself;
   2. a known JoyID connection skips Auth; a rejection in JoyID shows "Cancelled. Nothing changed.", nothing is
-     previewed, the helper closes;
+     previewed, the helper closes; Cancel while JoyID's page is open ends the wait at once and nothing is previewed;
   3. `window.open` blocked → full-page redirect (Auth and sign round trips) on `/app?mode=browser`, resume, preview
      + code; no `fetch` ran while the answer was in the URL; the address bar is clean; no cross-origin request
      carried the answer in `Referer`; cross-origin isolated again; a Web Lock held like the Fiber device lock is
@@ -136,4 +138,11 @@ BroadcastChannel message can't get a foreign JoyID accepted. Findings and outcom
 Backward compatibility and UX copy: the reviewer found no issue. After the fixes every check was re-run: both
 typechecks, `npm test` (242 tests: 225 pass, 0 fail, 17 skipped by their own environment gates; 13 JoyID tests),
 the Postgres suite (43/43), `next build` against the pinned 0.2.6 and the local SDK, the demo typecheck against the
-new SDK, the docs build, the release workflow steps, and the e2e (22/22 against `next start`, 22/22 against `next dev`).
+new SDK, the docs build, the release workflow steps, and the e2e (26/26 against `next start`, 26/26 against `next dev`).
+
+## CodeRabbit (on the pull request)
+
+| Finding | Outcome |
+| --- | --- |
+| Major: `createJoyIdBackup(undefined, options)` dropped `options`, so `transport`, `onStage`, `signal` and the redirect options were ignored in that call form, which the demo uses (its stage labels and Cancel didn't reach the SDK). | Real, fixed: argument handling moved to `joyIdBackupArguments` and unit-tested for every call form. The e2e's stage check had accepted the default label; it now records every label and requires "Connecting JoyID…" then "Waiting for JoyID…". |
+| Nitpick: the e2e's helper-cleanup check passed whenever the helper closed; stages and Cancel weren't asserted. | Fixed: every return from JoyID must be followed by a clean URL and the helper must close clean; stages asserted; new Cancel scenario (JoyID's page held open, Cancel ends the wait, nothing previewed). |
