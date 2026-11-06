@@ -14,6 +14,7 @@ import {
   verifyCode,
   type SigningContext,
 } from "./general-signing.ts";
+import { runIdempotentMutation } from "./idempotency.ts";
 
 export type FiberCaller = { call<T>(method: string, params?: unknown[]): Promise<T> };
 export type PaymentContext = Pick<SigningContext, "user" | "appName" | "email" | "sendEmail" | "rateLimit">;
@@ -22,8 +23,19 @@ export type PaymentContext = Pick<SigningContext, "user" | "appName" | "email" |
  * Hosted-node payments: preview, request-email-code, send. There is no built-in dialog (apps may add
  * their own), but every payment counts toward the user's 24-hour email-confirmation amount, and past it
  * the emailed code is required. Each approval is bound to the exact payment by a single-use nonce.
+ *
+ * A send with an idempotency key is recorded under it: repeating the same request with the same key (a
+ * retry after a lost response) returns the first result, or the first error, and never pays twice.
  */
-export async function fiberPayment(context: PaymentContext, node: FiberCaller, body: Record<string, unknown>): Promise<unknown> {
+export async function fiberPayment(context: PaymentContext, node: FiberCaller, body: Record<string, unknown>, idempotencyKey?: string): Promise<unknown> {
+  if (body.stage === "send" && idempotencyKey) {
+    const { method, params, confirmationNonce, emailCode } = body;
+    return runIdempotentMutation(context.user.id, "fiber-pay", idempotencyKey, { method, params, confirmationNonce, emailCode }, () => payOnce(context, node, body));
+  }
+  return payOnce(context, node, body);
+}
+
+async function payOnce(context: PaymentContext, node: FiberCaller, body: Record<string, unknown>): Promise<unknown> {
   const method = body.method === "sendPaymentWithRouter" ? "sendPaymentWithRouter" : body.method === "sendPayment" ? "sendPayment" : undefined;
   if (!method) throw new Error("A Fiber payment method is required");
   const params = paymentFiberParams(method, body.params, "testnet");

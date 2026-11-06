@@ -252,6 +252,7 @@ export function KeyWayProvider({
     reason: EmailCodeReason;
     error?: string;
     sentTo?: string;
+    codeLength?: 6 | 8;
     resend: () => Promise<void>;
     verify?: (code: string) => Promise<void>;
     resolve: (code: string | undefined) => void;
@@ -607,6 +608,7 @@ export function KeyWayProvider({
           reason={codeRequest.reason}
           error={codeRequest.error}
           sentTo={codeRequest.sentTo}
+          codeLength={codeRequest.codeLength}
           resend={codeRequest.resend}
           verify={codeRequest.verify}
           answer={(code) => { codeRequest.resolve(code); setCodeRequest(undefined); }}

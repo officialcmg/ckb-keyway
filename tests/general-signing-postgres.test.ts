@@ -4,7 +4,7 @@ import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { formatCkbSignature } from "../src/server/funding-transaction.ts";
 import { database } from "../src/server/database.ts";
-import { messageSigning, signingSettings, transactionSigning, type SigningContext } from "../src/server/general-signing.ts";
+import { countLitCodeAttempt, issueRequest, loadRequest, messageSigning, recordLitCode, signingSettings, transactionSigning, type SigningContext } from "../src/server/general-signing.ts";
 import type { ValidatedTransaction } from "../src/server/transaction-policy.ts";
 import type { ReadyWallet } from "../src/server/user-wallet.ts";
 
@@ -255,5 +255,21 @@ test("general signing binds approvals, email codes and threshold changes", { ski
     await assert.rejects(() => messageSigning(context, { operation: "sign", message: "Something else", confirmationNonce: preview.confirmationNonce }), /invalid or expired/);
     const signed = await messageSigning(context, { operation: "sign", message: "Log in to Acme Pay", confirmationNonce: preview.confirmationNonce }) as { signature: string; identity: string };
     assert.equal(ccc.verifyMessageCkbSecp256k1("Log in to Acme Pay", signed.signature, signed.identity), true);
+  });
+
+  await t.test("a Lit-sent code: the ticket is kept with the request, which lives as long as the code and allows five tries", async () => {
+    const user = { id: crypto.randomUUID() };
+    const nonce = await issueRequest(user, "recovery", "digest", { lines: ["Turn on account recovery"] }, true);
+    await assert.rejects(() => countLitCodeAttempt(user, "recovery", nonce), /expired/);
+    await recordLitCode(user, "recovery", nonce, { litTicket: "v1.1.ticket", litBinding: "0x00" });
+    const request = await loadRequest(user, "recovery", nonce, "digest");
+    assert.deepEqual(request.summary, { lines: ["Turn on account recovery"], litTicket: "v1.1.ticket", litBinding: "0x00" });
+    for (let i = 0; i < 5; i++) await countLitCodeAttempt(user, "recovery", nonce);
+    await assert.rejects(() => countLitCodeAttempt(user, "recovery", nonce), /Too many wrong codes/);
+    // A new code starts the count again.
+    await recordLitCode(user, "recovery", nonce, { litTicket: "v1.2.ticket" });
+    await countLitCodeAttempt(user, "recovery", nonce);
+    assert.equal((await loadRequest(user, "recovery", nonce, "digest")).summary.litTicket, "v1.2.ticket");
+    await assert.rejects(() => recordLitCode(user, "recovery", crypto.randomUUID(), {}), /expired/);
   });
 });

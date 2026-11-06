@@ -137,6 +137,36 @@ test("hosted Fiber payments: daily amount, email codes and overlapping approvals
     assert.equal(on.requiresEmailCode, true);
   });
 
+  await t.test("a repeated send with the same idempotency key returns the first result and pays once", async () => {
+    const h = harness(10n * CKB);
+    const preview = await pay(h, { stage: "preview" });
+    const body = { method: "sendPayment", params: { invoice: "fibt1test" }, stage: "send", confirmationNonce: preview.confirmationNonce };
+    const key = `retry-${crypto.randomUUID()}`;
+    const first = await fiberPayment(h.context, h.node, body, key);
+    const again = await fiberPayment(h.context, h.node, body, key);
+    assert.deepEqual(again, first);
+    assert.equal(h.sent.length, 1);
+    // Without the key, or with another one, the used approval is refused rather than paid again.
+    await assert.rejects(() => fiberPayment(h.context, h.node, body), /request expired/i);
+    await assert.rejects(() => fiberPayment(h.context, h.node, body, `other-${crypto.randomUUID()}`), /request expired/i);
+    assert.equal(h.sent.length, 1);
+    // The same key can't be reused for another payment.
+    const next = await pay(h, { stage: "preview" });
+    await assert.rejects(() => fiberPayment(h.context, h.node, { ...body, confirmationNonce: next.confirmationNonce }, key), /already used for another request/);
+  });
+
+  await t.test("a repeated send after a failed payment returns the same failure and doesn't try again", async () => {
+    const failing = harness(10n * CKB, { failSend: true });
+    const preview = await pay(failing, { stage: "preview" });
+    const body = { method: "sendPayment", params: { invoice: "fibt1test" }, stage: "send", confirmationNonce: preview.confirmationNonce };
+    const key = `retry-${crypto.randomUUID()}`;
+    let calls = 0;
+    const node = { call: async <T>(method: string, params?: unknown[]): Promise<T> => { if (method === "send_payment") calls++; return failing.node.call<T>(method, params as never); } };
+    await assert.rejects(() => fiberPayment(failing.context, node, body, key), /no route/);
+    await assert.rejects(() => fiberPayment(failing.context, node, body, key), /no route/);
+    assert.equal(calls, 1);
+  });
+
   await t.test("refuses payments with neither an invoice nor a keysend target", async () => {
     const h = harness(1n * CKB);
     await assert.rejects(() => fiberPayment(h.context, h.node, { method: "sendPayment", stage: "preview", params: { amount: "0x1" } }), /keysend/);

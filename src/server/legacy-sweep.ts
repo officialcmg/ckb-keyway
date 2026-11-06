@@ -4,8 +4,8 @@ import { addTokenCellDeps } from "../sdk/browser/settlement-sweep.ts";
 import { hasPlainTokenArgs, isXudtCompatible } from "../sdk/browser/tokens.ts";
 import type { User } from "./auth-user.ts";
 import { database, type DatabaseSql } from "./database.ts";
-import { signAccountGroups, type SigningGroup } from "./funding-transaction.ts";
-import { sign, type SigningContext } from "./general-signing.ts";
+import type { SigningGroup } from "./funding-transaction.ts";
+import { signGroups, type SigningContext } from "./general-signing.ts";
 import { recordSigningEvent } from "./security-alerts.ts";
 import { feeRateCap, formatCkb } from "./transaction-policy.ts";
 import { readWallet, type ReadyWallet } from "./user-wallet.ts";
@@ -85,7 +85,7 @@ export async function sweepLegacyAddress(context: LegacySweepContext): Promise<L
 
       await checkLegacySweepTransaction(client, plan.transaction, wallet.litPublicKey, wallet.recovery);
       await (context.recordSigning ?? recordSigningEvent)(context.user.id);
-      const signed = await signAccountGroups(plan.transaction, plan.groups, client, (digest) => sign({ wallet, signDigest: context.signDigest }, digest));
+      const signed = await signGroups({ wallet, signDigest: context.signDigest }, plan.transaction, plan.groups, client);
       const blamed = attempt < MAX_BLAMED ? await blamedTokenCell(client, signed) : undefined;
       if (blamed) {
         console.info("[keyway] a token cell at the old address can't be moved; leaving it", { outPoint: `${blamed.txHash}:${blamed.index}` });

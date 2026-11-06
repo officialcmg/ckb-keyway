@@ -117,7 +117,7 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
   if (operation === "pay") {
     const scope = await resolveAuthScope(request);
     const context = { user, appName: scope.name, email: () => sessionEmail(request), sendEmail: sendTransactionalEmail, rateLimit: consumeRateLimit };
-    const result = await fiberPayment(context, managedFiberNode(user.id), body);
+    const result = await fiberPayment(context, managedFiberNode(user.id), body, request.headers.get("idempotency-key") || undefined);
     return Response.json(result, { headers: { "Cache-Control": "no-store" } });
   }
   const result = ["open-channel", "submit-channel-funding"].includes(operation)

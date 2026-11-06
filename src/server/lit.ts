@@ -74,6 +74,11 @@ export class LitTransientError extends Error {
 
 const NOT_GRANTED = /cannot use selected wallet/i;
 
+/** Runs a pinned Action with these parameters and returns its response. */
+export function runLitAction(config: LitRuntimeConfig, js_params: Record<string, unknown>): Promise<unknown> {
+  return executeAction(config, js_params);
+}
+
 async function executeAction(config: LitRuntimeConfig, js_params: Record<string, unknown>): Promise<unknown> {
   if (!config.apiKey || !config.actionCid) throw new Error("Lit runtime configuration is incomplete");
   // Lit allows only Action code whose CID is in the KeyWay group; refuse to send code that isn't the pinned CID.
