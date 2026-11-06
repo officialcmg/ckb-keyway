@@ -530,8 +530,11 @@ export async function runWatchtowerPass(deps: PassDependencies): Promise<void> {
     try {
       await checkChannel(deps, row, log);
     } catch (error) {
-      log(`${row.channel_id}: check failed: ${error instanceof Error ? error.message : String(error)}`);
-      await sql`update keyway_v2_watchtower_channels set checked_at = now() where user_id = ${row.user_id} and channel_id = ${row.channel_id}`;
+      const message = error instanceof Error ? error.message : String(error);
+      log(`${row.channel_id}: check failed: ${message}`);
+      // Shown in the user's status, so a channel the watchtower can't currently check isn't reported as fine.
+      const detail = `check failed: ${message.replace(/\s+/g, " ").slice(0, 200)}`;
+      await sql`update keyway_v2_watchtower_channels set checked_at = now(), detail = ${detail} where user_id = ${row.user_id} and channel_id = ${row.channel_id}`;
     }
   }
 }
