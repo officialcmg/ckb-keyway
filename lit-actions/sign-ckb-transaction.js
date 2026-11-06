@@ -342,6 +342,40 @@ async function fetchTransactions(hashes) {
   throw lastError ?? new Error("CKB RPC is unavailable");
 }
 
+/**
+ * The type hashes of the live recovery lists under this account's owner-only list lock, from the indexer. Each
+ * cell is checked against the transaction that created it; that it is still live is the node's word.
+ */
+async function liveLists(account) {
+  const searchKey = { script: { code_hash: OMNILOCK_CODE_HASH, hash_type: "data1", args: bytesToHex(account.listLock.args) }, script_type: "lock" };
+  const body = JSON.stringify({ id: 0, jsonrpc: "2.0", method: "get_cells", params: [searchKey, "asc", "0x20"] });
+  let objects;
+  let lastError;
+  for (const url of RPC_URLS) {
+    try {
+      const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body, redirect: "error" });
+      if (!response.ok) throw new Error(`CKB RPC returned HTTP ${response.status}`);
+      const result = (await response.json())?.result;
+      if (!result || !Array.isArray(result.objects)) throw new Error("CKB RPC returned an invalid cell list");
+      objects = result.objects;
+      break;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  if (!objects) throw lastError ?? new Error("CKB RPC is unavailable");
+  if (objects.length >= 0x20) throw new Error("Too many cells under this account's recovery list lock");
+  const created = await fetchTransactions(objects.map((object) => object?.out_point?.tx_hash));
+  const hashes = [];
+  for (const object of objects) {
+    const tx = created.get(object.out_point.tx_hash).tx;
+    const output = tx.outputs[Number(num(object.out_point.index, "out point index"))];
+    if (!output || !sameScript(output.lock, account.listLock)) throw new Error("CKB RPC returned a cell that isn't under the recovery list lock");
+    if (isTypeId(output.type)) hashes.push(bytesToHex(scriptHash(output.type)));
+  }
+  return hashes;
+}
+
 async function inputCellsOf(tx) {
   const found = await fetchTransactions(tx.inputs.map((input) => bytesToHex(input.previousOutput.txHash)));
   return tx.inputs.map((input) => {
@@ -562,9 +596,12 @@ async function analyse(pkpId, params) {
   const inputs = await inputCellsOf(tx);
   const inputLocks = inputs.map((cell) => cell.output.lock);
   const refs = adminRefs(account, [...inputLocks, ...tx.outputs.map((output) => output.lock)]);
-  const isListCell = (output) => lockKind(account, output.lock) === "list" || (isTypeId(output.type) && refs.has(bytesToHex(scriptHash(output.type))));
-  const listInputs = inputs.map((cell, index) => ({ ...cell, index })).filter((cell) => isListCell(cell.output));
-  const listOutputs = tx.outputs.map((output, index) => ({ output, index })).filter(({ output }) => isListCell(output));
+  const outputRefs = adminRefs(account, tx.outputs.map((output) => output.lock));
+  const referenced = (output) => isTypeId(output.type) && refs.has(bytesToHex(scriptHash(output.type)));
+  // A plain cell someone sent to the list lock isn't a list; any output under that lock is treated as one.
+  const listInputs = inputs.map((cell, index) => ({ ...cell, index }))
+    .filter((cell) => (lockKind(account, cell.output.lock) === "list" && isTypeId(cell.output.type)) || referenced(cell.output));
+  const listOutputs = tx.outputs.map((output, index) => ({ output, index })).filter(({ output }) => lockKind(account, output.lock) === "list" || referenced(output));
 
   const groups = [];
   inputLocks.forEach((lock) => {
@@ -574,6 +611,12 @@ async function analyse(pkpId, params) {
   if (groups.length === 0) throw new Error("The transaction spends nothing of this account's");
 
   let op = { kind: "plain" };
+  // Outside turning recovery on, the account's recovery address may only be the one naming its live list, so no
+  // transaction can move funds to an address whose list someone else made.
+  if (outputRefs.size > 0 && !(listInputs.length === 0 && listOutputs.length === 1)) {
+    const lists = await liveLists(account);
+    if (lists.length !== 1 || [...outputRefs].some((ref) => ref !== lists[0])) throw new Error("An output goes to an address with another recovery list");
+  }
   if (listInputs.length > 1 || listOutputs.length > 1) throw new Error("A transaction may touch only one recovery list");
   if (listInputs.length === 0 && listOutputs.length === 1) {
     const { output, index } = listOutputs[0];
@@ -583,6 +626,8 @@ async function analyse(pkpId, params) {
     if (lockKind(account, inputLocks[0]) !== "secp256k1") throw new Error("Input 0 must be this account's own cell");
     const typeHash = bytesToHex(scriptHash(output.type));
     for (const ref of refs) if (ref !== typeHash) throw new Error("An output goes to an address with another recovery list");
+    // First wins: a key that already has a recovery list can never make a second one (and an address with it).
+    if ((await liveLists(account)).length > 0) throw new Error("Recovery is already on for this key");
     const members = listMembers(recordAt(tx, 0), tx.outputsData[0]);
     const witness = parseWitnessArgs(tx.witnesses[0] ?? new Uint8Array(0));
     op = { kind: "enable", members, binding: witness.inputType };
@@ -646,7 +691,8 @@ function parseTicket(ticket) {
   const expiresAt = Number(match[1]);
   const now = Date.now();
   if (expiresAt <= now) throw new Error("The email code has expired. Request a new one");
-  if (expiresAt > now + CODE_TTL_MS) throw new Error("The email code ticket is invalid");
+  // A minute's slack for clock differences between the Lit nodes that issued and check the ticket.
+  if (expiresAt > now + CODE_TTL_MS + 60_000) throw new Error("The email code ticket is invalid");
   return expiresAt;
 }
 

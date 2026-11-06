@@ -42,7 +42,14 @@ export type ActionModule = {
  * A Lit runtime for one PKP. `lookup` answers the chain: a known transaction and its status, or undefined.
  * Encryption is a reversible stand-in, as only the Action and Lit ever see the plaintext.
  */
-export function fakeLit(options: { privateKey: Uint8Array; pkpId: string; actionKey?: Uint8Array; lookup: (hash: string) => { tx: ccc.Transaction; status: string } | undefined }) {
+export function fakeLit(options: {
+  privateKey: Uint8Array;
+  pkpId: string;
+  actionKey?: Uint8Array;
+  lookup: (hash: string) => { tx: ccc.Transaction; status: string } | undefined;
+  /** Every transaction the chain has, for the indexer's live cells. */
+  transactions: () => ccc.Transaction[];
+}) {
   const actionKey = options.actionKey ?? secp256k1.utils.randomSecretKey();
   const emails: SentEmail[] = [];
   const script = (s: ccc.Script) => ({ code_hash: s.codeHash, hash_type: s.hashType, args: s.args });
@@ -62,7 +69,17 @@ export function fakeLit(options: { privateKey: Uint8Array; pkpId: string; action
       return new Response(JSON.stringify({ id: "email" }), { status: 200 });
     }
     assert.ok(["https://testnet.ckb.dev/", "https://testnet.ckbapp.dev/"].includes(url), url);
-    const calls = JSON.parse(init.body) as Array<{ id: number; params: [string] }>;
+    const parsed = JSON.parse(init.body);
+    if (!Array.isArray(parsed) && parsed.method === "get_cells") {
+      const [{ script: wanted }] = parsed.params as [{ script: { code_hash: string; hash_type: string; args: string } }];
+      const all = options.transactions();
+      const spent = new Set(all.flatMap((tx) => tx.inputs.map((input) => `${input.previousOutput.txHash}:${input.previousOutput.index}`)));
+      const objects = all.flatMap((tx) => tx.outputs.map((output, index) => ({ tx, output, index })))
+        .filter(({ tx, output, index }) => !spent.has(`${tx.hash()}:${index}`) && output.lock.codeHash === wanted.code_hash && output.lock.hashType === wanted.hash_type && output.lock.args === wanted.args)
+        .map(({ tx, output, index }) => ({ out_point: { tx_hash: tx.hash(), index: ccc.numToHex(index) }, output: { capacity: ccc.numToHex(output.capacity), lock: script(output.lock), type: output.type ? script(output.type) : null }, output_data: tx.outputsData[index] }));
+      return new Response(JSON.stringify({ id: parsed.id, jsonrpc: "2.0", result: { objects, last_cursor: "0x" } }), { status: 200 });
+    }
+    const calls = parsed as Array<{ id: number; params: [string] }>;
     return new Response(JSON.stringify(calls.map(({ id, params: [hash] }) => {
       const found = options.lookup(hash);
       return { id, jsonrpc: "2.0", result: found ? { transaction: rpcTx(found.tx), tx_status: { status: found.status } } : null };

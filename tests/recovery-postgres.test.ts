@@ -388,7 +388,7 @@ test("with the policy Action: Lit emails the code, binds the email on chain, and
   const lit = fakeLit({ privateKey: h.privateKey, pkpId, lookup: (hash) => {
     const found = h.chain.get(hash);
     return found ? { tx: found.transaction, status: found.status } : undefined;
-  } });
+  }, transactions: () => [...h.chain.values()].map(({ transaction }) => transaction) });
   litPolicyRunner.run = await lit.runner();
   // No digest signer: everything goes through the Action.
   const context = (current: ReadyWallet): RecoveryContext => {
