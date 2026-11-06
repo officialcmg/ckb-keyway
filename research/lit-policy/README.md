@@ -70,8 +70,10 @@ It also enforces these invariants on the recovery list:
 - A new list must be output 0, under the owner-only lock, with its Type ID from input 0, which must be the
   account's own secp256k1 cell. Every administrator-mode output must name that list.
 - First wins: a new list is refused if the indexer shows any live list under the key's owner-only lock already.
-  A cell there only counts as a list if the transaction that created it spent one of the account's own cells.
-  Anyone can send a cell to that lock, so this stops outsiders blocking an account with fake lists.
+  A cell there only counts as a list if the transaction that created it spent a cell from the key's own
+  secp256k1 address or its list lock. An administrator-mode Omnilock doesn't count, because anyone can make one
+  with this key's auth and their own list. Anyone can send a cell to the list lock, so this stops outsiders
+  blocking an account with fake lists. A failed lookup refuses the request rather than leaving a list out.
 - An enable must spend every live plain cell at the key's secp256k1 address. Two enables signed before either is
   indexed then spend the same cells, so at most one can commit.
 - A change to a list made before on-chain records existed needs the previous record from the server. That record
@@ -196,7 +198,8 @@ Separate small fix: a hosted Fiber payment `send` that carries an `Idempotency-K
 first error, and never pays twice. A repeat that arrives while the first send is still running waits up to 30
 seconds for its outcome.
 
-Not handled: the server crashing after Fiber accepted a payment but before the result was stored. A retry then
+If a payment succeeds but its result can't be stored, the record stays "running" and is never marked failed.
+A repeat then never reports a failure for a payment that went through. Not handled: the server crashing after Fiber accepted a payment but before the result was stored. A retry then
 says "still in progress" until the key expires in 24 hours. It never pays twice, but checking the outcome with
 Fiber's `get_payment` is left for later. The SDK already retries once with the same key on network errors and 5xx
 (`api-client.ts`).

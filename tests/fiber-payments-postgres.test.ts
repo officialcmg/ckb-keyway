@@ -172,16 +172,24 @@ test("hosted Fiber payments: daily amount, email codes and overlapping approvals
     const preview = await pay(h, { stage: "preview" });
     const body = { method: "sendPayment", params: { invoice: "fibt1test" }, stage: "send", confirmationNonce: preview.confirmationNonce };
     let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
     const slow = { call: async <T>(method: string, params?: unknown[]): Promise<T> => {
-      if (method === "send_payment") { calls++; await new Promise((resolve) => setTimeout(resolve, 600)); }
+      if (method === "send_payment") { calls++; entered(); await gate; }
       return h.node.call<T>(method, params as never);
     } };
     const key = `retry-${crypto.randomUUID()}`;
-    const [first, again] = await Promise.all([
-      fiberPayment(h.context, slow, body, key),
-      new Promise((resolve) => setTimeout(resolve, 100)).then(() => fiberPayment(h.context, slow, body, key)),
-    ]);
-    assert.deepEqual(again, first);
+    const first = fiberPayment(h.context, slow, body, key);
+    // The repeat starts only once the first send is in flight, and is still waiting when that send is released.
+    await started;
+    let repeatDone = false;
+    const again = fiberPayment(h.context, slow, body, key).finally(() => { repeatDone = true; });
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(repeatDone, false, "the repeat waits for the running send");
+    release();
+    assert.deepEqual(await again, await first);
     assert.equal(calls, 1);
   });
 

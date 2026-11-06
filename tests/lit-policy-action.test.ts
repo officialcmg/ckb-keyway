@@ -330,6 +330,16 @@ test("a cell anyone sends to the list lock doesn't count as a list, and an enabl
     outputsData: [adminListData(`0x${"78".repeat(32)}`)],
   });
   env.add(forged);
+  // Another made by spending an Omnilock with this key's auth but the attacker's own list, which their own backup
+  // can unlock: still not a list of this key's.
+  const attackerOmnilock = ccc.Script.from({ ...plan.omnilock, args: ccc.hexFrom(ccc.bytesConcat(ccc.bytesFrom(plan.omnilock.args).slice(0, 22), `0x${"9a".repeat(32)}`)) });
+  const paid = ccc.Transaction.from({ inputs: [], outputs: [{ lock: attackerOmnilock, capacity: 500n * CKB }], outputsData: ["0x"] });
+  env.add(paid);
+  env.add(ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: paid.hash(), index: 0 } }],
+    outputs: [{ lock: plan.transaction.outputs[0].lock, type: adminListTypeScript({ adminListTypeArgs: `0x${"bc".repeat(32)}` }), capacity: 200n * CKB }],
+    outputsData: [adminListData(`0x${"de".repeat(32)}`)],
+  }));
   const sent = await policySendCode(plan.transaction, wallet, { email: "user@example.com", appName: "Demo" }, runner(action));
   assert.ok(sent.ticket);
   // A new plain cell at the secp256k1 address that the enable leaves out: refused.

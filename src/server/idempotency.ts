@@ -32,6 +32,7 @@ export async function runIdempotentMutation<T>(
     // With `waitMs`, a repeat that arrives while the first request still runs waits for its outcome.
     const deadline = Date.now() + (options.waitMs ?? 0);
     let stored: StoredResult | undefined;
+    let delay = 250;
     for (;;) {
       const rows = await sql<StoredResult[]>`
         select request_digest, status, response, error_message
@@ -42,7 +43,8 @@ export async function runIdempotentMutation<T>(
       `;
       stored = rows[0];
       if (stored?.status !== "running" || stored.request_digest !== digest || Date.now() >= deadline) break;
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay = Math.min(delay * 2, 2_000);
     }
     if (!stored) throw new Error("Idempotency record expired; use a new key");
     if (stored.request_digest !== digest) throw new Error("Idempotency key was already used for another request");
@@ -51,14 +53,9 @@ export async function runIdempotentMutation<T>(
     throw new Error("The request is still in progress");
   }
 
+  let result: T;
   try {
-    const result = await mutation();
-    await sql`
-      update keyway_v2_idempotency_keys
-      set status = 'completed', response = ${sql.json(result as never)}, updated_at = now()
-      where user_id = ${userId} and operation = ${operation} and idempotency_key = ${key}
-    `;
-    return result;
+    result = await mutation();
   } catch (error) {
     const message = error instanceof Error ? error.message : "Managed operation failed";
     await sql`
@@ -68,4 +65,12 @@ export async function runIdempotentMutation<T>(
     `;
     throw error;
   }
+  // The operation succeeded. If its result can't be stored, the record stays "running" rather than being marked
+  // failed, so a repeat never reports a failure for something that went through, and never runs it again.
+  await sql`
+    update keyway_v2_idempotency_keys
+    set status = 'completed', response = ${sql.json(result as never)}, updated_at = now()
+    where user_id = ${userId} and operation = ${operation} and idempotency_key = ${key}
+  `;
+  return result;
 }
