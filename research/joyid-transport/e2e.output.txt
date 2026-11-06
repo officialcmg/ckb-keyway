@@ -1,0 +1,366 @@
+{
+  "checks": {
+    "window: connect then sign in one helper window": "ok",
+    "window: JoyID saw the app's origin as referrer": "ok",
+    "window: JoyID returns to the helper on the app's origin": "ok",
+    "window: the server verified the JoyID proof": "ok",
+    "window: recovery turned on after preview and emailed code": "ok",
+    "window: main tab never reloaded and stayed cross-origin isolated": "ok",
+    "window: helper closed itself": "ok",
+    "window: helper stripped _data_ from its address bar": "ok",
+    "known connection skips connect": "ok",
+    "rejection in JoyID is a cancel, nothing previewed": "ok",
+    "helper closed after a rejection": "ok",
+    "redirect: connect and sign as two full-page round trips": "ok",
+    "redirect: returns to the same page (browser mode kept)": "ok",
+    "redirect: no fetch ran while the answer was in the URL": "ok",
+    "redirect: address bar clean after return": "ok",
+    "redirect: no cross-origin request carried the answer in Referer": "ok",
+    "redirect: page cross-origin isolated again after return": "ok",
+    "redirect: the Fiber Web Lock is free again after return": "ok",
+    "redirect: the server verified the JoyID proof and recovery turned on": "ok",
+    "crafted: refused with a plain message": "ok",
+    "crafted: URL stripped before any fetch": "ok",
+    "crafted: nothing reached the recovery API": "ok"
+  },
+  "chromium": "153.0.8010.12",
+  "1. window transport": {
+    "appHeaders": {
+      "coop": "same-origin",
+      "coep": "require-corp",
+      "csp": "default-src 'self'; script-src 'self' 'nonce-BoU5WeDCCa2JcZM…"
+    },
+    "stageSeen": "Connecting JoyID…",
+    "joyIdVisits": [
+      {
+        "path": "/auth",
+        "type": "redirect",
+        "referer": "http://localhost:3100/",
+        "redirectURL": "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c&joyid-redirect=true",
+        "state": {
+          "v": 1,
+          "id": "7f845785897e09fe7607f06d3902b269"
+        },
+        "answered": "auth"
+      },
+      {
+        "path": "/sign-message",
+        "type": "redirect",
+        "referer": "http://localhost:3100/",
+        "redirectURL": "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c&joyid-redirect=true",
+        "state": {
+          "v": 1,
+          "id": "60c5f752fd8b425b2379697193571c89"
+        },
+        "answered": "signed",
+        "challenge": "KeyWay account recovery…"
+      }
+    ],
+    "helperUrls": [
+      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c",
+      "https://testnet.joyid.dev/auth?type=redirect&_data_=…",
+      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c&joyid-redirect=true&_data_=…",
+      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c",
+      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c&joyid-redirect=true&_data_=…",
+      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c",
+      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c",
+      "https://testnet.joyid.dev/sign-message?type=redirect&_data_=…",
+      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c&joyid-redirect=true&_data_=…",
+      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c",
+      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c&joyid-redirect=true&_data_=…",
+      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c",
+      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c"
+    ],
+    "helperClosed": true,
+    "main": {
+      "url": "http://localhost:3100/app",
+      "crossOriginIsolated": true,
+      "sharedArrayBuffer": "function",
+      "sameDocument": true
+    },
+    "apiCalls": [
+      {
+        "path": "/recovery",
+        "operation": "challenge"
+      },
+      {
+        "path": "/recovery",
+        "operation": "preview",
+        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq8rxutxdqnnzvs86mhup9gcjzsj0fqfgug34x8k5"
+      },
+      {
+        "path": "/recovery",
+        "operation": "request-email-code",
+        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq8rxutxdqnnzvs86mhup9gcjzsj0fqfgug34x8k5"
+      },
+      {
+        "path": "/recovery",
+        "operation": "enable",
+        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq8rxutxdqnnzvs86mhup9gcjzsj0fqfgug34x8k5"
+      },
+      {
+        "path": "/recovery",
+        "operation": "status"
+      }
+    ]
+  },
+  "2. known JoyID, rejected in JoyID": {
+    "joyIdVisits": [
+      {
+        "path": "/sign-message",
+        "answered": "rejected"
+      }
+    ],
+    "helperClosed": true,
+    "apiCalls": [
+      {
+        "path": "/recovery",
+        "operation": "challenge"
+      }
+    ]
+  },
+  "3. blocked window -> full-page redirect": {
+    "before": {
+      "crossOriginIsolated": true,
+      "lock": true
+    },
+    "navigations": [
+      "https://testnet.joyid.dev/auth?type=redirect&_data_=…",
+      "http://localhost:3100/app?mode=browser&joyid-redirect=true&_data_=…",
+      "http://localhost:3100/app?mode=browser",
+      "http://localhost:3100/app?mode=browser&joyid-redirect=true&_data_=…",
+      "http://localhost:3100/app?mode=browser",
+      "http://localhost:3100/app?mode=browser",
+      "https://testnet.joyid.dev/sign-message?type=redirect&_data_=…",
+      "http://localhost:3100/app?mode=browser&joyid-redirect=true&_data_=…",
+      "http://localhost:3100/app?mode=browser",
+      "http://localhost:3100/app?mode=browser&joyid-redirect=true&_data_=…",
+      "http://localhost:3100/app?mode=browser",
+      "http://localhost:3100/app?mode=browser"
+    ],
+    "joyIdVisits": [
+      {
+        "path": "/auth",
+        "type": "redirect",
+        "answered": "auth",
+        "redirectURL": "http://localhost:3100/app?mode=browser&joyid-redirect=true",
+        "referer": "http://localhost:3100/"
+      },
+      {
+        "path": "/sign-message",
+        "type": "redirect",
+        "answered": "signed",
+        "redirectURL": "http://localhost:3100/app?mode=browser&joyid-redirect=true",
+        "referer": "http://localhost:3100/"
+      }
+    ],
+    "after": {
+      "url": "http://localhost:3100/app?mode=browser",
+      "crossOriginIsolated": true,
+      "sharedArrayBuffer": "function",
+      "fiberLockReacquired": true
+    },
+    "firstFetchesAfterReturn": [
+      {
+        "url": "https://keyway-api-production.up.railway.app/api/v1/keyway/auth/legacy-cleanup",
+        "href": "http://localhost:3100/app?mode=browser"
+      },
+      {
+        "url": "https://keyway-api-production.up.railway.app/api/v1/keyway/auth/session",
+        "href": "http://localhost:3100/app?mode=browser"
+      },
+      {
+        "url": "http://localhost:3100/?_rsc=R0tRxeXOP7hmQRIY",
+        "href": "http://localhost:3100/app?mode=browser"
+      },
+      {
+        "url": "http://localhost:3100/dashboard?_rsc=R0tRxeXOP7hmQRIY",
+        "href": "http://localhost:3100/app?mode=browser"
+      }
+    ],
+    "fetchesWithTheAnswerInTheUrl": [],
+    "requestsWithTheAnswerInReferer": [
+      {
+        "url": "http://localhost:3100/_next/static/media/26aa48c1bdeb5547-s.p.30a_ou6vtcpon.woff",
+        "referer": "…_data_=…",
+        "type": "font"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/media/99e609270109b47d-s.p.40sczeszzbjw1.woff",
+        "referer": "…_data_=…",
+        "type": "font"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/media/effe91970fc4db64-s.p.0oace-s_gkfks.woff",
+        "referer": "…_data_=…",
+        "type": "font"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/3un39emc2naih.css",
+        "referer": "…_data_=…",
+        "type": "stylesheet"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/3jhykuyianuk8.css",
+        "referer": "…_data_=…",
+        "type": "stylesheet"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/310vm2bl3xxpt.js",
+        "referer": "…_data_=…",
+        "type": "script"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/0eo1cde-rr3bs.js",
+        "referer": "…_data_=…",
+        "type": "script"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/0bma92pht_c97.js",
+        "referer": "…_data_=…",
+        "type": "script"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/1gd3h8x2ifg_a.js",
+        "referer": "…_data_=…",
+        "type": "script"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/turbopack-3jyd33d-ci9l1.js",
+        "referer": "…_data_=…",
+        "type": "script"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/3fntmmi971322.js",
+        "referer": "…_data_=…",
+        "type": "script"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/1co04a3o71x4i.js",
+        "referer": "…_data_=…",
+        "type": "script"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/30_x8ohec8exv.js",
+        "referer": "…_data_=…",
+        "type": "script"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/2eyltbqi53umb.js",
+        "referer": "…_data_=…",
+        "type": "script"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/3h5sy418awg4_.js",
+        "referer": "…_data_=…",
+        "type": "script"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/media/26aa48c1bdeb5547-s.p.30a_ou6vtcpon.woff",
+        "referer": "…_data_=…",
+        "type": "font"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/media/99e609270109b47d-s.p.40sczeszzbjw1.woff",
+        "referer": "…_data_=…",
+        "type": "font"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/media/effe91970fc4db64-s.p.0oace-s_gkfks.woff",
+        "referer": "…_data_=…",
+        "type": "font"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/3un39emc2naih.css",
+        "referer": "…_data_=…",
+        "type": "stylesheet"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/3jhykuyianuk8.css",
+        "referer": "…_data_=…",
+        "type": "stylesheet"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/310vm2bl3xxpt.js",
+        "referer": "…_data_=…",
+        "type": "script"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/0eo1cde-rr3bs.js",
+        "referer": "…_data_=…",
+        "type": "script"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/0bma92pht_c97.js",
+        "referer": "…_data_=…",
+        "type": "script"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/1gd3h8x2ifg_a.js",
+        "referer": "…_data_=…",
+        "type": "script"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/turbopack-3jyd33d-ci9l1.js",
+        "referer": "…_data_=…",
+        "type": "script"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/3fntmmi971322.js",
+        "referer": "…_data_=…",
+        "type": "script"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/1co04a3o71x4i.js",
+        "referer": "…_data_=…",
+        "type": "script"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/30_x8ohec8exv.js",
+        "referer": "…_data_=…",
+        "type": "script"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/2eyltbqi53umb.js",
+        "referer": "…_data_=…",
+        "type": "script"
+      },
+      {
+        "url": "http://localhost:3100/_next/static/chunks/3h5sy418awg4_.js",
+        "referer": "…_data_=…",
+        "type": "script"
+      }
+    ],
+    "apiCalls": [
+      {
+        "path": "/recovery",
+        "operation": "challenge"
+      },
+      {
+        "path": "/recovery",
+        "operation": "preview",
+        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq8rxutxdqnnzvs86mhup9gcjzsj0fqfgug34x8k5"
+      },
+      {
+        "path": "/recovery",
+        "operation": "request-email-code",
+        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq8rxutxdqnnzvs86mhup9gcjzsj0fqfgug34x8k5"
+      },
+      {
+        "path": "/recovery",
+        "operation": "enable",
+        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq8rxutxdqnnzvs86mhup9gcjzsj0fqfgug34x8k5"
+      },
+      {
+        "path": "/recovery",
+        "operation": "status"
+      }
+    ]
+  },
+  "4. crafted _data_ URL": {
+    "url": "http://localhost:3100/app",
+    "fetchesWithTheAnswerInTheUrl": [],
+    "apiCalls": []
+  },
+  "failures": []
+}

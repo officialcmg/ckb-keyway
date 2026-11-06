@@ -199,6 +199,7 @@ export function withoutJoyIdAnswer(href: string): string {
 }
 
 let captured: JoyIdResponse | undefined;
+let answeredOnLoad = false;
 
 /**
  * Reads a JoyID answer meant for KeyWay from this page's URL and strips it from the address bar at once, before
@@ -213,6 +214,24 @@ export function captureJoyIdReturn(): void {
   if (!joyIdStateId(response.state) && !helper) return;
   try { history.replaceState(history.state, "", withoutJoyIdAnswer(location.href)); } catch { /* keep the answer anyway */ }
   captured = response;
+  answeredOnLoad = true;
+}
+
+/**
+ * A router may put the URL it was served with back while it hydrates (Next.js's app router does, from its
+ * server-rendered state), so the provider strips the answer again before its first fetch. With `router`, the call
+ * goes through the router's own history hook (Next.js patches `history.replaceState` once it has mounted, and skips
+ * calls carrying its `__NA` marker), so the router forgets the old URL too and can't restore it later.
+ */
+export function stripJoyIdAnswerAgain(router = false): void {
+  if (!answeredOnLoad || typeof location === "undefined") return;
+  const clean = withoutJoyIdAnswer(location.href);
+  if (!router && clean === location.pathname + location.search + location.hash) return;
+  try {
+    if (!router) return history.replaceState(history.state, "", clean);
+    const { __NA: _marker, ...state } = (history.state ?? {}) as Record<string, unknown>;
+    history.replaceState(state, "", clean);
+  } catch { /* keep going: the answer was already taken */ }
 }
 
 /** The JoyID answer this page loaded with, once. */
