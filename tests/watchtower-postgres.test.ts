@@ -235,6 +235,33 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     assert.deepEqual({ state: byId[closedId].state, funding_spend: byId[closedId].funding_spend }, { state: "watching", funding_spend: null });
   });
 
+  await t.test("a close that is reorganized away and replaced by a revoked commitment is punished", async () => {
+    const { id, closing } = await revokedChannel(proof.revocationSignature);
+    const cooperative = ccc.Transaction.from({
+      inputs: [{ previousOutput: { txHash: `0x${"f0".repeat(32)}`, index: 0 } }],
+      outputs: [{ capacity: 1000n, lock: userLock }, { capacity: 1000n, lock: userLock }],
+      outputsData: ["0x", "0x"],
+    });
+    let onChain = cooperative;
+    const punished: string[] = [];
+    const chain: ChainView = {
+      fundingHistory: async () => ({ sawOutput: true, spend: { txHash: onChain.hash(), index: 0 } }),
+      transaction: async (hash) => (hash === onChain.hash() ? { tx: onChain, committed: true, status: "committed" } : undefined),
+      isLive: async () => true,
+      spender: async () => undefined,
+    };
+    const pass = () => runWatchtowerPass({ sql, chain, punish: async (row) => { punished.push(row.channel_id); return `0x${"cd".repeat(32)}`; }, log: () => undefined });
+    const state = async () => (await sql<Array<{ state: string }>>`select state from keyway_v2_watchtower_channels where channel_id = ${id}`)[0].state;
+    await pass();
+    assert.equal(await state(), "closed");
+    // A reorganization replaces the cooperative close with the peer's revoked commitment.
+    onChain = closing;
+    await pass(); // the close is found gone: watched again
+    await pass(); // the revoked commitment is found and punished
+    assert.equal(await state(), "penalty-sent");
+    assert.deepEqual(punished, [id]);
+  });
+
   await t.test("unfunded channels are checked from each account in turn", async () => {
     await sql`delete from keyway_v2_watchtower_channels`;
     const flooder = { id: crypto.randomUUID() };
