@@ -252,6 +252,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       for (const txHash of [...claimsToSweep]) {
         if (watchStopped) return;
         const status = (await fundingSigner.client.getTransaction(txHash).catch(() => undefined))?.status;
+        if (watchStopped) return;
         if (status !== "committed") continue;
         claimsToSweep.delete(txHash);
         await sweepNow().catch((error) => console.warn("[keyway] could not sweep the claimed funds yet", error));
