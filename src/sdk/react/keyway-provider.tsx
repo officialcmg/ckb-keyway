@@ -7,10 +7,12 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type ButtonHTMLAttributes,
   type CSSProperties,
   type ReactNode,
 } from "react";
+import * as ccc from "@ckb-ccc/core";
 import { KeyWayApiClient, KeyWayApiError } from "../browser/api-client";
 import { cleanupLegacyDatabases } from "../browser/legacy-cleanup";
 import {
@@ -28,8 +30,28 @@ import type { ApproveFiberChannelOpen, FiberChannelOpenPreview } from "../browse
 import type { ApproveFiberPayment } from "../browser/fiber-payment";
 import type { EmailCodeReason, RequestEmailCode } from "../browser/email-code";
 import { friendlyKeyWayError } from "../browser/friendly-error";
-import { changeRecoveryBackup, enableRecovery, requestBackupChallenge, type ApproveBackupChange, type ApproveRecovery, type BackupChanged, type BackupChangePreview, type RecoveryEnabled, type RecoveryPreview } from "../browser/account-recovery";
+import { changeRecoveryBackup, createJoyIdBackup as createJoyIdBackupWithSigner, enableRecovery, recoveryAccountAddress, requestBackupChallenge, type ApproveBackupChange, type ApproveRecovery, type BackupChanged, type BackupChangePreview, type RecoveryEnabled, type RecoveryPreview } from "../browser/account-recovery";
 import type { RecoveryBackup, RecoveryBackupProof } from "../browser/recovery-backups";
+import {
+  chooseJoyIdTransport,
+  isJoyIdHelperWindow,
+  isReturnPath,
+  joyIdAppUrl,
+  joyIdRecordClient,
+  joyIdStateId,
+  JoyIdCancelledError,
+  resumeJoyIdRedirect,
+  runJoyIdHelper,
+  startJoyIdBackup,
+  stopBrowserNodeForRedirect,
+  takeCapturedJoyIdReturn,
+  takeJoyIdRecord,
+  type JoyIdBackupOptions,
+  type JoyIdHelperStatus,
+  type JoyIdRequestRecord,
+  type JoyIdResponse,
+  type PendingJoyIdBackup,
+} from "../browser/joyid-redirect";
 import { KeyWaySigner, type ApproveCkbMessage, type ApproveCkbTransaction, type MessagePreview, type TransactionPreview } from "../browser/keyway-signer";
 import { KeyWayChannelCloseModal, KeyWayChannelSettingsModal, KeyWayEmailCodeModal, KeyWayFundingModal, KeyWayMessageModal, KeyWayBackupChangeModal, KeyWayPeerModal, KeyWayRecoveryModal, KeyWayTransactionModal } from "./signing-modals";
 import type { ApproveFiberChannelClose, ApproveFiberChannelSettings, ApproveFiberPeer, FiberApprovedAction, FiberChannelClosePreview, FiberChannelSettingsPreview, FiberPeerPreview } from "../browser/fiber-actions";
@@ -81,6 +103,11 @@ export type KeyWayProviderProps = {
   autoStartFiber?: boolean;
   /** Where the user's Fiber node runs: on KeyWay's servers (default) or in this page. */
   fiberNode?: FiberNodeKind;
+  /**
+   * The page on this site JoyID returns to when a JoyID backup can't use JoyID's own window (pages with
+   * `Cross-Origin-Opener-Policy: same-origin`). It must render KeyWayProvider. Defaults to the current page.
+   */
+  joyIdReturnPath?: string;
   onError?: (error: Error) => void;
   /** Reports each step of starting the Fiber node after `useFiber().start()`. */
   onFiberStartup?: (event: FiberStartupEvent) => void;
@@ -118,6 +145,13 @@ export type KeyWayContextValue = {
   changeRecoveryBackup: (change: "add" | "remove", backup: RecoveryBackupProof | RecoveryBackup) => Promise<BackupChanged>;
   /** A fresh nonce from KeyWay that a new backup signs to prove the user controls it. */
   requestBackupChallenge: () => Promise<string>;
+  /** Signs up a JoyID passkey as a backup over the transport the page allows. Call it straight from a click. */
+  createJoyIdBackup: (signer?: ccc.Signer | JoyIdBackupOptions, options?: JoyIdBackupOptions) => Promise<RecoveryBackupProof>;
+  /** A JoyID backup the page came back from JoyID with, while the provider finishes it. */
+  pendingJoyIdBackup?: PendingJoyIdBackup;
+  dismissPendingJoyIdBackup: () => void;
+  /** Counts a Fiber payment or channel change, so the page doesn't leave for JoyID in the middle of one. */
+  trackFiberOperation: <T>(work: () => Promise<T>) => Promise<T>;
 };
 
 const KeyWayContext = createContext<KeyWayContextValue | undefined>(undefined);
@@ -216,6 +250,7 @@ export function KeyWayProvider({
   approveBackupChange,
   autoStartFiber = false,
   fiberNode = "hosted",
+  joyIdReturnPath,
   onError,
   onFiberStartup,
 }: KeyWayProviderProps) {
@@ -238,6 +273,15 @@ export function KeyWayProvider({
   const [user, setUser] = useState<KeyWayUser>();
   const [ready, setReady] = useState(false);
   const [loginOpen, setLoginOpen] = useState(false);
+  // A JoyID window this provider runs in (`?keyway-joyid=`) never restores the session or starts Fiber.
+  const joyIdHelper = useSyncExternalStore(noSubscription, isJoyIdHelperWindow, () => false);
+  const [joyIdHelperStatus, setJoyIdHelperStatus] = useState<JoyIdHelperStatus>("waiting");
+  const [pendingJoyIdBackup, setPendingJoyIdBackup] = useState<PendingJoyIdBackup>();
+  // Holds Fiber autostart while a JoyID answer from a full-page redirect is checked or continued.
+  const [joyIdHold, setJoyIdHold] = useState(false);
+  const joyIdReturnRef = useRef<{ response: JoyIdResponse; record?: JoyIdRequestRecord }>(undefined);
+  const joyIdProofRef = useRef<{ op: JoyIdRequestRecord["op"]; proof: RecoveryBackupProof; otherProofs: RecoveryBackupProof[] }>(undefined);
+  const fiberOperationsRef = useRef(0);
   const transaction = useApproval<TransactionPreview>();
   const message = useApproval<MessagePreview>();
   const recovery = useApproval<RecoveryPreview>();
@@ -404,6 +448,10 @@ export function KeyWayProvider({
   }
 
   useEffect(() => {
+    if (isJoyIdHelperWindow()) {
+      setReady(true);
+      return;
+    }
     let active = true;
     void api.legacyCleanup().then((manifest) => {
       if (manifest.epoch && manifest.prefixes.length) return cleanupLegacyDatabases(manifest);
@@ -482,6 +530,8 @@ export function KeyWayProvider({
       return;
     }
     setLoginOpen(false);
+    // Checking or continuing a JoyID redirect comes first: the page may leave again straight away.
+    if (joyIdHold || isJoyIdHelperWindow()) return;
     let active = true;
     if (autoStartFiber) {
       void connect().catch(() => undefined);
@@ -506,7 +556,56 @@ export function KeyWayProvider({
       connectionRef.current = undefined;
       if (current) void current.keyway.stop();
     };
-  }, [authenticated, authToken, appId, autoStartFiber, fiberNode]);
+  }, [authenticated, authToken, appId, autoStartFiber, fiberNode, joyIdHold]);
+
+  // The JoyID window: hands requests to JoyID and answers back to the tab that opened it.
+  useEffect(() => {
+    if (!isJoyIdHelperWindow()) return;
+    return runJoyIdHelper(setJoyIdHelperStatus);
+  }, []);
+
+  // Back from JoyID after a full-page redirect. The SDK already took the answer out of the address bar when it
+  // loaded; its record is taken (and so deleted) now, before anything uses it.
+  useEffect(() => {
+    if (isJoyIdHelperWindow()) return;
+    const response = takeCapturedJoyIdReturn();
+    if (!response) return;
+    let record: JoyIdRequestRecord | undefined;
+    try { record = takeJoyIdRecord(sessionStorage, joyIdStateId(response.state)); } catch { record = undefined; }
+    joyIdReturnRef.current = { response, record };
+    setJoyIdHold(true);
+    setPendingJoyIdBackup({ operation: joyIdOperation(record), status: "checking" });
+  }, []);
+
+  useEffect(() => {
+    const resumed = joyIdReturnRef.current;
+    if (!resumed || !ready) return;
+    joyIdReturnRef.current = undefined;
+    const { response, record } = resumed;
+    const operation = joyIdOperation(record);
+    const token = authToken;
+    void resumeJoyIdRedirect(response, record, {
+      userId: user?.id,
+      client: record ? joyIdRecordClient(record) : new ccc.ClientPublicTestnet(),
+      requestChallenge: () => {
+        if (!token) throw new Error("Sign in again, then add the JoyID backup");
+        return requestBackupChallenge(token, new KeyWayApiClient({ appId }));
+      },
+    }).then((result) => {
+      if (result.status === "continuing") {
+        setPendingJoyIdBackup({ operation, status: "continuing" });
+        return;
+      }
+      joyIdProofRef.current = { op: result.record.op, proof: result.proof, otherProofs: result.record.otherProofs ?? [] };
+      setPendingJoyIdBackup({ operation, status: "applying" });
+      setJoyIdHold(false);
+    }).catch((cause) => {
+      const failure = cause instanceof Error ? cause : new Error("The JoyID backup couldn't be finished");
+      setPendingJoyIdBackup({ operation, status: failure instanceof JoyIdCancelledError ? "cancelled" : "failed", error: failure });
+      setJoyIdHold(false);
+      if (!(failure instanceof JoyIdCancelledError)) callbacksRef.current.onError?.(failure);
+    });
+  }, [ready]);
 
   const signer = useMemo(() => {
     if (!wallet || !authToken) return undefined;
@@ -538,6 +637,79 @@ export function KeyWayProvider({
     return requestBackupChallenge(authToken, new KeyWayApiClient({ appId }));
   }
 
+  // A JoyID backup proof from a full-page redirect goes into the usual flow: the preview, then the emailed code.
+  useEffect(() => {
+    const job = joyIdProofRef.current;
+    if (!job || !wallet || !authToken) return;
+    joyIdProofRef.current = undefined;
+    const operation = job.op === "backup-add" ? "add" as const : "enable" as const;
+    const work = operation === "add" ? changeBackup("add", job.proof) : turnOnRecovery([...job.otherProofs, job.proof]);
+    void work.then(
+      () => setPendingJoyIdBackup({ operation, status: "done" }),
+      (cause) => {
+        const failure = cause instanceof Error ? cause : new Error("The JoyID backup couldn't be finished");
+        setPendingJoyIdBackup({ operation, status: /cancelled/i.test(failure.message) ? "cancelled" : "failed", error: failure });
+      },
+    );
+  }, [wallet, authToken, pendingJoyIdBackup]);
+
+  /** Before the whole page goes to JoyID: a browser Fiber node stops cleanly, and never in the middle of a payment. */
+  function leaveForJoyId() {
+    const approvals = approvalsRef.current;
+    return stopBrowserNodeForRedirect({
+      kind: fiberNode,
+      busy: fiberOperationsRef.current > 0 || [approvals.funding, approvals.channelClose, approvals.peer, approvals.channelSettings].some((approval) => approval.request),
+      starting: operationRef.current,
+      running: () => Boolean(connectionRef.current),
+      stop: disconnect,
+    });
+  }
+
+  function joyIdBackup(signerOrOptions?: ccc.Signer | JoyIdBackupOptions, maybeOptions?: JoyIdBackupOptions): Promise<RecoveryBackupProof> {
+    const joyIdSigner = isSigner(signerOrOptions) ? signerOrOptions : undefined;
+    const options = (joyIdSigner ? maybeOptions : signerOrOptions as JoyIdBackupOptions | undefined) ?? {};
+    if (!wallet || !authToken || !user) return Promise.reject(new Error("Recover the CKB account before adding a backup"));
+    if (joyIdSigner && joyIdSigner.signType !== ccc.SignerSignType.JoyId) return Promise.reject(new Error("A JoyID backup needs CCC's JoyID signer"));
+    const publicKey = wallet.litPublicKey;
+    const client = joyIdSigner?.client ?? new ccc.ClientPublicTestnet();
+    const account = () => recoveryAccountAddress(publicKey, client);
+    try {
+      const transport = chooseJoyIdTransport(options.transport);
+      if (transport === "popup" && joyIdSigner) {
+        // As before 0.2.7: the app's own CCC JoyID signer, in JoyID's own window.
+        return (async () => createJoyIdBackupWithSigner(await account(), await backupChallenge(), joyIdSigner))();
+      }
+      const named = joyIdSigner as { name?: unknown; icon?: unknown } | undefined;
+      return startJoyIdBackup({
+        client,
+        app: {
+          joyIdAppURL: joyIdAppUrl(client),
+          name: typeof named?.name === "string" && named.name ? named.name : resolvedAppName,
+          logo: typeof named?.icon === "string" && named.icon ? named.icon : appLogo(),
+        },
+        userId: user.id,
+        appId,
+        op: (options.afterRedirect ?? (wallet.recovery ? "add" : "enable")) === "add" ? "backup-add" : "backup-enable",
+        returnPath: joyIdReturnPath ?? `${location.pathname}${location.search}`,
+        account,
+        requestChallenge: backupChallenge,
+        beforeLeaving: leaveForJoyId,
+        options,
+      }, transport);
+    } catch (cause) {
+      return Promise.reject(cause);
+    }
+  }
+
+  async function trackFiberOperation<T>(work: () => Promise<T>): Promise<T> {
+    fiberOperationsRef.current += 1;
+    try {
+      return await work();
+    } finally {
+      fiberOperationsRef.current -= 1;
+    }
+  }
+
   async function changeBackup(change: "add" | "remove", backup: RecoveryBackupProof | RecoveryBackup): Promise<BackupChanged> {
     if (!authToken || !wallet) throw new Error("Sign in before changing backups");
     const result = await settles(changeRecoveryBackup({
@@ -551,6 +723,8 @@ export function KeyWayProvider({
     setWallet((current) => current && current.litPublicKey === wallet.litPublicKey ? { ...current, recovery: result.recovery } : current);
     return result;
   }
+
+  if (joyIdHelper) return <JoyIdHelperScreen theme={theme} appName={resolvedAppName} status={joyIdHelperStatus} />;
 
   return (
     <KeyWayContext.Provider value={{
@@ -576,6 +750,10 @@ export function KeyWayProvider({
       enableRecovery: turnOnRecovery,
       changeRecoveryBackup: changeBackup,
       requestBackupChallenge: backupChallenge,
+      createJoyIdBackup: joyIdBackup,
+      pendingJoyIdBackup,
+      dismissPendingJoyIdBackup: () => setPendingJoyIdBackup(undefined),
+      trackFiberOperation,
     }}>
       {children}
       {loginOpen && !authenticated ? (
@@ -617,6 +795,50 @@ export function KeyWayProvider({
       {channelSettings.request ? <KeyWayChannelSettingsModal theme={theme} appName={resolvedAppName} preview={channelSettings.request.preview} step={channelSettings.request} answer={channelSettings.answer} /> : null}
       {funding.request ? <KeyWayFundingModal theme={theme} appName={resolvedAppName} preview={funding.request.preview} step={funding.request} answer={funding.answer} /> : null}
     </KeyWayContext.Provider>
+  );
+}
+
+const noSubscription = () => () => undefined;
+
+function isSigner(value: unknown): value is ccc.Signer {
+  return Boolean(value) && typeof (value as ccc.Signer).signMessage === "function";
+}
+
+function joyIdOperation(record: JoyIdRequestRecord | undefined): PendingJoyIdBackup["operation"] {
+  return record?.op === "backup-add" ? "add" : "enable";
+}
+
+/** The site's icon for JoyID's screen: the page's own icon link, or /favicon.ico. */
+function appLogo(): string {
+  const link = document.querySelector<HTMLLinkElement>('link[rel~="icon"]');
+  return link?.href || new URL("/favicon.ico", location.origin).href;
+}
+
+const JOYID_HELPER_TEXT: Record<JoyIdHelperStatus, { title: string; copy: (appName: string) => string }> = {
+  waiting: { title: "Opening JoyID", copy: (appName) => `${appName} is preparing the request.` },
+  opening: { title: "Opening JoyID", copy: () => "JoyID opens in this window." },
+  returning: { title: "Back from JoyID", copy: (appName) => `Returning the result to ${appName}. This window closes by itself.` },
+  done: { title: "Done", copy: () => "You can close this window." },
+  unknown: { title: "Nothing to do here", copy: (appName) => `This window isn't waiting for JoyID any more. Close it and try again in ${appName}.` },
+};
+
+/** What the JoyID window shows between JoyID's pages. The app's own page isn't rendered in it. */
+function JoyIdHelperScreen({ theme, appName, status }: { theme: "light" | "dark"; appName: string; status: JoyIdHelperStatus }) {
+  const text = JOYID_HELPER_TEXT[status];
+  return (
+    <Shell theme={theme} labelId="keyway-joyid-title" width={420}>
+      {(palette) => (
+        <>
+          <p style={{ ...modalEyebrow, color: palette.muted }}>{appName}</p>
+          <h2 id="keyway-joyid-title" style={modalTitle}>{text.title}</h2>
+          <p role="status" style={{ ...modalCopy, color: palette.muted }}>{text.copy(appName)}</p>
+          {status === "done" || status === "unknown" ? (
+            <button type="button" style={{ ...modalButton, borderColor: palette.border, color: palette.text }} onClick={() => window.close()}>Close window</button>
+          ) : null}
+          <p style={{ ...modalFootnote, color: palette.subtle }}>Secured by <strong>CKB KeyWay</strong></p>
+        </>
+      )}
+    </Shell>
   );
 }
 

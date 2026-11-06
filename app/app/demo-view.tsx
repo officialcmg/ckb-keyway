@@ -52,7 +52,18 @@ export type DemoModel = {
 };
 
 export type DemoBackup = { kind: "evm" | "joyid"; address: string };
-export type DemoRecovery = { status: "on" | "off"; backups: DemoBackup[]; legacyAddress?: string };
+/** Where a JoyID backup is: connecting JoyID, waiting for its signature, or leaving the page for JoyID. */
+export type JoyIdStage = "connecting" | "signing" | "leaving";
+/** A JoyID backup the page came back from JoyID with, while the SDK finishes it. */
+export type DemoPendingJoyId = { operation?: "enable" | "add"; status: "checking" | "continuing" | "applying" | "done" | "cancelled" | "failed"; error?: string };
+export type DemoRecovery = {
+  status: "on" | "off";
+  backups: DemoBackup[];
+  legacyAddress?: string;
+  /** Whether the SDK in use can add a JoyID backup on this page. */
+  joyId?: boolean;
+  pendingJoyId?: DemoPendingJoyId;
+};
 
 export type InvoiceCheck = { amount: bigint; unit: Unit; description?: string; fee?: bigint; error?: string };
 export type CreatedInvoice = { address: string; amount: bigint; description?: string; createdAt: number; paymentHash: string };
@@ -76,6 +87,10 @@ export type DemoActions = {
   /** Turns recovery on with the EVM wallet in this browser as the first backup. */
   enableRecovery?: () => Promise<void>;
   addEvmBackup?: () => Promise<void>;
+  /** Turns recovery on with a JoyID passkey. Must start JoyID straight from the click. */
+  enableRecoveryWithJoyId?: (onStage: (stage: JoyIdStage) => void, signal: AbortSignal) => Promise<void>;
+  addJoyIdBackup?: (onStage: (stage: JoyIdStage) => void, signal: AbortSignal) => Promise<void>;
+  dismissPendingJoyId?: () => void;
   removeBackup?: (backup: DemoBackup) => Promise<void>;
 };
 
@@ -330,17 +345,60 @@ function SignerCard({ actions }: { actions: DemoActions }) {
   );
 }
 
+const JOYID_STAGE_LABELS: Record<JoyIdStage, string> = {
+  connecting: "Connecting JoyID…",
+  signing: "Waiting for JoyID…",
+  leaving: "Opening JoyID…",
+};
+
+const PENDING_JOYID_TEXT: Record<Exclude<DemoPendingJoyId["status"], "failed">, string> = {
+  checking: "Checking JoyID's signature…",
+  continuing: "Opening JoyID to sign…",
+  applying: "Approve the JoyID backup, then enter the code we email you.",
+  done: "JoyID is now a backup for this account.",
+  cancelled: "Cancelled. Nothing changed.",
+};
+
 function RecoveryCard({ recovery, actions }: { recovery: DemoRecovery; actions: DemoActions }) {
   const [busy, setBusy] = useState<string>();
+  const [joyIdStage, setJoyIdStage] = useState<JoyIdStage>();
   const [error, setError] = useState<string>();
+  const [cancelled, setCancelled] = useState(false);
+  const abort = useRef<AbortController | undefined>(undefined);
   const on = recovery.status === "on";
+  const pending = recovery.pendingJoyId;
+  const joyId = Boolean(recovery.joyId && (on ? actions.addJoyIdBackup : actions.enableRecoveryWithJoyId));
 
   async function run(label: string, task?: () => Promise<void>) {
     if (!task) return;
     setBusy(label);
     setError(undefined);
-    try { await task(); } catch (cause) { setError(cause instanceof Error ? cause.message : "Something went wrong"); } finally { setBusy(undefined); }
+    setCancelled(false);
+    actions.dismissPendingJoyId?.();
+    try {
+      await task();
+    } catch (cause) {
+      const text = cause instanceof Error ? cause.message : "Something went wrong";
+      if (/cancelled/i.test(text)) setCancelled(true);
+      else setError(text);
+    } finally {
+      setBusy(undefined);
+      setJoyIdStage(undefined);
+      abort.current = undefined;
+    }
   }
+
+  // JoyID's window has to open in the click itself, so the action starts before anything is awaited.
+  function runJoyId(label: string, task?: (onStage: (stage: JoyIdStage) => void, signal: AbortSignal) => Promise<void>) {
+    if (!task) return;
+    const controller = new AbortController();
+    abort.current = controller;
+    void run(label, () => task(setJoyIdStage, controller.signal));
+  }
+
+  const blocked = Boolean(busy) || pending?.status === "checking" || pending?.status === "continuing" || pending?.status === "applying";
+  const joyIdLabel = (idle: string) => busy?.startsWith("joyid") ? JOYID_STAGE_LABELS[joyIdStage ?? "connecting"] : idle;
+  const waitingForJoyId = busy?.startsWith("joyid") && joyIdStage !== "leaving";
 
   return (
     <section className="card demo-card demo-card--16">
@@ -356,25 +414,47 @@ function RecoveryCard({ recovery, actions }: { recovery: DemoRecovery; actions: 
                 <span className="demo-backups__kind">{backup.kind === "evm" ? "EVM wallet" : "JoyID"}</span>
                 <span className="demo-backups__address">{backup.address}</span>
                 {recovery.backups.length > 1 && (
-                  <button type="button" className={`text-button${busy === backup.address ? " btn--busy" : ""}`} disabled={Boolean(busy)} onClick={() => void run(backup.address, actions.removeBackup && (() => actions.removeBackup!(backup)))}>Remove</button>
+                  <button type="button" className={`text-button${busy === backup.address ? " btn--busy" : ""}`} disabled={blocked} onClick={() => void run(backup.address, actions.removeBackup && (() => actions.removeBackup!(backup)))}>Remove</button>
                 )}
               </li>
             ))}
           </ul>
-          <button type="button" className={`btn btn--outline demo-card__action${busy === "add" ? " btn--busy" : ""}`} disabled={Boolean(busy)} onClick={() => void run("add", actions.addEvmBackup)}>
-            {busy === "add" ? "Waiting for approval…" : "Add an EVM wallet"}
-          </button>
+          <div className="demo-buttons">
+            <button type="button" className={`btn btn--outline${busy === "add" ? " btn--busy" : ""}`} disabled={blocked} onClick={() => void run("add", actions.addEvmBackup)}>
+              {busy === "add" ? "Waiting for approval…" : "Add an EVM wallet"}
+            </button>
+            {joyId && (
+              <button type="button" className={`btn btn--outline${busy === "joyid-add" ? " btn--busy" : ""}`} disabled={blocked} onClick={() => runJoyId("joyid-add", actions.addJoyIdBackup)}>
+                {busy === "joyid-add" ? joyIdLabel("Add JoyID") : "Add JoyID"}
+              </button>
+            )}
+          </div>
           {recovery.legacyAddress && <p className="demo-card__muted demo-backups__old">Earlier address: <span className="demo-card__code">{shortHash(recovery.legacyAddress)}</span>. Funds sent there move here when you sign in.</p>}
         </>
       ) : (
         <>
-          <p className="demo-card__body">Name an EVM wallet that can move everything in this account if KeyWay is ever gone. Turning this on changes your address once and locks 165 CKB for the backup list.</p>
-          <button type="button" className={`btn btn--route demo-card__action${busy === "enable" ? " btn--busy" : ""}`} disabled={Boolean(busy)} onClick={() => void run("enable", actions.enableRecovery)}>
-            {busy === "enable" ? "Waiting for approval…" : "Turn on with an EVM wallet"}
-          </button>
-          <p className="demo-card__muted demo-backups__old">Your EVM wallet signs to prove it&apos;s yours, then you approve and enter the code we email you.</p>
+          <p className="demo-card__body">Name {joyId ? "an EVM wallet or a JoyID passkey" : "an EVM wallet"} that can move everything in this account if KeyWay is ever gone. Turning this on changes your address once and locks 165 CKB for the backup list.</p>
+          <div className="demo-buttons">
+            <button type="button" className={`btn btn--route${busy === "enable" ? " btn--busy" : ""}`} disabled={blocked} onClick={() => void run("enable", actions.enableRecovery)}>
+              {busy === "enable" ? "Waiting for approval…" : "Turn on with an EVM wallet"}
+            </button>
+            {joyId && (
+              <button type="button" className={`btn btn--outline${busy === "joyid-enable" ? " btn--busy" : ""}`} disabled={blocked} onClick={() => runJoyId("joyid-enable", actions.enableRecoveryWithJoyId)}>
+                {busy === "joyid-enable" ? joyIdLabel("Turn on with JoyID") : "Turn on with JoyID"}
+              </button>
+            )}
+          </div>
+          <p className="demo-card__muted demo-backups__old">{joyId
+            ? "The backup signs to prove it\u2019s yours, then you approve and enter the code we email you. The first time, JoyID asks twice: once to connect, once to sign."
+            : <>Your EVM wallet signs to prove it&apos;s yours, then you approve and enter the code we email you.</>}</p>
         </>
       )}
+      {waitingForJoyId && (
+        <p className="demo-card__muted demo-backups__old" role="status">Finish in the JoyID window. <button type="button" className="text-button" onClick={() => abort.current?.abort()}>Cancel</button></p>
+      )}
+      {!busy && pending && pending.status !== "failed" && <p className="demo-card__muted demo-backups__old" role="status">{PENDING_JOYID_TEXT[pending.status]}</p>}
+      {!busy && pending?.status === "failed" && <p className="field-error"><AlertIcon />{pending.error ?? "The JoyID backup couldn't be finished."}</p>}
+      {cancelled && <p className="demo-card__muted demo-backups__old" role="status">Cancelled. Nothing changed.</p>}
       {error && <p className="field-error"><AlertIcon />{error}</p>}
     </section>
   );

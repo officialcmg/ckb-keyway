@@ -1,15 +1,16 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { createEvmBackup, createJoyIdBackup, recoveryAccountAddress, type EthereumProvider } from "../browser/account-recovery";
+import { createEvmBackup, recoveryAccountAddress, type EthereumProvider } from "../browser/account-recovery";
 import { getCkbAccountBalance } from "../browser/ckb-balance";
 import type { RecoveryBackup, RecoveryBackupProof } from "../browser/recovery-backups";
+import type { JoyIdBackupOptions } from "../browser/joyid-redirect";
 import type * as ccc from "@ckb-ccc/core";
 import type { KeyWay, KeyWayChannel, OpenKeyWayChannelOptions, ChannelOpenProgress } from "../browser/create-keyway";
 import { useKeyWayContext } from "./keyway-provider";
 
 export function useCkbWallet() {
-  const { authenticated, wallet, signer, error: recoveryError, enableRecovery, changeRecoveryBackup, requestBackupChallenge } = useKeyWayContext();
+  const { authenticated, wallet, signer, error: recoveryError, enableRecovery, changeRecoveryBackup, requestBackupChallenge, createJoyIdBackup, pendingJoyIdBackup, dismissPendingJoyIdBackup } = useKeyWayContext();
   const [balance, setBalance] = useState<bigint>();
   const [balanceError, setBalanceError] = useState<Error>();
   const [refreshing, setRefreshing] = useState(false);
@@ -77,17 +78,27 @@ export function useCkbWallet() {
         if (!wallet) throw new Error("Recover the CKB account before adding a backup");
         return createEvmBackup(await recoveryAccountAddress(wallet.litPublicKey), await requestBackupChallenge(), ethereum);
       },
-      /** Asks a CCC JoyID signer (from @ckb-ccc/joy-id) to sign up as a backup with its passkey. */
-      createJoyIdBackup: async (joyIdSigner: ccc.Signer) => {
-        if (!wallet) throw new Error("Recover the CKB account before adding a backup");
-        return createJoyIdBackup(await recoveryAccountAddress(wallet.litPublicKey, joyIdSigner.client), await requestBackupChallenge(), joyIdSigner);
-      },
+      /**
+       * Asks a JoyID passkey to sign up as a backup. Call it straight from the user's click. With a CCC JoyID signer
+       * (from @ckb-ccc/joy-id) on a page that isn't cross-origin isolated, that signer's JoyID window signs, as
+       * before. Without one, or on a page that sends `Cross-Origin-Opener-Policy: same-origin`, KeyWay reaches
+       * JoyID through a window on this site, or a full-page redirect when that window can't open (`transport`).
+       * A first-time JoyID asks the user twice: once to connect, once to sign. After a full-page redirect this
+       * promise never settles; the provider finishes the backup when the page returns (`pendingJoyIdBackup`).
+       */
+      createJoyIdBackup: (signer?: ccc.Signer | JoyIdBackupOptions, options?: JoyIdBackupOptions) => createJoyIdBackup(signer, options),
+      /**
+       * A JoyID backup the page came back from JoyID with, after a full-page redirect. The provider shows the usual
+       * approval and emailed code; this says how it went.
+       */
+      pendingJoyIdBackup,
+      dismissPendingJoyIdBackup,
     },
   };
 }
 
 export function useFiber() {
-  const { connection, startFiber, stopFiber, fiberStarting, fiberError, fiberNode, fiberStartupStage } = useKeyWayContext();
+  const { connection, startFiber, stopFiber, fiberStarting, fiberError, fiberNode, fiberStartupStage, trackFiberOperation } = useKeyWayContext();
   const connectionRef = useRef(connection);
   connectionRef.current = connection;
   const [channels, setChannels] = useState<KeyWayChannel[]>([]);
@@ -132,26 +143,33 @@ export function useFiber() {
     return () => { ++generation.current; clearInterval(timer); };
   }, [connection]);
 
-  async function openChannel(options: OpenKeyWayChannelOptions = {}, onProgress?: ChannelOpenProgress) {
-    const current = client();
-    const result = await current.activateCkbChannel(options, onProgress);
-    await current.waitForChannelReady(result.channelId, { timeout: 180_000, interval: 3_000 });
-    await refreshChannels().catch(() => undefined);
-    return result;
+  // Tracked, so a full-page JoyID redirect waits for them instead of stopping the node in the middle.
+  function openChannel(options: OpenKeyWayChannelOptions = {}, onProgress?: ChannelOpenProgress) {
+    return trackFiberOperation(async () => {
+      const current = client();
+      const result = await current.activateCkbChannel(options, onProgress);
+      await current.waitForChannelReady(result.channelId, { timeout: 180_000, interval: 3_000 });
+      await refreshChannels().catch(() => undefined);
+      return result;
+    });
   }
 
-  async function closeChannel(...args: Parameters<KeyWay["closeChannel"]>) {
-    await client().closeChannel(...args);
-    await refreshChannels().catch(() => undefined);
+  function closeChannel(...args: Parameters<KeyWay["closeChannel"]>) {
+    return trackFiberOperation(async () => {
+      await client().closeChannel(...args);
+      await refreshChannels().catch(() => undefined);
+    });
   }
 
-  async function payInvoice(invoice: string, options: Omit<Parameters<KeyWay["sendPayment"]>[0], "invoice"> = {}) {
-    const current = client();
-    const payment = await current.sendPayment({ ...options, invoice });
-    const result = await current.waitForPayment(payment.payment_hash, { timeout: 120_000 });
-    if (result.status !== "Success") throw new Error(result.failed_error ?? "Fiber payment failed");
-    await refreshChannels().catch(() => undefined);
-    return result;
+  function payInvoice(invoice: string, options: Omit<Parameters<KeyWay["sendPayment"]>[0], "invoice"> = {}) {
+    return trackFiberOperation(async () => {
+      const current = client();
+      const payment = await current.sendPayment({ ...options, invoice });
+      const result = await current.waitForPayment(payment.payment_hash, { timeout: 120_000 });
+      if (result.status !== "Success") throw new Error(result.failed_error ?? "Fiber payment failed");
+      await refreshChannels().catch(() => undefined);
+      return result;
+    });
   }
 
   return {
