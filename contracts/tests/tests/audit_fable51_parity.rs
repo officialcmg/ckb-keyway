@@ -73,17 +73,22 @@ fn valid_blob(msg: &[u8; 32]) -> (Vec<u8>, [u8; 20]) {
     blob.extend(&auth_data);
     blob.extend((client_data.len() as u16).to_le_bytes());
     blob.extend(client_data.as_bytes());
-    (blob, joyid_webauthn::blake160(&public_key))
+    (blob, joyid_webauthn::salted_id(&joyid_webauthn::blake160(&public_key), &SALT))
 }
+
+/// A stand-in account salt (the AdminList type hash the verifier reads from the running Omnilock's args).
+const SALT: [u8; 32] = [0x77; 32];
 
 #[test]
 fn a_valid_blob_verifies_only_for_its_approval() {
     let msg = [0x8au8; 32];
     let (blob, pubkey_hash) = valid_blob(&msg);
-    assert_eq!(verify(&pubkey_hash, &approval(&msg), &blob), Ok(()));
+    assert_eq!(verify(&pubkey_hash, &SALT, &approval(&msg), &blob), Ok(()));
+    // The same blob for another account (salt) is refused at the key binding.
+    assert_eq!(verify(&pubkey_hash, &[0x78; 32], &approval(&msg), &blob), Err(Error::PublicKeyHash));
     let mut other = msg;
     other[0] ^= 1;
-    assert_eq!(verify(&pubkey_hash, &approval(&other), &blob), Err(Error::Challenge));
+    assert_eq!(verify(&pubkey_hash, &SALT, &approval(&other), &blob), Err(Error::Challenge));
 }
 
 /// xorshift, so the run is reproducible without a dependency.
@@ -115,7 +120,7 @@ fn random_mutations_of_a_valid_blob_never_panic_and_never_verify() {
         }
         if mutated.len() > 1024 { mutated.truncate(1024); }
         let text = approval(&msg);
-        let result = std::panic::catch_unwind(|| verify(&pubkey_hash, &text, &mutated));
+        let result = std::panic::catch_unwind(|| verify(&pubkey_hash, &SALT, &text, &mutated));
         let result = result.expect("verify must not panic");
         if mutated != blob {
             // The signature covers the public key hash, authenticatorData and clientDataJSON; the only

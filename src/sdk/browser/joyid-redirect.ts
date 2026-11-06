@@ -444,6 +444,9 @@ function newRecord(run: JoyIdBackupRun, transport: "window" | "redirect", step: 
     logo: run.app.logo,
     expiresAt: Date.now() + AUTH_TTL_MS,
     returnPath: run.returnPath,
+    // Turning recovery on with other backups: they ride every step, so a connect step that leaves the page still
+    // hands them to the sign step it continues to.
+    ...(run.options.otherBackups?.length ? { otherProofs: run.options.otherBackups } : {}),
     ...extra,
   };
 }
@@ -456,7 +459,6 @@ async function signRecord(run: JoyIdBackupRun, transport: "window" | "redirect",
     joyIdAddress,
     challengeNonce,
     expiresAt: Number.isFinite(expiresAt) ? expiresAt : Date.now() + AUTH_TTL_MS,
-    ...(run.options.otherBackups?.length ? { otherProofs: run.options.otherBackups } : {}),
   });
 }
 

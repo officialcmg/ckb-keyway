@@ -7,6 +7,8 @@ import { keccak_256 } from "@noble/hashes/sha3.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import * as backups from "../src/sdk/browser/recovery-backups.ts";
 import {
+  accountSalt,
+  saltedBackupId,
   backupAuth,
   backupChallengeExpiry,
   ckbSecp256k1Auth,
@@ -69,29 +71,51 @@ async function joyIdWallet() {
   return { address, lock, sign, publicKey };
 }
 
-test("encodes each backup as its 21-byte Omnilock exec auth", async () => {
+test("encodes each backup as its 21-byte Omnilock exec auth, salted with the account's AdminList type hash", async () => {
   const evm = evmWallet();
-  // 0xFD (exec) ‖ blake160 of the 62-byte preimage naming the EVM verifier and the address.
-  const evmImage = evmPreimage(evm.address.toUpperCase().replace("0X", "0x"));
-  assert.equal(evmImage, ccc.hexFrom(ccc.bytesConcat(EVM_PERSONAL_SIGN_VERIFIER.codeHash, [0x02, 0x00], new Uint8Array(8), evm.address)));
-  assert.equal(evmBackupAuth(evm.address.toUpperCase().replace("0X", "0x")), `0xfd${ccc.hashCkbShort(evmImage).slice(2)}`);
+  const salt = ccc.hexFrom(new Uint8Array(32).fill(0x5a));
+  const other = ccc.hexFrom(new Uint8Array(32).fill(0xa5));
+  // 0xFD (exec) ‖ blake160 of the 62-byte preimage naming the EVM verifier and blake160(address ‖ salt).
+  const evmImage = evmPreimage(evm.address.toUpperCase().replace("0X", "0x"), salt);
+  const saltedAddress = ccc.hashCkbShort(ccc.bytesConcat(evm.address, salt));
+  assert.equal(saltedBackupId(evm.address, salt), ccc.hexFrom(saltedAddress));
+  assert.equal(evmImage, ccc.hexFrom(ccc.bytesConcat(EVM_PERSONAL_SIGN_VERIFIER.codeHash, [0x02, 0x00], new Uint8Array(8), saltedAddress)));
+  assert.ok(!evmImage.includes(evm.address.slice(2)), "the address itself isn't in the preimage");
+  assert.equal(evmBackupAuth(evm.address.toUpperCase().replace("0X", "0x"), salt), `0xfd${ccc.hashCkbShort(evmImage).slice(2)}`);
+  // Another account (salt) gives the same wallet an unrelated identity.
+  assert.notEqual(evmBackupAuth(evm.address, salt), evmBackupAuth(evm.address, other));
   // Flag 0x12's opaque "CKB transaction: 0x…" approval is gone.
   assert.ok(!("OMNILOCK_AUTH_ETHEREUM_DISPLAYING" in backups) && !("evmOmnilockMessage" in backups));
   const joy = await joyIdWallet();
-  // 0xFD (exec) ‖ blake160 of the 62-byte preimage naming the verifier and the passkey's key hash.
-  const preimage = joyIdPreimage(ccc.hashCkbShort(joy.publicKey));
-  assert.equal(preimage, ccc.hexFrom(ccc.bytesConcat(JOYID_WEBAUTHN_VERIFIER.codeHash, [0x02, 0x00], new Uint8Array(8), ccc.hashCkbShort(joy.publicKey))));
+  // 0xFD (exec) ‖ blake160 of the 62-byte preimage naming the verifier and blake160(passkey key hash ‖ salt).
+  const preimage = joyIdPreimage(ccc.hashCkbShort(joy.publicKey), salt);
+  const saltedKey = ccc.hashCkbShort(ccc.bytesConcat(ccc.hashCkbShort(joy.publicKey), salt));
+  assert.equal(preimage, ccc.hexFrom(ccc.bytesConcat(JOYID_WEBAUTHN_VERIFIER.codeHash, [0x02, 0x00], new Uint8Array(8), saltedKey)));
   assert.equal(ccc.bytesFrom(preimage).length, 62);
-  assert.equal(joyIdBackupAuth(joy.lock), `0xfd${ccc.hashCkbShort(preimage).slice(2)}`);
-  assert.equal(execAuth(preimage), joyIdBackupAuth(joy.lock));
-  assert.equal(await backupAuth(client, { kind: "joyid", address: joy.address }), joyIdBackupAuth(joy.lock));
-  assert.equal(await backupAuth(client, { kind: "evm", address: evm.address }), evmBackupAuth(evm.address));
+  assert.equal(joyIdBackupAuth(joy.lock, salt), `0xfd${ccc.hashCkbShort(preimage).slice(2)}`);
+  assert.equal(execAuth(preimage), joyIdBackupAuth(joy.lock, salt));
+  assert.notEqual(joyIdBackupAuth(joy.lock, salt), joyIdBackupAuth(joy.lock, other));
+  assert.equal(await backupAuth(client, { kind: "joyid", address: joy.address }, salt), joyIdBackupAuth(joy.lock, salt));
+  assert.equal(await backupAuth(client, { kind: "evm", address: evm.address }, salt), evmBackupAuth(evm.address, salt));
   const publicKey = ccc.hexFrom(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true));
   assert.equal(ckbSecp256k1Auth(publicKey), `0x00${ccc.hashCkbShort(publicKey).slice(2)}`);
   // Not JoyID: a secp256k1 address, and a JoyID lock that isn't a main key.
-  await assert.rejects(() => backupAuth(client, { kind: "joyid", address: ACCOUNT }), /isn't a JoyID address/);
+  await assert.rejects(() => backupAuth(client, { kind: "joyid", address: ACCOUNT }, salt), /isn't a JoyID address/);
   const subKey = ccc.Address.fromScript(ccc.Script.from({ ...joy.lock, args: `0x0002${joy.lock.args.slice(6)}` }), client).toString();
-  await assert.rejects(() => backupAuth(client, { kind: "joyid", address: subKey }), /main key/);
+  await assert.rejects(() => backupAuth(client, { kind: "joyid", address: subKey }, salt), /main key/);
+  // The salt must be 32 bytes and the id 20.
+  assert.throws(() => saltedBackupId(evm.address, "0x1234"), /salt must be 32 bytes/);
+  assert.throws(() => saltedBackupId("0x1234", salt), /20 bytes/);
+});
+
+test("reads an account's salt from its Omnilock args as the verifiers do", () => {
+  const typeHash = ccc.hexFrom(new Uint8Array(32).fill(0x33));
+  const args = ccc.hexFrom(ccc.bytesConcat([0x00], new Uint8Array(20).fill(0x22), [0x01], typeHash));
+  assert.equal(accountSalt(args), typeHash);
+  // Owner mode, other Omnilock flags or another length: not a KeyWay account.
+  for (const bad of [ccc.hexFrom(ccc.bytesConcat(ccc.bytesFrom(args).slice(0, 21), [0x00], typeHash)), ccc.hexFrom(ccc.bytesConcat(ccc.bytesFrom(args).slice(0, 21), [0x03], typeHash)), args.slice(0, -2), `${args}00`, "0x"]) {
+    assert.throws(() => accountSalt(bad), /isn't a KeyWay recovery account's lock/);
+  }
 });
 
 test("matches JoyID's own main-key lock args for a known public key", () => {
@@ -159,7 +183,7 @@ test("builds the admin witness lock the spike used on chain", () => {
   const lock = omnilockAdminWitnessLock({ signature, auth: "0x0079af2d8dbb19362ec15a4acc3c026c2386e0ffa2", proof: "0x4c4f00" });
   assert.equal(lock, `0x9200000010000000550000009200000041000000${signature.slice(2)}3d0000000c000000210000000079af2d8dbb19362ec15a4acc3c026c2386e0ffa21c00000008000000140000000c0000000d00000003030000004c4f00`);
   // An exec (JoyID) backup also carries its 62-byte preimage, as Bytes, in the third field.
-  const preimage = joyIdPreimage(new Uint8Array(20).fill(0x11));
+  const preimage = joyIdPreimage(new Uint8Array(20).fill(0x11), new Uint8Array(32).fill(0x5a));
   const exec = ccc.bytesFrom(omnilockAdminWitnessLock({ signature: new Uint8Array(768), auth: execAuth(preimage), proof: "0x4c4f00", preimage }));
   assert.equal(exec.length, 146 + 768 - 65 + 4 + 62);
   assert.equal(ccc.hexFrom(exec.slice(-62)), preimage);
@@ -179,4 +203,11 @@ test("an EVM backup's approval signature is version ‖ network ‖ r ‖ s ‖ 
   assert.equal(ccc.hexFrom(blob.slice(2)), normalized);
   assert.equal(ccc.bytesFrom(evmApprovalSignature(1, signature))[1], 1);
   assert.throws(() => evmSignature("0x00"), /65 bytes/);
+});
+
+test("the SDK names exactly the verifier binaries in contracts/build", async () => {
+  const { readFileSync } = await import("node:fs");
+  const hash = (name: string) => ccc.hashCkb(readFileSync(new URL(`../contracts/build/${name}`, import.meta.url)));
+  assert.equal(EVM_PERSONAL_SIGN_VERIFIER.codeHash, hash("evm-personal-sign"));
+  assert.equal(JOYID_WEBAUTHN_VERIFIER.codeHash, hash("joyid-webauthn"));
 });

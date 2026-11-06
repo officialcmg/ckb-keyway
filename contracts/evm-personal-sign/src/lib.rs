@@ -2,26 +2,28 @@
 //!
 //! Omnilock execs this binary with one argument, the ckb-auth exec convention: lowercase hex fields
 //! `code_hash:hash_type:pubkey_hash:msg:signature` joined by `:`. `msg` is the lock group's sighash_all and
-//! `pubkey_hash` is the last 20 bytes of the identity's preimage, here the EVM address. The binary exits 0 only
-//! when that address personal_signed (EIP-191) KeyWay's readable approval for this transaction
+//! `pubkey_hash` is the last 20 bytes of the identity's preimage: `blake160(EVM address ‖ salt)`, the salt being
+//! the AdminList type hash in the running Omnilock's args (`keyway_approval::account_salt`), so the same address
+//! has an unrelated identity in every account and the identity doesn't name the address. The binary exits 0
+//! only when an address giving `pubkey_hash` with this account's salt personal_signed (EIP-191) KeyWay's readable approval for this transaction
 //! (`keyway_approval`), which the binary rebuilds from the transaction itself.
 #![no_std]
 
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
-pub use keyway_approval::{ApprovalError, Network, MAX_TEXT};
+pub use keyway_approval::{account_salt, blake160, salted_id, ApprovalError, Network, MAX_TEXT};
 use sha3::{Digest, Keccak256};
 
 pub const SIGNATURE_VERSION: u8 = 1;
 /// version ‖ network ‖ r ‖ s ‖ v.
 pub const SIGNATURE_LENGTH: usize = 1 + 1 + 65;
 
-/// Exit codes. Omnilock's own codes stay below 100; the approval's are 110–113.
+/// Exit codes. Omnilock's own codes stay below 100; the approval's are 110–114.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i8)]
 pub enum Error {
     /// The exec argument isn't five hex fields of the expected lengths.
     Args = 100,
-    /// The signature doesn't recover to the identity's address.
+    /// The signature recovers to an address whose salted hash isn't the identity's.
     Address = 101,
     /// The signature's version, length or v is wrong.
     Encoding = 102,
@@ -31,6 +33,7 @@ pub enum Error {
     Shape = 111,
     TooLong = 112,
     Syscall = 113,
+    Account = 114,
 }
 
 impl From<ApprovalError> for Error {
@@ -40,13 +43,15 @@ impl From<ApprovalError> for Error {
             ApprovalError::Shape => Error::Shape,
             ApprovalError::TooLong => Error::TooLong,
             ApprovalError::Syscall => Error::Syscall,
+            ApprovalError::Account => Error::Account,
         }
     }
 }
 
 /// The parsed exec argument.
 pub struct Argument {
-    pub address: [u8; 20],
+    /// `blake160(address ‖ salt)`.
+    pub pubkey_hash: [u8; 20],
     pub msg: [u8; 32],
     pub network: Network,
     /// r ‖ s ‖ recovery id 0 or 1.
@@ -59,12 +64,12 @@ pub fn parse_argument(argument: &[u8]) -> Result<Argument, Error> {
     let mut fields = argument.split(|&byte| byte == b':');
     let mut code_hash = [0u8; 32];
     let mut hash_type = [0u8; 1];
-    let mut address = [0u8; 20];
+    let mut pubkey_hash = [0u8; 20];
     let mut msg = [0u8; 32];
     let mut blob = [0u8; SIGNATURE_LENGTH];
     decode_exact(fields.next(), &mut code_hash)?;
     decode_exact(fields.next(), &mut hash_type)?;
-    decode_exact(fields.next(), &mut address)?;
+    decode_exact(fields.next(), &mut pubkey_hash)?;
     decode_exact(fields.next(), &mut msg)?;
     let field = fields.next().ok_or(Error::Args)?;
     if fields.next().is_some() {
@@ -85,7 +90,7 @@ pub fn parse_argument(argument: &[u8]) -> Result<Argument, Error> {
         1 | 28 => 1,
         _ => return Err(Error::Encoding),
     };
-    Ok(Argument { address, msg, network, signature })
+    Ok(Argument { pubkey_hash, msg, network, signature })
 }
 
 /// keccak256("\x19Ethereum Signed Message:\n" ‖ decimal length ‖ text).
@@ -121,9 +126,11 @@ pub fn recover_address(digest: &[u8; 32], signature: &[u8; 65]) -> Result<[u8; 2
     Ok(address)
 }
 
-/// Checks the signature over `text` (the approval the transaction is rebuilt into) against the address.
-pub fn verify(argument: &Argument, text: &[u8]) -> Result<(), Error> {
-    if recover_address(&personal_sign_digest(text), &argument.signature)? != argument.address {
+/// Checks the signature over `text` (the approval the transaction is rebuilt into): the address it recovers to,
+/// salted with the account's `salt`, must be the identity's pubkey hash.
+pub fn verify(argument: &Argument, salt: &[u8; 32], text: &[u8]) -> Result<(), Error> {
+    let address = recover_address(&personal_sign_digest(text), &argument.signature)?;
+    if salted_id(&address, salt) != argument.pubkey_hash {
         return Err(Error::Address);
     }
     Ok(())
