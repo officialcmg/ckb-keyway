@@ -107,13 +107,16 @@ Both accept every other `<button>` prop.
 
 ## Silent signing
 
-Each approval prop replaces KeyWay's dialog with your app's answer. An app that returns `true` signs without showing a dialog:
+Each approval prop replaces KeyWay's dialog with your app's answer. An app that returns `true` signs without showing a dialog. This one signs plain CKB transfers of up to 100 CKB silently and cancels anything else:
 
 ```tsx
 <KeyWayProvider
   appId="keyway_..."
-  approveCkbTransaction={(preview) => Number(preview.sendingCkb) <= 100 && preview.tokens.length === 0 && preview.nfts.length === 0 && preview.unrecognized.length === 0}
-  approveCkbMessage={() => true}
+  approveCkbTransaction={(preview) =>
+    Number(preview.sendingCkb) <= 100 &&
+    // No cell with a type script: no tokens, NFTs, Nervos DAO or other contracts.
+    [...preview.details.inputs, ...preview.details.outputs].every((cell) => !cell.type)
+  }
 >
   <App />
 </KeyWayProvider>
