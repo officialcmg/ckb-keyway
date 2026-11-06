@@ -6,6 +6,8 @@
  * commitment, then fail with "TransactionFailedToResolve" and never reach the chain. Fiber 0.9.1's testnet
  * config uses 0x12c569a2…:0, which is live, so KeyWay swaps it in before the node starts.
  */
+import { withWatchtower, withWorkerShim, workerShimSource } from "./watchtower-bridge";
+
 type FiberWasmInstance = {
   start(config: string, fiberKeyPair: Uint8Array, ckbSecretKey?: Uint8Array, chainSpec?: string, logLevel?: "trace" | "debug" | "info" | "error", databasePrefix?: string): Promise<void>;
   stop(): Promise<void>;
@@ -23,8 +25,11 @@ export function withFiberContracts(config: string, network: "testnet" | "mainnet
   return config.replaceAll(CKB_AUTH_CELL.wrong, CKB_AUTH_CELL.testnet);
 }
 
-/** A WASM factory for FiberBrowserNode that loads fiber-js on start and fixes its config first. */
-export function fiberWasmFactory(network: "testnet" | "mainnet"): () => FiberWasmInstance {
+/**
+ * A WASM factory for FiberBrowserNode that loads fiber-js on start and fixes its config first. With
+ * `watchtowerChannel`, the node's watchtower events go to the page over that BroadcastChannel (watchtower-bridge.ts).
+ */
+export function fiberWasmFactory(network: "testnet" | "mainnet", options: { watchtowerChannel?: string } = {}): () => FiberWasmInstance {
   return () => {
     let fiber: FiberWasmInstance | undefined;
     return {
@@ -32,8 +37,20 @@ export function fiberWasmFactory(network: "testnet" | "mainnet"): () => FiberWas
         const module = await import("@nervosnetwork/fiber-js") as { Fiber?: new () => FiberWasmInstance; default?: { Fiber?: new () => FiberWasmInstance } };
         const Fiber = module.Fiber ?? module.default?.Fiber;
         if (!Fiber) throw new Error("Could not load Fiber's browser node");
-        fiber = new Fiber();
-        await fiber.start(withFiberContracts(config, network), ...rest);
+        let nodeConfig = withFiberContracts(config, network);
+        if (!options.watchtowerChannel) {
+          fiber = new Fiber();
+          await fiber.start(nodeConfig, ...rest);
+          return;
+        }
+        nodeConfig = withWatchtower(nodeConfig);
+        const shimmed = withWorkerShim(workerShimSource(options.watchtowerChannel), () => new Fiber!());
+        fiber = shimmed.value;
+        try {
+          await fiber.start(nodeConfig, ...rest);
+        } finally {
+          shimmed.release();
+        }
       },
       async stop() {
         await fiber?.stop();

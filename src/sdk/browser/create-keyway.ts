@@ -33,6 +33,9 @@ import { createFiberNode, listLoggedPayments, type ListPaymentsParams } from "./
 import { createPaymentLog } from "./payment-log";
 import { sweepSettlement } from "./settlement-sweep";
 import { fiberWasmFactory } from "./fiber-wasm";
+import { listenForWatchtowerCalls } from "./watchtower-bridge";
+import { openWatchtowerStore } from "./watchtower-store";
+import { settleChannel } from "./watchtower-settle";
 import { createFeeReserve, FEE_RESERVE, needsFeeReserve } from "./fee-reserve";
 import type { RequestEmailCode } from "./email-code";
 
@@ -95,6 +98,7 @@ export type PaymentEstimate =
   | { routable: false; error: KeyWayError };
 
 const DEFAULT_CHANNEL_FUNDING = 1_000n * 100_000_000n;
+const WATCH_INTERVAL = 60_000;
 
 export function createKeyWay(options: CreateKeyWayOptions) {
   let deviceLease: DeviceLease | undefined;
@@ -103,10 +107,15 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     return options.loadFiberKey(deviceLease.leaseId);
   });
   const network = options.network ?? "testnet";
+  const databasePrefix = `/wasm-${options.identifier}`;
+  // Fiber's browser build has no watchtower, so its watchtower events come to the page (watchtower-bridge.ts).
+  const watchtowerChannel = `keyway-watchtower-${ccc.hexFrom(crypto.getRandomValues(new Uint8Array(16))).slice(2)}`;
+  const watchtower = openWatchtowerStore(databasePrefix);
+  let stopWatchtowerBridge: (() => void) | undefined;
   const node = new FiberBrowserNode({
     network,
     credential,
-    wasmFactory: fiberWasmFactory(network),
+    wasmFactory: fiberWasmFactory(network, { watchtowerChannel }),
   });
   let deviceLock: DeviceLock | undefined;
   const api = options.apiClient ?? new KeyWayApiClient();
@@ -154,7 +163,6 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       }
     },
   });
-  const databasePrefix = `/wasm-${options.identifier}`;
   const paymentLog = createPaymentLog(databasePrefix);
   let restoreRequired = options.restoreRequired ?? false;
 
@@ -175,6 +183,10 @@ export function createKeyWay(options: CreateKeyWayOptions) {
         await restoreClaimedBackup();
       }
       options.onFiberStartup?.("starting_browser_node");
+      stopWatchtowerBridge ??= listenForWatchtowerCalls(watchtowerChannel, async (call) => {
+        await watchtower.apply(call);
+        console.info(`[keyway] watchtower: stored ${call.method}`);
+      });
       const info = await node.start();
       startSweeping();
       return info;
@@ -203,11 +215,63 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   function startSweeping() {
     void sweepNow().catch(() => undefined);
     sweepTimer ??= setInterval(() => void sweepNow().catch(() => undefined), 10 * 60_000);
+    void watchNow().catch(() => undefined);
+    watchTimer ??= setInterval(() => void watchNow().catch(() => undefined), WATCH_INTERVAL);
+  }
+
+  /**
+   * The in-page watchtower's pass (Fiber's own runs every 60 s): for each channel the node handed it, claim the
+   * user's share once a force-close commitment's delay has passed, then sweep it to the user's address.
+   */
+  let watchTimer: ReturnType<typeof setInterval> | undefined;
+  let watching = false;
+  const watchStatus = new Map<string, string>();
+  const DONE = new Set(["settled", "closed cooperatively", "the user's share is already claimed", "the user has no share in this channel"]);
+  async function watchNow() {
+    if (watching || !node.isRunning || !credential.isUnlocked()) return;
+    watching = true;
+    try {
+      const watched = await watchtower.list();
+      if (watched.length === 0) return;
+      const { channels } = await node.listChannels({ include_closed: true });
+      const key = await credential.getCkbSecretKey();
+      try {
+        for (const channel of watched) {
+          const raw = channels.find((item) => String(item.channel_id).toLowerCase() === channel.channelId);
+          const outpoint = raw?.channel_outpoint ? String(raw.channel_outpoint) : undefined;
+          if (!outpoint) continue;
+          try {
+            const result = await settleChannel({
+              client: fundingSigner.client, network, channel, nodeKey: ccc.hexFrom(key),
+              ref: { channelId: channel.channelId, fundingOutPoint: ccc.OutPoint.decode(outpoint) },
+            });
+            if (watchStatus.get(channel.channelId) !== result.status) {
+              watchStatus.set(channel.channelId, result.status);
+              console.info(`[keyway] watchtower: channel ${channel.channelId}: ${result.status}${result.txHash ? ` ${result.txHash}` : ""}`);
+            }
+            if (result.txHash) {
+              await fundingSigner.client.waitTransaction(result.txHash, 0, 600_000).catch(() => undefined);
+              await sweepNow().catch((error) => console.warn("[keyway] could not sweep the claimed funds yet", error));
+            } else if (DONE.has(result.status)) {
+              await watchtower.remove(channel.channelId);
+            }
+          } catch (error) {
+            console.warn(`[keyway] watchtower: channel ${channel.channelId} could not be settled yet`, error);
+          }
+        }
+      } finally {
+        key.fill(0);
+      }
+    } finally {
+      watching = false;
+    }
   }
 
   async function stop() {
     if (sweepTimer) clearInterval(sweepTimer);
     sweepTimer = undefined;
+    if (watchTimer) clearInterval(watchTimer);
+    watchTimer = undefined;
     try {
       await node.stop();
     } finally {
@@ -220,6 +284,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   async function stopForLogout() {
     if (sweepTimer) clearInterval(sweepTimer);
     sweepTimer = undefined;
+    if (watchTimer) clearInterval(watchTimer);
+    watchTimer = undefined;
     if (!deviceLease) {
       await stop();
       return;
