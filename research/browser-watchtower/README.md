@@ -147,7 +147,8 @@ browser tab (fiber-wasm)                          KeyWay API (Railway)          
 - Reorganizations: a saved spend whose transaction leaves the chain is forgotten and the scan looks again. A
   channel resolved as `closed` or `penalized` in the last 30 minutes is confirmed again every pass; if its closing
   transaction (or penalty) has left the chain, it goes back to `watching` (or `penalty-sent`, so the penalty is
-  sent again if needed).
+  sent again if needed). Assumption: reorganizations are at most 24 blocks deep and settle within 30 minutes
+  (CKB's are typically one or two blocks); a deeper one could hide a spend that the scans had already passed.
 - Each pass checks every channel whose funding has been seen (recent scan, one backlog page, and the penalty if
   one is due), 8 at a time, before anything else. Channels never seen funded can't have been closed; at most 500 of
   them are checked per pass, taken from each account in turn, so registrations can't slow the funded channels'
