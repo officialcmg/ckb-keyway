@@ -342,9 +342,16 @@ async function fetchTransactions(hashes) {
   throw lastError ?? new Error("CKB RPC is unavailable");
 }
 
-/** Live cells under a lock, from the indexer, a page of 64 at a time; refuses more than `maxCells`. */
-async function indexerCells(lock, maxCells) {
-  const searchKey = { script: { code_hash: bytesToHex(lock.codeHash), hash_type: lock.hashType, args: bytesToHex(lock.args) }, script_type: "lock" };
+/**
+ * Live cells under a lock, from the indexer, a page of 64 at a time; refuses more than `maxCells`. With `typeId`,
+ * only cells whose type is a Type ID are returned.
+ */
+async function indexerCells(lock, maxCells, typeId = false) {
+  const searchKey = {
+    script: { code_hash: bytesToHex(lock.codeHash), hash_type: lock.hashType, args: bytesToHex(lock.args) },
+    script_type: "lock",
+    ...(typeId ? { filter: { script: { code_hash: TYPE_ID_CODE_HASH, hash_type: "type", args: "0x" } } } : {}),
+  };
   const cells = [];
   let cursor = null;
   for (;;) {
@@ -378,8 +385,12 @@ async function indexerCells(lock, maxCells) {
  * is the node's word.
  */
 async function liveLists(account) {
-  const objects = (await indexerCells(account.listLock, 256)).filter((object) => isTypeId(object?.output?.type ? parseScript(object.output.type, "cell type") : undefined));
+  // Only Type ID cells are asked for, so plain cells sent to the lock can't crowd out the check. Each fake list
+  // locks its capacity under this key for good, so blocking with more than 1024 costs an attacker about 129k CKB.
+  const objects = (await indexerCells(account.listLock, 1024, true)).filter((object) => isTypeId(object?.output?.type ? parseScript(object.output.type, "cell type") : undefined));
+  // Two batched lookups in all, whatever the number of cells: the creating transactions, then their inputs.
   const created = await fetchTransactions(objects.map((object) => object?.out_point?.tx_hash));
+  const spentFrom = await fetchTransactions([...created.values()].flatMap(({ tx }) => tx.inputs.map((input) => bytesToHex(input.previousOutput.txHash))));
   const hashes = [];
   for (const object of objects) {
     const tx = created.get(object.out_point.tx_hash).tx;
@@ -388,8 +399,13 @@ async function liveLists(account) {
     // Proof is a spend from the key's own secp256k1 address or its owner-only list lock. An administrator-mode
     // Omnilock doesn't count: anyone can make one with this key's auth and their own list, and spend it with
     // their own backup. A failed lookup fails the whole check rather than leaving a list out.
-    const spent = await inputCellsOf(tx);
-    if (spent.some((cell) => ["secp256k1", "list"].includes(lockKind(account, cell.output.lock)))) hashes.push(bytesToHex(scriptHash(output.type)));
+    const proven = tx.inputs.some((input) => {
+      const previous = spentFrom.get(bytesToHex(input.previousOutput.txHash)).tx;
+      const cell = previous.outputs[input.previousOutput.index];
+      if (!cell) throw new Error("An input doesn't exist");
+      return ["secp256k1", "list"].includes(lockKind(account, cell.lock));
+    });
+    if (proven) hashes.push(bytesToHex(scriptHash(output.type)));
   }
   return [...new Set(hashes)];
 }

@@ -71,11 +71,13 @@ export function fakeLit(options: {
     assert.ok(["https://testnet.ckb.dev/", "https://testnet.ckbapp.dev/"].includes(url), url);
     const parsed = JSON.parse(init.body);
     if (!Array.isArray(parsed) && parsed.method === "get_cells") {
-      const [{ script: wanted }] = parsed.params as [{ script: { code_hash: string; hash_type: string; args: string } }];
+      const [{ script: wanted, filter }] = parsed.params as [{ script: { code_hash: string; hash_type: string; args: string }; filter?: { script?: { code_hash: string; hash_type: string; args: string } } }];
+      const typeFilter = filter?.script;
       const all = options.transactions();
       const spent = new Set(all.flatMap((tx) => tx.inputs.map((input) => `${input.previousOutput.txHash}:${input.previousOutput.index}`)));
       const objects = all.flatMap((tx) => tx.outputs.map((output, index) => ({ tx, output, index })))
-        .filter(({ tx, output, index }) => !spent.has(`${tx.hash()}:${index}`) && output.lock.codeHash === wanted.code_hash && output.lock.hashType === wanted.hash_type && output.lock.args === wanted.args)
+        .filter(({ tx, output, index }) => !spent.has(`${tx.hash()}:${index}`) && output.lock.codeHash === wanted.code_hash && output.lock.hashType === wanted.hash_type && output.lock.args === wanted.args
+          && (!typeFilter || (output.type?.codeHash === typeFilter.code_hash && output.type.hashType === typeFilter.hash_type && output.type.args.startsWith(typeFilter.args))))
         .map(({ tx, output, index }) => ({ out_point: { tx_hash: tx.hash(), index: ccc.numToHex(index) }, output: { capacity: ccc.numToHex(output.capacity), lock: script(output.lock), type: output.type ? script(output.type) : null }, output_data: tx.outputsData[index] }));
       return new Response(JSON.stringify({ id: parsed.id, jsonrpc: "2.0", result: { objects, last_cursor: "0x" } }), { status: 200 });
     }

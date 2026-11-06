@@ -340,6 +340,8 @@ test("a cell anyone sends to the list lock doesn't count as a list, and an enabl
     outputs: [{ lock: plan.transaction.outputs[0].lock, type: adminListTypeScript({ adminListTypeArgs: `0x${"bc".repeat(32)}` }), capacity: 200n * CKB }],
     outputsData: [adminListData(`0x${"de".repeat(32)}`)],
   }));
+  // Plain cells sent to the list lock aren't even looked at, however many there are.
+  env.add(ccc.Transaction.from({ inputs: [], outputs: Array.from({ length: 300 }, () => ({ lock: plan.transaction.outputs[0].lock, capacity: 70n * CKB })), outputsData: Array.from({ length: 300 }, () => "0x") }));
   const sent = await policySendCode(plan.transaction, wallet, { email: "user@example.com", appName: "Demo" }, runner(action));
   assert.ok(sent.ticket);
   // A new plain cell at the secp256k1 address that the enable leaves out: refused.
