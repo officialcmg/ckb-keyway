@@ -417,6 +417,11 @@ type HelperMessage =
 export function startJoyIdBackup(run: JoyIdBackupRun, transport: "popup" | "window" | "redirect"): Promise<RecoveryBackupProof> {
   const stage = (next: JoyIdBackupStage) => { try { run.options.onStage?.(next); } catch { /* the app's callback */ } };
   if (run.options.signal?.aborted) return Promise.reject(new JoyIdCancelledError());
+  // A window or a redirect returns to joyIdReturnPath. Refuse a bad one now, before a window opens, a request is
+  // saved or a browser node stops for the redirect.
+  if (transport !== "popup") {
+    try { joyIdReturnUrl(run.returnPath); } catch (error) { return Promise.reject(error); }
+  }
   const known = knownJoyIdAddress(run.app.joyIdAppURL);
   if (transport === "popup") {
     if (joyIdPage().isolated) return Promise.reject(new Error("JoyID's own window can't answer this page, because it is cross-origin isolated. Use the \"window\" or \"redirect\" transport"));
