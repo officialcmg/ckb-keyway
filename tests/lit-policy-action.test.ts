@@ -315,3 +315,62 @@ test("a key with a recovery list can't make a second one, or move funds to an ad
   assert.equal(ok.operation, "plain");
   assert.ok(recovery.litEmailBound);
 });
+
+test("a cell anyone sends to the list lock doesn't count as a list, and an enable must spend every plain cell", async () => {
+  const { funding, client } = await funded();
+  const env = world([funding]);
+  const action = await loadAction(env);
+  const plan = await planRecovery(client, walletFor(), [evm(15)], { emailBinding: true });
+  // An outsider creates a Type ID cell under the key's list lock from their own cell.
+  const outsider = ccc.Transaction.from({ inputs: [], outputs: [{ lock: ccc.Script.from({ codeHash: `0x${"97".repeat(32)}`, hashType: "type", args: "0x" }), capacity: 500n * CKB }], outputsData: ["0x"] });
+  env.add(outsider);
+  const forged = ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: outsider.hash(), index: 0 } }],
+    outputs: [{ lock: plan.transaction.outputs[0].lock, type: adminListTypeScript({ adminListTypeArgs: `0x${"56".repeat(32)}` }), capacity: 200n * CKB }],
+    outputsData: [adminListData(`0x${"78".repeat(32)}`)],
+  });
+  env.add(forged);
+  const sent = await policySendCode(plan.transaction, wallet, { email: "user@example.com", appName: "Demo" }, runner(action));
+  assert.ok(sent.ticket);
+  // A new plain cell at the secp256k1 address that the enable leaves out: refused.
+  const extra = ccc.Transaction.from({ inputs: [], outputs: [{ lock: plan.secp, capacity: 100n * CKB }], outputsData: ["0x"] });
+  env.add(extra);
+  await assert.rejects(policySendCode(plan.transaction, wallet, { email: "user@example.com", appName: "Demo" }, runner(action)), /spend every plain cell/);
+});
+
+test("a list made before on-chain records changes by one backup only, checked against the record the server supplies", async () => {
+  const backups = [evm(16), evm(17)];
+  const { funding, client } = await funded();
+  const plan = await planRecovery(client, walletFor(), backups, { emailBinding: false });
+  const signed = plan.transaction.clone();
+  const w0 = signed.getWitnessArgsAt(0)!;
+  w0.outputType = undefined; // no record, as before records existed
+  signed.setWitnessArgsAt(0, w0);
+  await signed.prepareSighashAllWitness(plan.secp, 65, client);
+  const digest = (await signed.getSignHashInfo(plan.secp, client))!.message;
+  const raw = secp256k1.sign(ccc.bytesFrom(digest), privateKey, { prehash: false, format: "recovered" } as never) as Uint8Array;
+  const witness = signed.getWitnessArgsAt(0)!;
+  witness.lock = ccc.hexFrom(Uint8Array.from([...raw.slice(1), raw[0]]));
+  signed.setWitnessArgsAt(0, witness);
+  const env = world([funding, signed]);
+  const action = await loadAction(env);
+  const recovery: KeyWayRecovery = {
+    omnilockArgs: plan.omnilock.args, omnilock: KEYWAY_OMNILOCK.testnet, adminListTypeArgs: plan.adminListType.args, adminListTypeHash: plan.adminListType.hash(),
+    adminListOutPoint: { txHash: signed.hash(), index: 0 }, enableTransactionHash: signed.hash(), legacyAddress: plan.preview.legacyAddress, enabledAt: "2026-09-01T00:00:00.000Z", backups,
+  };
+  const listClient = await offlineClient([funding, signed], [`${funding.hash()}:0`, `${funding.hash()}:1`]);
+  const change = await planBackupChange(listClient, walletFor(recovery), { change: "add", backup: evm(18) });
+  const groups = [{ script: change.listLock, kind: "omnilock" as const }, { script: change.omnilock, kind: "omnilock" as const }];
+  const sign = (previousListRecord?: ccc.Hex) => policySignTransaction(change.transaction.clone(), groups, listClient, wallet, { enableTransactionHash: recovery.enableTransactionHash, ...(previousListRecord ? { previousListRecord } : {}) }, runner(action));
+  await assert.rejects(sign(), /previousListRecord is required/);
+  await assert.rejects(sign(await recoveryListRecord(listClient, [evm(19), evm(20)])), /don't match the recovery list's root/);
+  // Replacing every backup at once, with the true previous record: refused.
+  const replaced = change.transaction.clone();
+  const list = [evm(21), evm(22), evm(23)];
+  const { root } = whitelistTree(await Promise.all(list.map((backup) => backupAuth(listClient, backup))));
+  replaced.outputsData[0] = adminListData(root);
+  setRecoveryListRecord(replaced, 0, await recoveryListRecord(listClient, list));
+  await assert.rejects(action.main({ mode: "transaction", pkpId, transaction: JSON.parse(ccc.stringify(replaced)), enableTransactionHash: recovery.enableTransactionHash, previousListRecord: change.previousRecord }), /exactly one backup/);
+  const result = await sign(change.previousRecord);
+  assert.equal(result.hash(), change.transaction.hash());
+});

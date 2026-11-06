@@ -14,6 +14,7 @@ export async function runIdempotentMutation<T>(
   key: string,
   request: unknown,
   mutation: () => Promise<T>,
+  options: { waitMs?: number } = {},
 ): Promise<T> {
   if (!/^[A-Za-z0-9_-]{16,128}$/.test(key)) throw new Error("A valid idempotency key is required");
   const digest = createHash("sha256").update(JSON.stringify(request)).digest("hex");
@@ -28,14 +29,21 @@ export async function runIdempotentMutation<T>(
   `;
 
   if (!claimed) {
-    const rows = await sql<StoredResult[]>`
-      select request_digest, status, response, error_message
-      from keyway_v2_idempotency_keys
-      where user_id = ${userId} and operation = ${operation} and idempotency_key = ${key}
-        and expires_at > now()
-      limit 1
-    `;
-    const stored = rows[0];
+    // With `waitMs`, a repeat that arrives while the first request still runs waits for its outcome.
+    const deadline = Date.now() + (options.waitMs ?? 0);
+    let stored: StoredResult | undefined;
+    for (;;) {
+      const rows = await sql<StoredResult[]>`
+        select request_digest, status, response, error_message
+        from keyway_v2_idempotency_keys
+        where user_id = ${userId} and operation = ${operation} and idempotency_key = ${key}
+          and expires_at > now()
+        limit 1
+      `;
+      stored = rows[0];
+      if (stored?.status !== "running" || stored.request_digest !== digest || Date.now() >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
     if (!stored) throw new Error("Idempotency record expired; use a new key");
     if (stored.request_digest !== digest) throw new Error("Idempotency key was already used for another request");
     if (stored.status === "completed") return stored.response as T;

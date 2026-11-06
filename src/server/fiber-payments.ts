@@ -25,12 +25,13 @@ export type PaymentContext = Pick<SigningContext, "user" | "appName" | "email" |
  * the emailed code is required. Each approval is bound to the exact payment by a single-use nonce.
  *
  * A send with an idempotency key is recorded under it: repeating the same request with the same key (a
- * retry after a lost response) returns the first result, or the first error, and never pays twice.
+ * retry after a lost response) returns the first result, or the first error, and never pays twice. A repeat that
+ * arrives while the first send still runs waits for it (up to 30 seconds).
  */
 export async function fiberPayment(context: PaymentContext, node: FiberCaller, body: Record<string, unknown>, idempotencyKey?: string): Promise<unknown> {
   if (body.stage === "send" && idempotencyKey) {
     const { method, params, confirmationNonce, emailCode } = body;
-    return runIdempotentMutation(context.user.id, "fiber-pay", idempotencyKey, { method, params, confirmationNonce, emailCode }, () => payOnce(context, node, body));
+    return runIdempotentMutation(context.user.id, "fiber-pay", idempotencyKey, { method, params, confirmationNonce, emailCode }, () => payOnce(context, node, body), { waitMs: 30_000 });
   }
   return payOnce(context, node, body);
 }

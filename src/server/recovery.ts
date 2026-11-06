@@ -443,6 +443,8 @@ export type BackupChangePlan = {
   listLock: ccc.Script;
   adminList: ccc.Cell;
   backups: RecoveryBackup[];
+  /** The list's on-chain record before the change, for the policy Action to check against the list's root. */
+  previousRecord: ccc.Hex;
   preview: BackupChangePreview;
 };
 
@@ -501,14 +503,14 @@ export async function recoveryBackupChange(context: RecoveryContext, body: Recor
       await checkBackupChangeTransaction(client, plan.transaction, wallet.recovery, plan.backups);
       await countLitCodeAttempt(context.user, "recovery", nonce);
       await context.recordSigning(context.user.id);
-      signed = await signGroups({ ...context, wallet }, plan.transaction, groups, client, { enableTransactionHash, emailCode });
+      signed = await signGroups({ ...context, wallet }, plan.transaction, groups, client, { enableTransactionHash, emailCode, previousListRecord: plan.previousRecord });
       await consumeRequest(context.user, "recovery", nonce);
     } else {
       await verifyCode(context.user, "recovery", nonce, body.emailCode);
       await consumeRequest(context.user, "recovery", nonce);
       await checkBackupChangeTransaction(client, plan.transaction, wallet.recovery, plan.backups);
       await context.recordSigning(context.user.id);
-      signed = await signGroups({ ...context, wallet }, plan.transaction, groups, client, { enableTransactionHash });
+      signed = await signGroups({ ...context, wallet }, plan.transaction, groups, client, { enableTransactionHash, previousListRecord: plan.previousRecord });
     }
     const transactionHash = signed.hash();
     const recovery: KeyWayRecovery = { ...wallet.recovery, adminListOutPoint: { txHash: transactionHash, index: 0 }, backups: plan.backups };
@@ -597,7 +599,7 @@ export async function planBackupChange(client: ccc.Client, wallet: ReadyWallet, 
   transaction.outputs[1].capacity = funded - fee;
   const label = (backup: RecoveryBackup) => ({ ...backup, label: describeBackup(backup) });
   return {
-    transaction, omnilock, listLock, adminList, backups,
+    transaction, omnilock, listLock, adminList, backups, previousRecord: await recoveryListRecord(client, current),
     preview: {
       network: "CKB testnet",
       change: change.change,
