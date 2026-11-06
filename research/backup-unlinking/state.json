@@ -1,0 +1,213 @@
+{
+  "evm-personal-sign": {
+    "outPoint": {
+      "txHash": "0x1d487850a80c6e75a841e97184d52a6a84bf3405cb8ddc3152b1d03eeed9e089",
+      "index": 0
+    },
+    "codeHash": "0x14715402af1d6cdb6036ac02d10c822e84349c289c938320c2f7e8bb6d54b86f",
+    "hashType": "data1",
+    "size": 99072,
+    "capacity": "99133"
+  },
+  "joyid-webauthn": {
+    "outPoint": {
+      "txHash": "0x2b25815f1a4e130878880b079530646887560fcec104fb09e3fdfdec26be58c6",
+      "index": 0
+    },
+    "codeHash": "0x01ac20c4c1a7e5e073a9369b452382970d7d493ad98169dbfa017df1351e2957",
+    "hashType": "data1",
+    "size": 41392,
+    "capacity": "41453"
+  },
+  "users": {
+    "A": "ab398bf4-fe54-48ff-b3b2-59a676141b66",
+    "B": "00a8cbb1-1480-4181-bfa4-1e44802daa87"
+  },
+  "enableA": "0xf709012a4e22b078bf6217aa73b8890d3c31b6dafab35805b352137ca38cb295",
+  "addressA": "ckt1qp4jndh3qdrtg0z5pefcq6ag3ws0uwsv8g5aw3yw742cgry0svv05qsqp2gx3wmylja0e2n5r5nc2z0u4ypvp7z2q90e902wsuasnktldzwkh2ra570eq4z6mmlvk7wjvr98s6mzpv6mj8k3v56",
+  "recoveryA": {
+    "backups": [
+      {
+        "kind": "evm",
+        "address": "0x6371025b4a7e62d6acccdaa96061acc0c774f43e"
+      },
+      {
+        "kind": "joyid",
+        "address": "ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqqxhnyynqdn0w3ukfvnlz44tgcusk2p6ecurrdqmx"
+      }
+    ],
+    "omnilock": {
+      "cellDeps": [
+        {
+          "depType": "depGroup",
+          "outPoint": {
+            "index": 0,
+            "txHash": "0xf8de3bb47d055cdf460d93a2a6e1b05f7432f9777c8c474abf4eec1d4aee5d37"
+          }
+        },
+        {
+          "depType": "code",
+          "outPoint": {
+            "index": 0,
+            "txHash": "0xf4ce65847089d24bbc8e7d999f396d4227d34376bbfef0f5e3c11967c5a13271"
+          }
+        }
+      ],
+      "codeHash": "0x6b29b6f10346b43c540e53806ba88ba0fe3a0c3a29d7448ef555840c8f8318fa",
+      "hashType": "data1"
+    },
+    "enabledAt": "2026-11-06T18:20:39.210Z",
+    "omnilockArgs": "0x000a9068bb64fcbafcaa741d278509fca902c0f84a015f92bd4e873b09d97f689d6ba87da79f90545adefecb79d260ca786b620b35b9",
+    "legacyAddress": "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqg2jp5tke8uht725aqay7zsnl9fqtq0sjsj3zusx",
+    "adminListOutPoint": {
+      "index": 0,
+      "txHash": "0xf709012a4e22b078bf6217aa73b8890d3c31b6dafab35805b352137ca38cb295"
+    },
+    "adminListTypeArgs": "0xfab798252271c9968277b41a8404740485cbca02020b5919209f3a137d34afa9",
+    "adminListTypeHash": "0x5f92bd4e873b09d97f689d6ba87da79f90545adefecb79d260ca786b620b35b9",
+    "enableTransactionHash": "0xf709012a4e22b078bf6217aa73b8890d3c31b6dafab35805b352137ca38cb295"
+  },
+  "enableB": "0x6807abfa7a21fa5f7ce58f852ff6a6885544605119dd4fd158f7495ac89d206f",
+  "addressB": "ckt1qp4jndh3qdrtg0z5pefcq6ag3ws0uwsv8g5aw3yw742cgry0svv05qsq7763qz4hup66hjkvd2g636pqct8p8l7dq8n4fptgjvygphxe7tqg9uwz4e5prjgeuc63gajgsax8x4z4qtav26xufal",
+  "recoveryB": {
+    "backups": [
+      {
+        "kind": "evm",
+        "address": "0x6371025b4a7e62d6acccdaa96061acc0c774f43e"
+      },
+      {
+        "kind": "joyid",
+        "address": "ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqqxhnyynqdn0w3ukfvnlz44tgcusk2p6ecurrdqmx"
+      }
+    ],
+    "omnilock": {
+      "cellDeps": [
+        {
+          "depType": "depGroup",
+          "outPoint": {
+            "index": 0,
+            "txHash": "0xf8de3bb47d055cdf460d93a2a6e1b05f7432f9777c8c474abf4eec1d4aee5d37"
+          }
+        },
+        {
+          "depType": "code",
+          "outPoint": {
+            "index": 0,
+            "txHash": "0xf4ce65847089d24bbc8e7d999f396d4227d34376bbfef0f5e3c11967c5a13271"
+          }
+        }
+      ],
+      "codeHash": "0x6b29b6f10346b43c540e53806ba88ba0fe3a0c3a29d7448ef555840c8f8318fa",
+      "hashType": "data1"
+    },
+    "enabledAt": "2026-11-06T18:20:50.657Z",
+    "omnilockArgs": "0x00f7b5100ab7e075abcacc6a91a8e820c2ce13ffcd01e7548568930880dcd9f2c082f1c2ae6811c919e635147648874c73545502fac5",
+    "legacyAddress": "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq0hk5gq4dlqwk4u4nr2jx5wsgxzecfllngv9pka4",
+    "adminListOutPoint": {
+      "index": 0,
+      "txHash": "0x6807abfa7a21fa5f7ce58f852ff6a6885544605119dd4fd158f7495ac89d206f"
+    },
+    "adminListTypeArgs": "0x84e4119d5761d9d07892b6f365eafe6389e694212c74f381e820c6f7eae0d59c",
+    "adminListTypeHash": "0xe7548568930880dcd9f2c082f1c2ae6811c919e635147648874c73545502fac5",
+    "enableTransactionHash": "0x6807abfa7a21fa5f7ce58f852ff6a6885544605119dd4fd158f7495ac89d206f"
+  },
+  "enableC": "0xb027fdd3bc42088d85352e981568b85583a06dfaf074bb4c9a07c29612a714a8",
+  "addressC": "ckt1qp4jndh3qdrtg0z5pefcq6ag3ws0uwsv8g5aw3yw742cgry0svv05qsq6h7kpv3s6090ftkl9gglqc6ug9mvdwawq88w0xdj69eartfwpt76lw7q6v49qalhj700e6e4ydkyf9ul4wlxz6asajw",
+  "saltC": "0xcee799b2d173d1ad2e0afdafbbc0d32a5077f7979efceb35236c44979fabbe61",
+  "compare": {
+    "A": {
+      "address": "ckt1qp4jndh3qdrtg0z5pefcq6ag3ws0uwsv8g5aw3yw742cgry0svv05qsqp2gx3wmylja0e2n5r5nc2z0u4ypvp7z2q90e902wsuasnktldzwkh2ra570eq4z6mmlvk7wjvr98s6mzpv6mj8k3v56",
+      "salt": "0x5f92bd4e873b09d97f689d6ba87da79f90545adefecb79d260ca786b620b35b9",
+      "record": "0x4b57524c0302fd74d929da39f79d3c15d7f6f28a25d463cda20110fd6e8472fcfb4109ce447fcc144074615e4734f06e",
+      "auths": [
+        "0xfd74d929da39f79d3c15d7f6f28a25d463cda20110",
+        "0xfd6e8472fcfb4109ce447fcc144074615e4734f06e"
+      ],
+      "E1": "0xfd74d929da39f79d3c15d7f6f28a25d463cda20110",
+      "J1": "0xfd6e8472fcfb4109ce447fcc144074615e4734f06e",
+      "E1preimage": "0x14715402af1d6cdb6036ac02d10c822e84349c289c938320c2f7e8bb6d54b86f020000000000000000007e5aa7ce404f54383a6ab16223c36c0656f0fa75",
+      "J1preimage": "0x01ac20c4c1a7e5e073a9369b452382970d7d493ad98169dbfa017df1351e29570200000000000000000005079b81c5b6e584711c9f41335ac3156ce4c3da",
+      "recordNamesE1": false,
+      "recordNamesJ1": false
+    },
+    "B": {
+      "address": "ckt1qp4jndh3qdrtg0z5pefcq6ag3ws0uwsv8g5aw3yw742cgry0svv05qsq7763qz4hup66hjkvd2g636pqct8p8l7dq8n4fptgjvygphxe7tqg9uwz4e5prjgeuc63gajgsax8x4z4qtav26xufal",
+      "salt": "0xe7548568930880dcd9f2c082f1c2ae6811c919e635147648874c73545502fac5",
+      "record": "0x4b57524c0302fd15266353601f62504ee1e69daf00c27dc2fc716cfd0ec3ac3669295e06bd2e19e48ee900a4078297bb",
+      "auths": [
+        "0xfd15266353601f62504ee1e69daf00c27dc2fc716c",
+        "0xfd0ec3ac3669295e06bd2e19e48ee900a4078297bb"
+      ],
+      "E1": "0xfd15266353601f62504ee1e69daf00c27dc2fc716c",
+      "J1": "0xfd0ec3ac3669295e06bd2e19e48ee900a4078297bb",
+      "E1preimage": "0x14715402af1d6cdb6036ac02d10c822e84349c289c938320c2f7e8bb6d54b86f02000000000000000000d96caa4de7ad03c29b01a5de0e07a253c417d0c7",
+      "J1preimage": "0x01ac20c4c1a7e5e073a9369b452382970d7d493ad98169dbfa017df1351e295702000000000000000000dcf12e15c6d0a20a07b5c786ed2cb09664b19bd4",
+      "recordNamesE1": false,
+      "recordNamesJ1": false
+    }
+  },
+  "negative": [
+    {
+      "label": "E1 spends account A with its own salted identity",
+      "accepted": true,
+      "detail": "8053004 cycles"
+    },
+    {
+      "label": "J1 spends account A with its own salted identity",
+      "accepted": true,
+      "detail": "7317384 cycles"
+    },
+    {
+      "label": "E1 spends account B with its own salted identity",
+      "accepted": true,
+      "detail": "8038734 cycles"
+    },
+    {
+      "label": "J1 spends account B with its own salted identity",
+      "accepted": true,
+      "detail": "7341257 cycles"
+    },
+    {
+      "label": "E1: account A's auth and proof in a spend of account B",
+      "accepted": false,
+      "detail": "Inputs[0].Lock ValidationFailure: see error code 59 on page https://nervosnetwork.github.io/ckb-script-error-codes/by-data-hash/6b29b6f10346b43c540e53806ba88ba0fe3a0c3a29d7448ef555840c8f8318fa.html#59"
+    },
+    {
+      "label": "E1: account B's auth with account A's preimage",
+      "accepted": false,
+      "detail": "Inputs[0].Lock ValidationFailure: see error code 72 on page https://nervosnetwork.github.io/ckb-script-error-codes/by-data-hash/6b29b6f10346b43c540e53806ba88ba0fe3a0c3a29d7448ef555840c8f8318fa.html#72"
+    },
+    {
+      "label": "E1: the signature from a spend of account A replayed in a spend of account B",
+      "accepted": false,
+      "detail": "Inputs[0].Lock ValidationFailure: see error code 101 on page https://nervosnetwork.github.io/ckb-script-error-codes/by-data-hash/6b29b6f10346b43c540e53806ba88ba0fe3a0c3a29d7448ef555840c8f8318fa.html#101"
+    },
+    {
+      "label": "E1: account A's identity on account C, whose list copies A's auths, signed over C's own readable text",
+      "accepted": false,
+      "detail": "Inputs[0].Lock ValidationFailure: see error code 101 on page https://nervosnetwork.github.io/ckb-script-error-codes/by-data-hash/6b29b6f10346b43c540e53806ba88ba0fe3a0c3a29d7448ef555840c8f8318fa.html#101"
+    },
+    {
+      "label": "J1: account A's auth and proof in a spend of account B",
+      "accepted": false,
+      "detail": "Inputs[0].Lock ValidationFailure: see error code 59 on page https://nervosnetwork.github.io/ckb-script-error-codes/by-data-hash/6b29b6f10346b43c540e53806ba88ba0fe3a0c3a29d7448ef555840c8f8318fa.html#59"
+    },
+    {
+      "label": "J1: account B's auth with account A's preimage",
+      "accepted": false,
+      "detail": "Inputs[0].Lock ValidationFailure: see error code 72 on page https://nervosnetwork.github.io/ckb-script-error-codes/by-data-hash/6b29b6f10346b43c540e53806ba88ba0fe3a0c3a29d7448ef555840c8f8318fa.html#72"
+    },
+    {
+      "label": "J1: the signature from a spend of account A replayed in a spend of account B",
+      "accepted": false,
+      "detail": "Inputs[0].Lock ValidationFailure: see error code 107 on page https://nervosnetwork.github.io/ckb-script-error-codes/by-data-hash/6b29b6f10346b43c540e53806ba88ba0fe3a0c3a29d7448ef555840c8f8318fa.html#107"
+    },
+    {
+      "label": "J1: account A's identity on account C, whose list copies A's auths, signed over C's own readable text",
+      "accepted": false,
+      "detail": "Inputs[0].Lock ValidationFailure: see error code 101 on page https://nervosnetwork.github.io/ckb-script-error-codes/by-data-hash/6b29b6f10346b43c540e53806ba88ba0fe3a0c3a29d7448ef555840c8f8318fa.html#101"
+    }
+  ],
+  "rescueE1A": "0xfd7674dd90339f559e678456d0aaff25973b1f3df488de48cfe1b6a156dc6d12",
+  "rescueJ1B": "0xe4634e3f51c94eb3a1fa67ba97177f207f3f0144e4c44fcf862419cdb256b757"
+}

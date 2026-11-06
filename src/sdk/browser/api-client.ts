@@ -122,6 +122,11 @@ export class KeyWayApiClient {
       : undefined);
   }
 
+  /** KeyWay's watchtower for browser nodes: register a channel, send its newest revocation, or read the status. */
+  watchtower<T = unknown>(authToken: string, body: Record<string, unknown>): Promise<T> {
+    return this.json(`${KEYWAY_API_PATH}/watchtower`, authToken, body);
+  }
+
   saveNodeBackup(
     authToken: string,
     body: { deviceIdHash: string; leaseId: string; backup: NodeBackupPayload },

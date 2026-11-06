@@ -330,4 +330,43 @@ export const migrations: Array<{
     version: 18, name: "drop-managed-confirmations",
     up: (sql) => sql`drop table if exists keyway_v2_managed_confirmations`,
   },
+  {
+    version: 19, name: "browser-node-watchtower",
+    up: async (sql) => {
+      // KeyWay's watchtower for browser nodes: per channel, the funding keys and the newest revocation only
+      // (never a private key). Kept until the channel's close is resolved, then 30 days for the user's history.
+      await sql`create table keyway_v2_watchtower_channels (
+        user_id uuid not null,
+        channel_id text not null check (channel_id ~ '^0x[0-9a-f]{64}$'),
+        local_funding_pubkey text not null check (local_funding_pubkey ~ '^0x[0-9a-f]{66}$'),
+        remote_funding_pubkey text not null check (remote_funding_pubkey ~ '^0x[0-9a-f]{66}$'),
+        funding_lock_args text not null check (funding_lock_args ~ '^0x[0-9a-f]{40}$'),
+        peer_commitment_key text not null check (peer_commitment_key ~ '^0x[0-9a-f]{64}$'),
+        funding_udt_type_script jsonb,
+        commitment_number numeric(20, 0),
+        aggregated_signature text check (aggregated_signature ~ '^0x[0-9a-f]{128}$'),
+        revocation_output text,
+        revocation_output_data text,
+        state text not null default 'watching' check (state in ('watching', 'penalty-sent', 'penalized', 'closed', 'missed', 'invalid')),
+        attempts integer not null default 0,
+        detail text,
+        funding_out_point text,
+        -- The scans of the funding lock's history: where each resumes, whether any cell was seen, and the first spend.
+        history_cursor text,
+        recent_scan text,
+        funding_seen boolean not null default false,
+        funding_spend text,
+        closing_tx text,
+        penalty_tx text,
+        -- A close or penalty is final only once a check made REORG_RECHECK_MINUTES after it still finds it on-chain.
+        resolution_confirmed boolean not null default false,
+        unwatch_requested_at timestamptz,
+        checked_at timestamptz,
+        created_at timestamptz not null default now(),
+        updated_at timestamptz not null default now(),
+        primary key (user_id, channel_id)
+      )`;
+      await sql`create index keyway_v2_watchtower_channels_active on keyway_v2_watchtower_channels (state, checked_at)`;
+    },
+  },
 ];

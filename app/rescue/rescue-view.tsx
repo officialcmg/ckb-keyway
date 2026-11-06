@@ -88,7 +88,7 @@ export function RescueView() {
   const connectEvm = () => void run("backup", "evm", async () => {
     reset("backup");
     const ethereum = (window as { ethereum?: EthereumProvider }).ethereum;
-    const entry = await connectEvmBackup(account!, ethereum);
+    const entry = await connectEvmBackup(client!, account!, ethereum);
     setBackup({ kind: "evm", entry, ethereum: ethereum! });
   });
 
@@ -97,7 +97,7 @@ export function RescueView() {
     const { JoyId } = await import("@ckb-ccc/joy-id");
     const signer = new JoyId.CkbSigner(client!, "KeyWay rescue", `${window.location.origin}/icon.svg`);
     await signer.connect();
-    const entry = rescueEntryForJoyId(account!, await signer.getRecommendedAddress());
+    const entry = await rescueEntryForJoyId(client!, account!, await signer.getRecommendedAddress());
     setBackup({ kind: "joyid", entry, signer });
   });
 
@@ -108,7 +108,7 @@ export function RescueView() {
     void run("review", "review", async () => {
       const fresh = await openRescueAccount(client!, address, excluded);
       setAccount(fresh);
-      setPlan(await planRescue(client!, fresh, fresh.entries.find(({ auth }) => auth === backup!.entry.auth) ?? backup!.entry, destination));
+      setPlan(await planRescue(client!, fresh, backup!.entry, destination));
     });
   };
 
@@ -125,7 +125,7 @@ export function RescueView() {
       const nextAccount = await openRescueAccount(client!, address, nextExcluded);
       setExcluded(nextExcluded);
       setAccount(nextAccount);
-      setPlan(await planRescue(client!, nextAccount, nextAccount.entries.find(({ auth }) => auth === backup!.entry.auth) ?? backup!.entry, destination));
+      setPlan(await planRescue(client!, nextAccount, backup!.entry, destination));
       throw cause;
     }
   });
@@ -190,15 +190,11 @@ export function RescueView() {
               {account.other.length > 0 && <div><dt>Other cells, not moved</dt><dd>{account.other.length} ({ckb(account.other.reduce((sum, cell) => sum + cell.cellOutput.capacity, 0n))})</dd></div>}
             </dl>
             <div className="rescue-backups">
-              <h3>Backups on the recovery list</h3>
-              <ul>
-                {account.entries.map(({ backup: listed }) => (
-                  <li key={`${listed.kind}:${listed.address}`}>
-                    <span className="rescue-backups__kind">{listed.kind === "evm" ? "EVM wallet" : "JoyID"}</span>
-                    <span className="mono rescue-backups__address">{listed.address}</span>
-                  </li>
-                ))}
-              </ul>
+              <h3>Recovery list</h3>
+              <p className="rescue-copy">
+                {account.auths.length} backup{account.auths.length === 1 ? "" : "s"}. The list on chain doesn&apos;t name them; connecting a backup checks
+                whether it&apos;s one of them.
+              </p>
             </div>
             {account.later > 0 && <p className="rescue-note">This address has more cells than one transaction moves. After this rescue, look up the address again to move the other {account.later}.</p>}
           </div>
@@ -208,7 +204,7 @@ export function RescueView() {
       <Step number={2} title="Connect a backup" done={Boolean(backup)} disabled={!account}>
         {account && (
           <>
-            <p className="rescue-copy">Connect one of the backups listed above. It only signs; nothing is sent until you approve the transaction in step 4.</p>
+            <p className="rescue-copy">Connect one of this account&apos;s backups. It only signs; nothing is sent until you approve the transaction in step 4.</p>
             <div className="rescue-buttons">
               <button type="button" className={`btn btn--outline${busy === "evm" ? " btn--busy" : ""}`} onClick={connectEvm} disabled={Boolean(busy)}>
                 {busy === "evm" ? <><SpinnerIcon /> Waiting for the wallet</> : "EVM wallet"}
@@ -218,7 +214,7 @@ export function RescueView() {
               </button>
             </div>
             {backup && (
-              <p className="rescue-ok"><CheckIcon /> <span>{backup.kind === "evm" ? "EVM wallet" : "JoyID"} <span className="mono">{backup.entry.backup.address}</span> is on the list.</span></p>
+              <p className="rescue-ok"><CheckIcon /> <span>This wallet is on the list: {backup.kind === "evm" ? "EVM wallet" : "JoyID"} <span className="mono">{backup.entry.backup.address}</span></span></p>
             )}
             {error?.step === "backup" && <Problem text={error.text} />}
           </>

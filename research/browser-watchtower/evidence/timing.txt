@@ -1,0 +1,4 @@
+600 channels (10 with 100000 padded cells; the revoked one's spend under 40000 before it and 300 after), 100 ms per request, 200 entries per page
+pass 1: 132.9 s, 2185 requests so far
+pass 2: 135.3 s, 4571 requests so far; penalty sent at 168.5 s
+penalty sent 168.5 s after the first pass started

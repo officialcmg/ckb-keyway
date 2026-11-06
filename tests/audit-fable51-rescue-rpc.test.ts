@@ -9,8 +9,8 @@ import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { adminListLock, KEYWAY_OMNILOCK, omnilockArgsFor, omnilockScript, secp256k1Lock } from "../src/sdk/browser/account-lock.ts";
-import { backupAuth, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
-import { recoveryListRecord, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
+import { type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
+import { backupAuths, recoveryListRecord, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
 import { adminListData, whitelistTree } from "../src/sdk/browser/recovery-smt.ts";
 import { checkRescueTransaction, connectEvmBackup, openRescueAccount, planRescue, signRescueWithEvm } from "../src/rescue/rescue.ts";
 
@@ -63,9 +63,10 @@ async function realChain() {
   const adminType = ccc.Script.from({ codeHash: TYPE_ID, hashType: "type", args: ccc.hexFrom(new Uint8Array(32).fill(0x42)) });
   const lock = omnilockScript({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: omnilockArgsFor(publicKey, adminType.hash()) });
   const listLock = adminListLock({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: lock.args });
-  const { root } = whitelistTree(await Promise.all(backups.map((backup) => backupAuth(base, backup))));
+  const auths = await backupAuths(base, backups, adminType.hash());
+  const { root } = whitelistTree(auths);
   const created = ccc.Transaction.from({ outputs: [{ lock: listLock, type: adminType, capacity: 165n * CKB }], outputsData: [adminListData(root)] });
-  setRecoveryListRecord(created, 0, await recoveryListRecord(base, backups));
+  setRecoveryListRecord(created, 0, recoveryListRecord(auths));
   const adminList = ccc.Cell.from({ outPoint: { txHash: created.hash(), index: 0 }, cellOutput: created.outputs[0], outputData: created.outputsData[0] });
   const xudt = await base.getKnownScript(ccc.KnownScript.XUdt);
   const token = ccc.Script.from({ codeHash: xudt.codeHash, hashType: xudt.hashType, args: `0x${"77".repeat(32)}` });
@@ -92,7 +93,7 @@ test("M1 fixed: a node that under-reports a cell's capacity can't make the backu
 
   const account = await openRescueAccount(node, chain.address);
   assert.equal(account.ckb, 10_000n * CKB, "the page reads the cell from the transaction that created it");
-  const entry = await connectEvmBackup(account, evmWallet());
+  const entry = await connectEvmBackup(node, account, evmWallet());
   const plan = await planRescue(node, account, entry, chain.destination);
   const signed = await signRescueWithEvm(node, account, plan, evmWallet());
 
@@ -109,7 +110,7 @@ test("M1 fixed: a node that under-reports a token cell's amount can't make the r
   const node = await offlineClient(lying, [chain.created, chain.funding]);
   const account = await openRescueAccount(node, chain.address);
   assert.equal(account.tokens[0].amount, 2_500n);
-  const entry = await connectEvmBackup(account, evmWallet());
+  const entry = await connectEvmBackup(node, account, evmWallet());
   const plan = await planRescue(node, account, entry, chain.destination);
   const signed = await signRescueWithEvm(node, account, plan, evmWallet());
   const tokenOutput = signed.outputs.findIndex((output) => output.type?.eq(chain.token));
@@ -134,7 +135,7 @@ test("M1 fixed: a node that reports the AdminList's out point as a plain cell ca
   const account = await openRescueAccount(node, chain.address);
   assert.ok(account.adminList.outPoint.eq(chain.adminList.outPoint));
   assert.ok(!account.movable.some((movable) => movable.outPoint.eq(chain.adminList.outPoint)));
-  const entry = await connectEvmBackup(account, evmWallet());
+  const entry = await connectEvmBackup(node, account, evmWallet());
   const plan = await planRescue(node, account, entry, chain.destination);
   const signed = await signRescueWithEvm(node, account, plan, evmWallet());
   assert.ok(!signed.inputs.some((input) => input.previousOutput.eq(chain.adminList.outPoint)), "the AdminList isn't an input");

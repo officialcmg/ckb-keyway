@@ -6,8 +6,8 @@ import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { adminListLock, adminListTypeScript, KEYWAY_OMNILOCK, omnilockArgsFor, omnilockScript, secp256k1Lock, type KeyWayRecovery } from "../src/sdk/browser/account-lock.ts";
 import { recoveryApprovalText, rescueApproval } from "../src/sdk/browser/recovery-approval.ts";
-import { backupAuth, evmBackupAuth, evmPersonalSignAddress, recoveryBackupChallenge, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
-import { decodeRecoveryList, readRecoveryList, recoveryListRecord, recoveryListRecordOf, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
+import { accountSalt, backupAuth, EVM_PERSONAL_SIGN_VERIFIER, evmBackupAuth, evmPersonalSignAddress, evmPreimage, joyIdPreimage, recoveryBackupChallenge, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
+import { backupAuths, decodeRecoveryList, readRecoveryList, recoveryListEntry, recoveryListRecord, recoveryListRecordOf, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
 import { adminListData, whitelistTree } from "../src/sdk/browser/recovery-smt.ts";
 import { verifyWebAuthn } from "../src/sdk/browser/webauthn.ts";
 import { formatCkbSignature, previewFundingTransaction, signAccountGroups } from "../src/server/funding-transaction.ts";
@@ -129,7 +129,10 @@ test("builds the one recovery transaction from the account's own cells", async (
   assert.equal(plan.omnilock.hashType, "data1");
   assert.ok(adminList.type!.eq(typeId) && adminList.lock.eq(adminListLock({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: plan.omnilock.args })));
   assert.equal(adminList.lock.args, `0x00${ccc.hashCkbShort(publicKey).slice(2)}00`);
-  assert.equal(transaction.outputsData[0], adminListData(whitelistTree([evmBackupAuth(evmAddress)]).root));
+  // The backup's auth is salted with this account's AdminList type hash, and the record holds only that auth.
+  assert.equal(transaction.outputsData[0], adminListData(whitelistTree([evmBackupAuth(evmAddress, typeId.hash())]).root));
+  assert.deepEqual(decodeRecoveryList(recoveryListRecordOf(transaction, 0)!), [evmBackupAuth(evmAddress, typeId.hash())]);
+  assert.ok(!recoveryListRecordOf(transaction, 0)!.includes(evmAddress.slice(2)), "the backup's address isn't on chain");
   // 165 CKB: the owner-only lock's args are 22 bytes, 32 fewer than the account's.
   assert.equal(adminList.capacity, 165n * CKB);
   // A token cell needs 34 more bytes for the 54-byte Omnilock args: 176 CKB, up from this cell's 143.
@@ -164,40 +167,33 @@ test("refuses when the balance can't cover it or there is no plain CKB", async (
   assert.ok(await planRecovery(await offlineClient([cell(secp, 261n * CKB)]), walletFor(publicKey), backups));
 });
 
-test("reproduces the testnet proof: enable, adding a backup, and both backups' rescues through the approval verifiers", async () => {
-  // research/omnilock/audit-fixes-results.md: 0xe44afcb8…b7c0 turned recovery on with an EVM and a JoyID-style
-  // backup, 0x5042f429…b8bc added an EVM backup, 0xe7a8a2c4…100a and 0xbaf16903…e2dd are the two rescues.
-  const fixture = JSON.parse(await readFile(new URL("./fixtures/recovery-audit-fixes.json", import.meta.url), "utf8"));
+test("reproduces the testnet proof: two accounts, one EVM and one JoyID-style backup each, unrelated on chain, each rescued through the salted verifiers", async () => {
+  // research/backup-unlinking/README.md: 0xf709012a…b295 and 0x6807abfa…206f turned recovery on for A and B with
+  // the same two backups; 0xfd7674dd…6d12 (E1 rescues A) and 0xe4634e3f…b757 (J1 rescues B).
+  const fixture = JSON.parse(await readFile(new URL("./fixtures/recovery-backup-unlinking.json", import.meta.url), "utf8"));
   const evm: RecoveryBackup = { kind: "evm", address: fixture.evmBackup };
   const joy: RecoveryBackup = { kind: "joyid", address: fixture.joyIdBackup };
-  const funding = ccc.Transaction.from(fixture.enableFunding);
-  const enable = ccc.Transaction.from(fixture.enable.transaction);
-  const client = await offlineClient(fixture.enable.inputCells, [funding]);
-  const plan = await planRecovery(client, walletFor(fixture.publicKey), [evm, joy]);
-  assert.equal(plan.transaction.hash(), "0xe44afcb8ae5c43c28c555fce402297122b51f8e12fa7d41812adc03a94d2b7c0");
-  assert.equal(plan.transaction.hash(), enable.hash());
-  // The account runs KeyWay's pinned Omnilock; the list is under the key's owner-only lock; the record reads back.
-  assert.equal(plan.omnilock.codeHash, KEYWAY_OMNILOCK.testnet.codeHash);
-  assert.equal(enable.outputs[0].lock.args, `0x00${ccc.hashCkbShort(fixture.publicKey).slice(2)}00`);
-  assert.deepEqual((await decodeRecoveryList(client, recoveryListRecordOf(enable, 0)!)).map(({ backup }) => backup), [evm, joy]);
-
-  // Adding the third backup: rebuilt from the chain's own list, it hashes the same and passes the checks.
-  const recovery = recoveryFrom(plan, [evm, joy]);
-  const add = ccc.Transaction.from(fixture.add.transaction);
-  const addClient = await offlineClient(fixture.add.inputCells, [funding, enable]);
-  const added: RecoveryBackup = { kind: "evm", address: fixture.addedBackup };
-  const change = await planBackupChange(addClient, walletFor(fixture.publicKey, recovery), { change: "add", backup: added });
-  assert.equal(change.transaction.hash(), "0x5042f4295d96cdc3a31f5a72c200eccc23b8a4598bbb6c87b4d4a0e8e3d1b8bc");
-  assert.equal(change.transaction.hash(), add.hash());
-  await checkBackupChangeTransaction(addClient, add, recovery, [evm, joy, added]);
-  // Two owner signatures by the account key: the list's owner-only lock and the account's Omnilock.
-  for (const [index, script] of [[0, change.listLock], [1, change.omnilock]] as const) {
-    const digest = (await change.transaction.getSignHashInfo(script, addClient))!.message;
-    const owner = ccc.bytesFrom(add.getWitnessArgsAt(index)!.lock!).slice(20);
-    assert.equal(ccc.hexFrom(secp256k1.recoverPublicKey(Uint8Array.from([owner[64], ...owner.slice(0, 64)]), ccc.bytesFrom(digest), { prehash: false })), fixture.publicKey);
+  const lists: ccc.Hex[][] = [];
+  for (const [name, hash] of [["A", "0xf709012a4e22b078bf6217aa73b8890d3c31b6dafab35805b352137ca38cb295"], ["B", "0x6807abfa7a21fa5f7ce58f852ff6a6885544605119dd4fd158f7495ac89d206f"]] as const) {
+    const recorded = fixture[`enable${name}`];
+    const enable = ccc.Transaction.from(recorded.transaction);
+    const client = await offlineClient(recorded.inputCells, [ccc.Transaction.from(recorded.funding)]);
+    const plan = await planRecovery(client, walletFor(fixture[`publicKey${name}`]), [evm, joy]);
+    assert.equal(plan.transaction.hash(), hash);
+    assert.equal(enable.hash(), hash);
+    await checkRecoveryTransaction(client, enable, fixture[`publicKey${name}`], [evm, joy]);
+    // The record is the two auths salted with this account's AdminList type hash; it names neither backup.
+    const salt = plan.adminListType.hash();
+    const record = recoveryListRecordOf(enable, 0)!;
+    const auths = decodeRecoveryList(record);
+    assert.deepEqual(auths, await backupAuths(client, [evm, joy], salt));
+    assert.ok(!record.includes(fixture.evmBackup.slice(2)) && !record.includes(ccc.hexFrom(ccc.hashCkbShort(fixture.joyIdPublicKey)).slice(2)));
+    lists.push(auths);
   }
+  // The same backups have unrelated auths in the two accounts.
+  assert.ok(lists[0].every((auth) => !lists[1].includes(auth)));
 
-  // Each rescue's backup signed the readable text the verifier rebuilds from that transaction.
+  // Each rescue's backup signed the readable text the verifier rebuilds, and the witness carries the salted preimage.
   const approvalOf = async (recorded: { transaction: ccc.TransactionLike; inputCells: ccc.CellLike[] }) => {
     const transaction = ccc.Transaction.from(recorded.transaction);
     const spendClient = await offlineClient(recorded.inputCells);
@@ -207,10 +203,15 @@ test("reproduces the testnet proof: enable, adding a backup, and both backups' r
     zeroed.setWitnessArgsAt(0, ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(witness.length)) }));
     const sighash = (await zeroed.getSignHashInfo(lock, spendClient))!.message;
     const inputs = recorded.inputCells.reduce((sum, cell) => sum + ccc.CellOutput.from(cell.cellOutput).capacity, 0n);
-    return { text: recoveryApprovalText(spendClient, rescueApproval(transaction, lock, inputs), sighash), witness, transaction };
+    return { text: recoveryApprovalText(spendClient, rescueApproval(transaction, lock, inputs), sighash), witness, salt: accountSalt(lock.args) };
   };
-  const joyRescue = await approvalOf(fixture.rescueJoyId);
-  assert.match(joyRescue.text, /^KeyWay recovery\nMove everything to ckt1q[0-9a-z]+\nCKB: 9,834\.99993392\nTokens: none\nFee: 0\.0000246 CKB\nTransaction: 0x[0-9a-f]{64}$/);
+  const evmRescue = await approvalOf(fixture.rescueEvmA);
+  assert.match(evmRescue.text, /\nCKB: 9,834\.99997964\nTokens: none\nFee: 0\.00001025 CKB\n/);
+  assert.deepEqual([evmRescue.witness[20], evmRescue.witness[21]], [1, 0]);
+  assert.equal(evmPersonalSignAddress(evmRescue.text, evmRescue.witness.slice(22, 87)), fixture.evmBackup);
+  assert.equal(ccc.hexFrom(evmRescue.witness.slice(-62)), evmPreimage(fixture.evmBackup, evmRescue.salt));
+  const joyRescue = await approvalOf(fixture.rescueJoyIdB);
+  assert.match(joyRescue.text, /\nCKB: 9,834\.99996529\nTokens: none\nFee: 0\.0000246 CKB\n/);
   const blob = joyRescue.witness.slice(20, 20 + 1024);
   assert.deepEqual([blob[0], blob[1]], [2, 0]);
   assert.deepEqual(blob.slice(2, 66), ccc.bytesFrom(fixture.joyIdPublicKey));
@@ -220,11 +221,7 @@ test("reproduces the testnet proof: enable, adding a backup, and both backups' r
     clientDataJson: blob.slice(clientAt + 2, clientAt + 2 + (blob[clientAt] | (blob[clientAt + 1] << 8))),
   };
   assert.ok(verifyWebAuthn(assertion, joyRescue.text));
-  assert.ok(!verifyWebAuthn(assertion, joyRescue.text.replace("CKB: 9,834", "CKB: 9,833")));
-  const evmRescue = await approvalOf(fixture.rescueEvm);
-  assert.match(evmRescue.text, /\nCKB: 8,999\.99998975\nTokens: none\nFee: 0\.00001025 CKB\n/);
-  assert.deepEqual([evmRescue.witness[20], evmRescue.witness[21]], [1, 0]);
-  assert.equal(evmPersonalSignAddress(evmRescue.text, evmRescue.witness.slice(22, 87)), fixture.evmBackup);
+  assert.equal(ccc.hexFrom(joyRescue.witness.slice(-62)), joyIdPreimage(ccc.hashCkbShort(fixture.joyIdPublicKey), joyRescue.salt));
 });
 
 test("refuses a recovery transaction that doesn't match what KeyWay computed", async () => {
@@ -240,7 +237,11 @@ test("refuses a recovery transaction that doesn't match what KeyWay computed", a
   await tamper((tx) => { tx.outputs[last].lock = stranger; }, /somewhere other than your new address/);
   await tamper((tx) => { tx.outputs.push(ccc.CellOutput.from({ lock: stranger, capacity: 100n * CKB })); tx.outputsData.push("0x"); tx.outputs[last].capacity -= 100n * CKB; }, /somewhere other than your new address/);
   await tamper(() => undefined, /exactly these backups/, [{ kind: "evm", address: `0x${"44".repeat(20)}` }]);
-  await tamper((tx) => { tx.outputsData[0] = adminListData(whitelistTree([evmBackupAuth(evmAddress), evmBackupAuth(`0x${"44".repeat(20)}`)]).root); }, /exactly these backups/);
+  const salt = plan.adminListType.hash();
+  await tamper((tx) => { tx.outputsData[0] = adminListData(whitelistTree([evmBackupAuth(evmAddress, salt), evmBackupAuth(`0x${"44".repeat(20)}`, salt)]).root); }, /exactly these backups/);
+  // The right backup under another account's salt, or unsalted as the previous record format had it.
+  await tamper((tx) => { const auths = [evmBackupAuth(evmAddress, `0x${"24".repeat(32)}`)]; tx.outputsData[0] = adminListData(whitelistTree(auths).root); setRecoveryListRecord(tx, 0, recoveryListRecord(auths)); }, /exactly these backups/);
+  await tamper((tx) => { setRecoveryListRecord(tx, 0, ccc.hexFrom(ccc.bytesConcat("0x4b57524c", [2, 1, 0xfd], EVM_PERSONAL_SIGN_VERIFIER.codeHash, [2, 0], new Uint8Array(8), evmAddress))); }, /recorded backup list/);
   await tamper((tx) => { tx.outputs[0].capacity += CKB; tx.outputs[last].capacity -= CKB; }, /capacity is wrong/);
   // The list under the account's own admin-mode Omnilock, where a backup could spend or rewrite it, is refused.
   await tamper((tx) => { tx.outputs[0].lock = plan.omnilock; }, /locked to your key alone/);
@@ -353,18 +354,29 @@ test("reads the backup list back from the chain and checks it against the root",
   const second: RecoveryBackup = { kind: "evm", address: `0x${"44".repeat(20)}` };
   const { client, recovery, plan } = await enabledAccount([...backups, second]);
   const list = await readRecoveryList(client, recovery);
-  assert.deepEqual(list.entries.map(({ backup }) => backup), [...backups, second]);
-  assert.equal(list.root, whitelistTree([evmBackupAuth(evmAddress), evmBackupAuth(second.address)]).root);
-  assert.equal(list.proofs[evmBackupAuth(second.address)], whitelistTree([evmBackupAuth(evmAddress), evmBackupAuth(second.address)]).proofs[evmBackupAuth(second.address)]);
+  const salt = recovery.adminListTypeHash;
+  const auths = [evmBackupAuth(evmAddress, salt), evmBackupAuth(second.address, salt)];
+  assert.equal(list.salt, salt);
+  assert.deepEqual(list.auths, auths);
+  assert.equal(list.root, whitelistTree(auths).root);
+  assert.equal(list.proofs[auths[1]], whitelistTree(auths).proofs[auths[1]]);
+  // Whoever holds a backup finds it on the list by computing its auth with the account's salt.
+  assert.deepEqual(await recoveryListEntry(client, list, second), { backup: second, auth: auths[1], preimage: evmPreimage(second.address, salt) });
+  assert.equal(await recoveryListEntry(client, list, { kind: "evm", address: `0x${"45".repeat(20)}` }), undefined);
+  assert.equal(await recoveryListEntry(client, { ...list, salt: `0x${"24".repeat(32)}` }, second), undefined);
   // A record that doesn't hash to the cell's root, a malformed one, and none at all are all refused.
   const forged = plan.transaction.clone();
-  setRecoveryListRecord(forged, 0, await recoveryListRecord(client, backups));
+  setRecoveryListRecord(forged, 0, recoveryListRecord(await backupAuths(client, backups, salt)));
   await assert.rejects(readRecoveryList(await offlineClient([plan.transaction.outputs[0]].map((cellOutput) => ({ outPoint: { txHash: forged.hash(), index: 0 }, cellOutput, outputData: plan.transaction.outputsData[0] })), [forged]), recovery), /don't match/);
-  await assert.rejects(decodeRecoveryList(client, "0x4b57524c0201"), /malformed/);
-  // Version 1 records (flag 0x12 EVM entries) are gone.
-  await assert.rejects(decodeRecoveryList(client, ccc.hexFrom(ccc.bytesConcat("0x4b57524c", [1, 1, 0x12], new Uint8Array(20).fill(0x55)))), /version 1/);
-  // An exec entry naming a verifier that isn't KeyWay's is refused.
-  await assert.rejects(decodeRecoveryList(client, ccc.hexFrom(ccc.bytesConcat("0x4b57524c", [2, 1, 0xfd], new Uint8Array(32).fill(9), [2, 0], new Uint8Array(8), new Uint8Array(20).fill(0x55)))), /malformed/);
+  assert.throws(() => decodeRecoveryList("0x4b57524c0301"), /malformed/);
+  assert.throws(() => decodeRecoveryList("0x4b57524c0300"), /malformed/);
+  assert.throws(() => decodeRecoveryList(ccc.hexFrom(ccc.bytesConcat("0x4b57524c", [3, 1], auths[0], [0]))), /malformed/);
+  assert.throws(() => decodeRecoveryList(ccc.hexFrom(ccc.bytesConcat("0x4b57524c", [3, 2], auths[0], auths[0]))), /malformed/);
+  assert.throws(() => decodeRecoveryList(ccc.hexFrom(ccc.bytesConcat("0x4b57524c", [3, 1, 0x00], new Uint8Array(20).fill(0x55)))), /malformed/);
+  assert.throws(() => recoveryListRecord([ccc.hexFrom(ccc.bytesConcat([0x00], new Uint8Array(20)))]), /only exec auths/);
+  // Version 1 (flag 0x12 EVM entries) and version 2 (preimages naming the backup) records are gone.
+  assert.throws(() => decodeRecoveryList(ccc.hexFrom(ccc.bytesConcat("0x4b57524c", [1, 1, 0x12], new Uint8Array(20).fill(0x55)))), /version 1/);
+  assert.throws(() => decodeRecoveryList(ccc.hexFrom(ccc.bytesConcat("0x4b57524c", [2, 1, 0xfd], new Uint8Array(32).fill(9), [2, 0], new Uint8Array(8), new Uint8Array(20).fill(0x55)))), /version 2/);
   const bare = plan.transaction.clone();
   bare.setWitnessArgsAt(0, ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(65)) }));
   await assert.rejects(readRecoveryList(await offlineClient([{ outPoint: { txHash: bare.hash(), index: 0 }, cellOutput: plan.transaction.outputs[0], outputData: plan.transaction.outputsData[0] }], [bare]), recovery), /doesn't record its backups/);
@@ -381,8 +393,9 @@ test("builds the list update: same AdminList cell with the new root and record, 
   assert.equal(transaction.inputs.length, 2, "the DAO cell isn't touched");
   assert.ok(transaction.outputs[0].lock.eq(outputs[0].cellOutput.lock) && transaction.outputs[0].type!.eq(outputs[0].cellOutput.type!));
   assert.equal(transaction.outputs[0].capacity, outputs[0].cellOutput.capacity);
-  assert.equal(transaction.outputsData[0], adminListData(whitelistTree([evmBackupAuth(evmAddress), evmBackupAuth(added.address)]).root));
-  assert.equal(recoveryListRecordOf(transaction, 0), await recoveryListRecord(client, [...backups, added]));
+  const auths = [evmBackupAuth(evmAddress, recovery.adminListTypeHash), evmBackupAuth(added.address, recovery.adminListTypeHash)];
+  assert.equal(transaction.outputsData[0], adminListData(whitelistTree(auths).root));
+  assert.equal(recoveryListRecordOf(transaction, 0), recoveryListRecord(auths));
   assert.ok(transaction.outputs[1].lock.eq(plan.omnilock) && !transaction.outputs[1].type);
   // Two lock groups, the list's owner-only lock and the account's Omnilock, each with an owner placeholder.
   assert.equal(transaction.witnesses.length, 2);
@@ -458,7 +471,7 @@ test("the backup service refuses when recovery is off and needs the new backup's
   const { challengeNonce } = issueBackupChallenge(user);
   await assert.rejects(recoveryBackupChange(context(wallet), { operation: "preview", change: "add", backup: { ...added, challengeNonce } }), /didn't sign/);
   await assert.rejects(recoveryBackupChange(context(wallet), { operation: "preview", change: "add", backup: { kind: "joyid", address: "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqv82scyl0ywuurakhc80ha0agm5x8ye8kca6zq0u", challengeNonce } }), /isn't a JoyID address/);
-  assert.equal(await backupAuth(client, backups[0]), evmBackupAuth(evmAddress));
+  assert.equal(await backupAuth(client, backups[0], wallet.recovery!.adminListTypeHash), evmBackupAuth(evmAddress, wallet.recovery!.adminListTypeHash));
 });
 
 test("a malformed backup challenge nonce is refused as invalid, never a crash", () => {

@@ -1,9 +1,9 @@
 //! Reading the rescue the text describes from the transaction being verified. Omnilock execs the verifier in
 //! the same script group, so the running script is the account's Omnilock.
-use crate::{approval_text, parse_script, ApprovalError, Network, Rescue};
+use crate::{account_salt, approval_text, parse_script, ApprovalError, Network, Rescue};
 use ckb_std::ckb_constants::{CellField, Source};
 use ckb_std::error::SysError;
-use ckb_std::syscalls::{load_cell_by_field, load_cell_data, load_script_hash};
+use ckb_std::syscalls::{load_cell_by_field, load_cell_data, load_script, load_script_hash};
 
 /// A lock script longer than this can't be encoded within the text's limit anyway.
 const MAX_SCRIPT: usize = 400;
@@ -20,6 +20,23 @@ fn field(buffer: &mut [u8], index: usize, source: Source, cell_field: CellField)
 fn capacity(index: usize, source: Source) -> Result<Option<u64>, ApprovalError> {
     let mut bytes = [0u8; 8];
     Ok(field(&mut bytes, index, source, CellField::Capacity)?.map(|_| u64::from_le_bytes(bytes)))
+}
+
+/// A KeyWay account's Omnilock script: 53 bytes of molecule header, code hash and hash type, then 54 bytes of args.
+const ACCOUNT_SCRIPT: usize = 53 + crate::ACCOUNT_ARGS_LENGTH;
+
+/// The running script's salt (`crate::account_salt`). Omnilock execs the verifier with `ckb_exec_cell`, which
+/// replaces the program but keeps the script group, so `load_script` is the account's Omnilock lock being
+/// unlocked, whose args Omnilock has just checked the backup's SMT proof against (args[22..54] is the root).
+pub fn running_account_salt() -> Result<[u8; 32], ApprovalError> {
+    let mut script = [0u8; ACCOUNT_SCRIPT];
+    let length = match load_script(&mut script, 0) {
+        Ok(length) => length,
+        Err(SysError::LengthNotEnough(_)) => return Err(ApprovalError::Account),
+        Err(_) => return Err(ApprovalError::Syscall),
+    };
+    let parsed = parse_script(&script[..length]).ok_or(ApprovalError::Account)?;
+    account_salt(parsed.args)
 }
 
 /// Builds the approval text for this transaction into `out`, refusing anything that isn't a rescue.

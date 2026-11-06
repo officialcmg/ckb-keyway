@@ -48,7 +48,15 @@ The longer Omnilock lock is what raises the minimums. The preview shows the exac
 
 ## Backups
 
-A list holds one to eight backups. Each is an Omnilock exec identity that names one of KeyWay's verifiers (in [`contracts`](https://github.com/officialcmg/ckb-keyway/tree/main/contracts), referenced by data hash so they can't change) and the backup's 20-byte ID.
+A list holds one to eight backups. Each is an Omnilock exec identity that names one of KeyWay's verifiers (in [`contracts`](https://github.com/officialcmg/ckb-keyway/tree/main/contracts), referenced by data hash so they can't change) and the backup's ID **salted with the account's**:
+
+```text
+pubkey_hash = blake160(backup ID ‖ AdminList type hash)
+```
+
+The backup ID is the EVM address, or blake160 of the JoyID passkey's public key. The AdminList type hash is the last 32 bytes of the account's address args, so the verifier reads it from the lock it unlocks and checks `blake160(signer's ID ‖ salt)` against the identity.
+
+Each app gives the same email its own KeyWay account. A user who picks the same EVM wallet or passkey as a backup in two apps gets two unrelated identities, one per account, and the list recorded on chain holds only these salted identities. So nobody reading the chain can link the two accounts through the shared backup. The salt is public, though: someone who already knows a backup's address can check whether it's on a given account's list, and a rescue reveals the backup that signed it. KeyWay's own records and emails still name the real backups.
 
 Both kinds of backup approve a move by signing the same short text, which their wallet shows as written:
 
@@ -93,7 +101,7 @@ KeyWay's server builds and checks every recovery transaction itself. Ordinary si
 - one backup on the list,
 - a public CKB node (configurable).
 
-It doesn't call KeyWay's servers, use a database, Lit or any KeyWay secret. It reads the address, finds the AdminList by its type hash under its owner-only lock, rebuilds the list from chain data and checks it against the list's root, shows the balance, and builds one transaction that moves the CKB and tokens. It shows the exact text the backup will sign before asking for the signature.
+It doesn't call KeyWay's servers, use a database, Lit or any KeyWay secret. It reads the address, finds the AdminList by its type hash under its owner-only lock, rebuilds the list from chain data and checks it against the list's root, shows how many backups it has (the list doesn't name them), finds the connected backup on it by computing its salted identity, shows the balance, and builds one transaction that moves the CKB and tokens. It shows the exact text the backup will sign before asking for the signature.
 
 The balance comes from the node, but the node can't change what a cell holds: the page reads each cell from the transaction that created it and checks that transaction's hash. A node can only leave cells out, so a balance that looks low means trying another node. The page sends only to addresses whose lock it knows (the network's standard locks and KeyWay's Omnilock), so funds can't go to a lock nobody can spend.
 
@@ -128,7 +136,16 @@ function Recovery() {
 }
 ```
 
-A JoyID backup comes from CCC's JoyID signer:
+A JoyID backup needs no extra package. Call `createJoyIdBackup` straight from the user's click, so the browser lets it open a window:
+
+```tsx
+<button onClick={async () => {
+  const proof = await recovery.createJoyIdBackup(); // JoyID connects (first time only), then signs
+  await recovery.addBackup(proof); // dialog, then the emailed code
+}}>Add JoyID</button>
+```
+
+A CCC JoyID signer still works, as before; KeyWay uses its network, name and icon:
 
 ```ts
 import { ccc } from "@ckb-ccc/core";
@@ -139,13 +156,57 @@ await recovery.addBackup(await recovery.createJoyIdBackup(joyId));
 await recovery.removeBackup({ kind: "evm", address: "0x30033cae613a8331b8a7b756ce46cd7999ec1ef8" });
 ```
 
+### JoyID on a cross-origin isolated page
+
+JoyID normally answers in its own window, which reports back to the page that opened it. A page that sends `Cross-Origin-Opener-Policy: same-origin`, as the browser node requires, loses that link, so the answer never arrives. `createJoyIdBackup(signer?, { transport })` picks how to reach JoyID:
+
+| `transport` | What the user sees |
+| --- | --- |
+| `"auto"` (default) | `"popup"` on a page that isn't cross-origin isolated. Otherwise `"window"`, or `"redirect"` when that window can't open: the browser blocked it, or the app runs as an installed app. |
+| `"popup"` | JoyID's own window, as CCC's JoyID signer opens it. |
+| `"window"` | A window on your own site opens and goes to JoyID. JoyID sends the result back to it, it hands the result to your page and closes. Your page, and a browser node in it, keeps running. |
+| `"redirect"` | The whole page goes to JoyID and comes back. A browser node is stopped cleanly first; KeyWay refuses to leave while a payment or channel change started through `useFiber()` is still running. |
+
+**First use takes two steps.** The text a backup signs names its JoyID address, so a JoyID KeyWay hasn't seen yet first connects (JoyID asks for the passkey once) and then signs (once more). KeyWay remembers the connection where CCC's JoyID signer keeps it, so the next backup goes straight to signing.
+
+**After a full-page redirect** the page reloads, so the promise from `createJoyIdBackup` never settles. The provider finishes the job on return, before it starts Fiber: it checks JoyID's answer, continues to the signing step if JoyID only connected, then turns recovery on or adds the backup with the usual dialog and emailed code. It turns recovery on while recovery is off and adds the backup while it is on; set `afterRedirect: "enable" | "add"` to choose, and `otherBackups` to turn recovery on with other backups' proofs as well. Follow it in `recovery.pendingJoyIdBackup`:
+
+| `pendingJoyIdBackup.status` | Meaning |
+| --- | --- |
+| `checking` | The page came back from JoyID and the answer is being checked. |
+| `continuing` | JoyID connected; the page is going back to JoyID to sign. |
+| `applying` | The signature checked out; the user approves and enters the emailed code. |
+| `done` | Recovery is on, or the backup was added. |
+| `cancelled` | The user cancelled in JoyID or in the dialog. Nothing changed. |
+| `failed` | See `error`. Nothing changed. |
+
+Call `recovery.dismissPendingJoyIdBackup()` once you've shown the outcome. Other options: `onStage(stage)` reports `connecting`, `signing` or `leaving`, and `signal` (an `AbortSignal`) stops waiting for JoyID.
+
+JoyID returns to the page the user started on, or to the provider's `joyIdReturnPath` (a path on your site, such as `/wallet`). That page must render `KeyWayProvider`. A window KeyWay opens for JoyID shows only a short status: the provider doesn't restore the session or start Fiber in it, and replaces your page with that status once it hydrates (your page's own code runs once before that).
+
+<Callout type="warn" title="Keep the return page minimal">
+  Any script on the return page that runs before the SDK loads, such as analytics or tag managers, can read JoyID's answer from the URL, and the page's own files are requested with the full URL as referrer. Point `joyIdReturnPath` at a page without third-party scripts if your app has them.
+</Callout>
+
+A cancel, in JoyID, in the JoyID window or through `signal`, rejects with an error whose `name` is `JoyIdCancelledError`. Explicit `transport: "popup"` on a cross-origin isolated page is refused, because JoyID's own window couldn't answer it. After a full-page redirect, a browser node the user started by hand stays stopped until they start it again; with `autoStartFiber` it starts again by itself.
+
+What KeyWay checks before it uses JoyID's answer:
+
+- Each request carries a fresh random 128-bit `state`, recorded once in the tab's `sessionStorage` and deleted before use, so an answer works only in the tab that asked for it, once, within the request's time.
+- The answer must be for the signed-in user, the step that was asked for, the exact challenge text, and a JoyID main key (ES256). KeyWay checks the passkey signature itself, as the server and the on-chain verifier do.
+- A rejection in JoyID is a cancel.
+
+JoyID writes its answer into the return URL's query. The SDK removes it from the address bar as soon as it loads, before your page fetches anything, but the request for that URL still reaches your server, so don't log query strings on the return page. The answer holds the signed text (account address, JoyID address, a 15-minute nonce) and the passkey's signature, which can only add that JoyID to that account with the user's session and emailed code.
+
 | `recovery` member | Behavior |
 | --- | --- |
 | `status` | `on` or `off`. |
 | `backups` | The list, as `RecoveryBackup` (`{ kind: "evm" \| "joyid", address }`). |
 | `legacyAddress` | The address from before recovery was on. |
 | `createEvmBackup(ethereum?)` | Gets a challenge from KeyWay, then asks an EVM wallet (`window.ethereum` by default) for its address and its signature over the recovery challenge. Returns a `RecoveryBackupProof`, valid for 15 minutes. |
-| `createJoyIdBackup(signer)` | The same with a CCC JoyID signer. |
+| `createJoyIdBackup(signer?, options?)` | The same with JoyID. Call it from the user's click. `options`: `transport`, `onStage`, `signal`, `afterRedirect`, `otherBackups` ([above](#joyid-on-a-cross-origin-isolated-page)). Without a signer, KeyWay talks to JoyID directly. |
+| `pendingJoyIdBackup` | After a full-page redirect to JoyID: `{ operation, status, error? }`, while the provider finishes the backup. |
+| `dismissPendingJoyIdBackup()` | Clears `pendingJoyIdBackup`. |
 | `enable(backups)` | Turns recovery on with these backups: preview, approval, emailed code. Resolves once the transaction is committed, with `RecoveryEnabled` (`transactionHash`, `ckbAddress`, `recovery`). |
 | `addBackup(proof)` | Adds a backup: preview, approval, emailed code. Resolves once committed, with `BackupChanged`. |
 | `removeBackup(backup)` | Removes a backup the same way. The last one can't be removed. |
