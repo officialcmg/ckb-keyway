@@ -692,6 +692,8 @@ export async function runWatchtowerPass(deps: PassDependencies): Promise<void> {
   await sql`
     delete from keyway_v2_watchtower_channels
     where state in ('penalized', 'closed', 'missed', 'invalid') and updated_at < now() - ${`${FINISHED_RETENTION_DAYS} days`}::interval
+      -- A close or penalty is kept until it is confirmed, however long the watchtower was down.
+      and (resolution_confirmed or state in ('missed', 'invalid'))
   `;
   // Channels whose funding is on-chain are all checked, every pass, first. Ones never seen funded can't have been
   // closed yet; at most UNFUNDED_PER_PASS of them are checked per pass, so registrations can't slow down the funded
