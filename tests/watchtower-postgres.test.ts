@@ -144,6 +144,17 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     assert.deepEqual({ ...row }, { state: "watching", attempts: 1 });
   });
 
+  await t.test("a check that fails shows in the channel's status", async () => {
+    const user = { id: crypto.randomUUID() };
+    const id = channelId();
+    await sql`delete from keyway_v2_watchtower_channels where state in ('watching', 'penalty-sent')`;
+    await watchtowerRequest(user, watch(id));
+    const chain: ChainView = { fundingHistory: async () => { throw new Error("indexer unavailable"); }, transaction: async () => undefined, isLive: async () => false, spender: async () => undefined };
+    await runWatchtowerPass({ sql, chain, punish: async () => { throw new Error("no"); }, log: () => undefined });
+    const status = (await watchtowerRequest(user, { operation: "status" })) as { channels: Array<{ state: string; detail: string }> };
+    assert.deepEqual(status.channels.map((c) => [c.state, c.detail]), [["watching", "check failed: indexer unavailable"]]);
+  });
+
   await t.test("a channel that was never funded and was removed is dropped", async () => {
     const user = { id: crypto.randomUUID() };
     const id = channelId();
