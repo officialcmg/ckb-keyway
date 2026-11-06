@@ -34,6 +34,8 @@ const MAX_RETRY_MS = 5 * 60_000;
 /** The most a penalty may cost the watchtower (Fiber's fee is about 0.00001 CKB). */
 const MAX_PENALTY_FEE = 100_000n;
 const CHANGE_RESERVE = ccc.fixedPointFrom(62);
+/** How many transactions under one funding lock the watchtower reads (a padded history costs 61 CKB per entry). */
+const MAX_FUNDING_HISTORY = 20_000;
 /** A channel whose funding never appears on-chain (an abandoned open) is dropped after this long. */
 const UNFUNDED_RETENTION_DAYS = 14;
 
@@ -390,7 +392,7 @@ export async function buildPenaltyTransaction(options: {
 }
 
 export type ChainView = {
-  /** Every transaction that touched the funding lock: [txHash, isInput] pairs, oldest first. */
+  /** The first output created under the funding lock and the first spend of a cell under it, oldest first. */
   fundingHistory(lock: ccc.Script): Promise<Array<{ txHash: ccc.Hex; isInput: boolean; index: number }>>;
   transaction(hash: ccc.Hex): Promise<{ tx: ccc.Transaction; committed: boolean; status: string } | undefined>;
   isLive(outPoint: ccc.OutPoint): Promise<boolean>;
@@ -400,10 +402,18 @@ export type ChainView = {
 export function chainView(client: ccc.Client): ChainView {
   return {
     async fundingHistory(lock) {
+      // Anyone can create cells under the funding lock (only spending needs both parties), so a peer could pad the
+      // history before publishing a revoked commitment. Read all of it, up to a bound that padding can't reach
+      // cheaply (each cell locks at least 61 CKB for good), and keep the first output and the first spend.
       const found: Array<{ txHash: ccc.Hex; isInput: boolean; index: number }> = [];
-      for await (const item of client.findTransactions({ script: lock, scriptType: "lock", scriptSearchMode: "exact" }, "asc", 50)) {
-        found.push({ txHash: item.txHash, isInput: item.isInput, index: Number(item.cellIndex) });
-        if (found.length >= 50) break;
+      let seen = 0;
+      for await (const item of client.findTransactions({ script: lock, scriptType: "lock", scriptSearchMode: "exact" }, "asc", 200)) {
+        if (++seen > MAX_FUNDING_HISTORY) throw new Error(`more than ${MAX_FUNDING_HISTORY} transactions under the funding lock`);
+        if (item.isInput) {
+          found.push({ txHash: item.txHash, isInput: true, index: Number(item.cellIndex) });
+          break;
+        }
+        if (!found.length) found.push({ txHash: item.txHash, isInput: false, index: Number(item.cellIndex) });
       }
       return found;
     },
@@ -441,10 +451,13 @@ export async function assessChannel(chain: ChainView, row: Pick<Row, "funding_lo
   const history = await chain.fundingHistory(fundingLock);
   const funded = history.find((item) => !item.isInput);
   const spent = history.find((item) => item.isInput);
-  const fundingOutPoint = funded ? `${funded.txHash}:${funded.index}` : undefined;
+  let fundingOutPoint = funded ? `${funded.txHash}:${funded.index}` : undefined;
   if (!spent || !funded) return { state: "watching", detail: funded ? "open" : "funding not on-chain yet", ...(fundingOutPoint ? { fundingOutPoint } : {}) };
   const closing = await chain.transaction(spent.txHash);
   if (!closing?.committed) return { state: "watching", detail: "closing transaction not committed yet", fundingOutPoint: fundingOutPoint! };
+  // The funding cell is the one this spend consumed (the first output under the lock could be someone else's).
+  const consumed = closing.tx.inputs[spent.index]?.previousOutput;
+  if (consumed) fundingOutPoint = `${consumed.txHash}:${Number(consumed.index)}`;
   const output = closing.tx.outputs[0];
   const commitment = COMMITMENT_LOCK[NETWORK];
   if (closing.tx.outputs.length !== 1 || output.lock.codeHash !== commitment.codeHash || output.lock.hashType !== "type") {

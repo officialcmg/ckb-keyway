@@ -4,7 +4,7 @@ import * as ccc from "@ckb-ccc/core";
 import { createRemoteWatchtower, remoteWatchUpdate, updatesForStoredChannel, type RemoteWatchUpdate } from "../src/sdk/browser/watchtower-remote.ts";
 import type { WatchedChannel } from "../src/sdk/browser/watchtower-store.ts";
 import {
-  FUNDING_LOCK, assessChannel, buildPenaltyTransaction, commitmentArgs, fundingLockArgs, keyAggXOnly, parseRevocation,
+  FUNDING_LOCK, assessChannel, chainView, buildPenaltyTransaction, commitmentArgs, fundingLockArgs, keyAggXOnly, parseRevocation,
   parseWatchtowerRequest, peerCommitmentKey, revocationSignatureValid, revocationWitness, type ChainView,
 } from "../src/server/watchtower.ts";
 import { COMMITMENT_LOCK, blake160 } from "../src/sdk/browser/watchtower-settle.ts";
@@ -159,6 +159,61 @@ test("one channel's failing update doesn't hold up another's, and a refused one 
   } finally {
     remote.stop();
   }
+});
+
+test("only the API's own refusals are final; other failures are retried", async () => {
+  const attempts: string[] = [];
+  let failures = 2;
+  const remote = createRemoteWatchtower({
+    send: async (update) => {
+      attempts.push(update.operation);
+      // What the API returns for a passing database fault: a 400 that isn't one of its refusals.
+      if (failures-- > 0) throw Object.assign(new Error("PostgresError: connection terminated unexpectedly"), { status: 400 });
+    },
+    retryMs: 5,
+    log: { info: () => undefined, warn: () => undefined },
+  });
+  try {
+    remote.enqueue({ operation: "revoke", channelId: CHANNEL, revocation: revocationJson(3n) });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await remote.flush();
+    assert.deepEqual(attempts, ["revoke", "revoke", "revoke"]);
+    assert.equal(remote.pending(), 0);
+  } finally {
+    remote.stop();
+  }
+});
+
+test("a revocation for a channel the device has no record of stops being retried", async () => {
+  let lookups = 0;
+  const remote = createRemoteWatchtower({
+    send: async () => { throw Object.assign(new Error("This channel is not watched; register it first"), { status: 400 }); },
+    registration: async () => { lookups++; return undefined; },
+    retryMs: 5,
+    log: { info: () => undefined, warn: () => undefined },
+  });
+  try {
+    remote.enqueue({ operation: "revoke", channelId: CHANNEL, revocation: revocationJson(3n) });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await remote.flush();
+    assert.equal(lookups, 1);
+    assert.equal(remote.pending(), 0, "nothing left to warn about on unload");
+  } finally {
+    remote.stop();
+  }
+});
+
+test("cells padded under the funding lock don't hide the spend", async () => {
+  const closingHash = `0x${"c1".repeat(32)}` as ccc.Hex;
+  const padding = Array.from({ length: 300 }, (_, i) => ({ txHash: ccc.hexFrom(ccc.numBeToBytes(BigInt(i + 1), 32)), isInput: false, cellIndex: 0n }));
+  const client = {
+    async *findTransactions() {
+      yield* padding;
+      yield { txHash: closingHash, isInput: true, cellIndex: 1n };
+    },
+  } as unknown as ccc.Client;
+  const history = await chainView(client).fundingHistory(ccc.Script.from({ ...FUNDING_LOCK, args: `0x${"00".repeat(20)}` }));
+  assert.deepEqual(history.map((item) => [item.txHash, item.isInput, item.index]), [[padding[0].txHash, false, 0], [closingHash, true, 1]]);
 });
 
 test("the API accepts only well-formed watch data", () => {
