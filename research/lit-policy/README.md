@@ -69,6 +69,11 @@ It also enforces these invariants on the recovery list:
 - At most 8 backups, and only KeyWay's two verifiers.
 - A new list must be output 0, under the owner-only lock, with its Type ID from input 0, which must be the
   account's own secp256k1 cell. Every administrator-mode output must name that list.
+- First wins: a new list is refused if the indexer shows any live list under the key's owner-only lock already.
+- Outside turning recovery on, every output to an administrator-mode Omnilock of the key must name the key's one
+  live list. Without this, a server could make a second list with its own backup and email, then move the funds
+  to that list's address in an ordinary transaction. The independent review found that gap; it is closed and has
+  a regression test.
 - No other mode signs a raw digest:
   - `identity` signs only the fixed `sha256("CKB KeyWay identity v1")`.
   - `message` hashes `"Nervos Message:" + text` itself.
@@ -85,7 +90,7 @@ What it stops:
 
 What it doesn't stop:
 
-- Sends.
+- Sends to anywhere other than an address naming a different list of the same key.
 - A list change of the allowed shape, such as adding one attacker backup, unless (b) applies.
 
 ### (b) Lit makes, emails and checks the code for list changes, with the email bound on chain (shipped)
@@ -105,7 +110,8 @@ How it works:
   The server can't choose the address.
 - Code: `HMAC-SHA256(action key, pkp | tx hash | email | ticket)`, as 8 digits. The action key comes from
   `getLitActionPrivateKey`, so only this exact Action can compute it. The ticket is `v1.<expiry ms>.<random>`,
-  expiring within 10 minutes. The code never leaves Lit except in the email.
+  expiring within 10 minutes, with a minute's slack for clock differences between Lit nodes. The code never leaves
+  Lit except in the email.
 
 What it stops:
 
@@ -194,8 +200,11 @@ Plainly, after the switch:
 - **Fiber channel funds.** `wrap-fiber-key.js` re-encrypts the Fiber key to whatever browser key the server
   relays. A compromised server can obtain a user's Fiber key.
 - **Creation and first use.** The server chooses the email bound when recovery is turned on.
-- **Recovery accounts from before the switch.** No binding, so list changes stay server-gated. The shape rules
-  still apply.
+- **Recovery accounts from before the switch.** No binding, so a compromised server can still add one backup per
+  transaction to them, without a code. The shape and first-wins rules still apply. To get the binding, these
+  users have to turn recovery off and on again; there is no in-place migration yet.
+- **Accounts with recovery off.** A compromised server can turn recovery on for them with its own backup and its
+  own email. That is no worse than what it can already do with a plain send, but it is not prevented.
 - **Lit itself.** The TEE network, Chipotle's group check, and the founder's Lit account key, which can register
   any CID.
 - **`LIT_PROVISIONING_API_KEY` on the server.** If it can add Actions to group 1, the server can register an
@@ -203,9 +212,17 @@ Plainly, after the switch:
   PKPs to the group, not add actions.** Otherwise PKP provisioning has to move off the server.
 - **Email.** Resend, the user's inbox, and KeyWay's DNS. Also, no `full_access` Resend key may be on the server,
   or it could read the code emails back.
-- **CKB RPC.** Pinned hosts `testnet.ckb.dev` and `testnet.ckbapp.dev`, for availability only. Every transaction
-  is checked against its hash. The binding's witness is checked against the account key's signature. Members are
-  checked against the on-chain root.
+- **CKB RPC.** Pinned hosts `testnet.ckb.dev` and `testnet.ckbapp.dev`. Every transaction is checked against its
+  hash. The binding's witness is checked against the account key's signature. Members are checked against the
+  on-chain root. Two things the RPC is simply believed on:
+  - a transaction's commit status;
+  - whether a list cell is still live, which the first-wins check uses.
+  A lying node, not the KeyWay server, could exploit those.
+- **The Resend account.** A sending-only key can't read mail back, but anyone with KeyWay's Resend dashboard can
+  read the sent codes.
+- **Real Lit API shapes.** The Action assumes `Lit.Actions.Encrypt` returns a string of at most 1017 bytes and
+  `getLitActionPrivateKey` returns hex. The tests use a stand-in for Lit, so step 4 below has to run on staging
+  before production.
 
 ## Founder steps
 

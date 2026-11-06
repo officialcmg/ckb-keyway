@@ -34,7 +34,7 @@ function world(transactions: ccc.Transaction[] = []) {
   const known = new Map<string, { tx: ccc.Transaction; status: string }>();
   const add = (tx: ccc.Transaction, status = "committed") => known.set(tx.hash(), { tx, status });
   transactions.forEach((tx) => add(tx));
-  const lit = fakeLit({ privateKey, pkpId, actionKey, lookup: (hash) => known.get(hash) });
+  const lit = fakeLit({ privateKey, pkpId, actionKey, lookup: (hash) => known.get(hash), transactions: () => [...known.values()].map(({ tx }) => tx) });
   return { ...lit, add };
 }
 
@@ -279,4 +279,39 @@ test("an account that turned recovery on before the policy Action keeps its serv
   const result = await policySignTransaction(change.transaction.clone(), groups, listClient, wallet, { enableTransactionHash: recovery.enableTransactionHash }, runner(action));
   assert.equal(result.hash(), change.transaction.hash());
   await assert.rejects(action.main({ mode: "send-code", pkpId, transaction: JSON.parse(ccc.stringify(change.transaction)), enableTransactionHash: recovery.enableTransactionHash, emailApiKey: "re_test_sending_key" }), /doesn't need an email code/);
+});
+
+test("a key with a recovery list can't make a second one, or move funds to an address naming another list", async () => {
+  const { funding, signed: enable, recovery, env, plan: enablePlan } = await enableWithPolicy([evm(13)]);
+  env.add(enable);
+  const action = await loadAction(env);
+  // Someone pays the old secp256k1 address again; the server tries to turn recovery on a second time, with its
+  // own backup and its own address for the code.
+  const refund = ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: `0x${(seed++).toString(16).padStart(64, "0")}`, index: 0 } }],
+    outputs: [{ lock: enablePlan.secp, capacity: 1_000n * CKB }],
+    outputsData: ["0x"],
+  });
+  env.add(refund);
+  const client = await offlineClient([funding, enable, refund], [`${funding.hash()}:0`, `${funding.hash()}:1`]);
+  const second = await planRecovery(client, walletFor(), [evm(14)], { emailBinding: true });
+  await assert.rejects(policySendCode(second.transaction, wallet, { email: "attacker@example.com", appName: "Demo" }, runner(action)), /already on for this key/);
+
+  // Moving the account's funds to an Omnilock of the same key that names another list is refused; to its own
+  // address it is fine.
+  const omnilockCell = enable.outputs.findIndex((output) => output.lock.eq(enablePlan.omnilock));
+  const spend = (lock: ccc.Script) => {
+    const tx = ccc.Transaction.from({
+      inputs: [{ previousOutput: { txHash: enable.hash(), index: omnilockCell } }],
+      outputs: [{ lock, capacity: enable.outputs[omnilockCell].capacity - 100_000n }],
+      outputsData: ["0x"],
+      witnesses: [ccc.hexFrom(ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(85)) }).toBytes())],
+    });
+    return action.main({ mode: "transaction", pkpId, transaction: JSON.parse(ccc.stringify(tx)) });
+  };
+  const foreign = ccc.Script.from({ ...enablePlan.omnilock, args: ccc.hexFrom(ccc.bytesConcat(ccc.bytesFrom(enablePlan.omnilock.args).slice(0, 22), second.adminListType.hash())) });
+  await assert.rejects(spend(foreign), /another recovery list/);
+  const ok = await spend(enablePlan.omnilock) as { operation: string };
+  assert.equal(ok.operation, "plain");
+  assert.ok(recovery.litEmailBound);
 });
