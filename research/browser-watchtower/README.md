@@ -138,20 +138,35 @@ browser tab (fiber-wasm)                          KeyWay API (Railway)          
   history; each padded cell locks 61 CKB for good. The history is read by two scans, each resuming from a position
   saved with the channel, and stops at the first spend, which only the 2-of-2 can make; the funding outpoint reported
   is the cell that spend consumed, never a guess from the outputs.
-  - The recent scan reads everything added since the channel was first checked, newest first (up to 20 s per channel
-    per pass; a longer range resumes next pass, after a look at the newest page). Each range also re-reads the last
-    24 blocks it had already read, so a reorganization that puts a spend into those blocks doesn't hide it; a saved
-    spend whose transaction leaves the chain is forgotten and the scan looks again.
+  - The recent scan reads everything added since the channel was first checked, newest first, up to 20 s per
+    channel per pass. A range it can't finish resumes from its saved position next pass, after first reading
+    everything added above that range (within the same 20 s), so a new spend never waits behind an old range.
+    Each range also re-reads the last 24 blocks it had already read, so a reorganization that puts a spend into
+    those blocks doesn't hide it.
   - The backlog scan reads what was there before, oldest first.
-- Each pass first checks every channel (recent scan, one backlog page, and the penalty if one is due), 8 at a time;
-  only then do the channels still catching up share a 2-minute catch-up budget equally. Passes start every 60 s
-  (one that runs longer is followed at once). So a spend made while a channel is watched is acted on in the first
-  pass after it is committed, whatever the other channels' backlogs: about 60 s plus one pass's checks (a few
-  requests per channel, 8 channels at a time), unless the peer pads more cells after it than a pass reads in 20 s
-  (thousands, at 61 CKB each), which only adds passes. A backlog from before registration clears at 2 minutes of
-  reading per pass shared by the channels catching up, far inside the commitment delay (about 4 h) for any realistic
-  padding. Tests cover a spend buried under 1,000 later cells, a recent range longer than a pass, and a pass where
-  two backlogged channels don't hold up a third channel's penalty.
+- Reorganizations: a saved spend whose transaction leaves the chain is forgotten and the scan looks again. A
+  channel resolved as `closed` or `penalized` in the last 30 minutes is confirmed again every pass; if its closing
+  transaction (or penalty) has left the chain, it goes back to `watching` (or `penalty-sent`, so the penalty is
+  sent again if needed).
+- Each pass checks every channel whose funding has been seen (recent scan, one backlog page, and the penalty if
+  one is due), 8 at a time, before anything else. Channels never seen funded can't have been closed; at most 200 of
+  them are checked per pass, least recently checked first, so registrations from many accounts can't slow the
+  funded channels' checks. Only then do the channels still catching up on a backlog share a 2-minute catch-up
+  budget equally; catch-up reads only the backlog, since the recent scan already ran. Passes start every 60 s (one
+  that runs longer is followed at once).
+- So, for a funded channel:
+  - a spend made while it is watched is acted on in the first pass after the spend is committed, whatever the other
+    channels' backlogs, unless the peer pads more cells after it than a pass reads in 20 s (thousands, at 61 CKB
+    each), which only adds passes;
+  - a spend already buried in a backlog when the channel was first checked (possible only for a channel registered
+    after it was closed, e.g. re-registered from an older SDK) is reached at 2 minutes of reading per pass, shared
+    by the channels catching up.
+- Measured (`timing.ts`, evidence/timing.txt): the real pass and scans against Postgres and a simulated indexer with
+  100 ms per request, 600 channels, 10 of them padded with 100,000 cells each, and a revoked commitment buried under
+  40,000 cells before its first check and 300 after. See the evidence file for the time to the penalty, against a
+  commitment delay of about 4 h. Tests cover a spend buried under 1,000 later cells, a spend made while an old
+  range is resumed, a recent range longer than a pass, a reorganized spend, a dropped close, the catch-up order and
+  funded-before-unfunded checks.
 - The advisory lock is re-asked every pass (re-entrant for the holder), so an instance whose connection was replaced
   stops when another holds it; on any error the instance unlocks and releases the connection.
 

@@ -208,6 +208,33 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     assert.ok(Number(catchUp[0].split(" ")[1]) <= 200, catchUp[0]);
   });
 
+  await t.test("funded channels are checked before unfunded ones, and a close that leaves the chain is watched again", async () => {
+    await sql`delete from keyway_v2_watchtower_channels`;
+    const user = { id: crypto.randomUUID() };
+    const [fundedId, unfundedId, closedId] = [channelId(), channelId(), channelId()];
+    for (const id of [unfundedId, fundedId, closedId]) await watchtowerRequest(user, watch(id));
+    await sql`update keyway_v2_watchtower_channels set funding_seen = true where channel_id in (${fundedId}, ${closedId})`;
+    await sql`update keyway_v2_watchtower_channels set history_cursor = 'funded' where channel_id = ${fundedId}`;
+    const goneClose = `0x${"9e".repeat(32)}`;
+    await sql`update keyway_v2_watchtower_channels set state = 'closed', closing_tx = ${goneClose}, funding_spend = ${`${goneClose}:0`} where channel_id = ${closedId}`;
+    const order: string[] = [];
+    const chain: ChainView = {
+      async fundingHistory(_lock, scan) {
+        order.push(scan.cursor ?? "unfunded");
+        return { sawOutput: scan.cursor === "funded" };
+      },
+      transaction: async () => undefined,
+      isLive: async () => false,
+      spender: async () => undefined,
+    };
+    await runWatchtowerPass({ sql, chain, concurrency: 1, punish: async () => { throw new Error("no"); }, log: () => undefined });
+    const rows = await sql<Array<{ channel_id: string; state: string; funding_seen: boolean; funding_spend: string | null }>>`
+      select channel_id, state, funding_seen, funding_spend from keyway_v2_watchtower_channels order by channel_id`;
+    const byId = Object.fromEntries(rows.map((row) => [row.channel_id, row]));
+    assert.deepEqual(order, ["funded", "unfunded"], "the funded channel first; the closed one isn't scanned");
+    assert.deepEqual({ state: byId[closedId].state, funding_spend: byId[closedId].funding_spend }, { state: "watching", funding_spend: null });
+  });
+
   await t.test("a channel that was never funded and was removed is dropped", async () => {
     const user = { id: crypto.randomUUID() };
     const id = channelId();

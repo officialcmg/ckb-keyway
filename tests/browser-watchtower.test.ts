@@ -274,10 +274,16 @@ test("a recent range longer than a pass can read is resumed, and a fresh spend s
   let state: HistoryScan = scan;
   for (let i = 0; i < 4; i++) state = await view.fundingHistory(lock, state);
   assert.deepEqual(state.recent, { from: "100", seenTo: "600" });
-  // A spend at the head while a range is still being read is found from the newest page at once.
-  entries = [...padding(1, 600), ...padding(601, 400), { txHash: closingHash, blockNumber: 1_001n, isInput: true, cellIndex: 0n }];
-  const midRange = await view.fundingHistory(lock, { recent: { from: "100", seenTo: "600", top: "1000", cursor: "900" } });
+  // A spend made while a range is still being read is found at once, even under more than a page of later cells.
+  entries = [...padding(1, 1_000), { txHash: closingHash, blockNumber: 1_001n, isInput: true, cellIndex: 0n }, ...padding(1_002, 500)];
+  const midRange = await chainView(fakeIndexer(() => entries)).fundingHistory(lock, { recent: { from: "100", seenTo: "600", top: "1000", cursor: "900" } });
   assert.deepEqual(midRange.spend, { txHash: closingHash, index: 0 });
+  // A catch-up call reads only the backlog: the recent scan already ran in the pass.
+  const orders: string[] = [];
+  const counting = fakeIndexer(() => entries);
+  const recorded = { findTransactionsPaged: (...args: Parameters<typeof counting.findTransactionsPaged>) => { orders.push(String(args[1])); return counting.findTransactionsPaged(...args); } } as unknown as ccc.Client;
+  await chainView(recorded).fundingHistory(lock, { cursor: "0", recent: { from: "100", seenTo: "1500" } }, { backlogBudgetMs: 0, recentScan: false });
+  assert.deepEqual(orders, ["asc"]);
 });
 
 test("a reorganization that moves a spend into blocks already read doesn't hide it", async () => {
