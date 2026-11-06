@@ -7,8 +7,8 @@ import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { adminListLock, adminListTypeScript, KEYWAY_OMNILOCK, omnilockArgsFor, omnilockScript, secp256k1Lock, type KeyWayRecovery } from "../src/sdk/browser/account-lock.ts";
-import { backupAuth, recoveryBackupChallenge, verifyBackupOwnership, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
-import { recoveryListRecord, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
+import { recoveryBackupChallenge, verifyBackupOwnership, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
+import { backupAuths, recoveryListRecord, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
 import { adminListData, whitelistTree } from "../src/sdk/browser/recovery-smt.ts";
 import { sweepSettlement } from "../src/sdk/browser/settlement-sweep.ts";
 import { checkRescueTransaction, openRescueAccount, planRescue, rescueEntryForEvm, RescueError } from "../src/rescue/rescue.ts";
@@ -75,7 +75,8 @@ async function recoveryChain(options: {
   const adminType = adminListTypeScript({ adminListTypeArgs });
   const omnilock = omnilockScript({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: omnilockArgsFor(publicKey, adminType.hash()) });
   const pinned = { omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: omnilock.args };
-  const { root } = whitelistTree(await Promise.all(backups.map((backup) => backupAuth(base, backup))));
+  const auths = await backupAuths(base, backups, adminType.hash());
+  const { root } = whitelistTree(auths);
   const listLock = options.adminListLock?.(pinned) ?? adminListLock(pinned);
   const outputs: Output[] = [
     { cellOutput: { lock: listLock, type: adminType, capacity: 165n * CKB }, outputData: adminListData(root) },
@@ -83,7 +84,7 @@ async function recoveryChain(options: {
     ...(options.extra?.(omnilock, secp) ?? []),
   ];
   const enable = ccc.Transaction.from({ inputs: [input0], outputs: outputs.map(({ cellOutput }) => cellOutput), outputsData: outputs.map(({ outputData }) => outputData) });
-  setRecoveryListRecord(enable, 0, await recoveryListRecord(base, backups));
+  setRecoveryListRecord(enable, 0, recoveryListRecord(auths));
   const real = enable.outputs.map((cellOutput, index) => ccc.Cell.from({ outPoint: { txHash: enable.hash(), index }, cellOutput, outputData: enable.outputsData[index] }));
   const client = await offlineClient(real.map((cell, index) => options.report?.(cell, index) ?? cell), [funding, enable]);
   const recovery: KeyWayRecovery = {
@@ -156,7 +157,7 @@ test("M2 fixed: a lying CKB node can't make the rescue page burn the account's C
   const account = await openRescueAccount(client, address);
   assert.equal(account.ckb, 51_000n * CKB);
   const destination = await secp256k1Lock(client, ccc.hexFrom(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true)));
-  const plan = await planRescue(client, account, rescueEntryForEvm(account, [evmAddress]), ccc.Address.fromScript(destination, client).toString());
+  const plan = await planRescue(client, account, await rescueEntryForEvm(client, account, [evmAddress]), ccc.Address.fromScript(destination, client).toString());
   checkRescueTransaction(plan.transaction, account, destination);
   const realFee = 51_000n * CKB - plan.transaction.getOutputsCapacity();
   assert.equal(realFee, plan.fee);
@@ -190,7 +191,7 @@ test("M2 fixed: a lying CKB node can't make the rescue page burn the account's t
   const account = await openRescueAccount(client, address);
   assert.deepEqual(account.tokens.map(({ typeHash, amount: value }) => ({ typeHash, value })), [{ typeHash: token.hash(), value: 2_500n }]);
   const destination = await secp256k1Lock(client, ccc.hexFrom(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true)));
-  const plan = await planRescue(client, account, rescueEntryForEvm(account, [evmAddress]), ccc.Address.fromScript(destination, client).toString());
+  const plan = await planRescue(client, account, await rescueEntryForEvm(client, account, [evmAddress]), ccc.Address.fromScript(destination, client).toString());
   const index = plan.transaction.outputs.findIndex((output) => output.type?.eq(token));
   assert.ok(index >= 0);
   assert.equal(plan.transaction.outputsData[index], amount(2_500n));

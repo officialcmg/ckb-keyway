@@ -3,14 +3,16 @@
 //! Omnilock execs this binary with one argument, the ckb-auth exec convention: lowercase hex fields
 //! `code_hash:hash_type:pubkey_hash:msg:signature` joined by `:`. `msg` is the lock group's sighash_all and
 //! `pubkey_hash` is the last 20 bytes of the identity's preimage. The signature is the blob described in
-//! `parse_signature`. The binary exits 0 only when a passkey whose public key hashes to `pubkey_hash` made a
-//! WebAuthn assertion whose challenge is KeyWay's readable approval for this transaction (`keyway_approval`),
+//! `parse_signature`. `pubkey_hash` is salted per account: `blake160(blake160(public key) ‖ salt)`, the salt being
+//! the AdminList type hash in the running Omnilock's args (`keyway_approval::account_salt`), so the same passkey
+//! has an unrelated identity in every account. The binary exits 0 only when a passkey whose public key gives
+//! `pubkey_hash` with this account's salt made a WebAuthn assertion whose challenge is KeyWay's readable approval for this transaction (`keyway_approval`),
 //! rebuilt from the transaction itself, the way JoyID's sign-message page turns a text challenge into a
 //! WebAuthn challenge (its UTF-8 bytes, base64url).
 #![no_std]
 
 use ecdsa::signature::hazmat::PrehashVerifier;
-pub use keyway_approval::{ApprovalError, Network, MAX_TEXT};
+pub use keyway_approval::{account_salt, blake160, salted_id, ApprovalError, Network, MAX_TEXT};
 use p256::NistP256;
 use sha2::{Digest, Sha256};
 
@@ -30,7 +32,7 @@ const MAX_KEYS: usize = 32;
 const MAX_KEY: usize = 256;
 const MAX_DEPTH: usize = 8;
 
-/// Exit codes. Omnilock's own codes stay below 100; the approval's are 110–113.
+/// Exit codes. Omnilock's own codes stay below 100; the approval's are 110–114.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i8)]
 pub enum Error {
@@ -58,6 +60,7 @@ pub enum Error {
     Shape = 111,
     TooLong = 112,
     Syscall = 113,
+    Account = 114,
 }
 
 impl From<ApprovalError> for Error {
@@ -67,6 +70,7 @@ impl From<ApprovalError> for Error {
             ApprovalError::Shape => Error::Shape,
             ApprovalError::TooLong => Error::TooLong,
             ApprovalError::Syscall => Error::Syscall,
+            ApprovalError::Account => Error::Account,
         }
     }
 }
@@ -119,11 +123,12 @@ pub fn signature_network(signature: &[u8]) -> Result<Network, Error> {
     Ok(Network::from_byte(signature[1])?)
 }
 
-/// The whole check against the approval `text`: key binding, blob, authenticatorData, clientDataJSON, then
-/// the P-256 signature.
-pub fn verify(pubkey_hash: &[u8; 20], text: &[u8], signature: &[u8]) -> Result<(), Error> {
+/// The whole check against the approval `text`: blob, key binding (`blake160(blake160(public key) ‖ salt)` is
+/// the identity's pubkey hash, `salt` being the account's, `keyway_approval::account_salt`), authenticatorData,
+/// clientDataJSON, then the P-256 signature.
+pub fn verify(pubkey_hash: &[u8; 20], salt: &[u8; 32], text: &[u8], signature: &[u8]) -> Result<(), Error> {
     let assertion = parse_signature(signature)?;
-    if blake160(assertion.public_key) != *pubkey_hash {
+    if salted_id(&blake160(assertion.public_key), salt) != *pubkey_hash {
         return Err(Error::PublicKeyHash);
     }
     check_auth_data(assertion.auth_data)?;
@@ -260,17 +265,6 @@ pub fn verify_p256(public_key: &[u8], rs: &[u8], digest: &[u8]) -> Result<(), Er
     let key = ecdsa::VerifyingKey::<NistP256>::from_sec1_bytes(&sec1).map_err(|_| Error::PublicKey)?;
     let signature = ecdsa::Signature::<NistP256>::from_slice(rs).map_err(|_| Error::Signature)?;
     key.verify_prehash(digest, &signature).map_err(|_| Error::Signature)
-}
-
-/// The first 20 bytes of CKB's blake2b-256 (personalisation "ckb-default-hash").
-pub fn blake160(data: &[u8]) -> [u8; 20] {
-    let mut hasher = blake2b_ref::Blake2bBuilder::new(32).personal(b"ckb-default-hash").build();
-    hasher.update(data);
-    let mut hash = [0u8; 32];
-    hasher.finalize(&mut hash);
-    let mut short = [0u8; 20];
-    short.copy_from_slice(&hash[..20]);
-    short
 }
 
 const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";

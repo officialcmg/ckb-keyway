@@ -32,7 +32,8 @@ fn program_entry() -> i8 {
         let argument = evm_personal_sign::parse_argument(argv[0].to_bytes())?;
         let mut text = [0u8; evm_personal_sign::MAX_TEXT];
         let length = keyway_approval::chain::rescue_text(argument.network, &argument.msg, &mut text)?;
-        evm_personal_sign::verify(&argument, &text[..length])
+        let salt = keyway_approval::chain::running_account_salt()?;
+        evm_personal_sign::verify(&argument, &salt, &text[..length])
     };
     match run() {
         Ok(()) => 0,

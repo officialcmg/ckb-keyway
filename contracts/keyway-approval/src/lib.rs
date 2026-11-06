@@ -21,6 +21,11 @@
 //! On chain, `chain::rescue_text` reads those values from the transaction being verified and refuses any
 //! transaction that isn't a rescue: at least one output, every output locked by the same lock, which isn't the
 //! account's own (the running script), and no output carrying data without a type script.
+//!
+//! The same running script gives each account's salt (`account_salt`): a backup's identity on chain is
+//! `blake160(backup id ‖ salt)`, never the backup's own id, so one backup used by two accounts has two unrelated
+//! identities, and an identity listed in one account is refused when the verifier runs for another. The salt is
+//! public: someone who already knows a backup's id can still check whether it is on an account's list.
 #![no_std]
 
 #[cfg(target_arch = "riscv64")]
@@ -44,6 +49,46 @@ pub enum ApprovalError {
     TooLong = 112,
     /// A syscall failed unexpectedly.
     Syscall = 113,
+    /// The running script's args aren't a KeyWay account's Omnilock args (54 bytes, administrator mode), so
+    /// there is no salt to check the backup against.
+    Account = 114,
+}
+
+/// A KeyWay account's Omnilock args: `auth (21) ‖ 0x01 (administrator mode) ‖ AdminList type hash (32)`.
+pub const ACCOUNT_ARGS_LENGTH: usize = 54;
+/// Omnilock's flags byte for administrator mode alone (OMNI_ROOT_MASK, no ACP, since or supply).
+pub const ADMINISTRATOR_MODE: u8 = 0x01;
+
+/// The account's salt: the AdminList type hash in its Omnilock args, the root Omnilock checks the backup's SMT
+/// proof against. Unique per account (a Type ID) and in the script being unlocked, so the verifier reads it
+/// without anything from the witness. Anything but a 54-byte administrator-mode args is refused.
+pub fn account_salt(args: &[u8]) -> Result<[u8; 32], ApprovalError> {
+    if args.len() != ACCOUNT_ARGS_LENGTH || args[21] != ADMINISTRATOR_MODE {
+        return Err(ApprovalError::Account);
+    }
+    let mut salt = [0u8; 32];
+    salt.copy_from_slice(&args[22..]);
+    Ok(salt)
+}
+
+/// The 20 bytes an account's identity commits to for a backup: `blake160(id ‖ salt)`, where `id` is the
+/// backup's own 20-byte id (an EVM address, or blake160 of a passkey's public key).
+pub fn salted_id(id: &[u8; 20], salt: &[u8; 32]) -> [u8; 20] {
+    let mut input = [0u8; 52];
+    input[..20].copy_from_slice(id);
+    input[20..].copy_from_slice(salt);
+    blake160(&input)
+}
+
+/// The first 20 bytes of CKB's blake2b-256 (personalisation "ckb-default-hash").
+pub fn blake160(data: &[u8]) -> [u8; 20] {
+    let mut hasher = blake2b_ref::Blake2bBuilder::new(32).personal(b"ckb-default-hash").build();
+    hasher.update(data);
+    let mut hash = [0u8; 32];
+    hasher.finalize(&mut hash);
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&hash[..20]);
+    out
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

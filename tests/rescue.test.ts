@@ -6,8 +6,8 @@ import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { adminListLock, KEYWAY_OMNILOCK, omnilockArgsFor, omnilockScript, secp256k1Lock } from "../src/sdk/browser/account-lock.ts";
-import { backupAuth, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
-import { recoveryListRecord, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
+import { evmBackupAuth, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
+import { backupAuths, recoveryListRecord, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
 import { adminListData, whitelistTree } from "../src/sdk/browser/recovery-smt.ts";
 import {
   checkRescueTransaction,
@@ -73,9 +73,11 @@ async function rescueChain(options: { plainCkb?: bigint[]; token?: boolean; list
   const adminType = ccc.Script.from({ codeHash: TYPE_ID, hashType: "type", args: typeArgs });
   const lock = omnilockScript({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: omnilockArgsFor(publicKey, adminType.hash()) });
   const listLock = adminListLock({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: lock.args });
-  const { root } = whitelistTree(await Promise.all(backups.map((backup) => backupAuth(base, backup))));
+  // Salted with the account's AdminList type hash, as the verifiers check them.
+  const auths = await backupAuths(base, backups, adminType.hash());
+  const { root } = whitelistTree(auths);
   const created = ccc.Transaction.from({ outputs: [{ lock: listLock, type: adminType, capacity: 165n * CKB }], outputsData: [options.listData ?? adminListData(root)] });
-  setRecoveryListRecord(created, 0, await recoveryListRecord(base, backups));
+  setRecoveryListRecord(created, 0, recoveryListRecord(auths));
   const adminList = ccc.Cell.from({ outPoint: { txHash: created.hash(), index: 0 }, cellOutput: created.outputs[0], outputData: created.outputsData[0] });
   const xudt = await base.getKnownScript(ccc.KnownScript.XUdt);
   const token = ccc.Script.from({ codeHash: xudt.codeHash, hashType: xudt.hashType, args: `0x${"77".repeat(32)}` });
@@ -95,7 +97,7 @@ async function rescueChain(options: { plainCkb?: bigint[]; token?: boolean; list
   const client = await offlineClient(cells, [created, funding]);
   const address = ccc.Address.fromScript(lock, client).toString();
   const destination = ccc.Address.fromScript(await secp256k1Lock(client, ccc.hexFrom(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true))), client).toString();
-  return { client, lock, listLock, address, adminList, token, destination, backups, cells, created, funding };
+  return { client, lock, listLock, address, adminList, token, destination, backups, cells, created, funding, auths, salt: adminType.hash() };
 }
 
 const evmWallet = (accounts = [evmAddress]) => ({
@@ -155,9 +157,10 @@ test("only accepts an HTTPS node URL (or a local node)", () => {
 });
 
 test("rebuilds the backup list and balance from the chain alone, leaving the AdminList and other cells", async () => {
-  const { client, address, adminList, token, backups } = await rescueChain();
+  const { client, address, adminList, token, auths } = await rescueChain();
   const account = await openRescueAccount(client, address);
-  assert.deepEqual(account.entries.map(({ backup }) => backup), backups);
+  // The list is salted auths only: no address or passkey hash of a backup is on chain.
+  assert.deepEqual(account.auths, auths);
   assert.ok(account.adminList.outPoint.eq(adminList.outPoint));
   assert.equal(account.ckb, 1_300n * CKB);
   assert.equal(account.tokenCkb, 176n * CKB);
@@ -172,20 +175,27 @@ test("refuses a list whose record doesn't match the AdminList's root", async () 
   await rejects(openRescueAccount(client, address), "list-missing");
 });
 
-test("finds the connected backup on the list, and names the list when it isn't there", async () => {
-  const { client, address } = await rescueChain();
+test("finds the connected backup on the list by its salted auth, and says how many backups there are when it isn't", async () => {
+  const { client, address, salt } = await rescueChain();
   const account = await openRescueAccount(client, address);
-  assert.equal((await connectEvmBackup(account, evmWallet([`0x${"00".repeat(20)}`, `0x${evmAddress.slice(2).toUpperCase()}`]))).backup.address, evmAddress);
-  await rejects(connectEvmBackup(account, evmWallet([`0x${"00".repeat(20)}`])), "not-backup");
-  await rejects(connectEvmBackup(account, undefined), "no-wallet");
-  assert.throws(() => rescueEntryForEvm(account, [`0x${"ab".repeat(20)}`]), /isn't a backup of this account. Its backups are: EVM wallet/);
-  assert.equal(rescueEntryForJoyId(account, await joyIdAddress(client)).backup.kind, "joyid");
+  const entry = await connectEvmBackup(client, account, evmWallet([`0x${"00".repeat(20)}`, `0x${evmAddress.slice(2).toUpperCase()}`]));
+  assert.equal(entry.backup.address, evmAddress);
+  assert.equal(entry.auth, evmBackupAuth(evmAddress, salt));
+  await rejects(connectEvmBackup(client, account, evmWallet([`0x${"00".repeat(20)}`])), "not-backup");
+  await rejects(connectEvmBackup(client, account, undefined), "no-wallet");
+  await assert.rejects(rescueEntryForEvm(client, account, [`0x${"ab".repeat(20)}`]), /isn't a backup of this account. It has 2 backups; connect one of them/);
+  assert.equal((await rescueEntryForJoyId(client, account, await joyIdAddress(client))).backup.kind, "joyid");
+  await rejects(rescueEntryForJoyId(client, account, address), "not-backup");
+  // The same wallet in another account (another AdminList, so another salt) has a different auth: this
+  // account's list doesn't match it.
+  const other = { ...account, adminListTypeHash: ccc.hexFrom(new Uint8Array(32).fill(0x24)) };
+  await rejects(rescueEntryForEvm(client, other, [evmAddress]), "not-backup");
 });
 
 test("moves every movable cell to the destination, signed once by an EVM backup", async () => {
   const { client, address, adminList, token, destination } = await rescueChain();
   const account = await openRescueAccount(client, address);
-  const entry = rescueEntryForEvm(account, [evmAddress]);
+  const entry = await rescueEntryForEvm(client, account, [evmAddress]);
   const plan = await planRescue(client, account, entry, destination);
   const to = (await ccc.Address.fromString(destination, client)).script;
   assert.equal(plan.transaction.inputs.length, 3);
@@ -215,7 +225,7 @@ test("moves every movable cell to the destination, signed once by an EVM backup"
 test("signs once with a JoyID backup, within the fee it was sized for", async () => {
   const { client, address, destination } = await rescueChain();
   const account = await openRescueAccount(client, address);
-  const entry = rescueEntryForJoyId(account, await joyIdAddress(client));
+  const entry = await rescueEntryForJoyId(client, account, await joyIdAddress(client));
   const plan = await planRescue(client, account, entry, destination);
   const signed = await signRescueWithJoyId(client, account, plan, await joyIdSigner(client));
   assert.equal(signed.hash(), plan.transaction.hash());
@@ -227,7 +237,7 @@ test("signs once with a JoyID backup, within the fee it was sized for", async ()
 test("refuses a bad destination", async () => {
   const { client, address, destination } = await rescueChain();
   const account = await openRescueAccount(client, address);
-  const entry = account.entries[0];
+  const entry = await rescueEntryForEvm(client, account, [evmAddress]);
   await rejects(planRescue(client, account, entry, address), "destination");
   await rejects(planRescue(client, account, entry, `ckb1${destination.slice(4)}`), "destination");
   await rejects(planRescue(client, account, entry, "nowhere"), "destination");
@@ -243,7 +253,7 @@ test("refuses a bad destination", async () => {
 test("leaves out a token cell the node blames and asks for a new signature", async () => {
   const { client, address, destination } = await rescueChain();
   const account = await openRescueAccount(client, address);
-  const plan = await planRescue(client, account, rescueEntryForEvm(account, [evmAddress]), destination);
+  const plan = await planRescue(client, account, await rescueEntryForEvm(client, account, [evmAddress]), destination);
   const signed = await signRescueWithEvm(client, account, plan, evmWallet());
   const blamed = plan.transaction.inputs.findIndex(({ previousOutput }) => account.movable.find((cell) => cell.outPoint.eq(previousOutput))?.cellOutput.type);
   let sent = false;
@@ -264,7 +274,7 @@ test("puts a small remainder into the token cell, and says how much is missing w
   // be a plain cell of its own.
   const small = await rescueChain({ plainCkb: [] });
   const account = await openRescueAccount(small.client, small.address);
-  const plan = await planRescue(small.client, account, account.entries[0], small.destination);
+  const plan = await planRescue(small.client, account, await rescueEntryForEvm(small.client, account, [evmAddress]), small.destination);
   assert.equal(plan.transaction.outputs.length, 1);
   assert.equal(plan.ckb, 0n);
   assert.equal(plan.tokens[0].capacity + plan.fee, 176n * CKB);
@@ -274,19 +284,19 @@ test("puts a small remainder into the token cell, and says how much is missing w
   const poor = await openRescueAccount(tiny.client, tiny.address);
   const omnilock = await ccc.Script.fromKnownScript(tiny.client, ccc.KnownScript.OmniLock, `0x00${"12".repeat(20)}00`);
   const omnilockDestination = ccc.Address.fromScript(ccc.Script.from({ ...omnilock, args: `0x00${"12".repeat(20)}01${"34".repeat(32)}` }), tiny.client).toString();
-  assert.ok((await planRescue(tiny.client, poor, poor.entries[0], tiny.destination)).ckb > 94n * CKB);
-  await assert.rejects(planRescue(tiny.client, poor, poor.entries[0], omnilockDestination), (error: unknown) =>
+  assert.ok((await planRescue(tiny.client, poor, await rescueEntryForEvm(tiny.client, poor, [evmAddress]), tiny.destination)).ckb > 94n * CKB);
+  await assert.rejects(planRescue(tiny.client, poor, await rescueEntryForEvm(tiny.client, poor, [evmAddress]), omnilockDestination), (error: unknown) =>
     error instanceof RescueError && error.code === "short" && /0\.0000\d+ CKB more is needed/.test(error.message));
 
   const none = await rescueChain({ plainCkb: [], token: false });
   const empty = await openRescueAccount(none.client, none.address);
-  await rejects(planRescue(none.client, empty, empty.entries[0], none.destination), "empty");
+  await rejects(planRescue(none.client, empty, await rescueEntryForEvm(none.client, empty, [evmAddress]), none.destination), "empty");
 });
 
 test("the transaction check refuses anything but the rescue's own shape", async () => {
   const { client, address, destination, adminList } = await rescueChain();
   const account = await openRescueAccount(client, address);
-  const plan = await planRescue(client, account, account.entries[0], destination);
+  const plan = await planRescue(client, account, await rescueEntryForEvm(client, account, [evmAddress]), destination);
   const to = (await ccc.Address.fromString(destination, client)).script;
   const tamper = (change: (transaction: ccc.Transaction) => void) => {
     const copy = plan.transaction.clone();
