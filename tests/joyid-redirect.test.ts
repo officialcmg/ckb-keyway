@@ -480,3 +480,41 @@ test("turning recovery on by redirect keeps the other backups through a first co
     if (saved.window === undefined) delete globals.window;
   }
 });
+
+test("a bad joyIdReturnPath is refused before a window opens, a request is saved or the browser node stops", async () => {
+  const globals = globalThis as Record<string, unknown>;
+  const saved = { location: globals.location, sessionStorage: globals.sessionStorage, localStorage: globals.localStorage, window: globals.window, BroadcastChannel: globals.BroadcastChannel };
+  const assigned: string[] = [];
+  const opened: string[] = [];
+  const storage = new MemoryStorage();
+  globals.location = { origin: APP, assign: (url: string) => assigned.push(url) };
+  globals.sessionStorage = storage;
+  globals.localStorage = new MemoryStorage();
+  globals.BroadcastChannel = class { onmessage: unknown = null; postMessage() { /* none */ } close() { /* none */ } };
+  globals.window = {
+    screenX: 0, screenY: 0, innerWidth: 800, innerHeight: 600,
+    open: (url: string) => { opened.push(url); return { closed: false, close: () => undefined }; },
+    addEventListener: () => undefined, removeEventListener: () => undefined,
+  };
+  try {
+    for (const transport of ["window", "redirect"] as const) {
+      for (const returnPath of ["//evil.example/app", "https://evil.example/app", "app"]) {
+        let stopped = 0;
+        let asked = 0;
+        await assert.rejects(startJoyIdBackup({
+          client, app: { joyIdAppURL: "https://testnet.joyid.dev", name: "Acme", logo: `${APP}/icon.svg` }, userId: "user-1", op: "backup-add", returnPath,
+          account: async () => { asked++; return "ckt1account"; }, requestChallenge: async () => { asked++; return freshNonce(); },
+          beforeLeaving: async () => { stopped++; }, options: {},
+        }, transport), /joyIdReturnPath must be a path on this site/);
+        assert.equal(stopped, 0, `${transport} ${returnPath}: the browser node stopped`);
+        assert.equal(asked, 0, `${transport} ${returnPath}: the flow started`);
+      }
+    }
+    assert.deepEqual(opened, []);
+    assert.deepEqual(assigned, []);
+    assert.equal(storage.length, 0);
+  } finally {
+    Object.assign(globals, saved);
+    for (const key of ["window", "BroadcastChannel"] as const) if (saved[key] === undefined) delete globals[key];
+  }
+});
