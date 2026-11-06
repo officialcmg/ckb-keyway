@@ -1,0 +1,126 @@
+{
+ "note": "CKB testnet transactions from the 2026-10-28 browser force-close run (research/e2e): the commitment and the peer settlement that spent it.",
+ "commitment": {
+  "hash": "0xfa3427cd841e6881b3f5f604cfb573a7b1e31c7fece5256a684c3e8c94308802",
+  "transaction": {
+   "cell_deps": [
+    {
+     "dep_type": "code",
+     "out_point": {
+      "index": "0x1",
+      "tx_hash": "0x12c569a258dd9c5bd99f632bb8314b1263b90921ba31496467580d6b79dd14a7"
+     }
+    },
+    {
+     "dep_type": "code",
+     "out_point": {
+      "index": "0x0",
+      "tx_hash": "0x12c569a258dd9c5bd99f632bb8314b1263b90921ba31496467580d6b79dd14a7"
+     }
+    }
+   ],
+   "header_deps": [],
+   "inputs": [
+    {
+     "previous_output": {
+      "index": "0x0",
+      "tx_hash": "0x68f0f30eaa898329c619c76b799bd6129f58757a497e96882f9e2eee3de73be7"
+     },
+     "since": "0x0"
+    }
+   ],
+   "outputs": [
+    {
+     "capacity": "0x1176592c38",
+     "lock": {
+      "args": "0x265a831e021d2a656653bd3285a73c21cdd448c701000000000100a000000000000000018c180a2fdadeb82536e365d5b41e0e4930361b0300",
+      "code_hash": "0x740dee83f87c6f309824d8fd3fbdd3c8380ee6fc9acc90b1a748438afcdf81d8",
+      "hash_type": "type"
+     },
+     "type": null
+    }
+   ],
+   "outputs_data": [
+    "0x"
+   ],
+   "version": "0x0",
+   "witnesses": [
+    "0x10000000100000001000000010000000b1efb8f8546da9c5bbc2675284d89ce459021a754907e9c62de6c3ae4d4f231d25903b75982f51d1e9111bcef971c06e7c872aba8808668fa2c7224bb3ef46c65376c66da9c80a4273f6d91fc92e8b1677411df3ffe41c4220e7421bd2cffbe1"
+   ]
+  }
+ },
+ "peerSettlement": {
+  "hash": "0x32ebef7c483c6a8370e80393e5dc4a46bc667a73d27dd764e22b6206055290f1",
+  "transaction": {
+   "cell_deps": [
+    {
+     "dep_type": "code",
+     "out_point": {
+      "index": "0x0",
+      "tx_hash": "0x764260c9cdd1f154b3942143a0aae01e4221287f94fca8c6f8945967c115331d"
+     }
+    },
+    {
+     "dep_type": "code",
+     "out_point": {
+      "index": "0x0",
+      "tx_hash": "0x12c569a258dd9c5bd99f632bb8314b1263b90921ba31496467580d6b79dd14a7"
+     }
+    },
+    {
+     "dep_type": "dep_group",
+     "out_point": {
+      "index": "0x0",
+      "tx_hash": "0xf8de3bb47d055cdf460d93a2a6e1b05f7432f9777c8c474abf4eec1d4aee5d37"
+     }
+    }
+   ],
+   "header_deps": [],
+   "inputs": [
+    {
+     "previous_output": {
+      "index": "0x0",
+      "tx_hash": "0xfa3427cd841e6881b3f5f604cfb573a7b1e31c7fece5256a684c3e8c94308802"
+     },
+     "since": "0xa000010000000001"
+    },
+    {
+     "previous_output": {
+      "index": "0x2",
+      "tx_hash": "0xad5dfdd993e1b03b9d0719827f549644fc3cf0d8f5f24ea25d10a5fb74b39866"
+     },
+     "since": "0x0"
+    }
+   ],
+   "outputs": [
+    {
+     "capacity": "0xba43b7238",
+     "lock": {
+      "args": "0x265a831e021d2a656653bd3285a73c21cdd448c701000000000100a000000000000000015b463e6d5059db4d9075ee0032a3c13d9e93259d01",
+      "code_hash": "0x740dee83f87c6f309824d8fd3fbdd3c8380ee6fc9acc90b1a748438afcdf81d8",
+      "hash_type": "type"
+     },
+     "type": null
+    },
+    {
+     "capacity": "0xcef5e2d99",
+     "lock": {
+      "args": "0x24ab9e804a1b7f3f303ff54af57e6a0112c72f2a",
+      "code_hash": "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8",
+      "hash_type": "type"
+     },
+     "type": null
+    }
+   ],
+   "outputs_data": [
+    "0x",
+    "0x"
+   ],
+   "version": "0x0",
+   "witnesses": [
+    "0x1000000010000000100000001000000001002c06cf190af53acc02d62e609383c7a0f4d9edd000743ba40b0000000000000000000000ef7bbbb41e5a46011792e9569035a3f70635918600ba1dd2050000000000000000000000ff00ac862497f39ae220998acc340557b68f03a8c4722ed5c36aa46bf6f5177ae74f0243ded2a137c92209992d7cba872b54750781d20aba7adba3eab9cb877f745600",
+    "0x550000001000000055000000550000004100000070ffd86dee454ed17b0d904a94c47a379f00cb9951cdb3ae5f6ffeeb23358d672ff3c8821e848318fccca06a2286152cd2edcac1f2b4edcdf9bce845c9948e9f01"
+   ]
+  }
+ }
+}
