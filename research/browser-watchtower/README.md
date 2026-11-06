@@ -149,9 +149,9 @@ browser tab (fiber-wasm)                          KeyWay API (Railway)          
   transaction (or penalty) has left the chain, it goes back to `watching` (or `penalty-sent`, so the penalty is
   sent again if needed).
 - Each pass checks every channel whose funding has been seen (recent scan, one backlog page, and the penalty if
-  one is due), 8 at a time, before anything else. Channels never seen funded can't have been closed; at most 200 of
-  them are checked per pass, least recently checked first, so registrations from many accounts can't slow the
-  funded channels' checks. Only then do the channels still catching up on a backlog share a 2-minute catch-up
+  one is due), 8 at a time, before anything else. Channels never seen funded can't have been closed; at most 500 of
+  them are checked per pass, taken from each account in turn, so registrations can't slow the funded channels'
+  checks and one account's registrations only delay its own channels' first checks. Only then do the channels still catching up on a backlog share a 2-minute catch-up
   budget equally; catch-up reads only the backlog, since the recent scan already ran. Passes start every 60 s (one
   that runs longer is followed at once).
 - So, for a funded channel:
@@ -163,8 +163,8 @@ browser tab (fiber-wasm)                          KeyWay API (Railway)          
     by the channels catching up.
 - Measured (`timing.ts`, evidence/timing.txt): the real pass and scans against Postgres and a simulated indexer with
   100 ms per request, 600 channels, 10 of them padded with 100,000 cells each, and a revoked commitment buried under
-  40,000 cells before its first check and 300 after. See the evidence file for the time to the penalty, against a
-  commitment delay of about 4 h. Tests cover a spend buried under 1,000 later cells, a spend made while an old
+  40,000 cells before its first check and 300 after: the penalty was sent 168.5 s after the first pass started
+  (passes of about 135 s, 4,571 requests), against a commitment delay of about 4 h. Tests cover a spend buried under 1,000 later cells, a spend made while an old
   range is resumed, a recent range longer than a pass, a reorganized spend, a dropped close, the catch-up order and
   funded-before-unfunded checks.
 - The advisory lock is re-asked every pass (re-entrant for the holder), so an instance whose connection was replaced
