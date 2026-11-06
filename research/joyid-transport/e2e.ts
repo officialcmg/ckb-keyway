@@ -11,6 +11,7 @@
  *
  * Build first: `npm run build:sdk && KEYWAY_LOCAL_SDK=1 npx next build`.
  * Run: NODE_PATH=$(npm root -g) node --import tsx research/joyid-transport/e2e.ts
+ * With KEYWAY_E2E_DEV=1 it runs against `next dev` instead (React StrictMode on) and writes e2e-dev.output.txt.
  */
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -31,6 +32,7 @@ type Route = import("playwright").Route;
 const { chromium } = createRequire(import.meta.url)("playwright") as typeof import("playwright");
 
 const root = new URL("../../", import.meta.url).pathname;
+const DEV = process.env.KEYWAY_E2E_DEV === "1";
 const PORT = 3100;
 const APP = `http://localhost:${PORT}`;
 const API = "https://keyway-api-production.up.railway.app";
@@ -171,10 +173,12 @@ async function offline(route: Route) {
 
 // --- The app ------------------------------------------------------------------------------------------------------
 async function startServer() {
-  const server = spawn("npx", ["next", "start", "-p", String(PORT)], { cwd: root, stdio: ["ignore", "pipe", "pipe"], detached: true, env: { ...process.env, NODE_ENV: "production" } });
+  const server = DEV
+    ? spawn("npx", ["next", "dev", "-p", String(PORT)], { cwd: root, stdio: ["ignore", "pipe", "pipe"], detached: true, env: { ...process.env, KEYWAY_LOCAL_SDK: "1" } })
+    : spawn("npx", ["next", "start", "-p", String(PORT)], { cwd: root, stdio: ["ignore", "pipe", "pipe"], detached: true, env: { ...process.env, NODE_ENV: "production" } });
   server.stdout.on("data", () => undefined);
   server.stderr.on("data", (chunk) => process.stderr.write(chunk));
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 400; i++) {
     try { if ((await fetch(`${APP}/app`)).ok) return server; } catch { /* starting */ }
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
@@ -212,9 +216,9 @@ const pageState = (page: Page) => page.evaluate(() => ({
 
 async function approveAndEnterCode(page: Page) {
   try {
-    await page.getByRole("button", { name: "Turn on recovery" }).click({ timeout: 30_000 });
-    await page.locator('input[autocomplete="one-time-code"]').fill("123456", { timeout: 30_000 });
-    await page.getByText("These backups can move everything").waitFor({ timeout: 30_000 });
+    await page.getByRole("button", { name: "Turn on recovery" }).click({ timeout: 90_000 });
+    await page.locator('input[autocomplete="one-time-code"]').fill("123456", { timeout: 90_000 });
+    await page.getByText("These backups can move everything").waitFor({ timeout: 90_000 });
   } catch (error) {
     await page.screenshot({ path: new URL("./e2e-failure.png", import.meta.url).pathname });
     console.error(JSON.stringify({ apiCalls, joyIdVisits: joyIdVisits.map(({ path, answered }) => ({ path, answered })), url: page.url(), text: (await page.locator("body").innerText()).slice(0, 2000) }, null, 2));
@@ -233,6 +237,7 @@ results.checks = {};
 const server = await startServer();
 const browser = await chromium.launch();
 results.chromium = browser.version();
+results.server = DEV ? "next dev (React StrictMode)" : "next start (production build)";
 try {
   // 1. Window transport, first use (connect, then sign) on the cross-origin isolated demo.
   {
@@ -250,7 +255,7 @@ try {
     helper.on("framenavigated", (frame) => { if (frame === helper.mainFrame()) helperUrls.push(frame.url()); });
     const stageSeen = await page.getByRole("button", { name: /Connecting JoyID…|Waiting for JoyID…/ }).textContent({ timeout: 10_000 }).catch(() => null);
     await approveAndEnterCode(page);
-    await helper.waitForEvent("close", { timeout: 10_000 }).catch(() => undefined);
+    await helper.waitForEvent("close", { timeout: 30_000 }).catch(() => undefined);
     const state = await pageState(page);
     const verified = apiCalls.filter((call) => call.verified);
     results["1. window transport"] = {
@@ -283,9 +288,10 @@ try {
     const opened = context.waitForEvent("page");
     await page.getByRole("button", { name: "Turn on with JoyID" }).click();
     const helper = await opened;
-    await page.getByText("Cancelled. Nothing changed.").waitFor({ timeout: 20_000 });
-    await helper.waitForEvent("close", { timeout: 10_000 }).catch(() => undefined);
-    results["2. known JoyID, rejected in JoyID"] = { joyIdVisits: joyIdVisits.map(({ path, answered }) => ({ path, answered })), helperClosed: helper.isClosed(), apiCalls: apiCalls.filter((call) => call.path === "/recovery") };
+    await page.getByText("Cancelled. Nothing changed.").waitFor({ timeout: 60_000 });
+    await helper.waitForEvent("close", { timeout: 30_000 }).catch(() => undefined);
+    const helperLeft = helper.isClosed() ? undefined : { url: helper.url().replace(/_data_=[^&]+/, "_data_=…"), text: (await helper.locator("body").innerText().catch(() => "")).slice(0, 300) };
+    results["2. known JoyID, rejected in JoyID"] = { helperLeft, joyIdVisits: joyIdVisits.map(({ path, answered }) => ({ path, answered })), helperClosed: helper.isClosed(), apiCalls: apiCalls.filter((call) => call.path === "/recovery") };
     check("known connection skips connect", joyIdVisits.length === 1 && joyIdVisits[0].path === "/sign-message");
     check("rejection in JoyID is a cancel, nothing previewed", !apiCalls.some((call) => call.operation === "preview"));
     check("helper closed after a rejection", helper.isClosed());
@@ -341,7 +347,7 @@ try {
     const page = await context.newPage();
     const forged = encodeSearch({ type: "SignMessage", data: { ...signMessage("anything"), challenge: "anything", alg: -7, pubkey: Buffer.from(passkeyPublic).toString("hex"), keyType: "main_key" }, state: { v: 1, id: hex(16) } });
     await page.goto(`${APP}/app?joyid-redirect=true&_data_=${encodeURIComponent(forged)}`);
-    await page.getByText("JoyID's answer doesn't match this request").waitFor({ timeout: 20_000 });
+    await page.getByText("JoyID's answer doesn't match this request").waitFor({ timeout: 60_000 });
     const state = await pageState(page);
     results["4. crafted _data_ URL"] = { url: state.url, fetchesWithTheAnswerInTheUrl: state.fetches.filter((fetch) => fetch.href.includes("_data_")), apiCalls: apiCalls.filter((call) => call.path === "/recovery") };
     check("crafted: refused with a plain message", true);
@@ -356,6 +362,6 @@ try {
 
 results.failures = failures;
 const output = JSON.stringify(results, null, 2);
-writeFileSync(new URL("./e2e.output.txt", import.meta.url), `${output}\n`);
+writeFileSync(new URL(DEV ? "./e2e-dev.output.txt" : "./e2e.output.txt", import.meta.url), `${output}\n`);
 console.log(output);
 if (failures.length) process.exit(1);

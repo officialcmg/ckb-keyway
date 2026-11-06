@@ -125,7 +125,15 @@ BroadcastChannel message can't get a foreign JoyID accepted. Findings and outcom
 | 11 | Low | The router-synced strip on `setTimeout(0)` may run before Next.js hooks history. | Fixed: it runs again after 300 ms. |
 | 12 | Low | Default return path drops the hash; direct `node.sendPayment` calls aren't counted; a custom JoyID app URI on a CCC signer is ignored; no docs sentence on manual node restart. | Hash kept; docs now say only `useFiber()` payments and channel changes are counted, and cover the restart. The custom app URI is left out on purpose: JoyID requests go only to JoyID's two apps (see 8). |
 
+**Second pass.** The fixes changed the window protocol, so the reviewer looked at that commit again:
+
+| # | Finding | Outcome |
+| --- | --- | --- |
+| 13 | Regression: React StrictMode (development) runs the JoyID window's effect twice, so it said `ready` twice, and the new "a second `ready` means it reloaded" rule cancelled the flow. | Fixed two ways: the JoyID window now keeps one channel and one set of listeners per page load, outside the effect, so a re-run says nothing again and leaves no gap; and the opening tab drops any `ready` said before each request. Running the e2e against `next dev` (StrictMode on, `KEYWAY_E2E_DEV=1`, `e2e-dev.output.txt`) also exposed a second StrictMode bug: the effect cleanup closed the channel, and the opening tab's `close` was lost, so the window stayed open after a rejection. The per-load channel fixed that too: 22/22 in dev and production. |
+| 14 | Back into a cached JoyID window from JoyID's page left the opening tab waiting. | Fixed: `pageshow` with `persisted` in the window posts `gone`. Unit-tested. |
+| 15 | After Back from a full-page redirect (cancelled), Forward and finishing in JoyID would still apply the backup. | Fixed: the cancelled request's record is deleted, so a late answer is refused. |
+
 Backward compatibility and UX copy: the reviewer found no issue. After the fixes every check was re-run: both
 typechecks, `npm test` (242 tests: 225 pass, 0 fail, 17 skipped by their own environment gates; 13 JoyID tests),
 the Postgres suite (43/43), `next build` against the pinned 0.2.6 and the local SDK, the demo typecheck against the
-new SDK, the docs build, the release workflow steps, and the e2e (22/22).
+new SDK, the docs build, the release workflow steps, and the e2e (22/22 against `next start`, 22/22 against `next dev`).
