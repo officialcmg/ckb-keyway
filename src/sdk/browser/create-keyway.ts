@@ -36,6 +36,7 @@ import { fiberWasmFactory } from "./fiber-wasm";
 import { listenForWatchtowerCalls } from "./watchtower-bridge";
 import { openWatchtowerStore } from "./watchtower-store";
 import { settleChannel } from "./watchtower-settle";
+import { createRemoteWatchtower, remoteWatchUpdate, updatesForStoredChannel } from "./watchtower-remote";
 import { createFeeReserve, FEE_RESERVE, needsFeeReserve } from "./fee-reserve";
 import type { RequestEmailCode } from "./email-code";
 
@@ -92,6 +93,19 @@ export type KeyWayChannel = {
   capacity: bigint;
   public: boolean;
   raw: Channel;
+};
+/** One channel as KeyWay's watchtower sees it. */
+export type WatchtowerChannelStatus = {
+  channelId: string;
+  /** watching: open or not yet resolved; penalty-sent/penalized: the peer published a revoked commitment. */
+  state: "watching" | "penalty-sent" | "penalized" | "closed" | "missed";
+  detail: string | null;
+  commitmentNumber: string | null;
+  fundingOutPoint: string | null;
+  closingTransaction: string | null;
+  penaltyTransaction: string | null;
+  checkedAt: string | null;
+  updatedAt: string;
 };
 export type PaymentEstimate =
   | { routable: true; fee: bigint }
@@ -176,6 +190,22 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   });
   const paymentLog = createPaymentLog(databasePrefix);
   let restoreRequired = options.restoreRequired ?? false;
+  // KeyWay's watchtower punishes a peer that publishes a revoked commitment while this tab is closed. It gets the
+  // funding keys and the newest revocation only (watchtower-remote.ts); the keys stay here.
+  const remoteWatchtower = createRemoteWatchtower({
+    send: (update) => api.watchtower(options.authToken, update),
+    registration: async (channelId) => {
+      const stored = await watchtower.get(channelId);
+      return stored ? updatesForStoredChannel(stored)[0] : undefined;
+    },
+  });
+  /** While KeyWay's watchtower is missing a revocation, closing the tab leaves that state unwatched: ask first. */
+  function warnBeforeUnload(event: BeforeUnloadEvent) {
+    if (remoteWatchtower.pending() === 0) return;
+    event.preventDefault();
+    // Some browsers only ask when returnValue is a non-empty string; none show the text.
+    event.returnValue = "Fiber channel updates have not reached KeyWay's watchtower yet.";
+  }
 
   /** Bumped by every stop, so a start that a stop overtook (e.g. while the key was loading) can undo itself. */
   let stopGeneration = 0;
@@ -204,7 +234,13 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       stopWatchtowerBridge ??= listenForWatchtowerCalls(watchtowerChannel, async (call) => {
         await watchtower.apply(call);
         console.info(`[keyway] watchtower: stored ${call.method}`);
+        remoteWatchtower.enqueue(remoteWatchUpdate(call));
       });
+      if (typeof window !== "undefined") window.addEventListener("beforeunload", warnBeforeUnload);
+      // Bring KeyWay's watchtower up to date with every channel this device already watches (it ignores repeats).
+      void watchtower.list().then((channels) => {
+        for (const channel of channels) for (const update of updatesForStoredChannel(channel)) remoteWatchtower.enqueue(update);
+      }).catch((error) => console.warn("[keyway] watchtower: could not read the stored channels", error));
       const info = await node.start();
       if (generation !== stopGeneration) {
         // @fiber-pay/sdk's stop() doesn't cancel a start that is still unlocking the key, so the node can come up
@@ -349,6 +385,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     await stopWatching();
     if (!deviceLease) {
       await stop();
+      remoteWatchtower.stop();
       return;
     }
     const lease = deviceLease;
@@ -367,6 +404,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       }),
       releaseOwnership: releaseGuards,
     });
+    // The session ends with the logout, so nothing more can reach KeyWay's watchtower from this page.
+    remoteWatchtower.stop();
   }
 
   async function restoreClaimedBackup() {
@@ -391,6 +430,9 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     // the node up (and then stop it); it calls this again once it has, and the bridge closes then.
     if (!starting) {
       await closeWatchtowerBridge();
+      // Give KeyWay's watchtower whatever is still queued before the page lets go of the node.
+      await Promise.race([remoteWatchtower.flush(), new Promise((resolve) => setTimeout(resolve, 10_000))]);
+      if (typeof window !== "undefined") window.removeEventListener("beforeunload", warnBeforeUnload);
       watchtower.close();
     }
     const lease = deviceLease;
@@ -578,6 +620,10 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     getCkbBalance,
     openChannelWithExternalFunding: node.openChannelWithExternalFunding.bind(node),
     submitSignedFundingTx: node.submitSignedFundingTx.bind(node),
+    /** What KeyWay's watchtower knows about this account's channels and how each one stands on-chain. */
+    watchtowerStatus: () => api.watchtower<{ channels: WatchtowerChannelStatus[] }>(options.authToken, { operation: "status" }),
+    /** Channels with an update KeyWay's watchtower doesn't have yet; closing the tab now leaves that state unwatched. */
+    watchtowerPending: () => remoteWatchtower.pending(),
     get state() { return node.state; },
     get isRunning() { return node.isRunning; },
   };
