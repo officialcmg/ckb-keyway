@@ -37,6 +37,7 @@ import { listenForWatchtowerCalls } from "./watchtower-bridge";
 import { openWatchtowerStore } from "./watchtower-store";
 import { settleChannel } from "./watchtower-settle";
 import { createRemoteWatchtower, remoteWatchUpdate, updatesForStoredChannel } from "./watchtower-remote";
+import { createNodeLifecycle } from "./node-lifecycle";
 import { createFeeReserve, FEE_RESERVE, needsFeeReserve } from "./fee-reserve";
 import type { RequestEmailCode } from "./email-code";
 
@@ -207,21 +208,11 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     event.returnValue = "Fiber channel updates have not reached KeyWay's watchtower yet.";
   }
 
-  /** Bumped by every stop, so a start that a stop overtook (e.g. while the key was loading) can undo itself. */
-  let stopGeneration = 0;
-  /** True while start() is running: a stop then leaves the bridge to start(), which closes it after the node stops. */
-  let starting = false;
-
-  async function start() {
-    if (node.isRunning) return node.nodeInfo();
-    const generation = stopGeneration;
-    if (typeof window !== "undefined" && window.crossOriginIsolated !== true) {
-      throw toKeyWayError(new Error("Cross-origin isolated browser context is required"));
-    }
-    options.onFiberStartup?.("claiming_device");
-    deviceLock = await acquireDeviceLock(options.identifier);
-    try {
-      starting = true;
+  const lifecycle = createNodeLifecycle({
+    node,
+    async claim() {
+      options.onFiberStartup?.("claiming_device");
+      deviceLock = await acquireDeviceLock(options.identifier);
       deviceLease = await acquireDeviceLease(options.authToken, api, (cause) => {
         const error = cause instanceof Error ? cause : new Error("The active KeyWay device lease expired");
         void stop().finally(() => options.onLeaseLost?.(error));
@@ -230,6 +221,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
         options.onFiberStartup?.("restoring_channels");
         await restoreClaimedBackup();
       }
+    },
+    openBridge() {
       options.onFiberStartup?.("starting_browser_node");
       stopWatchtowerBridge ??= listenForWatchtowerCalls(watchtowerChannel, async (call) => {
         await watchtower.apply(call);
@@ -241,22 +234,33 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       void watchtower.list().then((channels) => {
         for (const channel of channels) for (const update of updatesForStoredChannel(channel)) remoteWatchtower.enqueue(update);
       }).catch((error) => console.warn("[keyway] watchtower: could not read the stored channels", error));
-      const info = await node.start();
-      if (generation !== stopGeneration) {
-        // @fiber-pay/sdk's stop() doesn't cancel a start that is still unlocking the key, so the node can come up
-        // after stop() returned. Stop it again rather than leave it (and its timers) running without a lease.
-        await node.stop().catch(() => undefined);
-        throw toKeyWayError(new Error("The Fiber node was stopped while it was starting"));
-      }
-      startSweeping();
-      return info;
-    } catch (error) {
-      starting = false;
-      await releaseGuards();
-      throw error;
-    } finally {
-      starting = false;
+    },
+    closeBridge: closeWatchtowerBridge,
+    afterStart: startSweeping,
+    async stopTimers() {
+      if (sweepTimer) clearInterval(sweepTimer);
+      sweepTimer = undefined;
+      await stopWatching();
+    },
+    async release() {
+      // The bridge has drained. Give KeyWay's watchtower whatever is still queued before the page lets go of the node.
+      await Promise.race([remoteWatchtower.flush(), new Promise((resolve) => setTimeout(resolve, 10_000))]);
+      if (typeof window !== "undefined") window.removeEventListener("beforeunload", warnBeforeUnload);
+      watchtower.close();
+      const lease = deviceLease;
+      const lock = deviceLock;
+      deviceLease = undefined;
+      deviceLock = undefined;
+      await Promise.allSettled([lease?.release(), lock?.release()]);
+    },
+    overtaken: () => toKeyWayError(new Error("The Fiber node was stopped while it was starting")),
+  });
+
+  async function start() {
+    if (typeof window !== "undefined" && window.crossOriginIsolated !== true) {
+      throw toKeyWayError(new Error("Cross-origin isolated browser context is required"));
     }
+    return lifecycle.start();
   }
 
   /**
@@ -365,47 +369,45 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   }
 
   async function stop() {
-    stopGeneration++;
-    if (sweepTimer) clearInterval(sweepTimer);
-    sweepTimer = undefined;
-    await stopWatching();
     try {
-      await node.stop();
+      // Waits for a start it overtook to stop its node, then drains the bridge before the store closes.
+      await lifecycle.stop();
     } finally {
       preparedPeers = undefined;
       preparedFundingAmount = undefined;
-      await releaseGuards();
     }
   }
 
-  async function stopForLogout() {
-    stopGeneration++;
-    if (sweepTimer) clearInterval(sweepTimer);
-    sweepTimer = undefined;
-    await stopWatching();
-    if (!deviceLease) {
-      await stop();
+  function stopForLogout() {
+    // A start in progress settles first: one that already holds the lease is backed up below.
+    return lifecycle.logout(async (steps) => {
+      if (!deviceLease) {
+        try {
+          await steps.stop();
+        } finally {
+          preparedPeers = undefined;
+          preparedFundingAmount = undefined;
+        }
+        remoteWatchtower.stop();
+        return;
+      }
+      const lease = deviceLease;
+      const deviceIdHash = await getDeviceIdHash();
+      await backUpBeforeLogout({
+        loadFiberKey: () => options.loadFiberKey(lease.leaseId),
+        // The backup is taken only after the bridge has drained, so it holds every watchtower call.
+        stopNode: steps.stopNodeAndDrain,
+        createBackup: (fiberKey) => createEncryptedNodeBackup(databasePrefix, fiberKey),
+        saveBackup: (backup) => api.saveNodeBackup(options.authToken, {
+          deviceIdHash,
+          leaseId: lease.leaseId,
+          backup,
+        }),
+        releaseOwnership: steps.releaseGuards,
+      });
+      // The session ends with the logout, so nothing more can reach KeyWay's watchtower from this page.
       remoteWatchtower.stop();
-      return;
-    }
-    const lease = deviceLease;
-    const deviceIdHash = await getDeviceIdHash();
-    await backUpBeforeLogout({
-      loadFiberKey: () => options.loadFiberKey(lease.leaseId),
-      stopNode: async () => {
-        await node.stop();
-        await closeWatchtowerBridge();
-      },
-      createBackup: (fiberKey) => createEncryptedNodeBackup(databasePrefix, fiberKey),
-      saveBackup: (backup) => api.saveNodeBackup(options.authToken, {
-        deviceIdHash,
-        leaseId: lease.leaseId,
-        backup,
-      }),
-      releaseOwnership: releaseGuards,
     });
-    // The session ends with the logout, so nothing more can reach KeyWay's watchtower from this page.
-    remoteWatchtower.stop();
   }
 
   async function restoreClaimedBackup() {
@@ -423,23 +425,6 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       }),
     });
     restoreRequired = false;
-  }
-
-  async function releaseGuards() {
-    // The node has stopped by now, so it sends no more watchtower events. A start() still in progress may yet bring
-    // the node up (and then stop it); it calls this again once it has, and the bridge closes then.
-    if (!starting) {
-      await closeWatchtowerBridge();
-      // Give KeyWay's watchtower whatever is still queued before the page lets go of the node.
-      await Promise.race([remoteWatchtower.flush(), new Promise((resolve) => setTimeout(resolve, 10_000))]);
-      if (typeof window !== "undefined") window.removeEventListener("beforeunload", warnBeforeUnload);
-      watchtower.close();
-    }
-    const lease = deviceLease;
-    const lock = deviceLock;
-    deviceLease = undefined;
-    deviceLock = undefined;
-    await Promise.allSettled([lease?.release(), lock?.release()]);
   }
 
   async function openFundedChannel(params: KeyWayFundingParams) {
