@@ -2,6 +2,7 @@
 // sweeps it to the user's own address. Runs the local SDK build in headless Chromium under the production origin
 // against the production API, with a disposable account, and keeps the node running for the whole delay.
 //
+//   npm install --no-save playwright   (if it isn't installed; the repo doesn't depend on it)
 //   node research/e2e/browser-settlement.mjs
 //
 // Everything the page and Fiber's workers print goes to .evidence/settlement-console.log (nothing is filtered).
