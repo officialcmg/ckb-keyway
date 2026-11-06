@@ -443,7 +443,13 @@ export function chainView(client: ccc.Client, options: { historyBudgetMs?: numbe
       }
       // Still catching up on a long history: look at the newest entries too, so a spend made now isn't left
       // waiting behind the backlog. Only both parties together can spend a cell under this lock.
-      const newest = await client.findTransactionsPaged(key(lock), "desc", HISTORY_PAGE_SIZE);
+      let newest: Awaited<ReturnType<typeof client.findTransactionsPaged>>;
+      try {
+        newest = await client.findTransactionsPaged(key(lock), "desc", HISTORY_PAGE_SIZE);
+      } catch (error) {
+        // Keep the forward scan's progress; the next pass resumes from it and tries the newest page again.
+        return { sawOutput, ...(cursor ? { cursor } : {}), error: error instanceof Error ? error.message : String(error) };
+      }
       const recent = newest.transactions.find((item) => item.isInput);
       if (recent) return { sawOutput: true, spend: { txHash: recent.txHash, index: Number(recent.cellIndex) }, ...(cursor ? { cursor } : {}) };
       return { sawOutput: sawOutput || newest.transactions.length > 0, ...(cursor ? { cursor } : {}) };
