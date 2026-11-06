@@ -84,7 +84,41 @@ KeyWay's own watchtower, once it is configured and the SDK has sent it the chann
 
 ## Live proof (CKB testnet, production API, fixed SDK)
 
-_In progress; filled in below._
+**Result: DONE.** A browser-mode node running this branch claimed the user's share by itself after the delay, and the
+SDK swept it to the user's own address. Disposable account (temp-mail OTP) on the production API, user address
+`ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqtm8ww9j4w2uu0fdf9as5ffqp2cz4mvtpg0cyz4l`, funded with 10,000
+CKB from the Nervos testnet faucet, channel `0xbd3d33a2ad1213e27a4a6c27a9df43838dce436db888245cbf26b3eb4f59f07f`
+(500 CKB from the user, 250 CKB from the peer). Times are block timestamps from CKB RPC (`testnet.ckb.dev`), 2026-11-06 UTC.
+
+| Step | Transaction | Block | Time (UTC) |
+|---|---|---|---|
+| Funding (750 CKB channel) | `0x01ded4e7d32e615f92383fcb2499f579eafe52044b94cc8b145d4e1f0d72b0de` | 22984760 | 16:46:43 |
+| Fee reserve, 62 CKB to the node key (first open) | `0xa9a5b084ed9d78866a13fb3b3d0a2c111dccbb6b510171c7b804da6e7bdd5883` | 22984763 | 16:47:15 |
+| Force close requested from the browser node | n/a | n/a | 16:47:26 |
+| Commitment (749.99999544 CKB, 1-epoch delay) | `0x461d050f91bfb6eb82e3570d27321259e7348852f96dc9342d032b4a00335a7b` | 22984768 | 16:47:59 |
+| **Node's claim** of the user's share (unlock `0xFE`, `since` `0xa000010000000001`, fee from the reserve): 249.99999544 CKB left in a successor commitment cell for the peer, 561.99999216 CKB to the node key | `0x321662fafdc0ba1ad9cfb75b161117c9fdf06e116be65cfe7262d378b243844b` | 22986580 | 21:07:25 (sent 21:05:56) |
+| **SDK sweep** to the user's own address: 499.99993111 CKB to the user, 62 CKB kept as the reserve while the peer's part is unsettled | `0xa253b8f7a695f995809783ba66e0e486efe07ad96d2e870c4564cdb885cb80cb` | 22986587 | 21:08:23 |
+
+From force close to the user's address: 4 h 21 min, of which about 4 h 18 min is the commitment delay (epoch 14142
+index ~1673 to epoch 14143 index 1673). The claim went out on the first watchtower pass after the delay.
+
+Notes:
+- The in-page watchtower received `create_watch_channel`, `update_local_settlement` and
+  `update_pending_remote_settlement` from the WASM node within 2 s of the channel opening (console:
+  `[keyway] watchtower: stored ...`), and the data survived seven page reloads (the page was reloaded with each
+  review fix to the SDK; the node restarted each time and the watchtower reported `waiting for the commitment delay`).
+- Before the delay passed, the same claim built against the live commitment passed CKB `estimate_cycles` (0x302209
+  cycles), i.e. Fiber's commitment lock accepted the witness and signature.
+- Two harmless rejections in the console after the claim: a pass one minute later rebuilt the claim while the first
+  was still in the mempool (`PoolRejectedRBF ... unconfirmed inputs`), and the periodic sweep and the post-claim sweep
+  raced (`PoolRejectedDuplicatedTransaction`). Neither sent anything twice.
+- The peer had not claimed its 249.99999544 CKB by 21:10; that is its own watchtower's job.
+- Everything the page and both Fiber workers printed is in the run's console log (kept with the disposable account's
+  credentials in the gitignored `research/e2e/.evidence/`).
+
+### Run 2's stuck cells
+Still live at 21:10 on 2026-11-06: `0x32ebef7c…90f1:0` (499.99999544 CKB, the run-2 user's share) and the 62 CKB
+reserve `0x158925a8…d710:0`. They cannot be claimed: see "What run 2 actually left behind".
 
 ## Upstream issue text (nervosnetwork/fiber)
 
