@@ -174,6 +174,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
 
   /** Bumped by every stop, so a start that a stop overtook (e.g. while the key was loading) can undo itself. */
   let stopGeneration = 0;
+  /** True while start() is running: a stop then leaves the bridge to start(), which closes it after the node stops. */
+  let starting = false;
 
   async function start() {
     if (node.isRunning) return node.nodeInfo();
@@ -184,6 +186,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     options.onFiberStartup?.("claiming_device");
     deviceLock = await acquireDeviceLock(options.identifier);
     try {
+      starting = true;
       deviceLease = await acquireDeviceLease(options.authToken, api, (cause) => {
         const error = cause instanceof Error ? cause : new Error("The active KeyWay device lease expired");
         void stop().finally(() => options.onLeaseLost?.(error));
@@ -207,8 +210,11 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       startSweeping();
       return info;
     } catch (error) {
+      starting = false;
       await releaseGuards();
       throw error;
+    } finally {
+      starting = false;
     }
   }
 
@@ -376,9 +382,12 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   }
 
   async function releaseGuards() {
-    // The node has stopped by now, so it sends no more watchtower events.
-    await closeWatchtowerBridge();
-    watchtower.close();
+    // The node has stopped by now, so it sends no more watchtower events. A start() still in progress may yet bring
+    // the node up (and then stop it); it calls this again once it has, and the bridge closes then.
+    if (!starting) {
+      await closeWatchtowerBridge();
+      watchtower.close();
+    }
     const lease = deviceLease;
     const lock = deviceLock;
     deviceLease = undefined;
