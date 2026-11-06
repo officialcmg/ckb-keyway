@@ -176,6 +176,38 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     assert.deepEqual({ ...row }, { history_cursor: "c1", funding_spend: `${spendHash}:0`, detail: "check failed: node unavailable" });
   });
 
+  await t.test("channels catching up on a long backlog never hold up another channel's penalty", async () => {
+    const { id: revokedId, closing } = await revokedChannel(proof.revocationSignature);
+    const user = { id: crypto.randomUUID() };
+    const backlogged = [channelId(), channelId()];
+    for (const id of backlogged) await watchtowerRequest(user, watch(id));
+    const paddedLock = fundingLockArgs(K1, K2);
+    const events: string[] = [];
+    const chain: ChainView = {
+      async fundingHistory(lock, _scan, options) {
+        if (lock.args !== paddedLock) return { sawOutput: true, spend: { txHash: closing.hash(), index: 0 } };
+        const budget = options?.backlogBudgetMs ?? 0;
+        events.push(budget === 0 ? "check" : `catch-up ${Math.round(budget / 10) * 10}`);
+        await new Promise((resolve) => setTimeout(resolve, budget)); // uses its whole budget
+        return { sawOutput: true, backlog: true };
+      },
+      transaction: async (hash) => (hash === closing.hash() ? { tx: closing, committed: true, status: "committed" } : undefined),
+      isLive: async () => true,
+      spender: async () => undefined,
+    };
+    await runWatchtowerPass({
+      sql, chain, concurrency: 1, catchUpBudgetMs: 400, log: () => undefined,
+      punish: async (row) => { events.push(`punish ${row.channel_id === revokedId}`); return `0x${"cd".repeat(32)}`; },
+    });
+    // Every channel is checked (and the revoked one punished) before any backlog gets catch-up time, which is
+    // shared: the first of two channels gets half.
+    assert.deepEqual(events.filter((event) => !event.startsWith("catch-up")).sort(), ["check", "check", "punish true"]);
+    assert.ok(events.findIndex((event) => event.startsWith("catch-up")) > events.indexOf("punish true"));
+    const catchUp = events.filter((event) => event.startsWith("catch-up"));
+    assert.equal(catchUp.length, 2);
+    assert.ok(Number(catchUp[0].split(" ")[1]) <= 200, catchUp[0]);
+  });
+
   await t.test("a channel that was never funded and was removed is dropped", async () => {
     const user = { id: crypto.randomUUID() };
     const id = channelId();

@@ -4,7 +4,7 @@ import * as ccc from "@ckb-ccc/core";
 import { createRemoteWatchtower, remoteWatchUpdate, updatesForStoredChannel, type RemoteWatchUpdate } from "../src/sdk/browser/watchtower-remote.ts";
 import type { WatchedChannel } from "../src/sdk/browser/watchtower-store.ts";
 import {
-  FUNDING_LOCK, assessChannel, chainView, buildPenaltyTransaction, commitmentArgs, fundingLockArgs, keyAggXOnly, parseRevocation,
+  FUNDING_LOCK, assessChannel, chainView, type HistoryScan, buildPenaltyTransaction, commitmentArgs, fundingLockArgs, keyAggXOnly, parseRevocation,
   parseWatchtowerRequest, peerCommitmentKey, revocationSignatureValid, revocationWitness, type ChainView,
 } from "../src/server/watchtower.ts";
 import { COMMITMENT_LOCK, blake160 } from "../src/sdk/browser/watchtower-settle.ts";
@@ -203,57 +203,94 @@ test("a revocation for a channel the device has no record of stops being retried
   }
 });
 
-test("a padded funding history only delays the scan: it resumes until it reaches the spend", async () => {
+type Entry = { txHash: ccc.Hex; blockNumber: bigint; isInput: boolean; cellIndex: bigint };
+/** An indexer over `entries` (oldest first); a cursor is the position of the last entry returned, as the real one's. */
+function fakeIndexer(entries: () => Entry[], fail?: (order: string, after?: string) => boolean) {
+  return {
+    async findTransactionsPaged(_key: unknown, order: string, limit: number, after?: string) {
+      if (fail?.(order, after)) throw new Error("indexer timeout");
+      const all = entries().map((entry, position) => ({ entry, position }));
+      const list = order === "desc"
+        ? all.filter(({ position }) => after === undefined || position < Number(after)).reverse()
+        : all.filter(({ position }) => after === undefined || position > Number(after));
+      const page = list.slice(0, Number(limit));
+      return { transactions: page.map(({ entry }) => entry), lastCursor: page.length ? String(page.at(-1)!.position) : after ?? "" };
+    },
+  } as unknown as ccc.Client;
+}
+const padding = (from: number, count: number): Entry[] =>
+  Array.from({ length: count }, (_, i) => ({ txHash: ccc.hexFrom(ccc.numBeToBytes(BigInt(from + i), 32)), blockNumber: BigInt(from + i), isInput: false, cellIndex: 0n }));
+
+test("a padded funding history only delays the backlog scan: it resumes until it reaches the spend", async () => {
   const closingHash = `0x${"c1".repeat(32)}` as ccc.Hex;
-  // More padded cells than one pass reads (25 pages of 200), then the spend.
-  const entries = [
-    ...Array.from({ length: 9_000 }, (_, i) => ({ txHash: ccc.hexFrom(ccc.numBeToBytes(BigInt(i + 1), 32)), isInput: false, cellIndex: 0n })),
-    { txHash: closingHash, isInput: true, cellIndex: 1n },
-  ];
-  let tail = entries;
-  const client = {
-    async findTransactionsPaged(_key: unknown, order: string, limit: number, after?: string) {
-      if (order === "desc") return { transactions: [...tail].reverse().slice(0, Number(limit)), lastCursor: "" };
-      const start = after ? Number(after) : 0;
-      const page = entries.slice(start, start + Number(limit));
-      return { transactions: page, lastCursor: String(start + page.length) };
-    },
-  } as unknown as ccc.Client;
   const lock = ccc.Script.from({ ...FUNDING_LOCK, args: `0x${"00".repeat(20)}` });
-  // A pass that can't reach the spend (here: a 25-page budget) and where the spend is buried under later padding too.
-  tail = [...entries, ...Array.from({ length: 300 }, (_, i) => ({ txHash: ccc.hexFrom(ccc.numBeToBytes(BigInt(100_000 + i), 32)), isInput: false, cellIndex: 0n }))];
-  const view = chainView(client, { maxPages: 25 });
-  const first = await view.fundingHistory(lock);
-  assert.equal(first.spend, undefined);
-  assert.equal(first.sawOutput, true);
-  assert.equal(first.cursor, "5000");
-  const second = await view.fundingHistory(lock, first.cursor);
+  // Registered late: 9,000 padded cells, the spend, then 300 more, before the first check.
+  const entries = [...padding(1, 9_000), { txHash: closingHash, blockNumber: 9_001n, isInput: true, cellIndex: 1n }, ...padding(9_002, 300)];
+  const view = chainView(fakeIndexer(() => entries), { maxPages: 25 });
+  const first = await view.fundingHistory(lock, {}, { backlogBudgetMs: 60_000 });
+  assert.equal(first.spend, undefined, "neither the newest page nor 25 pages of backlog reach it");
+  assert.deepEqual({ cursor: first.cursor, backlog: first.backlog, recent: first.recent }, { cursor: "4999", backlog: true, recent: { from: "9301", seenTo: "9301" } });
+  const second = await view.fundingHistory(lock, first, { backlogBudgetMs: 60_000 });
   assert.deepEqual(second.spend, { txHash: closingHash, index: 1 }, "the next pass resumes and reaches it");
-  // A recent spend is caught from the newest page in the same pass, whatever the backlog.
-  tail = entries;
-  const recent = await view.fundingHistory(lock);
-  assert.deepEqual(recent.spend, { txHash: closingHash, index: 1 });
-  assert.equal(recent.cursor, "5000", "the backlog scan keeps its place");
-  // A page that fails partway returns what was read, with the error, instead of losing it.
-  const flaky = {
-    async findTransactionsPaged(_key: unknown, _order: string, limit: number, after?: string) {
-      const start = after ? Number(after) : 0;
-      if (start >= 400) throw new Error("indexer timeout");
-      return { transactions: entries.slice(start, start + Number(limit)), lastCursor: String(start + Number(limit)) };
-    },
-  } as unknown as ccc.Client;
-  const partial = await chainView(flaky).fundingHistory(lock);
-  assert.deepEqual(partial, { sawOutput: true, cursor: "400", error: "indexer timeout" });
-  // So does a failing check of the newest page after the forward scan has read pages.
-  const newestFails = {
-    async findTransactionsPaged(_key: unknown, order: string, limit: number, after?: string) {
-      if (order === "desc") throw new Error("indexer timeout");
-      const start = after ? Number(after) : 0;
-      return { transactions: entries.slice(start, start + Number(limit)), lastCursor: String(start + Number(limit)) };
-    },
-  } as unknown as ccc.Client;
-  const kept = await chainView(newestFails, { maxPages: 3 }).fundingHistory(lock);
-  assert.deepEqual(kept, { sawOutput: true, cursor: "600", error: "indexer timeout" });
+});
+
+test("a spend made while the channel is watched is caught in the next pass, padded or not, whatever the backlog", async () => {
+  const closingHash = `0x${"c2".repeat(32)}` as ccc.Hex;
+  const lock = ccc.Script.from({ ...FUNDING_LOCK, args: `0x${"00".repeat(20)}` });
+  let entries = padding(1, 9_000);
+  const view = chainView(fakeIndexer(() => entries), { maxPages: 1 });
+  const first = await view.fundingHistory(lock, {});
+  assert.deepEqual({ cursor: first.cursor, backlog: first.backlog, recent: first.recent }, { cursor: "199", backlog: true, recent: { from: "9000", seenTo: "9000" } });
+  // The peer spends, then buries the spend under 1,000 more cells (five pages) before the next pass.
+  entries = [...entries, { txHash: closingHash, blockNumber: 9_001n, isInput: true, cellIndex: 0n }, ...padding(9_002, 1_000)];
+  const next = await view.fundingHistory(lock, first);
+  assert.deepEqual(next.spend, { txHash: closingHash, index: 0 });
+  assert.equal(next.cursor, "199", "the backlog scan keeps its place");
+
+  // With nothing new the recent scan reads one page and moves on; new cells move its mark forward.
+  entries = padding(1, 9_000);
+  const quiet = await view.fundingHistory(lock, first);
+  assert.deepEqual(quiet.recent, { from: "9000", seenTo: "9000" });
+  entries = [...entries, ...padding(9_001, 50)];
+  assert.deepEqual((await view.fundingHistory(lock, quiet)).recent, { from: "9000", seenTo: "9050" });
+});
+
+test("a recent range longer than a pass can read is resumed, and a fresh spend still goes first", async () => {
+  const closingHash = `0x${"c3".repeat(32)}` as ccc.Hex;
+  const lock = ccc.Script.from({ ...FUNDING_LOCK, args: `0x${"00".repeat(20)}` });
+  let entries = [...padding(1, 100), { txHash: closingHash, blockNumber: 101n, isInput: true, cellIndex: 0n }, ...padding(102, 500)];
+  // A budget of 0: one page of the recent range per pass.
+  const view = chainView(fakeIndexer(() => entries), { recentBudgetMs: 0 });
+  const scan = { recent: { from: "100", seenTo: "100" } };
+  const one = await view.fundingHistory(lock, scan);
+  assert.equal(one.spend, undefined);
+  assert.deepEqual(one.recent, { from: "100", seenTo: "100", top: "601", cursor: "401" });
+  const two = await view.fundingHistory(lock, one);
+  assert.deepEqual(two.recent, { from: "100", seenTo: "100", top: "601", cursor: "201" });
+  const three = await view.fundingHistory(lock, two);
+  assert.deepEqual(three.spend, { txHash: closingHash, index: 0 });
+  // Unspent instead, the range completes and the next one starts above it.
+  entries = padding(1, 600);
+  let state: HistoryScan = scan;
+  for (let i = 0; i < 4; i++) state = await view.fundingHistory(lock, state);
+  assert.deepEqual(state.recent, { from: "100", seenTo: "600" });
+  // A spend at the head while a range is still being read is found from the newest page at once.
+  entries = [...padding(1, 600), ...padding(601, 400), { txHash: closingHash, blockNumber: 1_001n, isInput: true, cellIndex: 0n }];
+  const midRange = await view.fundingHistory(lock, { recent: { from: "100", seenTo: "600", top: "1000", cursor: "900" } });
+  assert.deepEqual(midRange.spend, { txHash: closingHash, index: 0 });
+});
+
+test("a failing read keeps the progress made before it", async () => {
+  const lock = ccc.Script.from({ ...FUNDING_LOCK, args: `0x${"00".repeat(20)}` });
+  const entries = padding(1, 9_000);
+  // A backlog page that fails partway returns what was read, with the error.
+  const flaky = chainView(fakeIndexer(() => entries, (order, after) => order === "asc" && Number(after) >= 399));
+  const partial = await flaky.fundingHistory(lock, { recent: { from: "9000", seenTo: "9000" } }, { backlogBudgetMs: 60_000 });
+  assert.deepEqual(partial, { sawOutput: true, cursor: "399", recent: { from: "9000", seenTo: "9000" }, backlog: false, error: "indexer timeout" });
+  // A failing recent scan still lets the backlog scan run, and reports the error.
+  const newestFails = chainView(fakeIndexer(() => entries, (order) => order === "desc"), { maxPages: 3 });
+  const kept = await newestFails.fundingHistory(lock, { cursor: "199", recent: { from: "9000", seenTo: "9000" } }, { backlogBudgetMs: 60_000 });
+  assert.deepEqual(kept, { sawOutput: true, cursor: "799", recent: { from: "9000", seenTo: "9000" }, backlog: true, error: "indexer timeout" });
 });
 
 test("the funding outpoint is the cell the spend consumed, not the first cell under the lock", async () => {
