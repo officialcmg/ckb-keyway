@@ -107,7 +107,7 @@ browser tab (fiber-wasm)                          KeyWay API (Railway)          
 - While anything is unsent, `beforeunload` asks before the tab closes; `watchtowerPending()` and
   `watchtowerStatus()` expose the queue and KeyWay's view to apps. Stopping the node waits up to 10 s for the queue.
 
-**API** (`src/server/watchtower.ts`, route in `http.ts`, migration 18)
+**API** (`src/server/watchtower.ts`, route in `http.ts`, migration 19)
 - Session-authenticated like every wallet route (`authenticateUser`); rate limits per user of 240 updates/min and,
   separately, 30 status reads/min; at most 64 unresolved channels per user; strict hex/point/molecule validation; a
   channel's funding keys can't be replaced; a revocation is stored only if newer. Token (UDT) channels are refused for
@@ -198,7 +198,7 @@ force-closed): revoked commitment `0x75000a9c71b2f4ee242a6263ebbe270b3da90085185
 number 1), block 22985878, 19:11:11; penalty `0x6c1aa0bfb54edab72b885ed32fc2a3a12ac425c753298a58c6312c68f180169a`,
 block 22985882, 19:12:16: 1,098.99999544 CKB to V's lock `0x18f0c6ee…ab0b`, change 9,999.99998578 CKB to the fee key
 (fee 711 shannons). Logs: `evidence/*-run2.txt`. (A first attempt at this run lost the channel's events because the
-proof database's old table had been renamed without its index, so migration 18 failed; Fiber logs a failed forward
+proof database's old table had been renamed without its index, so the watchtower migration failed; Fiber logs a failed forward
 and doesn't retry it. In the browser the in-page store keeps the data and the SDK queue retries, so this only
 affects the native harness.)
 
@@ -223,7 +223,7 @@ No managed-host (Railway `managed-host`) change: hosted nodes keep Fiber's built
    `KEYWAY_WATCHTOWER_CKB_RPC_URL` (default: CCC's public testnet RPC) and `KEYWAY_WATCHTOWER_INTERVAL_SECONDS`
    (default 60). Without the key the API runs as before and logs that the watchtower is off.
 4. Run the migration before the new API starts (production refuses to start on an old schema):
-   `npm run migrate:production` (adds migration 18, `keyway_v2_watchtower_channels`).
+   `npm run migrate:production` (adds migration 19, `keyway_v2_watchtower_channels`).
 5. Deploy the API. Check the log for `[watchtower] running; fee address ckt1…` on exactly one instance.
 6. Release the SDK (your call and version number): browser apps send watch data only from that version on; at first
    start the SDK registers channels opened earlier.

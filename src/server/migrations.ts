@@ -326,7 +326,12 @@ export const migrations: Array<{
     },
   },
   {
-    version: 18, name: "browser-node-watchtower",
+    // Created empty by version 8 (`like` copies no rows); no code has ever read or written it.
+    version: 18, name: "drop-managed-confirmations",
+    up: (sql) => sql`drop table if exists keyway_v2_managed_confirmations`,
+  },
+  {
+    version: 19, name: "browser-node-watchtower",
     up: async (sql) => {
       // KeyWay's watchtower for browser nodes: per channel, the funding keys and the newest revocation only
       // (never a private key). Kept until the channel's close is resolved, then 30 days for the user's history.
