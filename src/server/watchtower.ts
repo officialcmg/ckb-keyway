@@ -50,6 +50,10 @@ const RECENT_BUDGET_MS = 20_000;
 /** Blocks the recent scan reads again each pass, since a reorganization can replace them (CKB's are a few deep). */
 const REORG_DEPTH = 24n;
 const CATCH_UP_BUDGET_MS = 120_000;
+/** Channels never seen funded that are checked per pass (see `runWatchtowerPass`). */
+const UNFUNDED_PER_PASS = 200;
+/** How long after a close or penalty the watchtower confirms it is still on-chain (24 blocks are about 4 minutes). */
+const REORG_RECHECK_MINUTES = 30;
 /** Channels whose recent history is checked at the same time in a pass. */
 const CHECK_CONCURRENCY = 8;
 const HISTORY_PAGE_SIZE = 200;
@@ -419,7 +423,7 @@ export type ChainView = {
    * seen, the first spend found, and the scan's new position. Never throws: a failed read returns the progress made
    * before it, with the error.
    */
-  fundingHistory(lock: ccc.Script, scan: HistoryScan, options?: { backlogBudgetMs?: number }): Promise<HistoryProgress>;
+  fundingHistory(lock: ccc.Script, scan: HistoryScan, options?: { backlogBudgetMs?: number; recentScan?: boolean }): Promise<HistoryProgress>;
   transaction(hash: ccc.Hex): Promise<{ tx: ccc.Transaction; committed: boolean; status: string } | undefined>;
   isLive(outPoint: ccc.OutPoint): Promise<boolean>;
   spender(outPoint: ccc.OutPoint, lock: ccc.Script): Promise<ccc.Hex | undefined>;
@@ -442,7 +446,7 @@ export function chainView(client: ccc.Client, options: { recentBudgetMs?: number
   const spendOf = (item: { txHash: ccc.Hex; cellIndex: ccc.Num }) => ({ txHash: item.txHash, index: Number(item.cellIndex) });
   const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
   return {
-    async fundingHistory(lock, scan, { backlogBudgetMs = 0 } = {}) {
+    async fundingHistory(lock, scan, { backlogBudgetMs = 0, recentScan = true } = {}) {
       let sawOutput = false;
       let recent = scan.recent ? { ...scan.recent } : undefined;
       let cursor = scan.cursor;
@@ -475,6 +479,8 @@ export function chainView(client: ccc.Client, options: { recentBudgetMs?: number
         return progress({ backlog: true });
       };
 
+      // A catch-up call skips the recent scan, which ran earlier in the same pass.
+      if (!recentScan && recent) return backlog();
       // The recent scan (run first): every entry added since the channel was first checked, newest first.
       try {
         if (!recent) {
@@ -486,13 +492,21 @@ export function chainView(client: ccc.Client, options: { recentBudgetMs?: number
           const top = newest.transactions[0]?.blockNumber;
           if (top !== undefined) recent = { from: String(top), seenTo: String(top) };
         } else {
-          if (recent.cursor) {
-            // A range is still being read: look at the newest page first, so a spend made now isn't kept waiting.
-            const newest = await page(lock, "desc");
-            const spend = newest.transactions.find((item) => item.isInput && BigInt(item.blockNumber) > BigInt(recent!.seenTo) - REORG_DEPTH);
-            if (spend) return progress({ spend: spendOf(spend) });
-          }
           const started = Date.now();
+          if (recent.cursor && recent.top !== undefined) {
+            // A range is still being read: first read everything added above it (newest first), so a spend made
+            // since isn't kept waiting behind the old range. These entries are read again by the next range.
+            let after: string | undefined;
+            reading: for (;;) {
+              const result = await page(lock, "desc", after);
+              for (const item of result.transactions) {
+                if (BigInt(item.blockNumber) <= BigInt(recent.top) - REORG_DEPTH) break reading;
+                if (item.isInput) return progress({ spend: spendOf(item) });
+              }
+              if (result.transactions.length < HISTORY_PAGE_SIZE || Date.now() - started >= recentBudget) break;
+              after = result.lastCursor;
+            }
+          }
           for (;;) {
             const result = await page(lock, "desc", recent.cursor);
             let done = result.transactions.length < HISTORY_PAGE_SIZE;
@@ -579,7 +593,7 @@ export async function assessChannel(
   row: Pick<Row, "funding_lock_args" | "peer_commitment_key" | "commitment_number"> & Partial<ScanState>,
   /** Called with the scan's progress before anything else can fail, so a failing check never loses it. */
   saveScan?: (scan: ScanState) => Promise<unknown>,
-  options: { backlogBudgetMs?: number } = {},
+  options: { backlogBudgetMs?: number; recentScan?: boolean } = {},
 ): Promise<Assessment> {
   const scan: ScanState = {
     history_cursor: row.history_cursor ?? null,
@@ -661,10 +675,23 @@ export async function runWatchtowerPass(deps: PassDependencies): Promise<void> {
     delete from keyway_v2_watchtower_channels
     where state in ('penalized', 'closed', 'missed', 'invalid') and updated_at < now() - ${`${FINISHED_RETENTION_DAYS} days`}::interval
   `;
-  const rows = await sql<Row[]>`
-    select * from keyway_v2_watchtower_channels where state in ('watching', 'penalty-sent')
+  // Channels whose funding is on-chain are all checked, every pass, first. Ones never seen funded can't have been
+  // closed yet; at most UNFUNDED_PER_PASS of them are checked per pass (least recently first), so registrations from
+  // many accounts can't slow down the funded channels' checks.
+  const funded = await sql<Row[]>`
+    select * from keyway_v2_watchtower_channels where state in ('watching', 'penalty-sent') and (funding_seen or funding_spend is not null)
     order by checked_at asc nulls first
   `;
+  const unfunded = await sql<Row[]>`
+    select * from keyway_v2_watchtower_channels where state in ('watching', 'penalty-sent') and not funding_seen and funding_spend is null
+    order by checked_at asc nulls first limit ${UNFUNDED_PER_PASS}
+  `;
+  // Closes and penalties resolved in the last REORG_RECHECK_MINUTES are confirmed again: a reorganization can drop them.
+  const recent = await sql<Row[]>`
+    select * from keyway_v2_watchtower_channels
+    where state in ('closed', 'penalized') and updated_at > now() - ${`${REORG_RECHECK_MINUTES} minutes`}::interval
+  `;
+  const rows = [...funded, ...unfunded];
   // Penalties are sent one at a time, so two never pick the same fee cells.
   let sending: Promise<unknown> = Promise.resolve();
   const punish: PassDependencies["punish"] = (row, commitment) => {
@@ -690,6 +717,13 @@ export async function runWatchtowerPass(deps: PassDependencies): Promise<void> {
   await Promise.all(Array.from({ length: Math.min(deps.concurrency ?? CHECK_CONCURRENCY, queue.length) }, async () => {
     for (let row = queue.shift(); row; row = queue.shift()) if (await check(row, 0)) behind.push(row);
   }));
+  for (const row of recent) {
+    try {
+      await confirmResolution(deps, row, log);
+    } catch (error) {
+      log(`${row.channel_id}: could not confirm the ${row.state} state: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
 
   // Catching up: each channel gets an equal share of what is left of the budget, so one long backlog can't take it.
   const deadline = Date.now() + (deps.catchUpBudgetMs ?? CATCH_UP_BUDGET_MS);
@@ -705,6 +739,29 @@ export async function runWatchtowerPass(deps: PassDependencies): Promise<void> {
 }
 
 /** Checks one channel and acts on what it finds; says whether its backlog scan has more to read. */
+/** Puts a recently resolved channel back under watch if the transaction that resolved it left the chain. */
+async function confirmResolution(deps: PassDependencies, row: Row, log: (message: string) => void) {
+  const hash = row.state === "penalized" ? row.penalty_tx : row.closing_tx;
+  if (!hash) return;
+  const found = await deps.chain.transaction(hash as ccc.Hex);
+  if (found?.committed) return;
+  if (row.state === "penalized") {
+    // The revoked commitment is checked again next pass, and the penalty sent again if it is gone.
+    log(`${row.channel_id}: the penalty ${hash} left the chain; checking the commitment again`);
+    await deps.sql`
+      update keyway_v2_watchtower_channels set state = 'penalty-sent', detail = 'the penalty left the chain; checking again', updated_at = now()
+      where user_id = ${row.user_id} and channel_id = ${row.channel_id} and state = 'penalized'
+    `;
+    return;
+  }
+  log(`${row.channel_id}: the closing transaction ${hash} left the chain; watching again`);
+  await deps.sql`
+    update keyway_v2_watchtower_channels set
+      state = 'watching', detail = 'the close left the chain; watching again', funding_spend = null, closing_tx = null, funding_out_point = null, updated_at = now()
+    where user_id = ${row.user_id} and channel_id = ${row.channel_id} and state = 'closed'
+  `;
+}
+
 async function checkChannel(deps: PassDependencies, row: Row, log: (message: string) => void, backlogBudgetMs: number): Promise<boolean> {
   const { sql, chain } = deps;
   const save = (fields: Partial<Pick<Row, "state" | "detail" | "funding_out_point" | "closing_tx" | "penalty_tx">>) => sql`
@@ -727,7 +784,7 @@ async function checkChannel(deps: PassDependencies, row: Row, log: (message: str
         history_cursor = ${scan.history_cursor}, recent_scan = ${scan.recent_scan}, funding_seen = ${scan.funding_seen}, funding_spend = ${scan.funding_spend}
       where user_id = ${row.user_id} and channel_id = ${row.channel_id}
     `;
-  }, { backlogBudgetMs });
+  }, { backlogBudgetMs, recentScan: backlogBudgetMs === 0 });
   const { scan } = assessment;
   if (assessment.state === "watching") {
     const age = Date.now() - row.created_at.getTime();
