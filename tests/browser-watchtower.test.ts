@@ -234,6 +234,16 @@ test("a padded funding history only delays the scan: it resumes until it reaches
   const recent = await view.fundingHistory(lock);
   assert.deepEqual(recent.spend, { txHash: closingHash, index: 1 });
   assert.equal(recent.cursor, "5000", "the backlog scan keeps its place");
+  // A page that fails partway returns what was read, with the error, instead of losing it.
+  const flaky = {
+    async findTransactionsPaged(_key: unknown, _order: string, limit: number, after?: string) {
+      const start = after ? Number(after) : 0;
+      if (start >= 400) throw new Error("indexer timeout");
+      return { transactions: entries.slice(start, start + Number(limit)), lastCursor: String(start + Number(limit)) };
+    },
+  } as unknown as ccc.Client;
+  const partial = await chainView(flaky).fundingHistory(lock);
+  assert.deepEqual(partial, { sawOutput: true, cursor: "400", error: "indexer timeout" });
 });
 
 test("the funding outpoint is the cell the spend consumed, not the first cell under the lock", async () => {

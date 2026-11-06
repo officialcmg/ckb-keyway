@@ -155,6 +155,27 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     assert.deepEqual(status.channels.map((c) => [c.state, c.detail]), [["watching", "check failed: indexer unavailable"]]);
   });
 
+  await t.test("a check that fails after finding the spend keeps the scan's progress", async () => {
+    const user = { id: crypto.randomUUID() };
+    const id = channelId();
+    await sql`delete from keyway_v2_watchtower_channels where state in ('watching', 'penalty-sent')`;
+    await watchtowerRequest(user, watch(id));
+    const spendHash = `0x${"ab".repeat(32)}` as ccc.Hex;
+    let historyReads = 0;
+    const chain: ChainView = {
+      fundingHistory: async () => { historyReads++; return { sawOutput: true, spend: { txHash: spendHash, index: 0 }, cursor: "c1" }; },
+      transaction: async () => { throw new Error("node unavailable"); },
+      isLive: async () => true,
+      spender: async () => undefined,
+    };
+    const pass = () => runWatchtowerPass({ sql, chain, punish: async () => { throw new Error("no"); }, log: () => undefined });
+    await pass();
+    await pass();
+    assert.equal(historyReads, 1, "the second pass goes straight to the saved spend");
+    const [row] = await sql<Array<{ history_cursor: string; funding_spend: string; detail: string }>>`select history_cursor, funding_spend, detail from keyway_v2_watchtower_channels where channel_id = ${id}`;
+    assert.deepEqual({ ...row }, { history_cursor: "c1", funding_spend: `${spendHash}:0`, detail: "check failed: node unavailable" });
+  });
+
   await t.test("a channel that was never funded and was removed is dropped", async () => {
     const user = { id: crypto.randomUUID() };
     const id = channelId();
