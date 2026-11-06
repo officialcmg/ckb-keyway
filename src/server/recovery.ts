@@ -78,13 +78,17 @@ export async function recoverySetup(context: RecoveryContext, body: Record<strin
     await limit(context, "sign", { max: 10, window: 60 });
     await verifyBackups(client, context.user, context.wallet, body.backups as unknown[]);
     const planned = await plan(context.wallet);
-    const confirmationNonce = await issueRequest(context.user, "recovery", planDigest(planned, backups), { lines: recoveryLines(planned.preview) }, true);
+    const confirmationNonce = await issueRequest(context.user, "recovery", planDigest(planned, backups), { lines: recoveryLines(planned.preview), signer: policy ? "policy" : "digest" }, true);
     return { preview: planned.preview, confirmationNonce, requiresEmailCode: true };
   }
   const nonce = requiredNonce(body.confirmationNonce);
   if (body.operation === "request-email-code") {
     const planned = await plan(context.wallet);
-    const request = await loadRequest(context.user, "recovery", nonce, planDigest(planned, backups));
+    const request = await loadRequest(context.user, "recovery", nonce, planDigest(planned, backups)).catch((cause) => {
+      // With a different signer the plan differs (the binding's placeholder), so the request can't match.
+      throw cause instanceof Error && cause.message === REQUEST_EXPIRED ? cause : new Error(`${cause instanceof Error ? cause.message : "Signing confirmation is invalid"}. If KeyWay was just updated, start again`);
+    });
+    checkSignerMode(request.summary, policy ? "policy" : "digest");
     if (policy) {
       // The policy Action emails the code and binds this address to the account on chain; the code never comes here.
       await codeLimit(context);
@@ -106,8 +110,9 @@ export async function recoverySetup(context: RecoveryContext, body: Record<strin
     // The digest binds the approval to this exact transaction; any change in the account's cells refuses it.
     const digest = planDigest(planned, backups);
     const request = await loadRequest(context.user, "recovery", nonce, digest).catch((cause) => {
-      throw cause instanceof Error && cause.message === REQUEST_EXPIRED ? cause : new Error("Your account changed since the preview. Review turning on recovery again");
+      throw cause instanceof Error && cause.message === REQUEST_EXPIRED ? cause : new Error("Your account changed since the preview, or KeyWay was updated. Review turning on recovery again");
     });
+    checkSignerMode(request.summary, policy ? "policy" : "digest");
     let signed: ccc.Transaction;
     if (policy) {
       // The Action checks the code it emailed; the request is used up only once it has signed.
@@ -155,6 +160,14 @@ async function broadcast(context: RecoveryContext, client: ccc.Client, signed: c
     await clear();
     throw error;
   }
+}
+
+/** Which signer a recovery request was issued under. A request finishes under the same one, or not at all. */
+type SignerMode = "policy" | "digest";
+const SIGNER_CHANGED = "KeyWay switched signers while this request was open. Start again.";
+
+function checkSignerMode(summary: Record<string, unknown>, mode: SignerMode): void {
+  if ((summary.signer ?? "digest") !== mode) throw new Error(SIGNER_CHANGED);
 }
 
 function refusePending(wallet: ReadyWallet): void {
@@ -466,14 +479,17 @@ export async function recoveryBackupChange(context: RecoveryContext, body: Recor
     await limit(context, "sign", { max: 10, window: 60 });
     if (change.change === "add") await verifyBackups(client, context.user, context.wallet, [body.backup]);
     const plan = await planBackupChange(client, context.wallet, change);
-    const confirmationNonce = await issueRequest(context.user, "recovery", changeDigest(plan, change), { lines: backupChangeLines(plan.preview) }, true);
+    const mode: SignerMode = litPolicyEnabled() && !context.signDigest && context.wallet.recovery.litEmailBound ? "policy" : "digest";
+    const confirmationNonce = await issueRequest(context.user, "recovery", changeDigest(plan, change), { lines: backupChangeLines(plan.preview), signer: mode }, true);
     return { preview: plan.preview, confirmationNonce, requiresEmailCode: true };
   }
   const nonce = requiredNonce(body.confirmationNonce);
   if (body.operation === "request-email-code") {
     const plan = await planBackupChange(client, context.wallet, change);
     const request = await loadRequest(context.user, "recovery", nonce, changeDigest(plan, change));
-    if (litPolicyEnabled() && context.wallet.recovery.litEmailBound) {
+    const mode: SignerMode = litPolicyEnabled() && !context.signDigest && context.wallet.recovery.litEmailBound ? "policy" : "digest";
+    checkSignerMode(request.summary, mode);
+    if (mode === "policy") {
       // The policy Action emails the code to the address bound on chain when recovery was turned on.
       await codeLimit(context);
       const sent = await policySendCode(plan.transaction, context.wallet, { enableTransactionHash: context.wallet.recovery.enableTransactionHash, appName: context.appName });
@@ -496,8 +512,10 @@ export async function recoveryBackupChange(context: RecoveryContext, body: Recor
     });
     const groups = [{ script: plan.listLock, kind: "omnilock" as const }, { script: plan.omnilock, kind: "omnilock" as const }];
     const enableTransactionHash = wallet.recovery.enableTransactionHash;
+    const mode: SignerMode = litPolicyEnabled() && !context.signDigest && wallet.recovery.litEmailBound ? "policy" : "digest";
+    checkSignerMode(request.summary, mode);
     let signed: ccc.Transaction;
-    if (litPolicyEnabled() && !context.signDigest && wallet.recovery.litEmailBound) {
+    if (mode === "policy") {
       // The Action checks the code it emailed; the request is used up only once it has signed.
       const emailCode = parseLitEmailCode(body.emailCode, request.summary.litTicket);
       await checkBackupChangeTransaction(client, plan.transaction, wallet.recovery, plan.backups);

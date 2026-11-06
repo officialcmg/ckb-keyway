@@ -448,4 +448,15 @@ test("with the policy Action: Lit emails the code, binds the email on chain, and
   const applied = await recoveryBackupChange(context(enabled), { operation: "apply", change: "add", backup: proof, confirmationNonce: change.confirmationNonce, emailCode: litCodeIn(lit.emails[1]) }) as { transactionHash: string };
   assert.equal(h.broadcasts.at(-1)!.hash(), applied.transactionHash);
   assert.equal(ccc.bytesFrom(h.broadcasts.at(-1)!.getWitnessArgsAt(0)!.lock!).length, 85);
+
+  // A request opened under one signer can't be finished under the other: the user is asked to start again.
+  await h.settle();
+  const updated = await readWallet(h.user) as ReadyWallet;
+  await h.client.cache.recordCells(h.broadcasts.at(-1)!.outputs.map((cellOutput, index) => ({ outPoint: { txHash: h.broadcasts.at(-1)!.hash(), index }, cellOutput, outputData: h.broadcasts.at(-1)!.outputsData[index] })));
+  const third = h.sign(evmWallet());
+  delete process.env.KEYWAY_LIT_SIGNER;
+  const opened = await recoveryBackupChange(context(updated), { operation: "preview", change: "add", backup: third }) as { confirmationNonce: string };
+  process.env.KEYWAY_LIT_SIGNER = "policy";
+  await assert.rejects(recoveryBackupChange(context(updated), { operation: "request-email-code", change: "add", backup: third, confirmationNonce: opened.confirmationNonce }), /switched signers/);
+  await assert.rejects(recoveryBackupChange(context(updated), { operation: "apply", change: "add", backup: third, confirmationNonce: opened.confirmationNonce, emailCode: "12345678" }), /switched signers/);
 });
