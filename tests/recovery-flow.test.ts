@@ -13,6 +13,7 @@ import { verifyWebAuthn } from "../src/sdk/browser/webauthn.ts";
 import { formatCkbSignature, previewFundingTransaction, signAccountGroups } from "../src/server/funding-transaction.ts";
 import {
   backupChangeLines,
+  checkBackupChallenge,
   checkBackupChangeTransaction,
   issueBackupChallenge,
   checkRecoveryTransaction,
@@ -458,4 +459,20 @@ test("the backup service refuses when recovery is off and needs the new backup's
   await assert.rejects(recoveryBackupChange(context(wallet), { operation: "preview", change: "add", backup: { ...added, challengeNonce } }), /didn't sign/);
   await assert.rejects(recoveryBackupChange(context(wallet), { operation: "preview", change: "add", backup: { kind: "joyid", address: "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqv82scyl0ywuurakhc80ha0agm5x8ye8kca6zq0u", challengeNonce } }), /isn't a JoyID address/);
   assert.equal(await backupAuth(client, backups[0]), evmBackupAuth(evmAddress));
+});
+
+test("a malformed backup challenge nonce is refused as invalid, never a crash", () => {
+  const user = { id: "user-1" };
+  const { challengeNonce } = issueBackupChallenge(user);
+  checkBackupChallenge(user, challengeNonce);
+  const [time, random, tag] = challengeNonce.split(".");
+  const invalid = /invalid or expired/;
+  for (const nonce of [
+    undefined, 42, "", "...", `${time}.${random}`, `${time}.${random}.${tag}.00`,
+    `${time}.${random}.${tag.slice(2)}`, `${time}.${random}.${tag}00`, `${time}.${random}.ab`,
+    `${time}.${random}.${"zz".repeat(32)}`, `${time}.${random}.${tag.toUpperCase()}`, `${time}.${random.slice(2)}.${tag}`,
+    `${time.slice(1)}.${random}.${tag}`, `${time}.${random}.${"00".repeat(32)}`,
+  ]) assert.throws(() => checkBackupChallenge(user, nonce), invalid, String(nonce));
+  assert.throws(() => checkBackupChallenge({ id: "user-2" }, challengeNonce), invalid);
+  assert.throws(() => checkBackupChallenge(user, challengeNonce, new Date(Number(time))), invalid);
 });
