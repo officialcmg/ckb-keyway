@@ -40,6 +40,7 @@
     "node_modules",
     "docs-site",
     "research/joyid-transport/e2e.ts",
+    "research/joyid-transport/screenshots.ts",
     "research/omnilock/phase2",
     "research/omnilock/phase3",
     "research/omnilock/phase4/change-backup.ts",
