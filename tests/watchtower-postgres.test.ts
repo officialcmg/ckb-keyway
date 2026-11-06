@@ -269,9 +269,9 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     for (const id of [kept, dropped]) await watchtowerRequest(user, watch(id));
     const keptClose = `0x${"7a".repeat(32)}`;
     const droppedClose = `0x${"7b".repeat(32)}`;
-    // Both closed two hours ago, while the watchtower was down; one close was then reorganized away.
-    await sql`update keyway_v2_watchtower_channels set state = 'closed', funding_seen = true, closing_tx = ${keptClose}, funding_spend = ${`${keptClose}:0`}, updated_at = now() - interval '2 hours' where channel_id = ${kept}`;
-    await sql`update keyway_v2_watchtower_channels set state = 'closed', funding_seen = true, closing_tx = ${droppedClose}, funding_spend = ${`${droppedClose}:0`}, updated_at = now() - interval '2 hours' where channel_id = ${dropped}`;
+    // Both closed long ago (past the 30-day retention), while the watchtower was down; one close was then reorganized away.
+    await sql`update keyway_v2_watchtower_channels set state = 'closed', funding_seen = true, closing_tx = ${keptClose}, funding_spend = ${`${keptClose}:0`}, updated_at = now() - interval '40 days' where channel_id = ${kept}`;
+    await sql`update keyway_v2_watchtower_channels set state = 'closed', funding_seen = true, closing_tx = ${droppedClose}, funding_spend = ${`${droppedClose}:0`}, updated_at = now() - interval '40 days' where channel_id = ${dropped}`;
     const chain: ChainView = {
       fundingHistory: async () => ({ sawOutput: true }),
       transaction: async (hash) => (hash === keptClose ? { tx: ccc.Transaction.from({}), committed: true, status: "committed" } : undefined),
