@@ -566,6 +566,8 @@ function joyIdBackupByWindow(
 
   const step = async (record: JoyIdRequestRecord, first: boolean) => {
     if (first) await next("ready", Date.now() + HELPER_LOAD_MS, true);
+    // Only a "ready" after this request means the window reloaded; drop any said before it.
+    for (let index = helper.messages.length - 1; index >= 0; index--) if (helper.messages[index].kind === "ready") helper.messages.splice(index, 1);
     helper.channel.postMessage({ kind: "go", helper: helper.id, record } satisfies HelperMessage);
     const { response } = await next("response", record.expiresAt, false);
     return checkJoyIdResponse(record, response, { userId: run.userId, client: run.client });
@@ -606,6 +608,8 @@ async function joyIdBackupByRedirect(run: JoyIdBackupRun, known: string | undefi
     const back = (event: PageTransitionEvent) => {
       if (!event.persisted) return;
       window.removeEventListener("pageshow", back);
+      // The request is over: an answer that still arrives later (Forward) must not be applied.
+      takeJoyIdRecord(sessionStorage, record.id);
       reject(new JoyIdCancelledError());
     };
     window.addEventListener("pageshow", back);
@@ -665,51 +669,83 @@ export function joyIdRecordClient(record: Pick<JoyIdRequestRecord, "account">): 
 export type JoyIdHelperStatus = "waiting" | "opening" | "returning" | "done" | "unknown";
 
 /**
+ * The JoyID window's side, once per page load: one channel and one set of listeners that outlive the provider's
+ * effect, so a re-run (React StrictMode mounts effects twice) neither repeats a message nor leaves a gap in which
+ * the opening tab's message is lost.
+ */
+type HelperLoad = { status: JoyIdHelperStatus; report?: (status: JoyIdHelperStatus) => void };
+let helperLoad: HelperLoad | undefined;
+
+/** Forgets this page load's JoyID window. For tests, which simulate several loads in one process. */
+export function resetJoyIdHelperLoad(): void { helperLoad = undefined; }
+
+/**
  * The window KeyWay opened for JoyID: tells the opening tab it is ready, takes each request it sends, goes to
- * JoyID with it, and hands JoyID's answer back. It answers only for a request it recorded itself, once.
+ * JoyID with it, and hands JoyID's answer back. It answers only for a request it recorded itself, once. Closing it,
+ * or coming back to it from the browser's cache, tells the opening tab to stop waiting.
  */
 export function runJoyIdHelper(onStatus: (status: JoyIdHelperStatus) => void): () => void {
+  if (helperLoad) {
+    const load = helperLoad;
+    load.report = onStatus;
+    onStatus(load.status);
+    return () => { if (load.report === onStatus) load.report = undefined; };
+  }
+  const load: HelperLoad = { status: "waiting", report: onStatus };
+  helperLoad = load;
+  const status = (next: JoyIdHelperStatus) => { load.status = next; load.report?.(next); };
   const helperId = new URL(location.href).searchParams.get(JOYID_HELPER_PARAM) ?? "";
   if (!ID_PATTERN.test(helperId) || typeof BroadcastChannel === "undefined") {
-    onStatus("unknown");
-    return () => undefined;
+    status("unknown");
+    return () => { load.report = undefined; };
   }
   const channel = new BroadcastChannel(CHANNEL_NAME);
   let idle: ReturnType<typeof setTimeout> | undefined;
   let toJoyId = false;
-  // Closing this window (or leaving it for anything but JoyID) tells the tab that opened it to stop waiting.
-  const gone = () => { if (!toJoyId) channel.postMessage({ kind: "gone", helper: helperId } satisfies HelperMessage); };
-  window.addEventListener("pagehide", gone);
-  const finish = () => { onStatus("done"); window.close(); };
+  const post = (message: HelperMessage) => channel.postMessage(message);
   const waitForOpener = () => {
     clearTimeout(idle);
-    idle = setTimeout(() => onStatus("unknown"), 2 * 60_000);
+    idle = setTimeout(() => status("unknown"), 2 * 60_000);
   };
+  // Closing this window (or leaving it for anything but JoyID) tells the tab that opened it to stop waiting.
+  window.addEventListener("pagehide", () => { if (!toJoyId) post({ kind: "gone", helper: helperId }); });
+  // Back from JoyID's page into this page from the browser's cache: the request in flight is over.
+  window.addEventListener("pageshow", (event: PageTransitionEvent) => {
+    if (!event.persisted) return;
+    toJoyId = false;
+    post({ kind: "gone", helper: helperId });
+    status("unknown");
+  });
   channel.onmessage = (event: MessageEvent) => {
     const message = event.data as HelperMessage | undefined;
     if (!message || message.helper !== helperId) return;
-    if (message.kind === "close") { toJoyId = true; return finish(); }
+    if (message.kind === "close") {
+      toJoyId = true;
+      status("done");
+      window.close();
+      return;
+    }
     if (message.kind !== "go" || !isJoyIdRecord(message.record) || message.record.transport !== "window") return;
     clearTimeout(idle);
     saveJoyIdRecord(sessionStorage, message.record);
     toJoyId = true;
-    onStatus("opening");
+    status("opening");
     location.assign(joyIdRedirectUrl(message.record, joyIdReturnUrl(message.record.returnPath, helperId)));
   };
   const response = takeCapturedJoyIdReturn();
   if (response) {
     const record = takeJoyIdRecord(sessionStorage, joyIdStateId(response.state));
     if (!record || record.transport !== "window") {
-      onStatus("unknown");
+      status("unknown");
     } else {
-      onStatus("returning");
-      channel.postMessage({ kind: "response", helper: helperId, response } satisfies HelperMessage);
+      status("returning");
+      post({ kind: "response", helper: helperId, response });
       waitForOpener();
     }
   } else {
-    onStatus("waiting");
-    channel.postMessage({ kind: "ready", helper: helperId } satisfies HelperMessage);
+    status("waiting");
+    post({ kind: "ready", helper: helperId });
     waitForOpener();
   }
-  return () => { clearTimeout(idle); window.removeEventListener("pagehide", gone); channel.close(); };
+  return () => { if (load.report === onStatus) load.report = undefined; };
 }

@@ -27,6 +27,7 @@ import {
   joyIdReturnUrl,
   readJoyIdReturn,
   resumeJoyIdRedirect,
+  resetJoyIdHelperLoad,
   runJoyIdHelper,
   saveJoyIdRecord,
   stopBrowserNodeForRedirect,
@@ -372,6 +373,9 @@ test("the JoyID window answers only its own requests, and says when it is closed
     globals.window = { addEventListener: (type: string, listener: () => void) => listeners.set(type, listener), removeEventListener: () => undefined, close: () => { closed += 1; } };
     globals.location = { href: `${APP}/app?keyway-joyid=${ID}`, origin: APP, assign: (url: string) => assigned.push(url) };
     const statuses: string[] = [];
+    resetJoyIdHelperLoad();
+    // React StrictMode runs the effect, cleans up and runs it again: the opening tab hears "ready" once.
+    runJoyIdHelper(() => undefined)();
     const stop = runJoyIdHelper((status) => statuses.push(status));
     assert.deepEqual(broadcast.sent, [{ kind: "ready", helper: ID }]);
     const record = { ...await signRecord(await passkey()), transport: "window" as const, id: "a".repeat(32) };
@@ -394,11 +398,20 @@ test("the JoyID window answers only its own requests, and says when it is closed
     stop();
     // A fresh window that the user closes before JoyID: the opening tab hears "gone".
     broadcast.sent.length = 0;
+    resetJoyIdHelperLoad();
     const stopAgain = runJoyIdHelper(() => undefined);
     listeners.get("pagehide")!();
     assert.deepEqual(broadcast.sent, [{ kind: "ready", helper: ID }, { kind: "gone", helper: ID }]);
     stopAgain();
     assert.ok(statuses.includes("opening"));
+    // Back from JoyID's page into this page from the browser's cache: the request is over.
+    broadcast.sent.length = 0;
+    resetJoyIdHelperLoad();
+    const stopCached = runJoyIdHelper(() => undefined);
+    broadcast.deliver({ kind: "go", helper: ID, record: { ...record, id: "d".repeat(32) } });
+    (listeners.get("pageshow") as unknown as (event: { persisted: boolean }) => void)({ persisted: true });
+    assert.deepEqual(broadcast.sent.at(-1), { kind: "gone", helper: ID });
+    stopCached();
   } finally {
     Object.assign(globals, saved);
   }
