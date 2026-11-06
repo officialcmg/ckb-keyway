@@ -48,7 +48,15 @@ The longer Omnilock lock is what raises the minimums. The preview shows the exac
 
 ## Backups
 
-A list holds one to eight backups. Each is an Omnilock exec identity that names one of KeyWay's verifiers (in [`contracts`](https://github.com/officialcmg/ckb-keyway/tree/main/contracts), referenced by data hash so they can't change) and the backup's 20-byte ID.
+A list holds one to eight backups. Each is an Omnilock exec identity that names one of KeyWay's verifiers (in [`contracts`](https://github.com/officialcmg/ckb-keyway/tree/main/contracts), referenced by data hash so they can't change) and the backup's ID **salted with the account's**:
+
+```text
+pubkey_hash = blake160(backup ID ‖ AdminList type hash)
+```
+
+The backup ID is the EVM address, or blake160 of the JoyID passkey's public key. The AdminList type hash is the last 32 bytes of the account's address args, so the verifier reads it from the lock it unlocks and checks `blake160(signer's ID ‖ salt)` against the identity.
+
+Each app gives the same email its own KeyWay account. A user who picks the same EVM wallet or passkey as a backup in two apps gets two unrelated identities, one per account, and the list recorded on chain holds only these salted identities. So nobody reading the chain can link the two accounts through the shared backup. The salt is public, though: someone who already knows a backup's address can check whether it's on a given account's list, and a rescue reveals the backup that signed it. KeyWay's own records and emails still name the real backups.
 
 Both kinds of backup approve a move by signing the same short text, which their wallet shows as written:
 
@@ -93,7 +101,7 @@ KeyWay's server builds and checks every recovery transaction itself. Ordinary si
 - one backup on the list,
 - a public CKB node (configurable).
 
-It doesn't call KeyWay's servers, use a database, Lit or any KeyWay secret. It reads the address, finds the AdminList by its type hash under its owner-only lock, rebuilds the list from chain data and checks it against the list's root, shows the balance, and builds one transaction that moves the CKB and tokens. It shows the exact text the backup will sign before asking for the signature.
+It doesn't call KeyWay's servers, use a database, Lit or any KeyWay secret. It reads the address, finds the AdminList by its type hash under its owner-only lock, rebuilds the list from chain data and checks it against the list's root, shows how many backups it has (the list doesn't name them), finds the connected backup on it by computing its salted identity, shows the balance, and builds one transaction that moves the CKB and tokens. It shows the exact text the backup will sign before asking for the signature.
 
 The balance comes from the node, but the node can't change what a cell holds: the page reads each cell from the transaction that created it and checks that transaction's hash. A node can only leave cells out, so a balance that looks low means trying another node. The page sends only to addresses whose lock it knows (the network's standard locks and KeyWay's Omnilock), so funds can't go to a lock nobody can spend.
 

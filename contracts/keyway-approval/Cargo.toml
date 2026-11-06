@@ -9,6 +9,7 @@ description = "The readable text a KeyWay recovery backup signs, rebuilt from th
 path = "src/lib.rs"
 
 [dependencies]
+blake2b-ref = "0.3.1"
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 ckb-std = { version = "1.1.0", default-features = false, features = ["dummy-atomic"] }

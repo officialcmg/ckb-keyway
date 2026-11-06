@@ -199,6 +199,30 @@ fn evm_blob(network: u8, signature: &[u8]) -> Vec<u8> {
     blob
 }
 
+/// The account's salt: the AdminList type hash at args[22..54] of its Omnilock (the case's account lock).
+fn salt(case: &TransactionCase) -> [u8; 32] {
+    keyway_approval::account_salt(&unhex(&case.account.args)).unwrap()
+}
+
+/// The identity's pubkey hash for a backup id in this case's account: blake160(id ‖ salt).
+fn identity(id: &[u8; 20], case: &TransactionCase) -> [u8; 20] {
+    keyway_approval::salted_id(id, &salt(case))
+}
+
+/// The case with the account's lock (wherever it appears) given other args.
+fn with_account_args(case: &TransactionCase, args: &[u8]) -> TransactionCase {
+    let mut changed = case.clone();
+    let account = case.account.args.clone();
+    let args = format!("0x{}", hex::encode(args));
+    for lock in changed.inputs.iter_mut().map(|input| &mut input.lock).chain(changed.outputs.iter_mut().map(|output| &mut output.lock)) {
+        if lock.args == account && lock.code_hash == case.account.code_hash {
+            lock.args = args.clone();
+        }
+    }
+    changed.account.args = args;
+    changed
+}
+
 fn network_byte(name: &str) -> u8 {
     if name == "mainnet" { 1 } else { 0 }
 }
@@ -217,7 +241,7 @@ fn evm_verifier_rebuilds_the_sdk_text_from_random_transactions() {
         let sighash = unhex(&case.sighash);
         let text = case.text.clone().unwrap_or_else(|| "KeyWay recovery".into());
         let signature = evm_blob(network_byte(&case.network), &personal_sign(&key, text.as_bytes()));
-        let (code, cycles) = run("evm-personal-sign", case, &exec_argument(&code_hash, &address, &sighash, &signature));
+        let (code, cycles) = run("evm-personal-sign", case, &exec_argument(&code_hash, &identity(&address, case), &sighash, &signature));
         if case.text.is_some() {
             assert_eq!(code, 0, "{text}");
             accepted += 1;
@@ -242,12 +266,13 @@ fn evm_verifier_refuses_other_text() {
     let code_hash = [0x42u8; 32];
     let sighash = unhex(&case.sighash);
     let text = case.text.clone().unwrap();
-    let argument = |text: &str, network: u8| exec_argument(&code_hash, &address, &sighash, &evm_blob(network, &personal_sign(&key, text.as_bytes())));
+    let pubkey_hash = identity(&address, &case);
+    let argument = |text: &str, network: u8| exec_argument(&code_hash, &pubkey_hash, &sighash, &evm_blob(network, &personal_sign(&key, text.as_bytes())));
     assert_eq!(run("evm-personal-sign", &case, &argument(&text, 0)).0, 0);
 
     let mut low_v = personal_sign(&key, text.as_bytes());
     low_v[64] -= 27;
-    assert_eq!(run("evm-personal-sign", &case, &exec_argument(&code_hash, &address, &sighash, &evm_blob(0, &low_v))).0, 0);
+    assert_eq!(run("evm-personal-sign", &case, &exec_argument(&code_hash, &pubkey_hash, &sighash, &evm_blob(0, &low_v))).0, 0);
 
     let mut other_destination = case.clone();
     for output in &mut other_destination.outputs {
@@ -266,7 +291,7 @@ fn evm_verifier_refuses_other_text() {
     assert_eq!(run("evm-personal-sign", &case, &argument(&text, 1)).0, 101);
     assert_eq!(run("evm-personal-sign", &case, &argument(&text, 2)).0, 110);
     let other_key = EvmKey::from_slice(&[9u8; 32]).unwrap();
-    let foreign = exec_argument(&code_hash, &address, &sighash, &evm_blob(0, &personal_sign(&other_key, text.as_bytes())));
+    let foreign = exec_argument(&code_hash, &pubkey_hash, &sighash, &evm_blob(0, &personal_sign(&other_key, text.as_bytes())));
     assert_eq!(run("evm-personal-sign", &case, &foreign).0, 101);
 }
 
@@ -304,7 +329,7 @@ impl Passkey {
 fn webauthn_verifier_rebuilds_the_sdk_text_and_fits_omnilock() {
     let cases: Vec<TransactionCase> = fixture("approval-transaction-cases.json");
     let passkey = Passkey(SigningKey::from_slice(&[3u8; 32]).unwrap());
-    let pubkey_hash = joyid_webauthn::blake160(&passkey.public_key());
+    let pubkey_hash = identity(&joyid_webauthn::blake160(&passkey.public_key()), &cases[0]);
     let code_hash = [0x24u8; 32];
     let mut accepted = 0;
     let mut max_cycles = 0;
@@ -354,7 +379,9 @@ fn mutated_signatures_are_refused() {
     let msg = [1u8; 32];
     let evm = evm_blob(0, &personal_sign(&key, text.as_bytes()));
     let passkey = Passkey(SigningKey::from_slice(&[3u8; 32]).unwrap());
-    let pubkey_hash = joyid_webauthn::blake160(&passkey.public_key());
+    let salt = [0x5au8; 32];
+    let pubkey_hash = keyway_approval::salted_id(&joyid_webauthn::blake160(&passkey.public_key()), &salt);
+    let evm_hash = keyway_approval::salted_id(&address, &salt);
     let webauthn = passkey.blob(0, text, 768);
     let mut state = 0x1234_5678_9abc_def0u64;
     let mut next = move || { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state };
@@ -367,14 +394,14 @@ fn mutated_signatures_are_refused() {
             blob[at] = next() as u8;
         }
         if evm_round {
-            let argument = exec_argument(&[0; 32], &address, &msg, &blob);
-            let ok = evm_personal_sign::parse_argument(argument.as_bytes()).and_then(|parsed| evm_personal_sign::verify(&parsed, text.as_bytes())).is_ok();
+            let argument = exec_argument(&[0; 32], &evm_hash, &msg, &blob);
+            let ok = evm_personal_sign::parse_argument(argument.as_bytes()).and_then(|parsed| evm_personal_sign::verify(&parsed, &salt, text.as_bytes())).is_ok();
             if ok {
                 // Only v's alternative encodings (0/1 for 27/28) may still verify.
                 assert_eq!(blob[..66], evm[..66]);
                 accepted += 1;
             }
-        } else if joyid_webauthn::verify(&pubkey_hash, text.as_bytes(), &blob).is_ok() {
+        } else if joyid_webauthn::verify(&pubkey_hash, &salt, text.as_bytes(), &blob).is_ok() {
             // Bytes outside what is checked: the signCount, the clientDataJSON fields other than type and
             // challenge are signed, so only the network byte (same prefix) or nothing may differ.
             assert_eq!(blob, webauthn);
@@ -382,4 +409,64 @@ fn mutated_signatures_are_refused() {
         }
     }
     println!("mutations: 40000, accepted unchanged signatures: {accepted}");
+}
+
+/// A backup's identity is salted with the account's AdminList type hash, read by the verifier from the running
+/// Omnilock's args: the same EVM address or passkey has unrelated identities in two accounts, a signature with
+/// account A's identity is refused when the verifier runs for account B, the bare (unsalted) id is refused, and
+/// a lock that isn't a KeyWay account's administrator-mode Omnilock gives no salt (114).
+#[test]
+fn identities_are_salted_per_account() {
+    let cases: Vec<TransactionCase> = fixture("approval-transaction-cases.json");
+    let a = cases.iter().find(|case| case.text.is_some() && case.network == "testnet").unwrap().clone();
+    let mut b_args = unhex(&a.account.args);
+    for byte in &mut b_args[22..] {
+        *byte ^= 0xa5;
+    }
+    let b = with_account_args(&a, &b_args);
+    assert_ne!(salt(&a), salt(&b));
+    let sighash = unhex(&a.sighash);
+    let text = a.text.clone().unwrap();
+
+    let key = EvmKey::from_slice(&[7u8; 32]).unwrap();
+    let address = evm_address(&key);
+    let evm_code = [0x42u8; 32];
+    let signature = evm_blob(0, &personal_sign(&key, text.as_bytes()));
+    assert_ne!(identity(&address, &a), identity(&address, &b));
+    assert_ne!(identity(&address, &a), address);
+    let for_a = exec_argument(&evm_code, &identity(&address, &a), &sighash, &signature);
+    let for_b = exec_argument(&evm_code, &identity(&address, &b), &sighash, &signature);
+    assert_eq!(run("evm-personal-sign", &a, &for_a).0, 0);
+    assert_eq!(run("evm-personal-sign", &b, &for_b).0, 0);
+    assert_eq!(run("evm-personal-sign", &b, &for_a).0, 101);
+    assert_eq!(run("evm-personal-sign", &a, &for_b).0, 101);
+    assert_eq!(run("evm-personal-sign", &a, &exec_argument(&evm_code, &address, &sighash, &signature)).0, 101);
+
+    let passkey = Passkey(SigningKey::from_slice(&[3u8; 32]).unwrap());
+    let id = joyid_webauthn::blake160(&passkey.public_key());
+    let webauthn_code = [0x24u8; 32];
+    let blob = passkey.blob(0, &text, 1024);
+    assert_ne!(identity(&id, &a), identity(&id, &b));
+    let for_a = exec_argument(&webauthn_code, &identity(&id, &a), &sighash, &blob);
+    let for_b = exec_argument(&webauthn_code, &identity(&id, &b), &sighash, &blob);
+    assert_eq!(run("joyid-webauthn", &a, &for_a).0, 0);
+    assert_eq!(run("joyid-webauthn", &b, &for_b).0, 0);
+    assert_eq!(run("joyid-webauthn", &b, &for_a).0, 101);
+    assert_eq!(run("joyid-webauthn", &a, &for_b).0, 101);
+    assert_eq!(run("joyid-webauthn", &a, &exec_argument(&webauthn_code, &id, &sighash, &blob)).0, 101);
+
+    // Not a KeyWay account's lock: owner mode only, other Omnilock flags, or args of another length.
+    let evm = exec_argument(&evm_code, &identity(&address, &a), &sighash, &signature);
+    let webauthn = exec_argument(&webauthn_code, &identity(&id, &a), &sighash, &blob);
+    let args = unhex(&a.account.args);
+    let mut flags = args.clone();
+    for flag in [0x00u8, 0x03, 0x09, 0x81] {
+        flags[21] = flag;
+        assert_eq!(run("evm-personal-sign", &with_account_args(&a, &flags), &evm).0, 114);
+        assert_eq!(run("joyid-webauthn", &with_account_args(&a, &flags), &webauthn).0, 114);
+    }
+    for args in [args[..53].to_vec(), [args.clone(), vec![0]].concat(), args[..22].to_vec(), Vec::new(), [args.clone(), vec![0; 300]].concat()] {
+        assert_eq!(run("evm-personal-sign", &with_account_args(&a, &args), &evm).0, 114);
+        assert_eq!(run("joyid-webauthn", &with_account_args(&a, &args), &webauthn).0, 114);
+    }
 }

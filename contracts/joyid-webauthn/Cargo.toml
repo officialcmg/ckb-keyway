@@ -15,7 +15,6 @@ bench = false
 path = "src/lib.rs"
 
 [dependencies]
-blake2b-ref = "0.3.1"
 keyway-approval = { path = "../keyway-approval" }
 ecdsa = { version = "0.16.9", default-features = false, features = ["verifying"] }
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa"] }
