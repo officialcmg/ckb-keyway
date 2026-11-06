@@ -12,6 +12,7 @@
 import { createRequire } from "node:module";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { DEMO_APP_ID, EVIDENCE, json, launch, markSeen, newMailbox, nextCode } from "./lib.mjs";
+import { forAccount, forChannel, loadSettlementState } from "./settlement-state.mjs";
 
 const repo = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
 mkdirSync(EVIDENCE, { recursive: true, mode: 0o700 });
@@ -103,12 +104,12 @@ async function watchtowerData() {
 const redact = (rows) => JSON.stringify(rows, (key, value) => key === "localSettlementKey" || key === "local_key" ? "<redacted>" : value);
 
 const statePath = `${EVIDENCE}/settlement-state.json`;
-const state = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : {};
+// Kept across restarts, but keyed to this run's account and channel: a finished run's state is never reused.
+const state = loadSettlementState(existsSync(statePath) ? readFileSync(statePath, "utf8") : undefined);
 const save = () => writeFileSync(statePath, JSON.stringify(state, null, 2), { mode: 0o600 });
 
 try {
   const mailbox = await newMailbox("st");
-  state.email = mailbox.email; state.password = mailbox.password; save();
   await page.goto(url);
   await page.waitForFunction(() => window.probe?.auth.ready);
   await markSeen(mailbox);
@@ -117,7 +118,8 @@ try {
   await page.locator('input[type="email"]').press("Enter");
   await page.locator('input[autocomplete="one-time-code"]').fill((await nextCode(mailbox)).code);
   await page.waitForFunction(() => window.probe.account.status === "ready", undefined, { timeout: 180_000 });
-  state.address = await page.evaluate(() => window.probe.account.address); save();
+  forAccount(state, await page.evaluate(() => window.probe.account.address));
+  state.email = mailbox.email; state.password = mailbox.password; save();
   record(`user address ${state.address}`);
 
   await json("https://faucet-api.nervos.org/claim_events", { claim_event: { address_hash: state.address, amount: "10000" } });
@@ -136,7 +138,7 @@ try {
   log("open result", JSON.stringify(opened));
   const raw = await page.evaluate(async (id) => (await window.probe.fiber.node.listChannels({})).channels.find((c) => c.channel_id === id), opened.channelId);
   const op = raw.channel_outpoint;
-  state.channelId = opened.channelId;
+  forChannel(state, opened.channelId);
   state.funding = { txHash: `0x${op.slice(2, 66)}`, index: Number.parseInt(op.slice(66).match(/../g).reverse().join(""), 16) };
   state.feeReserveTxHash = opened.feeReserveTxHash ?? null; save();
   record(`channel ${state.channelId} ready; funding ${state.funding.txHash}:${state.funding.index}; fee reserve tx ${state.feeReserveTxHash}`);
@@ -218,6 +220,7 @@ try {
       await new Promise((r) => setTimeout(r, 60_000));
     }
   }
+  if (done) { state.finished = true; save(); }
   log(done ? "DONE" : "TIMEOUT");
 } catch (error) {
   log("FAILED", error.stack?.split("\n").slice(0, 3).join(" | ") ?? error);
