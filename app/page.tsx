@@ -34,15 +34,15 @@ const HOOKS = [
 
 const BUILT_IN = [
   "The CKB signing key lives in Lit's secure hardware and is never exported to your app.",
-  "Users approve every transaction before it's signed, and can require an emailed code for large transfers.",
-  "Fiber keys and node backups are encrypted at rest.",
+  "Transactions need approval before they're signed, in KeyWay's dialog or your app's own, and users can require an emailed code for large transfers.",
+  "A browser node's Fiber key is created and sealed inside Lit. KeyWay's backend never receives it.",
   "Each app has its own users, sessions and one-time codes.",
 ];
 
 const GOOD_TO_KNOW = [
   "KeyWay's backend authorizes signing, and approvals appear inside your app's page. Lit doesn't yet verify the user on its own.",
-  "Managed nodes run on KeyWay's infrastructure, which holds their fiber keys.",
-  "Access to a user's inbox can recover their account until 2FA ships.",
+  "Hosted nodes run on KeyWay's servers, which hold their Fiber keys.",
+  "Access to a user's inbox can sign in to their account until a second sign-in factor ships. Users can add their own recovery backups.",
   "KeyWay runs on CKB testnet and has not been audited yet.",
 ];
 
@@ -51,7 +51,7 @@ const STACK: Array<{ title: string; body: string; mono?: boolean }> = [
   { title: "KeyWay account", body: "One permanent account per user, per app." },
   { title: "Signing key in Lit", body: "A secp256k1 key held in Lit's secure hardware." },
   { title: "CKB address", body: "ckt1qzda0cr0…5kqg5uk4g", mono: true },
-  { title: "Fiber node", body: "Managed or in the browser, started when you call connect()." },
+  { title: "Fiber node", body: "Hosted or in the browser, started when you call start()." },
 ];
 
 export default function Home() {
@@ -143,16 +143,16 @@ export default function Home() {
           </div>
           <div className="lp-modes">
             <article className="lp-mode lp-mode--default">
-              <span className="lp-mode__head"><span className="lp-mode__title">Managed node</span><span className="lp-mode__tag">Default</span></span>
+              <span className="lp-mode__head"><span className="lp-mode__title">Hosted node</span><span className="lp-mode__tag">Default</span></span>
               <p>KeyWay runs a dedicated Fiber node for each user. It stays online, so payments can arrive while the app is closed.</p>
               <ul><li>Nothing runs in the user&apos;s browser</li><li>Encrypted node backups</li><li>KeyWay&apos;s host holds the node key</li></ul>
-              <code>nodeMode=&quot;managed&quot;</code>
+              <code>fiberNode=&quot;hosted&quot;</code>
             </article>
             <article className="lp-mode">
               <span className="lp-mode__title">In-browser node</span>
               <p>The node runs inside the user&apos;s tab with WebAssembly. Channel state stays on their device.</p>
-              <ul><li>No node on our servers</li><li>Moves devices through an encrypted sign-out handoff</li><li>Online only while the tab is open</li></ul>
-              <code>nodeMode=&quot;browser&quot;</code>
+              <ul><li>No node on our servers</li><li>Fiber key sealed in Lit</li><li>Moves devices through an encrypted sign-out handoff</li><li>Online only while the tab is open</li></ul>
+              <code>fiberNode=&quot;browser&quot;</code>
             </article>
           </div>
         </div>
@@ -199,9 +199,9 @@ export default function Home() {
         <div className="lp-stack lp-stack--tight">
           <h2 className="lp-h2">Roadmap</h2>
           <div className="lp-roadmap">
-            <div className="lp-roadmap__col lp-roadmap__col--now"><span className="lp-roadmap__title"><span className="lp-roadmap__dot" />Now on testnet</span><ul><li>Email sign-in with per-app isolation</li><li>CKB accounts and balances</li><li>Fiber channels and payments</li><li>Managed and in-browser nodes</li><li>Developer dashboard</li></ul></div>
-            <div className="lp-roadmap__col lp-roadmap__col--next"><span className="lp-roadmap__title">Next</span><ul><li>User verification enforced inside Lit</li><li>A second recovery factor</li><li>Independent security review</li></ul></div>
-            <div className="lp-roadmap__col"><span className="lp-roadmap__title">Exploring</span><ul><li>Mainnet support</li><li>Inbound liquidity for new channels</li><li>Fiber keys the backend never sees</li></ul></div>
+            <div className="lp-roadmap__col lp-roadmap__col--now"><span className="lp-roadmap__title"><span className="lp-roadmap__dot" />Now on testnet</span><ul><li>Email sign-in with per-app isolation</li><li>CKB accounts and balances</li><li>Fiber channels and payments</li><li>Hosted and in-browser nodes</li><li>Account recovery with the user's own backups</li><li>Developer dashboard</li></ul></div>
+            <div className="lp-roadmap__col lp-roadmap__col--next"><span className="lp-roadmap__title">Next</span><ul><li>User verification enforced inside Lit</li><li>A second sign-in factor</li><li>Independent security review</li></ul></div>
+            <div className="lp-roadmap__col"><span className="lp-roadmap__title">Exploring</span><ul><li>Mainnet support</li><li>Inbound liquidity for new channels</li><li>Hosted nodes without KeyWay holding their keys</li></ul></div>
           </div>
         </div>
       </section>
