@@ -1,0 +1,7 @@
+2026-11-06 18:28:13 funded the browser node's CKB key ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqfqflqlm52eu0zlvvyuuxmayefheuv2kqgvye8lv: 0x2d37d8de17d6081ce0e2b6653bbeb08f6f14e75ab4e3a682234e46c0126cd512
+2026-11-06 18:28:25 browser node running: 02520b50cdbf1cd3f376fb4bcdbe65e65abaf37f46d551dd51fc6ba5225ed3adc2; CKB key ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqfqflqlm52eu0zlvvyuuxmayefheuv2kqgvye8lv
+2026-11-06 18:28:28 browser node opened a 500 CKB channel to the peer: {"temporary_channel_id":"0x1c830996e5095b61fdf9459de811a976da1b7d59031abc32ededb14e3d0886ab"}
+2026-11-06 18:39:07 browser node running: 02520b50cdbf1cd3f376fb4bcdbe65e65abaf37f46d551dd51fc6ba5225ed3adc2; CKB key ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqfqflqlm52eu0zlvvyuuxmayefheuv2kqgvye8lv
+2026-11-06 18:39:10 browser node paid the peer 100 CKB: 0xd98a5d0da53be9b6908d57c80a67aa5c85db6aca91f441c3f630a130d5956700 on channel 0x4b8fb9ee455ad74fa7298659aafff3b7a9d716a84417000d6624f19c78b61730
+2026-11-06 18:39:15 remote watchtower queue after the payment: 0 channel(s) pending
+2026-11-06 18:39:15 tab closed (step pay)

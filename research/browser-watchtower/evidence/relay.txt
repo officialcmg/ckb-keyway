@@ -1,0 +1,19 @@
+2026-11-06 18:21:25 relay listening; test user e7af0fc6-f3a3-4682-9de7-b2f986f18770
+2026-11-06 18:22:19 node -> page: create_watch_channel {channel_id,funding_udt_type_script,local_funding_pubkey,local_settlement_key,remote_funding_pubkey,remote_settlement_key,settlement_data}  -> KeyWay watch {channelId,fundingUdtTypeScript,localFundingPubkey,remoteFundingPubkey} channel=0xead63244f10cd76e7df1cab4d6a54d0ccc9829bed0d6c0f40f8607fbc348ae97 commitment=-
+2026-11-06 18:22:19 node -> page: update_pending_remote_settlement {channel_id,settlement_data}  (stays on the device; nothing sent to KeyWay)
+2026-11-06 18:22:19 node -> page: update_local_settlement {channel_id,settlement_data}  (stays on the device; nothing sent to KeyWay)
+2026-11-06 18:24:11 node -> page: update_local_settlement {channel_id,settlement_data}  (stays on the device; nothing sent to KeyWay)
+2026-11-06 18:24:11 node -> page: update_pending_remote_settlement {channel_id,settlement_data}  (stays on the device; nothing sent to KeyWay)
+2026-11-06 18:24:11 node -> page: update_revocation {channel_id,revocation_data,settlement_data}  -> KeyWay revoke {channelId,revocation} channel=0xead63244f10cd76e7df1cab4d6a54d0ccc9829bed0d6c0f40f8607fbc348ae97 commitment=0x1
+2026-11-06 18:24:11 node -> page: create_preimage {payment_hash,preimage}  (stays on the device; nothing sent to KeyWay)
+2026-11-06 18:24:11 node -> page: update_pending_remote_settlement {channel_id,settlement_data}  (stays on the device; nothing sent to KeyWay)
+2026-11-06 18:24:11 node -> page: update_revocation {channel_id,revocation_data,settlement_data}  -> KeyWay revoke {channelId,revocation} channel=0xead63244f10cd76e7df1cab4d6a54d0ccc9829bed0d6c0f40f8607fbc348ae97 commitment=0x2
+2026-11-06 18:24:11 node -> page: update_local_settlement {channel_id,settlement_data}  (stays on the device; nothing sent to KeyWay)
+2026-11-06 18:24:11 node -> page: remove_preimage {payment_hash}  (stays on the device; nothing sent to KeyWay)
+2026-11-06 18:24:23 V stopped (tab closed)
+2026-11-06 18:24:33 C force-closed with its old (revoked) state
+2026-11-06 18:28:06 relay listening; test user e7af0fc6-f3a3-4682-9de7-b2f986f18770
+2026-11-06 18:28:37 browser SDK -> KeyWay watch {channelId,fundingUdtTypeScript,localFundingPubkey,remoteFundingPubkey} channel=0x4b8fb9ee455ad74fa7298659aafff3b7a9d716a84417000d6624f19c78b61730 commitment=-
+2026-11-06 18:39:10 browser SDK -> KeyWay revoke {channelId,revocation} channel=0x4b8fb9ee455ad74fa7298659aafff3b7a9d716a84417000d6624f19c78b61730 commitment=0x1
+2026-11-06 18:39:11 browser SDK -> KeyWay revoke {channelId,revocation} channel=0x4b8fb9ee455ad74fa7298659aafff3b7a9d716a84417000d6624f19c78b61730 commitment=0x2
+2026-11-06 18:39:23 tab closed; peer P force-closed channel 0x4b8f… with the current state
