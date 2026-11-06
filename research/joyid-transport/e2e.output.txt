@@ -28,7 +28,7 @@
     "appHeaders": {
       "coop": "same-origin",
       "coep": "require-corp",
-      "csp": "default-src 'self'; script-src 'self' 'nonce-BoU5WeDCCa2JcZM…"
+      "csp": "default-src 'self'; script-src 'self' 'nonce-5wDDlyzzsRKgzww…"
     },
     "stageSeen": "Connecting JoyID…",
     "joyIdVisits": [
@@ -36,10 +36,10 @@
         "path": "/auth",
         "type": "redirect",
         "referer": "http://localhost:3100/",
-        "redirectURL": "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c&joyid-redirect=true",
+        "redirectURL": "http://localhost:3100/app?keyway-joyid=01918a807ecd1e369d9467483c3da6a1&joyid-redirect=true",
         "state": {
           "v": 1,
-          "id": "7f845785897e09fe7607f06d3902b269"
+          "id": "4f375f18074ec4b917a49873d05caeb6"
         },
         "answered": "auth"
       },
@@ -47,29 +47,29 @@
         "path": "/sign-message",
         "type": "redirect",
         "referer": "http://localhost:3100/",
-        "redirectURL": "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c&joyid-redirect=true",
+        "redirectURL": "http://localhost:3100/app?keyway-joyid=01918a807ecd1e369d9467483c3da6a1&joyid-redirect=true",
         "state": {
           "v": 1,
-          "id": "60c5f752fd8b425b2379697193571c89"
+          "id": "2710a53be8ac0e97f2b975aa81e3faf2"
         },
         "answered": "signed",
         "challenge": "KeyWay account recovery…"
       }
     ],
     "helperUrls": [
-      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c",
+      "http://localhost:3100/app?keyway-joyid=01918a807ecd1e369d9467483c3da6a1",
       "https://testnet.joyid.dev/auth?type=redirect&_data_=…",
-      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c&joyid-redirect=true&_data_=…",
-      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c",
-      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c&joyid-redirect=true&_data_=…",
-      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c",
-      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c",
+      "http://localhost:3100/app?keyway-joyid=01918a807ecd1e369d9467483c3da6a1&joyid-redirect=true&_data_=…",
+      "http://localhost:3100/app?keyway-joyid=01918a807ecd1e369d9467483c3da6a1",
+      "http://localhost:3100/app?keyway-joyid=01918a807ecd1e369d9467483c3da6a1&joyid-redirect=true&_data_=…",
+      "http://localhost:3100/app?keyway-joyid=01918a807ecd1e369d9467483c3da6a1",
+      "http://localhost:3100/app?keyway-joyid=01918a807ecd1e369d9467483c3da6a1",
       "https://testnet.joyid.dev/sign-message?type=redirect&_data_=…",
-      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c&joyid-redirect=true&_data_=…",
-      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c",
-      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c&joyid-redirect=true&_data_=…",
-      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c",
-      "http://localhost:3100/app?keyway-joyid=147b087074245323bb5ae664462ac82c"
+      "http://localhost:3100/app?keyway-joyid=01918a807ecd1e369d9467483c3da6a1&joyid-redirect=true&_data_=…",
+      "http://localhost:3100/app?keyway-joyid=01918a807ecd1e369d9467483c3da6a1",
+      "http://localhost:3100/app?keyway-joyid=01918a807ecd1e369d9467483c3da6a1&joyid-redirect=true&_data_=…",
+      "http://localhost:3100/app?keyway-joyid=01918a807ecd1e369d9467483c3da6a1",
+      "http://localhost:3100/app?keyway-joyid=01918a807ecd1e369d9467483c3da6a1"
     ],
     "helperClosed": true,
     "main": {
@@ -86,17 +86,17 @@
       {
         "path": "/recovery",
         "operation": "preview",
-        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq8rxutxdqnnzvs86mhup9gcjzsj0fqfgug34x8k5"
+        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq8fh2evc3rk5l35jk0h2pj92p525rgdw257nem64"
       },
       {
         "path": "/recovery",
         "operation": "request-email-code",
-        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq8rxutxdqnnzvs86mhup9gcjzsj0fqfgug34x8k5"
+        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq8fh2evc3rk5l35jk0h2pj92p525rgdw257nem64"
       },
       {
         "path": "/recovery",
         "operation": "enable",
-        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq8rxutxdqnnzvs86mhup9gcjzsj0fqfgug34x8k5"
+        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq8fh2evc3rk5l35jk0h2pj92p525rgdw257nem64"
       },
       {
         "path": "/recovery",
@@ -135,6 +135,8 @@
       "http://localhost:3100/app?mode=browser&joyid-redirect=true&_data_=…",
       "http://localhost:3100/app?mode=browser",
       "http://localhost:3100/app?mode=browser&joyid-redirect=true&_data_=…",
+      "http://localhost:3100/app?mode=browser",
+      "http://localhost:3100/app?mode=browser",
       "http://localhost:3100/app?mode=browser",
       "http://localhost:3100/app?mode=browser"
     ],
@@ -251,7 +253,7 @@
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/3h5sy418awg4_.js",
+        "url": "http://localhost:3100/_next/static/chunks/2a-izdb6zpt6v.js",
         "referer": "…_data_=…",
         "type": "script"
       },
@@ -326,7 +328,7 @@
         "type": "script"
       },
       {
-        "url": "http://localhost:3100/_next/static/chunks/3h5sy418awg4_.js",
+        "url": "http://localhost:3100/_next/static/chunks/2a-izdb6zpt6v.js",
         "referer": "…_data_=…",
         "type": "script"
       }
@@ -339,17 +341,17 @@
       {
         "path": "/recovery",
         "operation": "preview",
-        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq8rxutxdqnnzvs86mhup9gcjzsj0fqfgug34x8k5"
+        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq8fh2evc3rk5l35jk0h2pj92p525rgdw257nem64"
       },
       {
         "path": "/recovery",
         "operation": "request-email-code",
-        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq8rxutxdqnnzvs86mhup9gcjzsj0fqfgug34x8k5"
+        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq8fh2evc3rk5l35jk0h2pj92p525rgdw257nem64"
       },
       {
         "path": "/recovery",
         "operation": "enable",
-        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq8rxutxdqnnzvs86mhup9gcjzsj0fqfgug34x8k5"
+        "verified": "joyid:ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqq8fh2evc3rk5l35jk0h2pj92p525rgdw257nem64"
       },
       {
         "path": "/recovery",

@@ -106,4 +106,26 @@ the research, and the independent review.
 
 ## Independent review (Fable)
 
-_Pending._
+An independent reviewer (Fable model) read `git diff origin/main...HEAD`, the research README (§1-5, §8) and its
+proofs, without these notes. It found no high-severity issue and confirmed that a crafted `_data_` URL or
+BroadcastChannel message can't get a foreign JoyID accepted. Findings and outcomes:
+
+| # | Severity | Finding | Outcome |
+| --- | --- | --- | --- |
+| 1 | Medium | The opening tab can't tell the JoyID window was closed or reloaded (Back from JoyID's page) and waits until the request expires. | Fixed. The window posts `gone` on `pagehide` unless it is leaving for JoyID or was told to close; a second `ready` while an answer is due means it reloaded. Either ends the wait as a cancel. Closing it *while JoyID's page shows* still can't be seen (no KeyWay code runs there); the Cancel link and `signal` cover that. Unit-tested. |
+| 2 | Medium | Scripts on the return page that run before the SDK can read `_data_`; the design asks for a minimal return path. | Fixed in docs: a warning callout in Account recovery recommending a `joyIdReturnPath` without third-party scripts. The demo `/app` has none, so it keeps the default. |
+| 3 | Medium | The window protocol has no test run by `npm test`. | Fixed: node:test with a fake BroadcastChannel covers ignoring another window's `go`/`close`, a full-page record, a non-JoyID app URL, recording once, the JoyID URL, `gone` on close and not when leaving for JoyID; plus return-URL tests. The e2e stays a research harness (it needs the environment's Playwright). |
+| 4 | Medium | Explicit `transport: "popup"` on an isolated page reports "cancelled". | Fixed: refused up front with a plain message; documented. |
+| 5 | Low | The app's page mounts once in the JoyID window before the helper screen replaces it. | Documented. `connect()` now refuses in the JoyID window as a second guard (session restore and bootstrap were already skipped, so it had no token). |
+| 6 | Low | Back to a bfcache-restored page after a full-page redirect leaves the promise pending forever. | Fixed: `pageshow` with `persisted` rejects it as a cancel. A browser node stopped for the redirect stays stopped until started again (or restarts with `autoStartFiber` on a normal load); documented. |
+| 7 | Low | `JoyIdCancelledError` isn't exported. | Not changed: the package's runtime exports are pinned by `tests/package-surface.test.ts`, and adding one is a public-API decision for the founder. The error's `name` is `JoyIdCancelledError`, now documented. |
+| 8 | Low | The JoyID window navigates to any http(s) `joyIdAppURL` in a `go` message. | Fixed: records must name `https://app.joy.id` or `https://testnet.joyid.dev`; `appId` and `otherProofs` shapes are checked too. |
+| 9 | Low | A rejection after the session expired shows "Sign in again"; a crafted link fires `onError`. | Fixed: a rejection is a cancel before any other check; an answer with no record behind it no longer calls `onError`. |
+| 10 | Low | `useLayoutEffect` warns in React 18 SSR. | Fixed: layout effect in the browser, plain effect on the server. |
+| 11 | Low | The router-synced strip on `setTimeout(0)` may run before Next.js hooks history. | Fixed: it runs again after 300 ms. |
+| 12 | Low | Default return path drops the hash; direct `node.sendPayment` calls aren't counted; a custom JoyID app URI on a CCC signer is ignored; no docs sentence on manual node restart. | Hash kept; docs now say only `useFiber()` payments and channel changes are counted, and cover the restart. The custom app URI is left out on purpose: JoyID requests go only to JoyID's two apps (see 8). |
+
+Backward compatibility and UX copy: the reviewer found no issue. After the fixes every check was re-run: both
+typechecks, `npm test` (242 tests: 225 pass, 0 fail, 17 skipped by their own environment gates; 13 JoyID tests),
+the Postgres suite (43/43), `next build` against the pinned 0.2.6 and the local SDK, the demo typecheck against the
+new SDK, the docs build, the release workflow steps, and the e2e (22/22).

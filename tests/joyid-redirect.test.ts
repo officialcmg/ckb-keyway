@@ -24,8 +24,10 @@ import {
   joyIdRequest,
   JoyIdCancelledError,
   joyIdStateId,
+  joyIdReturnUrl,
   readJoyIdReturn,
   resumeJoyIdRedirect,
+  runJoyIdHelper,
   saveJoyIdRecord,
   stopBrowserNodeForRedirect,
   takeCapturedJoyIdReturn,
@@ -338,4 +340,80 @@ test("a full-page redirect stops a browser node cleanly, and refuses mid-payment
   await stopBrowserNodeForRedirect({ ...node(false), kind: "hosted" });
   await stopBrowserNodeForRedirect(node(false, false));
   assert.equal(calls.includes("stop"), false);
+});
+
+/** A same-process BroadcastChannel: every channel with the name gets every other one's messages, in order. */
+function fakeBroadcast() {
+  const open = new Set<{ name: string; onmessage: ((event: MessageEvent) => void) | null }>();
+  const sent: unknown[] = [];
+  class Channel {
+    onmessage: ((event: MessageEvent) => void) | null = null;
+    constructor(readonly name: string) { open.add(this); }
+    postMessage(data: unknown) {
+      sent.push(structuredClone(data));
+      for (const channel of open) if (channel !== this && channel.name === this.name) channel.onmessage?.({ data: structuredClone(data) } as MessageEvent);
+    }
+    close() { open.delete(this); }
+  }
+  const deliver = (data: unknown) => { for (const channel of open) channel.onmessage?.({ data } as MessageEvent); };
+  return { Channel, sent, deliver };
+}
+
+test("the JoyID window answers only its own requests, and says when it is closed", async () => {
+  const globals = globalThis as Record<string, unknown>;
+  const saved = { window: globals.window, location: globals.location, history: globals.history, sessionStorage: globals.sessionStorage, BroadcastChannel: globals.BroadcastChannel };
+  const broadcast = fakeBroadcast();
+  const listeners = new Map<string, () => void>();
+  const assigned: string[] = [];
+  let closed = 0;
+  try {
+    globals.BroadcastChannel = broadcast.Channel;
+    globals.sessionStorage = new MemoryStorage();
+    globals.window = { addEventListener: (type: string, listener: () => void) => listeners.set(type, listener), removeEventListener: () => undefined, close: () => { closed += 1; } };
+    globals.location = { href: `${APP}/app?keyway-joyid=${ID}`, origin: APP, assign: (url: string) => assigned.push(url) };
+    const statuses: string[] = [];
+    const stop = runJoyIdHelper((status) => statuses.push(status));
+    assert.deepEqual(broadcast.sent, [{ kind: "ready", helper: ID }]);
+    const record = { ...await signRecord(await passkey()), transport: "window" as const, id: "a".repeat(32) };
+    // Another window's request, a full-page request, or a JoyID app that isn't JoyID's: ignored.
+    broadcast.deliver({ kind: "go", helper: "b".repeat(32), record });
+    broadcast.deliver({ kind: "go", helper: ID, record: { ...record, transport: "redirect" } });
+    broadcast.deliver({ kind: "go", helper: ID, record: { ...record, joyIdAppURL: "https://evil.example" } });
+    broadcast.deliver({ kind: "close", helper: "b".repeat(32) });
+    assert.equal(assigned.length, 0);
+    assert.equal(closed, 0);
+    // Its own request goes to JoyID, recorded once in this window; leaving for JoyID isn't "gone".
+    broadcast.deliver({ kind: "go", helper: ID, record });
+    assert.equal(assigned.length, 1);
+    const url = new URL(assigned[0]);
+    assert.equal(url.origin, "https://testnet.joyid.dev");
+    assert.equal((decodeSearch(url.searchParams.get("_data_")!) as { redirectURL: string }).redirectURL, `${APP}/app?keyway-joyid=${ID}&joyid-redirect=true`);
+    assert.ok(takeJoyIdRecord(globals.sessionStorage as Storage, record.id));
+    listeners.get("pagehide")!();
+    assert.equal(broadcast.sent.some((message) => (message as { kind: string }).kind === "gone"), false);
+    stop();
+    // A fresh window that the user closes before JoyID: the opening tab hears "gone".
+    broadcast.sent.length = 0;
+    const stopAgain = runJoyIdHelper(() => undefined);
+    listeners.get("pagehide")!();
+    assert.deepEqual(broadcast.sent, [{ kind: "ready", helper: ID }, { kind: "gone", helper: ID }]);
+    stopAgain();
+    assert.ok(statuses.includes("opening"));
+  } finally {
+    Object.assign(globals, saved);
+  }
+});
+
+test("JoyID return URLs stay on this site and drop stale JoyID parameters", () => {
+  const globals = globalThis as Record<string, unknown>;
+  const saved = globals.location;
+  globals.location = { origin: APP };
+  try {
+    assert.equal(joyIdReturnUrl(`/app?mode=browser&keyway-joyid=${"c".repeat(32)}&_data_=x&joyid-redirect=true`, ID), `${APP}/app?mode=browser&keyway-joyid=${ID}`);
+    assert.equal(joyIdReturnUrl("/app#recovery"), `${APP}/app#recovery`);
+    assert.throws(() => joyIdReturnUrl("//evil.example/app"), /path on this site/);
+    assert.throws(() => joyIdReturnUrl("https://evil.example/app"), /path on this site/);
+  } finally {
+    globals.location = saved;
+  }
 });

@@ -157,7 +157,7 @@ JoyID normally answers in its own window, which reports back to the page that op
 | `"auto"` (default) | `"popup"` on a page that isn't cross-origin isolated. Otherwise `"window"`, or `"redirect"` when that window can't open: the browser blocked it, or the app runs as an installed app. |
 | `"popup"` | JoyID's own window, as CCC's JoyID signer opens it. |
 | `"window"` | A window on your own site opens and goes to JoyID. JoyID sends the result back to it, it hands the result to your page and closes. Your page, and a browser node in it, keeps running. |
-| `"redirect"` | The whole page goes to JoyID and comes back. A browser node is stopped cleanly first; KeyWay refuses to leave while a payment or channel change is still running. |
+| `"redirect"` | The whole page goes to JoyID and comes back. A browser node is stopped cleanly first; KeyWay refuses to leave while a payment or channel change started through `useFiber()` is still running. |
 
 **First use takes two steps.** The text a backup signs names its JoyID address, so a JoyID KeyWay hasn't seen yet first connects (JoyID asks for the passkey once) and then signs (once more). KeyWay remembers the connection where CCC's JoyID signer keeps it, so the next backup goes straight to signing.
 
@@ -174,7 +174,13 @@ JoyID normally answers in its own window, which reports back to the page that op
 
 Call `recovery.dismissPendingJoyIdBackup()` once you've shown the outcome. Other options: `onStage(stage)` reports `connecting`, `signing` or `leaving`, and `signal` (an `AbortSignal`) stops waiting for JoyID.
 
-JoyID returns to the page the user started on, or to the provider's `joyIdReturnPath` (a path on your site, such as `/wallet`). That page must render `KeyWayProvider`. A window KeyWay opens for JoyID shows only a short status: the provider doesn't restore the session, start Fiber or render your page in it.
+JoyID returns to the page the user started on, or to the provider's `joyIdReturnPath` (a path on your site, such as `/wallet`). That page must render `KeyWayProvider`. A window KeyWay opens for JoyID shows only a short status: the provider doesn't restore the session or start Fiber in it, and replaces your page with that status once it hydrates (your page's own code runs once before that).
+
+<Callout type="warn" title="Keep the return page minimal">
+  Any script on the return page that runs before the SDK loads, such as analytics or tag managers, can read JoyID's answer from the URL, and the page's own files are requested with the full URL as referrer. Point `joyIdReturnPath` at a page without third-party scripts if your app has them.
+</Callout>
+
+A cancel, in JoyID, in the JoyID window or through `signal`, rejects with an error whose `name` is `JoyIdCancelledError`. Explicit `transport: "popup"` on a cross-origin isolated page is refused, because JoyID's own window couldn't answer it. After a full-page redirect, a browser node the user started by hand stays stopped until they start it again; with `autoStartFiber` it starts again by itself.
 
 What KeyWay checks before it uses JoyID's answer:
 
