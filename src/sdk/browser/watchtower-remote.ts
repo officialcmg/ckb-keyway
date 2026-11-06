@@ -131,10 +131,15 @@ export function createRemoteWatchtower(options: {
     void run(false);
   }
 
-  /** A request KeyWay refused for good (4xx other than 429): resending it can't succeed. */
-  const refused = (error: unknown) => {
+  /**
+   * A request KeyWay refused for good: resending it can't succeed. Only the API's own refusals count; any other
+   * failure (network, 5xx, 429, a database error the API reports as 400) is retried, so a revocation is never dropped
+   * because of a passing fault.
+   */
+  const PERMANENT = /Token channels are not watched|Invalid watchtower|Unsupported watchtower operation|already watched with other funding keys|already watches \d+ open channels|does not match the channel's asset/i;
+  const refused = (error: unknown, message: string) => {
     const status = (error as { status?: unknown })?.status;
-    return typeof status === "number" && status >= 400 && status < 500 && status !== 401 && status !== 429;
+    return status === 400 && PERMANENT.test(message);
   };
   /** Channels KeyWay won't watch (e.g. token channels): their later updates are dropped too. */
   const rejectedChannels = new Set<string>();
@@ -156,14 +161,18 @@ export function createRemoteWatchtower(options: {
           await options.send(update);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          if (kind === "revoke" && /not watched/i.test(message) && !queue.watch && !queue.reregistered) {
-            // KeyWay doesn't know this channel (e.g. it was opened before this SDK version): register it first.
-            const registration = await options.registration?.(channelId).catch(() => undefined);
-            if (registration?.operation === "watch") {
-              queue.watch = registration;
+          const notWatched = kind === "revoke" && /not watched/i.test(message);
+          if (notWatched && !queue.watch && !queue.reregistered) {
+            // KeyWay doesn't know this channel (e.g. it was opened before this SDK version): register it first. A
+            // lookup that fails is tried again; one that finds nothing ends the attempts.
+            try {
+              const registration = await options.registration?.(channelId);
               queue.reregistered = true;
+              if (registration?.operation === "watch") queue.watch = registration;
+            } catch {
+              // Retried with the update.
             }
-          } else if (refused(error)) {
+          } else if (refused(error, message) || (notWatched && queue.reregistered && !queue.watch)) {
             log.warn(`[keyway] watchtower: KeyWay refused ${kind} for channel ${channelId}`, message);
             if (kind === "watch") rejectedChannels.add(channelId);
             if (queue[kind] === update) delete queue[kind];
