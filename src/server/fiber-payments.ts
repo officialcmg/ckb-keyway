@@ -14,7 +14,7 @@ import {
   verifyCode,
   type SigningContext,
 } from "./general-signing.ts";
-import { runIdempotentMutation } from "./idempotency.ts";
+import { runIdempotentMutation, type RecordHandle } from "./idempotency.ts";
 
 export type FiberCaller = { call<T>(method: string, params?: unknown[]): Promise<T> };
 export type PaymentContext = Pick<SigningContext, "user" | "appName" | "email" | "sendEmail" | "rateLimit">;
@@ -26,17 +26,58 @@ export type PaymentContext = Pick<SigningContext, "user" | "appName" | "email" |
  *
  * A send with an idempotency key is recorded under it: repeating the same request with the same key (a
  * retry after a lost response) returns the first result, or the first error, and never pays twice. A repeat that
- * arrives while the first send still runs waits for it (up to 30 seconds).
+ * arrives while the first send still runs waits for it (up to 30 seconds). Before paying, the send records the
+ * payment hash; if its result was never stored (the process exited, or the database failed), a repeat a minute
+ * later asks the node for that payment and returns it, and never pays again.
  */
 export async function fiberPayment(context: PaymentContext, node: FiberCaller, body: Record<string, unknown>, idempotencyKey?: string): Promise<unknown> {
   if (body.stage === "send" && idempotencyKey) {
     const { method, params, confirmationNonce, emailCode } = body;
-    return runIdempotentMutation(context.user.id, "fiber-pay", idempotencyKey, { method, params, confirmationNonce, emailCode }, () => payOnce(context, node, body), { waitMs: 30_000 });
+    return runIdempotentMutation(context.user.id, "fiber-pay", idempotencyKey, { method, params, confirmationNonce, emailCode }, (record) => payOnce(context, node, body, record), {
+      waitMs: 30_000,
+      staleAfterMs: PAYMENT_STALE_MS,
+      reconcile: (handle) => reconcilePayment(node, handle),
+    });
   }
   return payOnce(context, node, body);
 }
 
-async function payOnce(context: PaymentContext, node: FiberCaller, body: Record<string, unknown>): Promise<unknown> {
+/** How long a send may stay unrecorded before a repeat asks the node for its outcome. */
+export const PAYMENT_STALE_MS = 60_000;
+/** Allowed clock difference between this server and the Fiber node when matching a payment to its send. */
+const CLOCK_SKEW_MS = 5 * 60_000;
+
+type PaymentHandle = { paymentHash: string; sentAfter: number };
+
+/**
+ * The node's record of a payment a send recorded but never stored: the payment with that hash, if the node made it
+ * after the send began (an older payment of the same invoice isn't this one). Undefined while the node doesn't
+ * know it, or can't be asked.
+ */
+async function reconcilePayment(node: FiberCaller, handle: unknown): Promise<{ completed: unknown } | undefined> {
+  const { paymentHash, sentAfter } = (handle ?? {}) as Partial<PaymentHandle>;
+  if (typeof paymentHash !== "string" || typeof sentAfter !== "number") return undefined;
+  let payment: { payment_hash?: unknown; created_at?: unknown } | undefined;
+  try {
+    payment = await node.call<{ payment_hash?: unknown; created_at?: unknown }>("get_payment", [{ payment_hash: paymentHash }]);
+  } catch {
+    return undefined;
+  }
+  if (!payment || payment.payment_hash !== paymentHash || typeof payment.created_at !== "string" || !/^0x[0-9a-f]{1,16}$/i.test(payment.created_at)) return undefined;
+  if (Number(BigInt(payment.created_at)) < sentAfter - CLOCK_SKEW_MS) return undefined;
+  return { completed: payment };
+}
+
+/** The payment hash a send will use, when it is known before sending: given, or the invoice's. A keysend has none. */
+async function paymentHashOf(node: FiberCaller, params: Record<string, unknown>): Promise<string | undefined> {
+  if (typeof params.payment_hash === "string") return params.payment_hash;
+  if (typeof params.invoice !== "string") return undefined;
+  const parsed = await node.call<ParseInvoiceResult>("parse_invoice", [{ invoice: params.invoice }]);
+  const hash = parsed?.invoice?.data?.payment_hash;
+  return typeof hash === "string" ? hash : undefined;
+}
+
+async function payOnce(context: PaymentContext, node: FiberCaller, body: Record<string, unknown>, record?: RecordHandle): Promise<unknown> {
   const method = body.method === "sendPaymentWithRouter" ? "sendPaymentWithRouter" : body.method === "sendPayment" ? "sendPayment" : undefined;
   if (!method) throw new Error("A Fiber payment method is required");
   const params = paymentFiberParams(method, body.params, "testnet");
@@ -74,6 +115,10 @@ async function payOnce(context: PaymentContext, node: FiberCaller, body: Record<
   const outflow = { id: `payment:${nonce}`, ...paymentOutflow(String(request.summary.asset ?? "ckb"), BigInt(String(request.summary.outflow ?? "0"))) };
   const release = await reserveOutflow(context.user, outflow, request.requires_email_code);
   try {
+    if (record) {
+      const paymentHash = await paymentHashOf(node, params);
+      if (paymentHash) await record({ paymentHash, sentAfter: Date.now() } satisfies PaymentHandle);
+    }
     return await node.call(FIBER_METHODS[method].rpc, [params]);
   } catch (error) {
     await release();
