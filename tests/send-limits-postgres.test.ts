@@ -49,6 +49,7 @@ function chain() {
         return found ? { transaction: found.tx, status: found.status } : undefined;
       },
       getFeeRate: async () => 1_000n,
+      requestor: { request: async (_method: string, [hash]: [string]) => ({ tx_status: { status: known.get(hash)?.status ?? "unknown" } }) },
       // The indexer: committed cells no committed transaction spent, oldest first.
       findCellsOnChain: async function* (key: ccc.ClientIndexerSearchKeyLike) {
         const search = ccc.ClientIndexerSearchKey.from(key);

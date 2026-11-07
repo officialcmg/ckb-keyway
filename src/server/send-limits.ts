@@ -54,7 +54,13 @@ async function localAction(): Promise<Planner> {
 }
 
 /** How planning runs; tests replace `run` with the Action under the fake Lit runtime. */
-export const sendLimitPlanner: { run: Planner } = { run: async (params) => (await (compiled ??= localAction()))(params) };
+export const sendLimitPlanner: { run: Planner } = {
+  run: async (params) => {
+    // A failed load (a transient file error) isn't kept, so the next preview tries again.
+    compiled ??= localAction().catch((error) => { compiled = undefined; throw error; });
+    return (await compiled)(params);
+  },
+};
 
 /** Whether this transaction needs the code under the account's send limits, and the record it must carry. */
 export async function planSendLimits(wallet: Pick<ReadyWallet, "litPkpId" | "litPublicKey">, transaction: ccc.Transaction): Promise<SendLimitPlan> {
@@ -130,10 +136,12 @@ export async function sendLimitHead(
   }
   // Anyone can plant a look-alike; the real one was made by a transaction that spent one of the key's own cells.
   const real: ccc.Cell[] = [];
-  for (const cell of found) {
+  // Bounded, so cells anyone can plant can't make this expensive: a few candidates, a few inputs each (KeyWay's own
+  // send-limit transactions spend the previous cell among their first inputs).
+  for (const cell of found.slice(0, MAX_CANDIDATES)) {
     const creator = (await client.getTransaction(cell.outPoint.txHash))?.transaction;
     if (!creator) continue;
-    const inputs = await Promise.all(creator.inputs.map((input) => input.getCell(client).catch(() => undefined)));
+    const inputs = await Promise.all(creator.inputs.slice(0, MAX_CREATOR_INPUTS).map((input) => input.getCell(client).catch(() => undefined)));
     if (inputs.some((input) => input?.cellOutput.lock.eq(secp))) real.push(cell);
   }
   if (real.length !== 1) return undefined;
@@ -144,6 +152,8 @@ export async function sendLimitHead(
 const TYPE_ID_CODE_HASH = "0x00000000000000000000000000000000000000000000000000545950455f4944";
 /** How long after signing a transaction the node doesn't know yet is waited for: its client is sending it. */
 const JUST_SIGNED_MS = 10_000;
+const MAX_CANDIDATES = 4;
+const MAX_CREATOR_INPUTS = 64;
 const FEE_RATE = 1_500n;
 
 /** The capacity a send-limit cell with this data occupies, in shannons. */
@@ -163,6 +173,8 @@ export async function buildSendLimitGenesis(client: ccc.Client, wallet: Pick<Rea
   let oldest: ccc.Cell | undefined;
   for await (const cell of client.findCellsOnChain({ script: secp, scriptType: "lock", scriptSearchMode: "exact", filter: { scriptLenRange: [0, 1], outputDataLenRange: [0, 1] } }, "asc", 1)) { oldest = cell; break; }
   if (!oldest) throw new Error("Turning send limits on needs a plain CKB cell at the account's secp256k1 address");
+  // The Action requires the oldest committed plain cell; one a pending send already spent can't be used yet.
+  if (await client.cache.isUnusable(oldest.outPoint)) throw new Error("Wait for your pending send to confirm, then turn send limits on");
   const data = encodeSendLimitSettings({ ...settings, fingerprint: ccc.hexFrom(new Uint8Array(32)) });
   const input = ccc.CellInput.from({ previousOutput: oldest.outPoint, cellOutput: oldest.cellOutput, outputData: oldest.outputData });
   const type = ccc.Script.from({ codeHash: TYPE_ID_CODE_HASH, hashType: "type", args: ccc.hashTypeId(input, 0) });

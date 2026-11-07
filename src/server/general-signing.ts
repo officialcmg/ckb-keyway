@@ -299,9 +299,11 @@ export async function signingSettings(context: SigningContext, body: Record<stri
     const onChain = await sendLimitSettings(context, body, current, next, change);
     if (onChain) return { ...view(onChain.amounts), enforcedByLit: true, ...onChain.response };
   }
+  // Below: the amounts live on the server only (no policy signer, or the account can't make the cell yet).
+  const serverOnly = !context.signDigest && litPolicyEnabled() ? { enforcedByLit: false } : {};
   if (!weakens(current, next)) {
     await writeDailyAmount(context.user, change.asset, change.amount);
-    return view(next);
+    return { ...view(next), ...serverOnly };
   }
   const digest = hashText(`daily-amount:${change.asset}:${change.amount?.toString() ?? "off"}`);
   if (body.confirmationNonce === undefined) {
@@ -313,14 +315,14 @@ export async function signingSettings(context: SigningContext, body: Record<stri
     await codeLimit(context);
     const confirmationNonce = await issueRequest(context.user, "settings", digest, { lines }, true);
     const sentTo = await sendCode(context, "settings", confirmationNonce, "Confirm a security change", lines, { limited: true });
-    return { requiresEmailCode: true, confirmationNonce, sentTo };
+    return { requiresEmailCode: true, confirmationNonce, sentTo, ...serverOnly };
   }
   const nonce = requiredNonce(body.confirmationNonce);
   await loadRequest(context.user, "settings", nonce, digest);
   await verifyCode(context.user, "settings", nonce, body.emailCode);
   await consumeRequest(context.user, "settings", nonce);
   await writeDailyAmount(context.user, change.asset, change.amount);
-  return view(next);
+  return { ...view(next), ...serverOnly };
 }
 
 /**
@@ -342,11 +344,14 @@ async function sendLimitSettings(
   if (body.confirmationNonce === undefined) {
     const pending = await listPendingTransactions(context.user.id, nodeStatus(client));
     const head = await sendLimitHead(client, context.wallet, pending);
+    // Cells the account's pending sends already spent are never picked again (the same as a client does).
+    for (const { transaction, status } of pending) if (status === "pending" || status === "proposed") await client.cache.markTransactions(transaction);
     let transaction: ccc.Transaction;
     try {
       transaction = head ? await buildSendLimitChange(client, context.wallet, head, settings) : await buildSendLimitGenesis(client, context.wallet, settings);
     } catch (error) {
       if (!head && error instanceof Error && /plain CKB cell|Insufficient CKB|insufficient/i.test(error.message)) return undefined;
+      if (!head && error instanceof Error && /pending send/.test(error.message)) throw error;
       throw error;
     }
     const plan = await planSendLimits(context.wallet, transaction);

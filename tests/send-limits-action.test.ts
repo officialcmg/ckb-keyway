@@ -403,3 +403,45 @@ test("an account without a send-limit cell signs as before, and accounts without
   assert.equal((await env.run("transaction", exempt) as { limits: string }).limits, "exempt");
   assert.equal(env.requests.length - before, 1, "an exempt transaction reads only its inputs");
 });
+
+test("a record-shaped witness someone adds on their own input after signing can't break the chain", async () => {
+  const env = await account();
+  const { head, change } = await turnOn(env, { ckb: 1_000n * CKB });
+  // Another party's input in the same transaction: its witness isn't covered by the account's signature.
+  const theirs = env.add(ccc.Transaction.from({ inputs: [outside()], outputs: [{ lock: stranger, capacity: 100n * CKB }], outputsData: ["0x"] }));
+  const send = sendTx(env, head, [change], 70n * CKB);
+  send.inputs.unshift(ccc.CellInput.from({ previousOutput: cellOf(theirs, 0).outPoint }));
+  send.witnesses.unshift("0x");
+  send.outputs.splice(2, 0, ccc.CellOutput.from({ lock: stranger, capacity: 100n * CKB }));
+  send.outputsData.splice(2, 0, "0x");
+  await planned(env, send, head);
+  await env.run("transaction", send);
+  const index = sendLimitInputIndex(send, head);
+  setSendLimitRecord(send, 0, send.getWitnessArgsAt(index)!.inputType!);
+  env.add(send, "pending");
+  const next = sendTx(env, headAfter(send), [changeOf(send)], 70n * CKB);
+  const plan = await planned(env, next, headAfter(send));
+  assert.equal(plan.limits, "chained");
+  assert.equal(plan.totals?.ckb, (70n * CKB + FEE).toString());
+  await env.run("transaction", next);
+});
+
+test("lowering the amount applies at once even when today's total is past the new one", async () => {
+  const env = await account();
+  const { head, change } = await turnOn(env, { ckb: 100n * CKB });
+  const first = sendTx(env, head, [change], 99n * CKB);
+  await planned(env, first, head);
+  await env.run("transaction", first);
+  env.add(first, "pending");
+  const cell = headAfter(first);
+  const before = decodeSendLimitSettings(cell.outputData);
+  const lower = ccc.Transaction.from({
+    inputs: [ccc.CellInput.from({ previousOutput: cell.outPoint })],
+    outputs: [{ ...cell.cellOutput, capacity: cell.cellOutput.capacity - FEE }],
+    outputsData: [encodeSendLimitSettings({ ...before, ckb: 10n * CKB })],
+  });
+  setSendLimitRecord(lower, 0, new Uint8Array(0));
+  prepare(env, lower, [env.secp]);
+  assert.equal((await planned(env, lower, cell)).needsCode, false);
+  await env.run("transaction", lower);
+});

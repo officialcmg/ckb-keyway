@@ -1066,11 +1066,10 @@ function recordIn(witness) {
  * record sits on that input) or is a genesis whose input 0 was a plain cell at the key's secp256k1 address. Both
  * need the key's signature, and the Action checked each earlier step when it signed it.
  */
-function previousEntries(account, input) {
+async function previousEntries(account, input) {
   const created = input.createdBy;
   const records = [];
-  created.witnesses.forEach((witness, index) => { const record = recordIn(witness); if (record) records.push({ index, record }); });
-  if (records.length > 1) throw new Error("The send-limit cell's history is malformed");
+  created.witnesses.forEach((witness, index) => { const record = recordIn(witness); if (record && index < created.inputs.length) records.push({ index, record }); });
   if (records.length === 0) {
     if (!equalBytes(input.output.type.args, typeIdArgs(created.inputs[0], input.outputIndex))) throw new Error("The send-limit cell isn't one this account made");
     const check = async () => {
@@ -1079,15 +1078,14 @@ function previousEntries(account, input) {
     };
     return { entries: [], check };
   }
-  const { index, record } = records[0];
-  if (index >= created.inputs.length) throw new Error("The send-limit cell isn't one this account made");
-  const entries = parseRecord(record);
+  // The record is the one on the input that spent the previous send-limit cell. Witnesses of other parties' inputs
+  // aren't covered by the account's signature, so anyone could add a record-shaped one there; those are ignored.
+  const cells = await inputCellsOf({ inputs: records.map(({ index }) => created.inputs[index]) });
+  const own = records.filter((_, i) => sameScript(cells[i].output.lock, account.secp) && sameScript(cells[i].output.type, input.output.type));
+  if (own.length !== 1) throw new Error("The send-limit cell isn't one this account made");
+  const entries = parseRecord(own[0].record);
   if (entries.length === 0 || bytesToHex(entries[entries.length - 1].hash) !== input.createdByHash) throw new Error("The send-limit record is malformed");
-  const check = async () => {
-    const [spent] = await inputCellsOf({ inputs: [created.inputs[index]] });
-    if (!sameScript(spent.output.lock, account.secp) || !sameScript(spent.output.type, input.output.type)) throw new Error("The send-limit cell isn't one this account made");
-  };
-  return { entries, check };
+  return { entries, check: async () => undefined };
 }
 
 /**
@@ -1269,14 +1267,16 @@ async function limitAnalysis(analysis, params) {
     const before = parseSettings(input.data);
     const after = parseSettings(output.data);
     if (!equalBytes(before.fingerprint, after.fingerprint)) throw new Error("The email bound to send limits can't change");
-    const { entries: previous, check } = previousEntries(account, input);
+    const { entries: previous, check } = await previousEntries(account, input);
     // The proof the input is the account's own and the ancestors' times are independent lookups: run them together.
     const [times] = await Promise.all([entryTimes(previous, input), check()]);
     const now = Date.now();
     const totals = windowTotals(previous, times, now);
     const self = { hash: analysis.txHash, time: 0n, ckb: flow.ckb, tokens: flow.tokens };
     const weakening = weakens(before, after);
-    const result = { kind: "chained", flow, settings: before, next: after, totals, weakening, inputIndex: input.index, needsCode: weakening || overAmount(before, totals, flow) };
+    const result = { kind: "chained", flow, settings: before, next: after, totals, weakening, inputIndex: input.index,
+      // A change that moves nothing but its fee doesn't count against the amount: lowering it always applies at once.
+      needsCode: weakening || (!(flow.ckb <= EXEMPT_OUTFLOW && flow.tokens.length === 0) && overAmount(before, totals, flow)) };
     if (planning) return { ...result, record: plannedRecord(previous, times, self, now) };
     const record = recordIn(tx.witnesses[input.index]);
     if (!record) throw new Error("The send-limit input carries no record");

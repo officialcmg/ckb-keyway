@@ -77,8 +77,8 @@ One cell per account, created when the account turns limits on:
   (`emailFingerprint`): never the address, never encrypted. A CKB amount of `2^64-1` means no limit. Flag bit 0 means
   tokens without an amount of their own are unlimited (limits off); without it they always need the code, as the
   server's rule does today. At most 8 tokens.
-- **Size:** 173 bytes with no tokens, so 173 CKB, plus 1 CKB the server leaves in it to pay the small fee every
-  send adds. That CKB stays the user's.
+- **Size:** 173 bytes with no tokens, so 173 CKB, plus 1 CKB the server leaves in it to pay the fee of later
+  settings changes. Ordinary sends pay their fee from their own change. That CKB stays the user's.
 
 Only a transaction the account's key signed can create or change it, and the key signs only through the Action:
 
@@ -89,16 +89,17 @@ Only a transaction the account's key signed can create or change it, and the key
   that cell first, then the live send-limit cells, from the same node: two geneses therefore spend the same cell
   or the second sees the first, so an account never has two. A genesis is refused if the account already has one.
 - **Change:** the fingerprint never changes. Raising an amount, removing one, or turning tokens unlimited
-  (weakening) needs the code sent to the bound address. Lowering or adding applies at once.
+  (weakening) needs the code sent to the bound address. Lowering or adding applies at once, even when today's total
+  is already past the new amount (a change that moves nothing but its fee isn't counted against the amount).
 - **Never destroyed:** every transaction that spends it creates exactly one successor with the same Type ID and
   lock.
 - **Proof it's real:** anyone can create a Type ID cell with this data at the user's address. A cell only counts if
   the transaction that created it was signed by the key: either it spent the previous send-limit cell (a
   continuation) or it is a genesis whose input 0 was a plain cell at the key's secp256k1 address. The Action
   checks one step back (it fetches that input's transaction); by induction every earlier step was checked by the
-  Action when it signed. For the "does this account have limits?" check below, the Action uses the same proof the
-  recovery list uses (`madeByKey`: input 0 spent from the key's own address, read from the key's lock history in
-  the candidate's block only).
+  Action when it signed. For the "does this account have limits?" check below, the Action uses the recovery list's
+  lock-history proof (`madeByKey`), with one difference: any input, not only input 0, spent from the key's own
+  address counts, because a send-limit transaction spends the cell wherever it sits.
 
 ### What every transaction must do
 
@@ -136,8 +137,10 @@ the window.
   send looks up one header, not the whole day.
 - The 24-hour total is the sum of the previous entries younger than 24 hours, by the Action's own reading, never
   by what the record claims.
-- At most 255 entries: an account can make 254 limited sends in 24 hours.
-- The Action refuses any other witness that looks like a record, so a record can only sit on the send-limit input.
+- At most 255 entries, the transaction's own included: an account can make 255 limited sends in 24 hours.
+- The Action refuses to sign a transaction with a record-shaped witness anywhere else. Other parties' inputs'
+  witnesses aren't covered by the account's signature, so someone could add one there after signing; when it reads
+  a previous record the Action therefore takes only the one on the input that spent the previous send-limit cell.
 
 **Why the race is closed:** two sends that could both commit can't spend the same send-limit cell, so one descends
 from the other, and the later one's record covers the earlier one. Parallel requests all spend the newest cell:
@@ -164,7 +167,8 @@ counted send, and fund channels only from there.
   code Lit will run, whether to ask for a code, and puts the record into the witness. Lit then checks it.
 - **Chaining in the SDK.** `KeyWaySigner.prepareTransaction` appends the newest send-limit cell (pending included)
   as an input, its unchanged copy as an output, and a witness with room for the record. CCC's fee step already
-  calls `prepareTransaction`, so the fee covers it, and the transaction hash the user approves doesn't change when
+  calls `prepareTransaction`, so the fee covers it (for apps that use CCC's `completeFee*`; an app that sets its fee by
+  hand must leave room for about 300 more bytes), and the transaction hash the user approves doesn't change when
   the server fills in the record (witnesses aren't in the hash).
 - **Codes.** When the plan says a code is needed, `request-email-code` has the Action email it (`send-code`), the
   server stores only the ticket, and the SDK's prompt takes 8 digits. When only the server's own rule (Fiber
@@ -175,7 +179,8 @@ counted send, and fund channels only from there.
 - **Pending sends (Goal 2).** Every transaction the server gets signed for an account is stored in
   `keyway_v2_pending_transactions` (migration 20). `POST /api/keyway/pending-transactions` returns the account's
   pending ones, after dropping those the node reports committed or rejected, or no longer knows after a grace period.
-  It also returns the newest send-limit cell and the record size to reserve. The SDK loads this when its signer
+  It also returns the newest send-limit cell and the record size to reserve. The node's status is read raw
+  (`get_transaction` with verbosity 1), because CCC returns nothing for "unknown" and "rejected". The SDK loads this when its signer
   starts and before every `findCells` (the step CCC uses to pick inputs), then marks the transactions in CCC's cache
   in the order they were signed, so their spent cells are skipped and their change can be used.
 
@@ -193,8 +198,26 @@ counted send, and fund channels only from there.
   genesis is committed (about one block): the "does this account have limits?" check reads the indexer, which
   only sees committed cells, so a send that leaves the cell out is treated as before during that block. The live
   proof shows both sides of it (section 6).
-- **Accounts whose amounts live only on the server** (set before this change, or without 175 free CKB). Their
-  limits stay server-enforced until the cell exists.
+- **Accounts whose amounts live only on the server**: set before this change, without 175 free CKB, or with
+  recovery on. A genesis needs a plain cell at the key's secp256k1 address, and the sign-in sweep empties that
+  address on recovery accounts, so they can't make the cell yet (a follow-up: move ~176 CKB there first with an
+  exempt transfer, or accept the oldest plain Omnilock cell as input 0). The server answers `enforcedByLit: false`
+  for these, so an app can tell the user.
+- **Trust on first use is permanent and can be started by the server.** For an account with no send-limit cell, a
+  compromised server can create one bound to its own address with an amount of 0. The cell can't be destroyed and
+  its fingerprint can't change, so after the compromise every send from that account needs a code only the attacker
+  receives, until a later version adds a way out (for example a rebind authorised by the code to the recovery-bound
+  address). It can't move funds that way, but it can freeze them; recovery backups can still move funds at the
+  Omnilock address. Accounts that turn limits on while the server is honest are protected from this.
+- **The server's copy of the amounts.** `signing-settings get` returns the server's database, written when the
+  change is signed and sent. If that transaction is later dropped, the database and the cell differ until the next
+  change; Lit enforces the cell.
+- **Pending list edge cases.** A client marks the listed transactions in CCC's cache, which has no "unmark": a
+  transaction that later drops out keeps its cells marked in that tab until it reloads. Two clients that both hold an
+  approval dialog open on the same send-limit cell each get a valid signature; the node keeps one. Channel funding
+  doesn't use the list (Fiber chooses its inputs).
+- **Before the old policy CID is removed** (founder step 6), a compromised server can sign anything through the
+  previous Action, including a record or a genesis-shaped transaction that this Action would then trust.
 - **Fiber.** Payments and channel balances are moved by the Fiber key, which a compromised server can obtain
   (`wrap-fiber-key`). Only the funding needs the code.
 - **Exempt transactions** may burn up to 0.001 CKB each as fee, so a compromised server could waste about
@@ -242,7 +265,8 @@ server: roughly +0.4 s per send with limits on. Today's policy signer takes 0.65
 
 1. Run the migration (`npm run migrate:production`): it adds `keyway_v2_pending_transactions`.
 2. In the Chipotle dashboard, paste `lit-actions/sign-ckb-transaction.js` into **Action Runner**, click **Get Lit
-   Action IPFS CID**, and check it equals `LIT_ACTION_CIDS["sign-ckb-transaction"]` in `src/server/lit-config.ts`.
+   Action IPFS CID**, and check it is `QmUs7kRWcAV1ARk3t4nmvgPFfYqJRfvJa8RUx5T1B1715C`, the same as `LIT_ACTION_CIDS["sign-ckb-transaction"]` in
+   `src/server/lit-config.ts`.
 3. Register it under **IPFS Actions** (for example as `keyway-ckb-policy-signer-v2`) and add it to group 1,
    `CKB Keyway`.
 4. Run `npm run verify:lit -- --policy` locally. It should print "policy Action".

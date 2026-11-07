@@ -26,8 +26,17 @@ export async function recordPendingTransaction(userId: string, transaction: ccc.
 export type TransactionStatus = "pending" | "proposed" | "committed" | "rejected" | "unknown" | string;
 export type StatusOf = (hash: string) => Promise<TransactionStatus | undefined>;
 
+/**
+ * The node's own status for a transaction. Read raw: CCC's getTransaction returns nothing for "unknown" and
+ * "rejected" (the node sends no transaction body then), and those are the statuses that drop an entry.
+ */
 export function nodeStatus(client: ccc.Client): StatusOf {
-  return async (hash) => (await client.getTransaction(hash))?.status;
+  return async (hash) => {
+    const known = await client.getTransaction(hash);
+    if (known) return known.status;
+    const result = await (client as unknown as { requestor: { request: (method: string, params: unknown[]) => Promise<unknown> } }).requestor.request("get_transaction", [hash, "0x1"]) as { tx_status?: { status?: string } } | null;
+    return result?.tx_status?.status;
+  };
 }
 
 /**
