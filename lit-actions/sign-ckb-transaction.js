@@ -23,6 +23,8 @@ const EMAIL_FROM = "CKB KeyWay <security@auth.ckbkeyway.dev>";
 const SECP256K1_CODE_HASH = "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8";
 // KeyWay's own testnet Omnilock, by data hash (src/sdk/browser/account-lock.ts KEYWAY_OMNILOCK.testnet).
 const OMNILOCK_CODE_HASH = "0x6b29b6f10346b43c540e53806ba88ba0fe3a0c3a29d7448ef555840c8f8318fa";
+// The official testnet Omnilock (CCC's KnownScript.OmniLock), by type: the same lock, so the same rules apply.
+const OFFICIAL_OMNILOCK_CODE_HASH = "0xf329effd1c475a2978453c8600e1eaf0bc2087ee093c3ee64cc96ec6847752cb";
 const TYPE_ID_CODE_HASH = "0x00000000000000000000000000000000000000000000000000545950455f4944";
 // KeyWay's backup verifiers, version 3 with salted identities (src/sdk/browser/recovery-backups.ts).
 const EVM_VERIFIER = "0x14715402af1d6cdb6036ac02d10c822e84349c289c938320c2f7e8bb6d54b86f";
@@ -38,6 +40,9 @@ const LIST_VERSION = 3;
 const AUTH_LENGTH = 21;
 const CODE_TTL_MS = 10 * 60_000;
 const MAX_MESSAGE_BYTES = 4096;
+// Entries of the key's own lock history read per check. Only the key can add inputs to it; anyone can add
+// outputs, but each costs them a cell's capacity given to this key.
+const MAX_HISTORY = 8192;
 
 // ---------- bytes ----------
 
@@ -355,6 +360,15 @@ async function fetchTransactions(hashes, urls = RPC_URLS) {
  * only cells whose type is a Type ID are returned.
  */
 async function indexerCells(lock, maxCells, typeId = false, urls = RPC_URLS) {
+  return indexerPages("get_cells", lock, maxCells, typeId, urls, 0x40);
+}
+
+/** The lock's history from the indexer, committed transactions only: { tx_hash, io_type, io_index } entries. */
+async function lockHistory(lock, maxEntries, urls = RPC_URLS) {
+  return indexerPages("get_transactions", lock, maxEntries, false, urls, 0x400);
+}
+
+async function indexerPages(method, lock, maxCells, typeId, urls, pageSize) {
   const searchKey = {
     script: { code_hash: bytesToHex(lock.codeHash), hash_type: lock.hashType, args: bytesToHex(lock.args) },
     script_type: "lock",
@@ -366,7 +380,7 @@ async function indexerCells(lock, maxCells, typeId = false, urls = RPC_URLS) {
   const cells = [];
   let cursor = null;
   for (;;) {
-    const body = JSON.stringify({ id: 0, jsonrpc: "2.0", method: "get_cells", params: [searchKey, "asc", "0x40", ...(cursor ? [cursor] : [])] });
+    const body = JSON.stringify({ id: 0, jsonrpc: "2.0", method, params: [searchKey, "asc", `0x${pageSize.toString(16)}`, ...(cursor ? [cursor] : [])] });
     let result;
     let lastError;
     for (const url of urls) {
@@ -374,7 +388,7 @@ async function indexerCells(lock, maxCells, typeId = false, urls = RPC_URLS) {
         const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body, redirect: "error" });
         if (!response.ok) throw new Error(`CKB RPC returned HTTP ${response.status}`);
         result = (await response.json())?.result;
-        if (!result || !Array.isArray(result.objects)) throw new Error("CKB RPC returned an invalid cell list");
+        if (!result || !Array.isArray(result.objects)) throw new Error(`CKB RPC returned an invalid ${method} page`);
         break;
       } catch (error) {
         result = undefined;
@@ -384,7 +398,7 @@ async function indexerCells(lock, maxCells, typeId = false, urls = RPC_URLS) {
     if (!result) throw lastError ?? new Error("CKB RPC is unavailable");
     cells.push(...result.objects);
     if (cells.length > maxCells) throw new Error("This account has too many cells to check");
-    if (result.objects.length < 0x40 || !result.last_cursor) return cells;
+    if (result.objects.length < pageSize || !result.last_cursor) return cells;
     cursor = result.last_cursor;
   }
 }
@@ -393,34 +407,32 @@ async function indexerCells(lock, maxCells, typeId = false, urls = RPC_URLS) {
  * The type hashes of the live recovery lists this key made, under its owner-only list lock. Anyone can send a
  * cell to that lock, so a cell only counts if the transaction that created it spent one of the account's own
  * cells as input 0, which needs this key's signature (an enable spends the secp256k1 cell there, a change the
- * list itself). Each cell is checked against that transaction; that it is still live
- * is the node's word.
+ * list itself). That is read from the key's own lock history, so nothing an outsider made is ever downloaded:
+ * a fake list costs one small indexer entry to rule out, however large the transaction that made it. Which
+ * cells are live, and the history, are the node's word; the indexer only follows committed blocks.
  */
 async function liveLists(account, urls = RPC_URLS) {
   // Only Type ID cells are asked for, so plain cells sent to the lock can't crowd out the check. Each fake list
-  // locks its capacity under this key for good, so blocking with more than 1024 costs an attacker about 129k CKB.
-  const objects = (await indexerCells(account.listLock, 1024, true, urls)).filter((object) => isTypeId(object?.output?.type ? parseScript(object.output.type, "cell type") : undefined));
-  // Two batched lookups in all, at most one transaction per cell each: the creating transactions, then the
-  // transactions of their input 0, so a fake list with thousands of inputs costs no more to check than any other.
-  const created = await fetchTransactions(objects.map((object) => object?.out_point?.tx_hash), urls);
-  const spentFrom = await fetchTransactions([...created.values()].flatMap(({ tx }) => tx.inputs.slice(0, 1).map((input) => bytesToHex(input.previousOutput.txHash))), urls);
+  // locks its capacity under this key for good, so blocking with more than 1024 costs an attacker about 131k CKB.
+  const objects = (await indexerCells(account.listLock, 1024, true, urls)).map((object) => {
+    const lock = parseScript(object?.output?.lock, "cell lock");
+    const type = object?.output?.type ? parseScript(object.output.type, "cell type") : undefined;
+    if (!sameScript(lock, account.listLock) || !isTypeId(type)) throw new Error("CKB RPC returned a cell that isn't under the recovery list lock");
+    return { txHash: object?.out_point?.tx_hash, type };
+  });
+  if (objects.length === 0) return [];
+  // Proof is input 0 spent from the key's own secp256k1 address or its owner-only list lock. An administrator-
+  // mode Omnilock doesn't count: anyone can make one with this key's auth and their own list, and spend it with
+  // their own backup. A failed lookup fails the whole check rather than leaving a list out.
+  const madeByKey = new Set();
+  for (const lock of [account.secp, account.listLock]) {
+    for (const entry of await lockHistory(lock, MAX_HISTORY, urls)) {
+      if (entry?.io_type === "input" && num(entry.io_index, "io index") === 0n) madeByKey.add(String(entry.tx_hash).toLowerCase());
+    }
+  }
   const hashes = [];
-  for (const object of objects) {
-    const creation = created.get(object.out_point.tx_hash);
-    // After a reorganisation the node may still list a cell whose transaction is back in the pool; refuse until it
-    // settles rather than decide on it either way.
-    if (creation.status !== "committed") throw new Error("A recovery list transaction isn't committed yet. Try again in a minute");
-    const tx = creation.tx;
-    const output = tx.outputs[Number(num(object.out_point.index, "out point index"))];
-    if (!output || !sameScript(output.lock, account.listLock) || !isTypeId(output.type)) throw new Error("CKB RPC returned a cell that isn't under the recovery list lock");
-    // Proof is input 0 spent from the key's own secp256k1 address or its owner-only list lock. An administrator-
-    // mode Omnilock doesn't count: anyone can make one with this key's auth and their own list, and spend it with
-    // their own backup. A failed lookup fails the whole check rather than leaving a list out.
-    const first = tx.inputs[0];
-    const cell = first && spentFrom.get(bytesToHex(first.previousOutput.txHash)).tx.outputs[first.previousOutput.index];
-    if (first && !cell) throw new Error("An input doesn't exist");
-    const proven = Boolean(cell) && ["secp256k1", "list"].includes(lockKind(account, cell.lock));
-    if (proven) hashes.push(bytesToHex(scriptHash(output.type)));
+  for (const { txHash, type } of objects) {
+    if (typeof txHash === "string" && madeByKey.has(txHash.toLowerCase())) hashes.push(bytesToHex(scriptHash(type)));
   }
   return [...new Set(hashes)];
 }
@@ -483,6 +495,19 @@ function lockKind(account, lock) {
   if (args.length === 22 && args[21] === 0x00) return "list";
   if (args.length === 54 && args[21] === 0x01) return "omnilock";
   return undefined;
+}
+
+/**
+ * An Omnilock of this key in administrator mode (flag bit 0) that isn't the account's own shape: other flags
+ * (anyone-can-pay, time lock, …) or the official Omnilock deployment. The named list's members could spend it
+ * as well, and KeyWay never builds one, so no output may go to one.
+ */
+function strayAdminOmnilock(account, lock) {
+  const omnilock = (lock.hashType === "data1" && bytesToHex(lock.codeHash) === OMNILOCK_CODE_HASH)
+    || (lock.hashType === "type" && bytesToHex(lock.codeHash) === OFFICIAL_OMNILOCK_CODE_HASH);
+  const args = lock.args;
+  if (!omnilock || args.length < 22 || args[0] !== 0x00 || !equalBytes(args.slice(1, 21), account.blake160)) return false;
+  return (args[21] & 0x01) === 0x01 && lockKind(account, lock) !== "omnilock";
 }
 
 /** The AdminList type hashes the account's administrator-mode Omnilock locks in this transaction name. */
@@ -705,6 +730,8 @@ async function analyse(pkpId, params) {
   const listInputs = inputs.map((cell, index) => ({ ...cell, index }))
     .filter((cell) => (lockKind(account, cell.output.lock) === "list" && isTypeId(cell.output.type)) || referenced(cell.output));
   const listOutputs = tx.outputs.map((output, index) => ({ output, index })).filter(({ output }) => lockKind(account, output.lock) === "list" || referenced(output));
+
+  if (tx.outputs.some((output) => strayAdminOmnilock(account, output.lock))) throw new Error("An output goes to an Omnilock of this key that KeyWay doesn't use");
 
   const groups = [];
   inputLocks.forEach((lock) => {

@@ -471,25 +471,84 @@ test("two enables from typed cells at an address with no plain cells are refused
   assert.equal(env.emails.length, 0);
 });
 
-test("a key's live list still blocks a second enable when the lookup of its creating input fails", async () => {
+test("a key's live list blocks a second enable without fetching its transactions, and a failed history read refuses", async () => {
   const { funding, signed: enable, plan } = await enableWithPolicy([evm(43)]);
   const refund = ccc.Transaction.from({
     inputs: [{ previousOutput: { txHash: `0x${(seed++).toString(16).padStart(64, "0")}`, index: 0 } }],
     outputs: [{ lock: plan.secp, capacity: 1_000n * CKB }],
     outputsData: ["0x"],
   });
-  // The chain has the enable and the refund, but the transaction the enable's input 0 came from can't be fetched:
-  // the list must not be left out of the count because of it.
-  const known = new Map<string, { tx: ccc.Transaction; status: string }>([enable, refund].map((tx) => [tx.hash(), { tx, status: "committed" }]));
-  const env = fakeLit({ privateKey, pkpId, actionKey, lookup: (hash) => known.get(hash), transactions: () => [funding, ...[...known.values()].map(({ tx }) => tx)] });
-  const action = await env.load();
   const client = await offlineClient([funding, enable, refund], [`${funding.hash()}:0`, `${funding.hash()}:1`]);
   const second = await planRecovery(client, walletFor(), [evm(44)], { emailBinding: true });
-  await assert.rejects(
-    policySendCode(second.transaction, wallet, { email: "attacker@example.com", appName: "Demo", backups: [evm(44)], client }, runner(action)),
-    /isn't on chain/,
-  );
-  assert.equal(env.emails.length, 0);
+  // Even with the transaction the enable spent unknown to get_transaction, the key's own history proves the list.
+  const known = new Map<string, { tx: ccc.Transaction; status: string }>([enable, refund].map((tx) => [tx.hash(), { tx, status: "committed" }]));
+  const env = fakeLit({ privateKey, pkpId, actionKey, lookup: (hash) => known.get(hash), transactions: () => [funding, enable, refund] });
+  await assert.rejects(policySendCode(second.transaction, wallet, { email: "attacker@example.com", appName: "Demo", backups: [evm(44)], client }, runner(await env.load())), /already on for this key/);
+  assert.ok(!env.fetched.includes(enable.hash()), "the list's creating transaction isn't downloaded");
+  // If the history can't be read, the check fails closed rather than leaving the list out.
+  const down = fakeLit({ privateKey, pkpId, actionKey, lookup: (hash) => known.get(hash), transactions: () => [funding, enable, refund], failing: (method) => method === "get_transactions" });
+  await assert.rejects(policySendCode(second.transaction, wallet, { email: "attacker@example.com", appName: "Demo", backups: [evm(44)], client }, runner(await down.load())), /HTTP 500/);
+  assert.equal(env.emails.length + down.emails.length, 0);
+});
+
+test("fake lists made by huge transactions are ruled out from the key's history, without downloading them", async () => {
+  const { funding, signed: enable, plan } = await enableWithPolicy([evm(45)]);
+  const env = world([funding, enable]);
+  // An outsider plants Type ID cells under the list lock, each from its own transaction padded with a big witness,
+  // so that fetching them all would exhaust the Action's memory or the node's response limit.
+  const listLock = enable.outputs[0].lock;
+  const planted: string[] = [];
+  for (let i = 0; i < 8; i++) {
+    const own = ccc.Transaction.from({ inputs: [], outputs: [{ lock: ccc.Script.from({ codeHash: `0x${"97".repeat(32)}`, hashType: "type", args: ccc.numToHex(i) }), capacity: 500n * CKB }], outputsData: ["0x"] });
+    env.add(own);
+    const fake = ccc.Transaction.from({
+      inputs: [{ previousOutput: { txHash: own.hash(), index: 0 } }],
+      outputs: [{ lock: listLock, type: adminListTypeScript({ adminListTypeArgs: ccc.hexFrom(ccc.hashCkb(ccc.numLeToBytes(i, 4))) }), capacity: 200n * CKB }],
+      outputsData: [adminListData(`0x${"78".repeat(32)}`)],
+      witnesses: [ccc.hexFrom(new Uint8Array(500_000))],
+    });
+    env.add(fake);
+    planted.push(fake.hash(), own.hash());
+  }
+  const action = await loadAction(env);
+  const index = enable.outputs.findIndex((output) => output.lock.eq(plan.omnilock));
+  const spend = ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: enable.hash(), index } }],
+    outputs: [{ lock: plan.omnilock, capacity: enable.outputs[index].capacity - 100_000n }],
+    outputsData: ["0x"],
+    witnesses: [ccc.hexFrom(ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(85)) }).toBytes())],
+  });
+  const result = await action.main({ mode: "transaction", pkpId, transaction: JSON.parse(ccc.stringify(spend)) }) as { operation: string };
+  assert.equal(result.operation, "plain");
+  assert.deepEqual(env.fetched.filter((hash) => planted.includes(hash)), [], "no planted transaction is fetched");
+});
+
+test("no output may go to an administrator-mode Omnilock of the key in another shape: other flags or the official deployment", async () => {
+  const { funding, signed: enable, plan } = await enableWithPolicy([evm(46)]);
+  const env = world([funding, enable]);
+  const action = await loadAction(env);
+  const index = enable.outputs.findIndex((output) => output.lock.eq(plan.omnilock));
+  const spendTo = (lock: ccc.Script) => {
+    const tx = ccc.Transaction.from({
+      inputs: [{ previousOutput: { txHash: enable.hash(), index } }],
+      outputs: [{ lock, capacity: enable.outputs[index].capacity - 100_000n }],
+      outputsData: ["0x"],
+      witnesses: [ccc.hexFrom(ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(85)) }).toBytes())],
+    });
+    return action.main({ mode: "transaction", pkpId, transaction: JSON.parse(ccc.stringify(tx)) });
+  };
+  const auth = ccc.bytesFrom(plan.omnilock.args).slice(0, 21);
+  const attackerList = new Uint8Array(32).fill(0x9a);
+  const official = { codeHash: "0xf329effd1c475a2978453c8600e1eaf0bc2087ee093c3ee64cc96ec6847752cb" as const, hashType: "type" as const };
+  const variants = [
+    ccc.Script.from({ ...plan.omnilock, args: ccc.hexFrom(ccc.bytesConcat(auth, [0x03], attackerList, [0x00])) }), // admin + anyone-can-pay
+    ccc.Script.from({ ...plan.omnilock, args: ccc.hexFrom(ccc.bytesConcat(auth, [0x05], attackerList, new Uint8Array(8))) }), // admin + time lock
+    ccc.Script.from({ ...official, args: ccc.hexFrom(ccc.bytesConcat(auth, [0x01], attackerList)) }),
+    // The official deployment naming the account's own list is still not the account's address.
+    ccc.Script.from({ ...official, args: plan.omnilock.args }),
+  ];
+  for (const lock of variants) await assert.rejects(spendTo(lock), /Omnilock of this key that KeyWay doesn't use/);
+  assert.equal((await spendTo(plan.omnilock) as { operation: string }).operation, "plain");
 });
 
 test("a list made before on-chain records changes by one backup only, checked against the record the server supplies", async () => {
