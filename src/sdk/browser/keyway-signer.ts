@@ -4,7 +4,7 @@ import { KeyWayApiClient } from "./api-client";
 import { serializeCccTransaction } from "./ccc-transaction";
 import { withEmailCode, type RequestEmailCode } from "./email-code";
 import { PendingTransactions } from "./pending-transactions";
-import { chainOnSendLimit } from "./send-limits";
+import { chainOnSendLimit, SEND_LIMIT_UNLIMITED, type SendLimitOffer } from "./send-limits";
 
 export type { RequestEmailCode };
 
@@ -47,11 +47,19 @@ export type MessagePreview = { message: string };
 
 export type ApproveCkbTransaction = (preview: TransactionPreview) => boolean | Promise<boolean>;
 export type ApproveCkbMessage = (preview: MessagePreview) => boolean | Promise<boolean>;
+/**
+ * Asked once, before an account's first send with send limits available: the daily CKB amount (in shannons) to turn
+ * them on with, starting from `offer.ckb`. Return the amount (the offer's to accept it), or null to cancel the send.
+ * The code KeyWay's Lit Action emails follows.
+ */
+export type ApproveDailyLimit = (offer: SendLimitOffer) => bigint | null | Promise<bigint | null>;
 
 export type KeyWaySignerHandlers = {
   approveCkbTransaction: ApproveCkbTransaction;
   approveCkbMessage: ApproveCkbMessage;
   requestEmailCode: RequestEmailCode;
+  /** Without it, the offered amount is used as it is. */
+  approveDailyLimit?: ApproveDailyLimit;
 };
 
 /**
@@ -77,10 +85,44 @@ export class KeyWaySigner extends KeyWayAccountSigner {
     void this.pending.refresh(true);
   }
 
-  /** CCC picks inputs here: first load what other clients sent, so their spent cells are skipped and their change used. */
+  /**
+   * CCC picks inputs here: first load what other clients sent, so their spent cells are skipped and their change
+   * used. When CCC is collecting inputs for a send, send limits are turned on first if the account doesn't have
+   * them yet, so the send is built on the new send-limit cell.
+   */
   async *findCells(filter: Parameters<ccc.Signer["findCells"]>[0], withData?: boolean | null, order?: "asc" | "desc", limit?: number): AsyncGenerator<ccc.Cell> {
+    if (collectsForSend(filter)) await this.ensureSendLimits();
     await this.pending.refresh();
     yield* super.findCells(filter, withData, order, limit);
+  }
+
+  private sendLimitsStep?: Promise<void>;
+
+  /**
+   * Turns send limits on before a send if KeyWay offers them (an account without them that could have them). Two
+   * sends at once share one offer. Cancelling cancels the send; the offer comes back on the next one.
+   */
+  private ensureSendLimits(): Promise<void> {
+    this.sendLimitsStep ??= this.offerSendLimits().finally(() => { this.sendLimitsStep = undefined; });
+    return this.sendLimitsStep;
+  }
+
+  private async offerSendLimits(): Promise<void> {
+    const { sendLimit, sendLimitOffer } = await this.pending.refresh();
+    if (sendLimit || !sendLimitOffer) return;
+    const chosen = this.handlers.approveDailyLimit ? await this.handlers.approveDailyLimit(sendLimitOffer) : sendLimitOffer.ckb;
+    if (chosen === null || chosen === undefined) throw new Error("The transaction was not approved");
+    if (typeof chosen !== "bigint" || chosen <= 0n || chosen >= SEND_LIMIT_UNLIMITED) throw new Error("Enter a daily limit above 0 CKB");
+    try {
+      await this.setDailyConfirmationAmount("ckb", chosen);
+    } catch (error) {
+      // A send of this account's is still in the pool, so its oldest cell can't start the limits yet: send as
+      // before, and offer them again next time.
+      if (error instanceof Error && /pending send to confirm/i.test(error.message)) return;
+      throw error;
+    }
+    // The new send-limit cell (still pending) is what this send chains on.
+    await this.pending.refresh(true);
   }
 
   /**
@@ -161,4 +203,16 @@ export class KeyWaySigner extends KeyWayAccountSigner {
   private withEmailCode<T>(reason: "transaction" | "settings", send: () => Promise<unknown>, complete: (code: string) => Promise<T>, sent?: unknown): Promise<T> {
     return withEmailCode(this.handlers.requestEmailCode, reason, send, complete, sent);
   }
+}
+
+/**
+ * Whether CCC is collecting inputs for a transaction: plain CKB (`completeInputsByCapacity`) or a token's cells
+ * (`completeInputsByUdt`). Other lookups (an app listing its cells) never turn send limits on.
+ */
+export function collectsForSend(filter: Parameters<ccc.Signer["findCells"]>[0]): boolean {
+  if (!filter) return false;
+  const lengths = (filter as { scriptLenRange?: unknown }).scriptLenRange;
+  const plain = Array.isArray(lengths) && Number(lengths[0]) === 0 && Number(lengths[1]) === 1;
+  const token = Boolean((filter as { script?: unknown }).script);
+  return plain || token;
 }

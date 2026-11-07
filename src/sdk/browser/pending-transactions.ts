@@ -1,8 +1,8 @@
 import * as ccc from "@ckb-ccc/core";
-import type { SendLimitHead } from "./send-limits";
+import type { SendLimitHead, SendLimitOffer } from "./send-limits";
 
-export type PendingState = { transactions: ccc.Transaction[]; sendLimit?: SendLimitHead };
-type Load = () => Promise<{ transactions: ccc.TransactionLike[]; sendLimit?: SendLimitHead }>;
+export type PendingState = { transactions: ccc.Transaction[]; sendLimit?: SendLimitHead; sendLimitOffer?: SendLimitOffer };
+type Load = () => Promise<{ transactions: ccc.TransactionLike[]; sendLimit?: SendLimitHead; sendLimitOffer?: { ckb: string } }>;
 
 /**
  * Keeps CCC's cache in step with the account's transactions that another client (another tab, a reload, another
@@ -27,7 +27,8 @@ export class PendingTransactions {
         const transactions = (Array.isArray(answer?.transactions) ? answer.transactions : []).map((transaction) => ccc.Transaction.from(transaction));
         // One at a time: a later transaction may spend an earlier one's output, and must mark it spent after.
         for (const transaction of transactions) await this.client.cache.markTransactions(transaction);
-        this.state = { transactions, ...(answer?.sendLimit ? { sendLimit: answer.sendLimit } : {}) };
+        const offer = answer?.sendLimitOffer && /^[0-9]{1,20}$/.test(String(answer.sendLimitOffer.ckb)) ? { ckb: BigInt(answer.sendLimitOffer.ckb) } : undefined;
+        this.state = { transactions, ...(answer?.sendLimit ? { sendLimit: answer.sendLimit } : {}), ...(offer && !answer?.sendLimit ? { sendLimitOffer: offer } : {}) };
       } catch {
         // Sending still works without it; only a cell another client spent may be picked.
       }

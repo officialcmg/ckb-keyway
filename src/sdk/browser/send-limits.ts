@@ -17,6 +17,21 @@ export const RECORD_TOKEN_BYTES = 48;
 /** Spare CKB the server leaves in a new cell, which pays the few hundred bytes each send adds. */
 export const SEND_LIMIT_SPARE = 100_000_000n;
 
+/**
+ * Send limits are on by default: an account's first send offers to turn them on with this daily amount, which the
+ * user can change before confirming.
+ */
+export const DEFAULT_DAILY_LIMIT_CKB = 100_000n;
+export const DEFAULT_DAILY_LIMIT_SHANNONS = DEFAULT_DAILY_LIMIT_CKB * 100_000_000n;
+/**
+ * Plain CKB at the key's secp256k1 address before limits are offered: the cell itself (173 CKB plus the 1 CKB spare),
+ * a change cell (61 CKB) and the fee. Below this the account sends as before until it has enough.
+ */
+export const SEND_LIMIT_OFFER_MINIMUM = 236n * 100_000_000n;
+
+/** What KeyWay offers when an account without send limits sends: the daily CKB amount to start from, in shannons. */
+export type SendLimitOffer = { ckb: bigint };
+
 export type SendLimitSettings = {
   /** The keyed fingerprint of the bound email (32 bytes); never the address. */
   fingerprint: ccc.Hex;

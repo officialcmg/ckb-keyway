@@ -7,8 +7,8 @@ import type { TransactionSql } from "postgres";
 import { database, type DatabaseSql } from "./database.ts";
 import { createConfirmationEmailTemplate } from "./email-template.ts";
 import { formatCkbSignature, serializeTransaction, signAccountGroups, signingGroups, type SigningGroup } from "./funding-transaction.ts";
-import { accountLocks } from "../sdk/browser/account-lock.ts";
-import { settingsFromDailyAmounts } from "../sdk/browser/send-limits.ts";
+import { accountLocks, secp256k1Lock } from "../sdk/browser/account-lock.ts";
+import { DEFAULT_DAILY_LIMIT_SHANNONS, SEND_LIMIT_OFFER_MINIMUM, settingsFromDailyAmounts, type SendLimitHead } from "../sdk/browser/send-limits.ts";
 import { loadLitAction } from "./lit-actions.ts";
 import { LIT_ACTION_CIDS } from "./lit-config.ts";
 import { signCkbDigest } from "./lit.ts";
@@ -597,6 +597,25 @@ export async function verifyCode(user: User, purpose: Purpose, nonce: string, co
   const expected = Buffer.from(row.email_code_hash, "hex");
   const supplied = Buffer.from(codeHash(nonce, code), "hex");
   if (expected.length !== supplied.length || !timingSafeEqual(expected, supplied)) throw new Error("That email code isn't right");
+}
+
+/**
+ * Send limits are on by default: an account with the policy signer, no send-limit cell, no recovery (it can't make
+ * the cell yet) and enough plain CKB for the cell is offered them on its next send, starting from its own CKB
+ * amount if it set one, else the default. Undefined when there is nothing to offer.
+ */
+export async function sendLimitOffer(
+  user: User,
+  wallet: Pick<ReadyWallet, "litPublicKey" | "recovery">,
+  head: SendLimitHead | undefined,
+  client: ccc.Client,
+): Promise<{ ckb: bigint } | undefined> {
+  if (!litPolicyEnabled() || head || wallet.recovery) return undefined;
+  const secp = await secp256k1Lock(client, wallet.litPublicKey);
+  const plain = await client.getCellsCapacity({ script: secp, scriptType: "lock", scriptSearchMode: "exact", filter: { scriptLenRange: [0, 1], outputDataLenRange: [0, 1] } });
+  if (plain < SEND_LIMIT_OFFER_MINIMUM) return undefined;
+  const amounts = await readDailyAmounts(user);
+  return { ckb: amounts.get("ckb") ?? DEFAULT_DAILY_LIMIT_SHANNONS };
 }
 
 async function readDailyAmounts(user: User, connection?: Query): Promise<DailyAmounts> {
