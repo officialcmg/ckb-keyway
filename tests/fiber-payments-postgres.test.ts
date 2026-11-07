@@ -35,7 +35,8 @@ function harness(amount: bigint, options: { failSend?: boolean } = {}) {
       throw new Error(`unexpected ${method}`);
     },
   };
-  const settings = (threshold: bigint | null) => signingSettings({ ...context, wallet: {} } as unknown as SigningContext, { operation: "set-daily-amount", asset: "ckb", amount: threshold?.toString() ?? null });
+  // The amounts as the server keeps them (a test signer, so no send-limit cell is built on chain).
+  const settings = (threshold: bigint | null) => signingSettings({ ...context, wallet: {}, signDigest: async () => "0x" } as unknown as SigningContext, { operation: "set-daily-amount", asset: "ckb", amount: threshold?.toString() ?? null });
   return { context, node, emails, sent, settings, codeFrom: () => /code is (\d{6})/.exec(emails.at(-1)!.plaintext)![1] };
 }
 
