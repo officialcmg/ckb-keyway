@@ -116,12 +116,13 @@ const redact = (rows) => JSON.stringify(rows, (key, value) => key === "localSett
 
 
 try {
-  const mailbox = resuming ? await openMailbox(state.email, state.password) : await newMailbox("st");
   if (resuming) log(`resuming the run for ${state.address}, channel ${state.channelId}, force-closed at ${state.forceCloseAt ?? "(not yet)"}`);
   await page.goto(url);
   await page.waitForFunction(() => window.probe?.auth.ready);
-  // A resumed run's profile may still hold its session.
+  // A resumed run's profile may still hold its session: the mailbox is only opened when sign-in needs a code.
+  let mailbox;
   if (!await page.evaluate(() => window.probe.auth.authenticated)) {
+    mailbox = resuming ? await openMailbox(state.email, state.password) : await newMailbox("st");
     await markSeen(mailbox);
     await page.evaluate(() => window.probe.auth.login());
     await page.locator('input[type="email"]').fill(mailbox.email);
@@ -132,7 +133,8 @@ try {
   const address = await page.evaluate(() => window.probe.account.address);
   if (resuming && address !== state.address) throw new Error(`resumed account signed in as ${address}, not ${state.address}`);
   forAccount(state, address);
-  state.email = mailbox.email; state.password = mailbox.password; save();
+  if (mailbox) { state.email = mailbox.email; state.password = mailbox.password; }
+  save();
   record(`user address ${state.address}`);
 
   if (!plan.setUp) {
@@ -184,8 +186,12 @@ try {
       const dialog = page.getByRole("dialog");
       await dialog.waitFor({ timeout: 60_000 });
       await dialog.getByRole("button", { name: "Force close", exact: true }).click();
+      // Approving isn't submitting: only a force close the node accepted is recorded. Otherwise the run stays
+      // resumable without it, and the next start tries the force close again.
+      const closing = await page.evaluate(() => window.closing);
+      if (closing !== "ok") throw new Error(`the force close failed: ${closing}`);
       state.forceCloseAt = now(); save();
-      record(`force close requested: ${await page.evaluate(() => window.closing)}`);
+      record(`force close requested: ${closing}`);
     }
   }
 
