@@ -11,8 +11,8 @@
 //   .evidence/eval.js             is evaluated in the page once (then renamed) and its result logged
 import { createRequire } from "node:module";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { DEMO_APP_ID, EVIDENCE, json, launch, markSeen, newMailbox, nextCode } from "./lib.mjs";
-import { forAccount, forChannel, loadSettlementState } from "./settlement-state.mjs";
+import { DEMO_APP_ID, EVIDENCE, json, launch, markSeen, newMailbox, nextCode, openMailbox } from "./lib.mjs";
+import { forAccount, forChannel, loadSettlementState, resumableRun } from "./settlement-state.mjs";
 
 const repo = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
 mkdirSync(EVIDENCE, { recursive: true, mode: 0o700 });
@@ -104,12 +104,15 @@ async function watchtowerData() {
 const redact = (rows) => JSON.stringify(rows, (key, value) => key === "localSettlementKey" || key === "local_key" ? "<redacted>" : value);
 
 const statePath = `${EVIDENCE}/settlement-state.json`;
-// Kept across restarts, but keyed to this run's account and channel: a finished run's state is never reused.
+// Kept across restarts so an unfinished run resumes on its account and channel; a finished run's state is never reused.
 const state = loadSettlementState(existsSync(statePath) ? readFileSync(statePath, "utf8") : undefined);
 const save = () => writeFileSync(statePath, JSON.stringify(state, null, 2), { mode: 0o600 });
 
 try {
-  const mailbox = await newMailbox("st");
+  // A restart of an unfinished run signs in to the same account and follows the same channel.
+  const resuming = resumableRun(state);
+  const mailbox = resuming ? await openMailbox(state.email, state.password) : await newMailbox("st");
+  if (resuming) log(`resuming the run for ${state.address}, channel ${state.channelId}, force-closed at ${state.forceCloseAt}`);
   await page.goto(url);
   await page.waitForFunction(() => window.probe?.auth.ready);
   await markSeen(mailbox);
@@ -118,51 +121,59 @@ try {
   await page.locator('input[type="email"]').press("Enter");
   await page.locator('input[autocomplete="one-time-code"]').fill((await nextCode(mailbox)).code);
   await page.waitForFunction(() => window.probe.account.status === "ready", undefined, { timeout: 180_000 });
-  forAccount(state, await page.evaluate(() => window.probe.account.address));
+  const address = await page.evaluate(() => window.probe.account.address);
+  if (resuming && address !== state.address) throw new Error(`resumed account signed in as ${address}, not ${state.address}`);
+  forAccount(state, address);
   state.email = mailbox.email; state.password = mailbox.password; save();
   record(`user address ${state.address}`);
 
-  await json("https://faucet-api.nervos.org/claim_events", { claim_event: { address_hash: state.address, amount: "10000" } });
-  for (let i = 0; ; i++) {
-    const balance = BigInt(await page.evaluate(async () => (await window.probe.account.refreshBalance()).toString()));
-    if (balance >= 5000n * CKB) { record(`funded from the faucet: ${balance / CKB} CKB`); break; }
-    if (i > 120) throw new Error("not funded");
-    await new Promise((r) => setTimeout(r, 5000));
-  }
-
-  await startNode();
-  record("browser node running");
-  await page.evaluate(() => { window.opening = window.probe.fiber.openChannel({ fundingAmount: 500n * 100_000_000n, public: true }); });
-  await page.getByRole("button", { name: "Activate", exact: true }).click({ timeout: 300_000 });
-  const opened = await page.evaluate(async () => { const r = await window.opening; return JSON.parse(JSON.stringify(r, (_k, v) => typeof v === "bigint" ? v.toString() : v)); });
-  log("open result", JSON.stringify(opened));
-  const raw = await page.evaluate(async (id) => (await window.probe.fiber.node.listChannels({})).channels.find((c) => c.channel_id === id), opened.channelId);
-  const op = raw.channel_outpoint;
-  forChannel(state, opened.channelId);
-  state.funding = { txHash: `0x${op.slice(2, 66)}`, index: Number.parseInt(op.slice(66).match(/../g).reverse().join(""), 16) };
-  state.feeReserveTxHash = opened.feeReserveTxHash ?? null; save();
-  record(`channel ${state.channelId} ready; funding ${state.funding.txHash}:${state.funding.index}; fee reserve tx ${state.feeReserveTxHash}`);
-
-  for (let i = 0; i < 30; i++) {
-    const rows = await watchtowerData();
-    if (rows?.some((row) => row.channelId === state.channelId)) {
-      writeFileSync(`${EVIDENCE}/settlement-watchtower.json`, JSON.stringify(rows, null, 2), { mode: 0o600 });
-      record(`in-page watchtower holds the channel: ${redact(rows.filter((row) => row.channelId === state.channelId)).slice(0, 700)}`);
-      break;
+  if (resuming) {
+    // The node comes back only if the account has a node backup; the chain is followed either way.
+    await startNode().then(() => record("browser node running again"), (error) => log("WARN the browser node did not start", error.message));
+  } else {
+    await json("https://faucet-api.nervos.org/claim_events", { claim_event: { address_hash: state.address, amount: "10000" } });
+    for (let i = 0; ; i++) {
+      const balance = BigInt(await page.evaluate(async () => (await window.probe.account.refreshBalance()).toString()));
+      if (balance >= 5000n * CKB) { record(`funded from the faucet: ${balance / CKB} CKB`); break; }
+      if (i > 120) throw new Error("not funded");
+      await new Promise((r) => setTimeout(r, 5000));
     }
-    if (i === 29) log("WARN the in-page watchtower has no data for the channel");
-    await new Promise((r) => setTimeout(r, 2000));
-  }
 
-  await page.evaluate((id) => { window.closing = window.probe.fiber.node.shutdownChannel({ channel_id: id, force: true }).then(() => "ok", (e) => e.message); }, state.channelId);
-  const dialog = page.getByRole("dialog");
-  await dialog.waitFor({ timeout: 60_000 });
-  await dialog.getByRole("button", { name: "Force close", exact: true }).click();
-  state.forceCloseAt = now(); save();
-  record(`force close requested: ${await page.evaluate(() => window.closing)}`);
+    await startNode();
+    record("browser node running");
+    await page.evaluate(() => { window.opening = window.probe.fiber.openChannel({ fundingAmount: 500n * 100_000_000n, public: true }); });
+    await page.getByRole("button", { name: "Activate", exact: true }).click({ timeout: 300_000 });
+    const opened = await page.evaluate(async () => { const r = await window.opening; return JSON.parse(JSON.stringify(r, (_k, v) => typeof v === "bigint" ? v.toString() : v)); });
+    log("open result", JSON.stringify(opened));
+    const raw = await page.evaluate(async (id) => (await window.probe.fiber.node.listChannels({})).channels.find((c) => c.channel_id === id), opened.channelId);
+    const op = raw.channel_outpoint;
+    forChannel(state, opened.channelId);
+    state.funding = { txHash: `0x${op.slice(2, 66)}`, index: Number.parseInt(op.slice(66).match(/../g).reverse().join(""), 16) };
+    state.feeReserveTxHash = opened.feeReserveTxHash ?? null; save();
+    record(`channel ${state.channelId} ready; funding ${state.funding.txHash}:${state.funding.index}; fee reserve tx ${state.feeReserveTxHash}`);
+
+    for (let i = 0; i < 30; i++) {
+      const rows = await watchtowerData();
+      if (rows?.some((row) => row.channelId === state.channelId)) {
+        writeFileSync(`${EVIDENCE}/settlement-watchtower.json`, JSON.stringify(rows, null, 2), { mode: 0o600 });
+        record(`in-page watchtower holds the channel: ${redact(rows.filter((row) => row.channelId === state.channelId)).slice(0, 700)}`);
+        break;
+      }
+      if (i === 29) log("WARN the in-page watchtower has no data for the channel");
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+
+    await page.evaluate((id) => { window.closing = window.probe.fiber.node.shutdownChannel({ channel_id: id, force: true }).then(() => "ok", (e) => e.message); }, state.channelId);
+    const dialog = page.getByRole("dialog");
+    await dialog.waitFor({ timeout: 60_000 });
+    await dialog.getByRole("button", { name: "Force close", exact: true }).click();
+    state.forceCloseAt = now(); save();
+    record(`force close requested: ${await page.evaluate(() => window.closing)}`);
+  }
 
   const seen = new Set();
-  const frontier = [];
+  // A resumed run already found its commitment: follow on from it.
+  const frontier = state.commitment ? [state.commitment] : [];
   const deadline = Date.now() + 7.5 * 60 * 60 * 1000;
   let done = false;
   while (Date.now() < deadline && !done) {
