@@ -74,8 +74,9 @@ It also enforces these invariants on the recovery list:
   Type ID type hash, and refuses any listed auth it can't rebuild that way: another account's salt, an unsalted
   id, the old verifiers, or anything else. It also refuses an id that isn't on the list. The emailed code names
   backups by these ids.
-- A new list must be output 0, under the owner-only lock, with its Type ID from input 0, which must be the
-  account's own secp256k1 cell. Every administrator-mode output must name that list.
+- A new list must be output 0, under the owner-only lock, with its Type ID from input 0, which must be a plain
+  CKB cell (no type, no data) at the account's own secp256k1 address. Every administrator-mode output must name
+  that list.
 - First wins: a new list is refused if the indexer shows any live list under the key's owner-only lock already.
   A cell there only counts as a list if the transaction that created it spent, as input 0, a cell from the key's
   own secp256k1 address or its list lock (so each candidate costs one lookup however many inputs it has; a change
@@ -87,7 +88,11 @@ It also enforces these invariants on the recovery list:
   Only Type ID cells are fetched, up to 1024. Every fake list locks its capacity under this key for good, so
   blocking an account that way costs an attacker more than 1024 such cells, about 129k CKB.
 - An enable must spend every live plain cell at the key's secp256k1 address. Two enables signed before either is
-  indexed then spend the same cells, so at most one can commit.
+  indexed then spend the same cells, so at most one can commit. Input 0 being plain means every enable spends at
+  least one plain cell, so two enables made only from typed cells someone sent to the address can't both pass.
+  The Action reads the plain cells first and the lists second, both from the same node: an enable that commits
+  between the two reads either still shows its plain input 0 in the first (so this one must spend it too) or its
+  list in the second. Read the other way round, or from two nodes, a list committed in between was missed.
 - A change to a list without an on-chain record needs the previous record (version 3) from the server. That record
   must hash to the list's root, and the one-backup rule applies as usual.
 - Outside turning recovery on, every output to an administrator-mode Omnilock of the key must name the key's one
@@ -262,7 +267,7 @@ You run these locally. The server has no Lit account credentials.
    actions to groups.
 3. **Register the policy Action.**
    1. In the Chipotle dashboard, open **Action Runner** and paste `lit-actions/sign-ckb-transaction.js` exactly.
-   2. Click **Get Lit Action IPFS CID**. It must be `QmZ8ezupgLEb23xk1U9UqdECnjog8Gtpgtt37aHqQuZaqi`, the same as
+   2. Click **Get Lit Action IPFS CID**. It must be `Qmcn6SRwdS8pFWVV4FwCKupoQtY4Qwu9KQFYJ18TtdK2cN`, the same as
       `LIT_POLICY_ACTION_CID` in `.env.example` and `POLICY_ACTION_CID` in `src/server/lit-policy.ts`. Any other
       CID means the pasted source differs from this branch.
    3. Under **IPFS Actions**, register the CID as `keyway-ckb-policy-signer`.

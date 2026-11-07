@@ -12,7 +12,7 @@ import { recoverPkpPublicKey } from "./pkp-identity.ts";
  * the recovery list's rules and checks the code it emailed for every list change. The pinned CID below is the
  * hash of that source (tests/lit-action-packaging.test.ts); the founder registers it in the Lit group.
  */
-export const POLICY_ACTION_CID = "QmZ8ezupgLEb23xk1U9UqdECnjog8Gtpgtt37aHqQuZaqi";
+export const POLICY_ACTION_CID = "Qmcn6SRwdS8pFWVV4FwCKupoQtY4Qwu9KQFYJ18TtdK2cN";
 
 /** Set KEYWAY_LIT_SIGNER=policy once the policy Action's CID is in the Lit group; until then the digest signer is used. */
 export function litPolicyEnabled(): boolean {

@@ -320,12 +320,12 @@ function sighash(tx, inputLocks, lock) {
 // ---------- chain ----------
 
 /** Fetches transactions by hash in one batch call, and checks each against its hash. */
-async function fetchTransactions(hashes) {
+async function fetchTransactions(hashes, urls = RPC_URLS) {
   const unique = [...new Set(hashes)];
   if (unique.length === 0) return new Map();
   const body = JSON.stringify(unique.map((hash, id) => ({ id, jsonrpc: "2.0", method: "get_transaction", params: [hash] })));
   let lastError;
-  for (const url of RPC_URLS) {
+  for (const url of urls) {
     try {
       const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body, redirect: "error" });
       if (!response.ok) throw new Error(`CKB RPC returned HTTP ${response.status}`);
@@ -354,7 +354,7 @@ async function fetchTransactions(hashes) {
  * Live cells under a lock, from the indexer, a page of 64 at a time; refuses more than `maxCells`. With `typeId`,
  * only cells whose type is a Type ID are returned.
  */
-async function indexerCells(lock, maxCells, typeId = false) {
+async function indexerCells(lock, maxCells, typeId = false, urls = RPC_URLS) {
   const searchKey = {
     script: { code_hash: bytesToHex(lock.codeHash), hash_type: lock.hashType, args: bytesToHex(lock.args) },
     script_type: "lock",
@@ -369,7 +369,7 @@ async function indexerCells(lock, maxCells, typeId = false) {
     const body = JSON.stringify({ id: 0, jsonrpc: "2.0", method: "get_cells", params: [searchKey, "asc", "0x40", ...(cursor ? [cursor] : [])] });
     let result;
     let lastError;
-    for (const url of RPC_URLS) {
+    for (const url of urls) {
       try {
         const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body, redirect: "error" });
         if (!response.ok) throw new Error(`CKB RPC returned HTTP ${response.status}`);
@@ -396,14 +396,14 @@ async function indexerCells(lock, maxCells, typeId = false) {
  * list itself). Each cell is checked against that transaction; that it is still live
  * is the node's word.
  */
-async function liveLists(account) {
+async function liveLists(account, urls = RPC_URLS) {
   // Only Type ID cells are asked for, so plain cells sent to the lock can't crowd out the check. Each fake list
   // locks its capacity under this key for good, so blocking with more than 1024 costs an attacker about 129k CKB.
-  const objects = (await indexerCells(account.listLock, 1024, true)).filter((object) => isTypeId(object?.output?.type ? parseScript(object.output.type, "cell type") : undefined));
+  const objects = (await indexerCells(account.listLock, 1024, true, urls)).filter((object) => isTypeId(object?.output?.type ? parseScript(object.output.type, "cell type") : undefined));
   // Two batched lookups in all, at most one transaction per cell each: the creating transactions, then the
   // transactions of their input 0, so a fake list with thousands of inputs costs no more to check than any other.
-  const created = await fetchTransactions(objects.map((object) => object?.out_point?.tx_hash));
-  const spentFrom = await fetchTransactions([...created.values()].flatMap(({ tx }) => tx.inputs.slice(0, 1).map((input) => bytesToHex(input.previousOutput.txHash))));
+  const created = await fetchTransactions(objects.map((object) => object?.out_point?.tx_hash), urls);
+  const spentFrom = await fetchTransactions([...created.values()].flatMap(({ tx }) => tx.inputs.slice(0, 1).map((input) => bytesToHex(input.previousOutput.txHash))), urls);
   const hashes = [];
   for (const object of objects) {
     const creation = created.get(object.out_point.tx_hash);
@@ -423,6 +423,29 @@ async function liveLists(account) {
     if (proven) hashes.push(bytesToHex(scriptHash(output.type)));
   }
   return [...new Set(hashes)];
+}
+
+const isPlain = (output, data) => !output.type && data.length === 0;
+
+/**
+ * The live plain cells at the key's secp256k1 address and the key's live lists, read in that order from one node.
+ * An enable that commits at any point is then seen: if it commits after the first read, that read still shows the
+ * plain cell it spends as input 0, which this enable must then spend too, so at most one of them can commit; if
+ * before, its list is in the second read (a node's view only moves forward). Reading the two from different nodes
+ * could pair a newer first read with an older second one, so a failing node retries both on the next.
+ */
+async function enableView(account) {
+  let lastError;
+  for (const url of RPC_URLS) {
+    try {
+      const plain = (await indexerCells(account.secp, 256, false, [url])).filter((cell) => !cell?.output?.type && (cell?.output_data ?? "0x") === "0x");
+      const lists = await liveLists(account, [url]);
+      return { plain, lists };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError ?? new Error("CKB RPC is unavailable");
 }
 
 async function inputCellsOf(tx) {
@@ -704,15 +727,17 @@ async function analyse(pkpId, params) {
     if (!sameScript(output.lock, account.listLock)) throw new Error("The new recovery list must be locked to this account's key alone");
     if (!isTypeId(output.type) || !equalBytes(output.type.args, typeIdArgs(tx.inputs[0], 0))) throw new Error("The new recovery list's Type ID must come from input 0");
     if (lockKind(account, inputLocks[0]) !== "secp256k1") throw new Error("Input 0 must be this account's own cell");
+    // A plain cell, so every enable spends at least one, and the rule below makes any two of them conflict.
+    if (!isPlain(inputs[0].output, inputs[0].data)) throw new Error("Input 0 must be a plain CKB cell at this key's address");
     const typeHash = bytesToHex(scriptHash(output.type));
     for (const ref of refs) if (ref !== typeHash) throw new Error("An output goes to an address with another recovery list");
+    const view = await enableView(account);
     // First wins: a key that already has a recovery list can never make a second one (and an address with it).
-    if ((await liveLists(account)).length > 0) throw new Error("Recovery is already on for this key");
+    if (view.lists.length > 0) throw new Error("Recovery is already on for this key");
     // Every live plain cell at the key's secp256k1 address must be spent, so two enables signed before either is
     // indexed spend the same cells and at most one can ever commit.
     const spending = new Set(tx.inputs.map((input) => `${bytesToHex(input.previousOutput.txHash)}:${input.previousOutput.index}`));
-    for (const cell of await indexerCells(account.secp, 256)) {
-      if (cell?.output?.type || (cell?.output_data ?? "0x") !== "0x") continue;
+    for (const cell of view.plain) {
       const key = `${cell.out_point?.tx_hash}:${Number(num(cell.out_point?.index, "out point index"))}`;
       if (!spending.has(key)) throw new Error("Turning recovery on must spend every plain cell at this key's address");
     }

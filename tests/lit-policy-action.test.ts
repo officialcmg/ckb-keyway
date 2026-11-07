@@ -6,7 +6,7 @@ import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { sha256 } from "@noble/hashes/sha2.js";
-import { adminListLock, adminListTypeScript, KEYWAY_OMNILOCK, secp256k1Lock, type KeyWayRecovery } from "../src/sdk/browser/account-lock.ts";
+import { adminListLock, adminListTypeScript, KEYWAY_OMNILOCK, omnilockArgsFor, secp256k1Lock, type KeyWayRecovery } from "../src/sdk/browser/account-lock.ts";
 import { execAuth, execPreimage, saltedBackupId, type RecoveryBackup } from "../src/sdk/browser/recovery-backups.ts";
 import { backupAuths, recoveryListRecord, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
 import { adminListData, whitelistTree } from "../src/sdk/browser/recovery-smt.ts";
@@ -405,6 +405,91 @@ test("a cell anyone sends to the list lock doesn't count as a list, and an enabl
   const extra = ccc.Transaction.from({ inputs: [], outputs: [{ lock: plan.secp, capacity: 100n * CKB }], outputsData: ["0x"] });
   env.add(extra);
   await assert.rejects(policySendCode(plan.transaction, wallet, { email: "user@example.com", appName: "Demo", backups: [evm(15)], client }, runner(action)), /spend every plain cell/);
+});
+
+test("an enable that commits between the Action's two chain reads can't let a second enable through", async () => {
+  // Enable A is signed and broadcast; a new plain cell arrives at the key's address; then enable B, spending only
+  // that new cell, is checked, and A commits while the Action is between its reads of the chain.
+  const { funding, signed: enableA, plan: planA } = await enableWithPolicy([evm(40)]);
+  const fresh = ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: `0x${(seed++).toString(16).padStart(64, "0")}`, index: 0 } }],
+    outputs: [{ lock: planA.secp, capacity: 1_000n * CKB }],
+    outputsData: ["0x"],
+  });
+  const known = new Map<string, { tx: ccc.Transaction; status: string }>([funding, fresh].map((tx) => [tx.hash(), { tx, status: "committed" }]));
+  let reads = 0;
+  const env = fakeLit({
+    privateKey, pkpId, actionKey,
+    lookup: (hash) => known.get(hash),
+    transactions: () => {
+      const snapshot = [...known.values()].map(({ tx }) => tx);
+      if (++reads === 1) known.set(enableA.hash(), { tx: enableA, status: "committed" });
+      return snapshot;
+    },
+  });
+  const action = await env.load();
+  const client = await offlineClient([funding, enableA, fresh], [`${funding.hash()}:0`, `${funding.hash()}:1`]);
+  const planB = await planRecovery(client, walletFor(), [evm(41)], { emailBinding: true });
+  assert.deepEqual(planB.transaction.inputs.map((input) => input.previousOutput.txHash), [fresh.hash()]);
+  await assert.rejects(
+    policySendCode(planB.transaction, wallet, { email: "attacker@example.com", appName: "Demo", backups: [evm(41)], client }, runner(action)),
+    /spend every plain cell|already on for this key/,
+  );
+  assert.equal(env.emails.length, 0);
+});
+
+test("two enables from typed cells at an address with no plain cells are refused, so they can't both commit", async () => {
+  // Anyone can send typed cells to the key's address. Without the plain input 0 rule, two enables each spending one
+  // of them conflict on nothing, and with no plain cell to spend, both would pass and both commit.
+  const client0 = await offlineClient([]);
+  const secp = await secp256k1Lock(client0, publicKey);
+  const gift = ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: `0x${(seed++).toString(16).padStart(64, "0")}`, index: 0 } }],
+    outputs: [0, 1].map(() => ({ lock: secp, type: ccc.Script.from({ codeHash: `0x${"77".repeat(32)}`, hashType: "type", args: "0x" }), capacity: 1_000n * CKB })),
+    outputsData: ["0x", "0x"],
+  });
+  const env = world([gift]);
+  const action = await loadAction(env);
+  const { client: planClient } = await funded();
+  const base = await planRecovery(planClient, walletFor(), [evm(42)], { emailBinding: true });
+  const fromTyped = async (index: number) => {
+    const tx = base.transaction.clone();
+    tx.inputs = [ccc.CellInput.from({ previousOutput: { txHash: gift.hash(), index } })];
+    tx.witnesses = [tx.witnesses[0]];
+    const type = adminListTypeScript({ adminListTypeArgs: ccc.hashTypeId(tx.inputs[0], 0) });
+    const auths = await backupAuths(planClient, [evm(42)], type.hash());
+    tx.outputs[0].type = type;
+    tx.outputsData[0] = adminListData(whitelistTree(auths).root);
+    setRecoveryListRecord(tx, 0, recoveryListRecord(auths));
+    const omnilockArgs = omnilockArgsFor(publicKey, type.hash());
+    tx.outputs[0].lock = adminListLock({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs });
+    tx.outputs[tx.outputs.length - 1].lock = ccc.Script.from({ ...base.omnilock, args: omnilockArgs });
+    return action.main({ mode: "send-code", pkpId, transaction: JSON.parse(ccc.stringify(tx)), email: "user@example.com", backups: await litBackupIds(planClient, [evm(42)]), emailApiKey: "re_test_sending_key" });
+  };
+  await assert.rejects(fromTyped(0), /plain CKB cell/);
+  await assert.rejects(fromTyped(1), /plain CKB cell/);
+  assert.equal(env.emails.length, 0);
+});
+
+test("a key's live list still blocks a second enable when the lookup of its creating input fails", async () => {
+  const { funding, signed: enable, plan } = await enableWithPolicy([evm(43)]);
+  const refund = ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: `0x${(seed++).toString(16).padStart(64, "0")}`, index: 0 } }],
+    outputs: [{ lock: plan.secp, capacity: 1_000n * CKB }],
+    outputsData: ["0x"],
+  });
+  // The chain has the enable and the refund, but the transaction the enable's input 0 came from can't be fetched:
+  // the list must not be left out of the count because of it.
+  const known = new Map<string, { tx: ccc.Transaction; status: string }>([enable, refund].map((tx) => [tx.hash(), { tx, status: "committed" }]));
+  const env = fakeLit({ privateKey, pkpId, actionKey, lookup: (hash) => known.get(hash), transactions: () => [funding, ...[...known.values()].map(({ tx }) => tx)] });
+  const action = await env.load();
+  const client = await offlineClient([funding, enable, refund], [`${funding.hash()}:0`, `${funding.hash()}:1`]);
+  const second = await planRecovery(client, walletFor(), [evm(44)], { emailBinding: true });
+  await assert.rejects(
+    policySendCode(second.transaction, wallet, { email: "attacker@example.com", appName: "Demo", backups: [evm(44)], client }, runner(action)),
+    /isn't on chain/,
+  );
+  assert.equal(env.emails.length, 0);
 });
 
 test("a list made before on-chain records changes by one backup only, checked against the record the server supplies", async () => {
