@@ -11,7 +11,7 @@
 //   .evidence/eval.js             is evaluated in the page once (then renamed) and its result logged
 import { createRequire } from "node:module";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { DEMO_APP_ID, EVIDENCE, json, launch, markSeen, newMailbox, nextCode, openMailbox } from "./lib.mjs";
+import { DEMO_APP_ID, EVIDENCE, json, launchPersistent, markSeen, newMailbox, nextCode, openMailbox } from "./lib.mjs";
 import { forAccount, forChannel, loadSettlementState, resumableRun } from "./settlement-state.mjs";
 
 const repo = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -72,14 +72,24 @@ async function spender(txHash, index) {
   return "unknown";
 }
 
-const browser = await launch();
+const statePath = `${EVIDENCE}/settlement-state.json`;
+// Kept across restarts so an unfinished run resumes on its account and channel; a finished run's state is never reused.
+const state = loadSettlementState(existsSync(statePath) ? readFileSync(statePath, "utf8") : undefined);
+const save = () => writeFileSync(statePath, JSON.stringify(state, null, 2), { mode: 0o600 });
+// A restart of an unfinished run signs in to the same account and follows the same channel.
+const resuming = resumableRun(state);
+
+// The browser profile is kept with the run: a resumed run needs this device's ID, its session and the node's channel
+// databases, or the node can't come back to claim the settlement. A fresh run starts from an empty profile.
+const profile = `${EVIDENCE}/settlement-profile`;
+if (!resuming) rmSync(profile, { recursive: true, force: true });
+const context = await launchPersistent(profile);
 let currentBundle = await bundle();
 const isolation = { "Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Embedder-Policy": "require-corp" };
-const context = await browser.newContext();
 await context.route(`${origin}/__settlement*`, (route) => route.request().url().includes("fixture.js")
   ? route.fulfill({ contentType: "text/javascript", headers: isolation, body: currentBundle })
   : route.fulfill({ contentType: "text/html", headers: isolation, body: '<div id="root"></div><script src="/__settlement-fixture.js"></script>' }));
-const page = await context.newPage();
+const page = context.pages()[0] ?? await context.newPage();
 const stamp = (source, text) => appendFileSync(CONSOLE, `${now()} [${source}] ${text.replace(/\x1b\[[0-9;]*m/g, "")}\n`);
 page.on("console", (m) => stamp(`page:${m.type()}`, m.text()));
 page.on("pageerror", (error) => stamp("pageerror", String(error?.stack ?? error)));
@@ -103,23 +113,20 @@ async function watchtowerData() {
 }
 const redact = (rows) => JSON.stringify(rows, (key, value) => key === "localSettlementKey" || key === "local_key" ? "<redacted>" : value);
 
-const statePath = `${EVIDENCE}/settlement-state.json`;
-// Kept across restarts so an unfinished run resumes on its account and channel; a finished run's state is never reused.
-const state = loadSettlementState(existsSync(statePath) ? readFileSync(statePath, "utf8") : undefined);
-const save = () => writeFileSync(statePath, JSON.stringify(state, null, 2), { mode: 0o600 });
 
 try {
-  // A restart of an unfinished run signs in to the same account and follows the same channel.
-  const resuming = resumableRun(state);
   const mailbox = resuming ? await openMailbox(state.email, state.password) : await newMailbox("st");
   if (resuming) log(`resuming the run for ${state.address}, channel ${state.channelId}, force-closed at ${state.forceCloseAt}`);
   await page.goto(url);
   await page.waitForFunction(() => window.probe?.auth.ready);
-  await markSeen(mailbox);
-  await page.evaluate(() => window.probe.auth.login());
-  await page.locator('input[type="email"]').fill(mailbox.email);
-  await page.locator('input[type="email"]').press("Enter");
-  await page.locator('input[autocomplete="one-time-code"]').fill((await nextCode(mailbox)).code);
+  // A resumed run's profile may still hold its session.
+  if (!await page.evaluate(() => window.probe.auth.authenticated)) {
+    await markSeen(mailbox);
+    await page.evaluate(() => window.probe.auth.login());
+    await page.locator('input[type="email"]').fill(mailbox.email);
+    await page.locator('input[type="email"]').press("Enter");
+    await page.locator('input[autocomplete="one-time-code"]').fill((await nextCode(mailbox)).code);
+  }
   await page.waitForFunction(() => window.probe.account.status === "ready", undefined, { timeout: 180_000 });
   const address = await page.evaluate(() => window.probe.account.address);
   if (resuming && address !== state.address) throw new Error(`resumed account signed in as ${address}, not ${state.address}`);
@@ -128,8 +135,8 @@ try {
   record(`user address ${state.address}`);
 
   if (resuming) {
-    // The node comes back only if the account has a node backup; the chain is followed either way.
-    await startNode().then(() => record("browser node running again"), (error) => log("WARN the browser node did not start", error.message));
+    // The kept profile brings the node back with its channels; if it doesn't start now, the loop below retries.
+    await startNode().then(() => record("browser node running again"), (error) => log("WARN the browser node did not start yet", error.message));
   } else {
     await json("https://faucet-api.nervos.org/claim_events", { claim_event: { address_hash: state.address, amount: "10000" } });
     for (let i = 0; ; i++) {
@@ -176,6 +183,7 @@ try {
   const frontier = state.commitment ? [state.commitment] : [];
   const deadline = Date.now() + 7.5 * 60 * 60 * 1000;
   let done = false;
+  let nextStartAttempt = 0;
   while (Date.now() < deadline && !done) {
     if (existsSync(`${EVIDENCE}/reload`)) {
       rmSync(`${EVIDENCE}/reload`);
@@ -228,6 +236,11 @@ try {
     if (!done) {
       const status = await page.evaluate(() => window.probe.fiber.status).catch(() => "page gone");
       log(`waiting; fiber ${status}`);
+      // The node claims and sweeps the settlement, so a stopped node is started again while the chain is followed.
+      if (status !== "running" && status !== "page gone" && Date.now() >= nextStartAttempt) {
+        nextStartAttempt = Date.now() + 5 * 60_000;
+        await startNode().then(() => record("browser node running again"), (error) => log("WARN the browser node did not start", error.message));
+      }
       await new Promise((r) => setTimeout(r, 60_000));
     }
   }
@@ -238,5 +251,5 @@ try {
   process.exitCode = 1;
 } finally {
   writeFileSync(`${EVIDENCE}/settlement-watchtower-final.json`, JSON.stringify(await watchtowerData().catch(() => null), null, 2), { mode: 0o600 });
-  await browser.close();
+  await context.close();
 }

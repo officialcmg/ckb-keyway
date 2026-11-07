@@ -58,6 +58,11 @@ export async function nextCode(mailbox) {
   throw new Error("OTP email did not arrive within 90 s");
 }
 
+/** A browser whose profile (local storage, IndexedDB) lives in `dir`, so a restarted run keeps the page's state. */
+export async function launchPersistent(dir) {
+  return chromium.launchPersistentContext(dir, { headless: true, ...(process.env.CHROME_PATH ? { executablePath: process.env.CHROME_PATH } : {}) });
+}
+
 export async function launch() {
   return chromium.launch({ headless: true, ...(process.env.CHROME_PATH ? { executablePath: process.env.CHROME_PATH } : {}) });
 }
