@@ -18,11 +18,20 @@ export function loadSettlementState(text) {
 }
 
 /**
- * An unfinished run that got as far as its force close: a restart signs in to the same account and follows the same
- * channel instead of setting up new ones.
+ * An unfinished run that got as far as opening its channel: a restart signs in to the same account and carries on with
+ * the same channel (force-closing it if that hadn't happened yet) instead of setting up new ones.
  */
 export function resumableRun(state) {
-  return !state.finished && Boolean(state.email && state.password && state.address && state.channelId && state.funding && state.forceCloseAt);
+  return !state.finished && Boolean(state.email && state.password && state.address && state.channelId && state.funding);
+}
+
+/**
+ * What a start of the script does with the saved state: resume (keeping the browser profile, which holds the device
+ * ID and the node's channel databases) or start fresh, and which setup steps still have to run.
+ */
+export function startupPlan(state) {
+  if (!resumableRun(state)) return { resume: false, keepProfile: false, setUp: true, forceClose: true };
+  return { resume: true, keepProfile: true, setUp: false, forceClose: !state.forceCloseAt };
 }
 
 /** Records the run's account. A different account than the saved one starts from nothing. */
