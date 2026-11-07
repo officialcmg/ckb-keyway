@@ -6,11 +6,15 @@ import type { User } from "./auth-user.ts";
 import type { TransactionSql } from "postgres";
 import { database, type DatabaseSql } from "./database.ts";
 import { createConfirmationEmailTemplate } from "./email-template.ts";
-import { formatCkbSignature, serializeTransaction, signAccountGroups, type SigningGroup } from "./funding-transaction.ts";
+import { formatCkbSignature, serializeTransaction, signAccountGroups, signingGroups, type SigningGroup } from "./funding-transaction.ts";
+import { accountLocks } from "../sdk/browser/account-lock.ts";
+import { settingsFromDailyAmounts } from "../sdk/browser/send-limits.ts";
 import { loadLitAction } from "./lit-actions.ts";
 import { LIT_ACTION_CIDS } from "./lit-config.ts";
 import { signCkbDigest } from "./lit.ts";
-import { litPolicyEnabled, policySignMessage, policySignTransaction, type LitEmailCode } from "./lit-policy.ts";
+import { litPolicyEnabled, parseLitEmailCode, policySendCode, policySignMessage, policySignTransaction, type LitEmailCode } from "./lit-policy.ts";
+import { listPendingTransactions, nodeStatus, recordPendingTransaction } from "./pending-transactions.ts";
+import { applySendLimitRecord, buildSendLimitChange, buildSendLimitGenesis, LIT_CODE_KINDS, planSendLimits, sendLimitHead, withFingerprint } from "./send-limits.ts";
 import { recoverPkpPublicKey } from "./pkp-identity.ts";
 import { formatCkb, previewGeneralTransaction, previewSummaryLines, type ValidatedTransaction } from "./transaction-policy.ts";
 import type { ReadyWallet } from "./user-wallet.ts";
@@ -28,6 +32,9 @@ export type SigningContext = {
   recordSigning: (userId: string) => Promise<void>;
   preview?: (wallet: ReadyWallet, transaction: unknown) => Promise<ValidatedTransaction>;
   signDigest?: (digest: ccc.Hex, wallet: ReadyWallet) => Promise<ccc.Hex>;
+  /** The CKB client and broadcast for transactions the server builds itself (send-limit settings); tests replace them. */
+  client?: ccc.Client;
+  broadcast?: (transaction: ccc.Transaction) => Promise<ccc.Hex>;
 };
 
 // An approval waits this long for the user; sending a code moves its expiry to the code's, so it always outlives it.
@@ -42,17 +49,32 @@ export async function transactionSigning(context: SigningContext, body: Record<s
   const preview = context.preview ?? previewGeneralTransaction;
   const validated = await preview(context.wallet, body.transaction);
   const digest = hashText(JSON.stringify(serializeTransaction(validated.transaction)));
+  // With the policy Action signing, Lit enforces the send limits itself; the server plans with the same rules.
+  const policy = !context.signDigest && litPolicyEnabled();
 
   if (body.operation === "preview") {
     await limit(context, "sign", { max: 10, window: 60 });
-    const requiresEmailCode = await outflowNeedsEmailCode(context.user, transactionOutflow(validated));
-    const confirmationNonce = await issueRequest(context.user, "transaction", digest, { lines: previewSummaryLines(validated.preview) }, requiresEmailCode);
+    const plan = policy ? await planSendLimits(context.wallet, validated.transaction) : undefined;
+    const litCode = Boolean(plan && LIT_CODE_KINDS.includes(plan.limits));
+    // Lit's rule, or the server's own (which also counts Fiber payments): either one asks for the code.
+    const requiresEmailCode = Boolean(plan?.needsCode) || await outflowNeedsEmailCode(context.user, transactionOutflow(validated));
+    const summary = { lines: previewSummaryLines(validated.preview), ...(plan ? { sendLimits: { kind: plan.limits, litCode, ...(plan.record ? { record: plan.record, recordIndex: plan.recordIndex } : {}) } } : {}) };
+    const confirmationNonce = await issueRequest(context.user, "transaction", digest, summary, requiresEmailCode);
     return { preview: validated.preview, confirmationNonce, requiresEmailCode };
   }
   const nonce = requiredNonce(body.confirmationNonce);
   if (body.operation === "request-email-code") {
     const request = await loadRequest(context.user, "transaction", nonce, digest);
     if (!request.requires_email_code) throw new Error("This transaction doesn't need an email code");
+    const limits = sendLimitsOf(request);
+    if (limits?.litCode) {
+      // The Action makes the code and emails it to the address bound in the account's send-limit cell.
+      await codeLimit(context);
+      applySendLimitRecord(validated.transaction, limits);
+      const sent = await policySendCode(validated.transaction, context.wallet, { email: await context.email(), appName: context.appName });
+      await recordLitCode(context.user, "transaction", nonce, { litTicket: sent.ticket });
+      return { sent: true, sentTo: sent.sentTo, codeLength: 8 };
+    }
     const sentTo = await sendCode(context, "transaction", nonce, "Confirm a transaction", request.summary.lines ?? []);
     return { sent: true, sentTo };
   }
@@ -62,12 +84,84 @@ export async function transactionSigning(context: SigningContext, body: Record<s
   if (!request.requires_email_code && await outflowNeedsEmailCode(context.user, transactionOutflow(validated))) {
     throw new Error("This transaction now needs an email code. Review it again");
   }
-  if (request.requires_email_code) await verifyCode(context.user, "transaction", nonce, body.emailCode);
-  await consumeRequest(context.user, "transaction", nonce);
+  const limits = sendLimitsOf(request);
+  let emailCode: LitEmailCode | undefined;
+  if (request.requires_email_code && limits?.litCode) {
+    emailCode = parseLitEmailCode(body.emailCode, request.summary.litTicket);
+    await countLitCodeAttempt(context.user, "transaction", nonce);
+  } else if (request.requires_email_code) {
+    await verifyCode(context.user, "transaction", nonce, body.emailCode);
+    await consumeRequest(context.user, "transaction", nonce);
+  } else {
+    await consumeRequest(context.user, "transaction", nonce);
+  }
   await context.recordSigning(context.user.id);
-  const signed = await signTransaction(context, validated);
+  if (limits) applySendLimitRecord(validated.transaction, limits);
+  let signed: ccc.Transaction;
+  try {
+    signed = await signGroups(context, validated.transaction, validated.groups, validated.signer.client, emailCode ? { email: await context.email(), emailCode } : {});
+  } catch (error) {
+    // Lit counted something the preview didn't see yet (another send landed in between).
+    if (!emailCode && error instanceof Error && /eight-digit code/.test(error.message)) throw new Error("This transaction now needs an email code. Review it again");
+    throw error;
+  }
+  // A mistyped Lit code fails above and leaves the request for another try; a signature uses it up.
+  if (emailCode) await consumeRequest(context.user, "transaction", nonce);
   await recordOutflow(context.user, transactionOutflow(validated));
+  await recordPendingTransaction(context.user.id, signed);
   return { transaction: serializeTransaction(signed) };
+}
+
+/** Whether Lit will ask for its code before signing this channel funding (the account has send limits on). */
+export async function fundingNeedsLitCode(wallet: ReadyWallet, transaction: ccc.Transaction): Promise<boolean> {
+  if (!litPolicyEnabled()) return false;
+  const plan = await planSendLimits(wallet, transaction);
+  return plan.needsCode && LIT_CODE_KINDS.includes(plan.limits);
+}
+
+/** A funding approval that needs the Lit code: an ordinary transaction request, bound to the funding's bytes. */
+export function issueFundingCodeRequest(user: User, serialized: string): Promise<string> {
+  return issueRequest(user, "transaction", hashText(serialized), { funding: true, sendLimits: { kind: "unchained", litCode: true } }, true);
+}
+
+type FundingCodeContext = Pick<SigningContext, "user" | "wallet" | "appName" | "email" | "rateLimit">;
+
+async function fundingRequest(user: User, nonce: string, serialized: string): Promise<RequestRow | undefined> {
+  try {
+    const request = await loadRequest(user, "transaction", requiredNonce(nonce), hashText(serialized));
+    return request.summary.funding === true ? request : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Has the Action email its code for a funding approval. */
+export async function sendFundingCode(context: FundingCodeContext, nonce: string, serialized: string, transaction: ccc.Transaction): Promise<unknown> {
+  const request = await fundingRequest(context.user, nonce, serialized);
+  if (!request) throw new Error("This channel opening doesn't need an email code");
+  await codeLimit(context);
+  const sent = await policySendCode(transaction, context.wallet, { email: await context.email(), appName: context.appName });
+  await recordLitCode(context.user, "transaction", nonce, { litTicket: sent.ticket });
+  return { sent: true, sentTo: sent.sentTo, codeLength: 8 };
+}
+
+/**
+ * For a funding approval that needs the Lit code: the code to pass to the Action, and a way to use up the request
+ * once it has signed. Undefined for an ordinary funding approval.
+ */
+export async function fundingCode(context: FundingCodeContext, nonce: string, serialized: string, code: unknown): Promise<{ email: string; emailCode: LitEmailCode; consume: () => Promise<void> } | undefined> {
+  const request = await fundingRequest(context.user, nonce, serialized);
+  if (!request) return undefined;
+  const emailCode = parseLitEmailCode(code, request.summary.litTicket);
+  await countLitCodeAttempt(context.user, "transaction", nonce);
+  return { email: await context.email(), emailCode, consume: () => consumeRequest(context.user, "transaction", nonce) };
+}
+
+type SendLimitsSummary = { kind: string; litCode: boolean; record?: ccc.Hex; recordIndex?: number };
+
+function sendLimitsOf(request: RequestRow): SendLimitsSummary | undefined {
+  const value = request.summary.sendLimits as SendLimitsSummary | undefined;
+  return value && typeof value === "object" ? value : undefined;
 }
 
 function transactionOutflow(validated: ValidatedTransaction): Outflow {
@@ -201,6 +295,10 @@ export async function signingSettings(context: SigningContext, body: Record<stri
   const change = { asset: parseAsset(body.asset), amount: parseThreshold(body.amount) };
   const next = new Map(current);
   if (change.amount === null) next.delete(change.asset); else next.set(change.asset, change.amount);
+  if (!context.signDigest && litPolicyEnabled()) {
+    const onChain = await sendLimitSettings(context, body, current, next, change);
+    if (onChain) return { ...view(onChain.amounts), enforcedByLit: true, ...onChain.response };
+  }
   if (!weakens(current, next)) {
     await writeDailyAmount(context.user, change.asset, change.amount);
     return view(next);
@@ -223,6 +321,73 @@ export async function signingSettings(context: SigningContext, body: Record<stri
   await consumeRequest(context.user, "settings", nonce);
   await writeDailyAmount(context.user, change.asset, change.amount);
   return view(next);
+}
+
+/**
+ * The daily amounts as the account's send-limit cell, which Lit enforces. Turning limits on creates the cell (always
+ * with the Lit code, which binds the email); later changes spend it, with the code only when they weaken it. The
+ * transaction is built, signed and sent here. Returns undefined when the account can't afford the cell yet, so the
+ * amounts stay on the server alone until it can.
+ */
+async function sendLimitSettings(
+  context: SigningContext,
+  body: Record<string, unknown>,
+  current: DailyAmounts,
+  next: DailyAmounts,
+  change: { asset: string; amount: bigint | null },
+): Promise<{ amounts: DailyAmounts; response?: Record<string, unknown> } | undefined> {
+  const client = context.client ?? new ccc.ClientPublicTestnet();
+  const digest = hashText(`daily-amount:${change.asset}:${change.amount?.toString() ?? "off"}`);
+  const settings = settingsFromDailyAmounts(next, new Uint8Array(32));
+  if (body.confirmationNonce === undefined) {
+    const pending = await listPendingTransactions(context.user.id, nodeStatus(client));
+    const head = await sendLimitHead(client, context.wallet, pending);
+    let transaction: ccc.Transaction;
+    try {
+      transaction = head ? await buildSendLimitChange(client, context.wallet, head, settings) : await buildSendLimitGenesis(client, context.wallet, settings);
+    } catch (error) {
+      if (!head && error instanceof Error && /plain CKB cell|Insufficient CKB|insufficient/i.test(error.message)) return undefined;
+      throw error;
+    }
+    const plan = await planSendLimits(context.wallet, transaction);
+    applySendLimitRecord(transaction, plan);
+    if (!plan.needsCode) {
+      await signAndSendSettings(context, client, transaction, {});
+      await writeDailyAmount(context.user, change.asset, change.amount);
+      return { amounts: next };
+    }
+    const lines = [
+      head ? "Change your daily send limits" : "Turn on daily send limits, enforced by KeyWay's Lit Action",
+      `CKB: ${describeAmount(current, "ckb")} → ${describeAmount(next, "ckb")}`,
+      ...(change.asset === "ckb" ? [] : [`${assetName(change.asset)}: ${describeAmount(current, change.asset)} → ${describeAmount(next, change.asset)}`]),
+    ];
+    await codeLimit(context);
+    const confirmationNonce = await issueRequest(context.user, "settings", digest, { lines, settingsTransaction: serializeTransaction(transaction) }, true);
+    const sent = await policySendCode(transaction, context.wallet, { email: await context.email(), appName: context.appName });
+    await recordLitCode(context.user, "settings", confirmationNonce, { litTicket: sent.ticket, ...(sent.fingerprint ? { litFingerprint: sent.fingerprint } : {}) });
+    return { amounts: current, response: { requiresEmailCode: true, confirmationNonce, sentTo: sent.sentTo, codeLength: 8 } };
+  }
+  const nonce = requiredNonce(body.confirmationNonce);
+  const request = await loadRequest(context.user, "settings", nonce, digest);
+  // A request made while the account couldn't afford the cell carries no transaction; the server's code applies.
+  if (!request.summary.settingsTransaction) return undefined;
+  const transaction = ccc.Transaction.from(request.summary.settingsTransaction as ccc.TransactionLike);
+  if (typeof request.summary.litFingerprint === "string") withFingerprint(transaction, request.summary.litFingerprint);
+  const emailCode = parseLitEmailCode(body.emailCode, request.summary.litTicket);
+  await countLitCodeAttempt(context.user, "settings", nonce);
+  await signAndSendSettings(context, client, transaction, { email: await context.email(), emailCode });
+  await consumeRequest(context.user, "settings", nonce);
+  await writeDailyAmount(context.user, change.asset, change.amount);
+  return { amounts: next };
+}
+
+async function signAndSendSettings(context: SigningContext, client: ccc.Client, transaction: ccc.Transaction, options: { email?: string; emailCode?: LitEmailCode }): Promise<void> {
+  const locks = await accountLocks(client, context.wallet.litPublicKey, context.wallet.recovery);
+  const groups = signingGroups(locks, await Promise.all(transaction.inputs.map((input) => input.getCell(client))));
+  await context.recordSigning(context.user.id);
+  const signed = await signGroups(context, transaction, groups, client, options);
+  await recordPendingTransaction(context.user.id, signed);
+  await (context.broadcast ?? ((tx: ccc.Transaction) => client.sendTransaction(tx, "passthrough")))(signed);
 }
 
 /**

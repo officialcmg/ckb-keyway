@@ -38,7 +38,10 @@ import { managedFiberNode, managedNodeReady, managedNodeRequest, sweepHostedSett
 import { fiberPayment } from "./fiber-payments.ts";
 import { runIdempotentMutation } from "./idempotency.ts";
 import { recordSigningEvent } from "./security-alerts.ts";
-import { messageSigning, signingSettings, transactionSigning, type SigningContext } from "./general-signing.ts";
+import { fundingCode, fundingNeedsLitCode, issueFundingCodeRequest, messageSigning, sendFundingCode, signingSettings, transactionSigning, type SigningContext } from "./general-signing.ts";
+import { litPolicyEnabled } from "./lit-policy.ts";
+import { listPendingTransactions, nodeStatus, recordPendingTransaction } from "./pending-transactions.ts";
+import { sendLimitHead } from "./send-limits.ts";
 import { recoveryBackupChange, recoverySetup, settleRecoveryChange } from "./recovery.ts";
 import { sweepLegacyAfterSignIn } from "./legacy-sweep.ts";
 import { parseWatchtowerRequest, watchtowerRequest } from "./watchtower.ts";
@@ -80,6 +83,7 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
       : path === "/api/keyway/node-backup/load" ? await loadNodeBackupRequest(request)
       : path === "/api/keyway/node-backup/confirm" ? await confirmNodeBackupRequest(request)
       : path === "/api/keyway/sign-transaction" ? await signTransactionRequest(request)
+      : path === "/api/keyway/pending-transactions" ? await pendingTransactionsRequest(request)
       : path === "/api/keyway/sign-message" ? await generalSigningRequest(request, "message")
       : path === "/api/keyway/signing-settings" ? await generalSigningRequest(request, "settings")
       : path === "/api/keyway/recovery" ? await generalSigningRequest(request, "recovery")
@@ -332,21 +336,50 @@ async function signTransactionRequest(request: Request): Promise<Response> {
   if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
   const validated = await previewFundingTransaction(wallet, transaction);
   const serialized = JSON.stringify(serializeTransaction(validated.transaction));
+  const scope = await resolveAuthScope(request);
+  const codeContext = { user, wallet, appName: scope.name, email: () => sessionEmail(request), rateLimit: consumeRateLimit };
   if (operation === "preview") {
+    // Once the account has send limits, Lit signs a funding only with its code: Fiber chooses the inputs, so the
+    // funding can't chain on the send-limit cell and count toward the daily amount.
+    if (await fundingNeedsLitCode(wallet, validated.transaction)) {
+      return Response.json({ preview: validated.preview, confirmationNonce: await issueFundingCodeRequest(user, serialized), requiresEmailCode: true });
+    }
     return Response.json({
       preview: validated.preview,
       confirmationNonce: await issueConfirmation(user, serialized),
     });
   }
+  if (operation === "request-email-code" && typeof confirmationNonce === "string") {
+    return Response.json(await sendFundingCode(codeContext, confirmationNonce, serialized, validated.transaction));
+  }
   if (operation !== "sign" || typeof confirmationNonce !== "string") {
     throw new Error("A valid signing operation is required");
   }
   return Response.json(await versionedMutation(request, user.id, "sign-transaction", body, async () => {
-    await consumeConfirmation(user, confirmationNonce, serialized);
+    const coded = await fundingCode(codeContext, confirmationNonce, serialized, body.emailCode);
+    if (!coded) await consumeConfirmation(user, confirmationNonce, serialized);
     await recordSigningEvent(user.id);
-    const signed = await signFundingTransaction(user, wallet, validated);
+    const signed = await signFundingTransaction(user, wallet, validated, coded ?? {});
+    await coded?.consume();
+    await recordPendingTransaction(user.id, signed);
     return { transaction: serializeTransaction(signed) };
   }));
+}
+
+/** The account's pending transactions and its newest send-limit cell, which a client loads before it builds a send. */
+async function pendingTransactionsRequest(request: Request): Promise<Response> {
+  const user = await authenticateUser(request);
+  const wallet = await readWallet(user);
+  if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
+  const limit = await consumeRateLimit(`pending:${user.id}`, { max: 120, window: 60 });
+  if (!limit.allowed) throw new Error(`Too many requests. Try again in ${limit.retryAfter ?? 60} seconds`);
+  const client = new ccc.ClientPublicTestnet();
+  const pending = await listPendingTransactions(user.id, nodeStatus(client));
+  const sendLimit = litPolicyEnabled() ? await sendLimitHead(client, wallet, pending) : undefined;
+  return Response.json({
+    transactions: pending.map(({ transaction }) => serializeTransaction(transaction)),
+    ...(sendLimit ? { sendLimit: JSON.parse(ccc.stringify(sendLimit)) } : {}),
+  }, { headers: { "Cache-Control": "no-store" } });
 }
 
 async function generalSigningRequest(

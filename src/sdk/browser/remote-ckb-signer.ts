@@ -2,6 +2,7 @@ import * as ccc from "@ckb-ccc/core";
 import { serializeCccTransaction } from "./ccc-transaction";
 import { KeyWayAccountSigner, type KeyWayRecovery } from "./account-lock";
 import { KeyWayApiClient } from "./api-client";
+import { withEmailCode, type RequestEmailCode } from "./email-code";
 import { formatAsset } from "./tokens";
 
 /** What the channel-open approval shows: what goes into the channel and the network fee. */
@@ -40,6 +41,11 @@ export class RemoteCkbSigner extends KeyWayAccountSigner {
     recovery?: KeyWayRecovery,
     /** Told once an approved funding transaction is signed, or signing failed. */
     private readonly settled?: (error?: unknown) => void,
+    /**
+     * Asks for the code KeyWay's Lit Action emails. Once the account has daily send limits, a channel funding always
+     * needs it: Fiber chooses the funding's inputs, so it can't count toward the daily amount.
+     */
+    private readonly requestEmailCode?: RequestEmailCode,
   ) {
     super(client, publicKey, recovery);
   }
@@ -54,11 +60,11 @@ export class RemoteCkbSigner extends KeyWayAccountSigner {
     if (!await this.approveChannelOpen(shown)) throw new Error("The channel opening was not approved");
 
     try {
-      const signed = await this.request({
-        operation: "sign",
-        transaction: serialized,
-        confirmationNonce: preview.confirmationNonce,
-      });
+      const base = { transaction: serialized, confirmationNonce: preview.confirmationNonce };
+      const sign = (emailCode?: string) => this.request({ ...base, operation: "sign", ...(emailCode ? { emailCode } : {}) });
+      const signed = preview.requiresEmailCode
+        ? await withEmailCode(this.requestEmailCode ?? (() => Promise.resolve(undefined)), "transaction", () => this.request({ ...base, operation: "request-email-code" }), sign)
+        : await sign();
       if (!signed || typeof signed !== "object" || !("transaction" in signed)) {
         throw new Error("KeyWay returned an invalid signed transaction");
       }
@@ -79,6 +85,7 @@ export class RemoteCkbSigner extends KeyWayAccountSigner {
 function isPreviewResponse(value: unknown): value is {
   preview: FiberChannelOpenPreview;
   confirmationNonce: string;
+  requiresEmailCode?: boolean;
 } {
   if (!value || typeof value !== "object") return false;
   const { preview, confirmationNonce } = value as Record<string, unknown>;

@@ -11,6 +11,7 @@ import { createRecoveryNoticeEmailTemplate } from "./email-template.ts";
 import { serializeTransaction } from "./funding-transaction.ts";
 import { codeLimit, consumeRequest, countLitCodeAttempt, hashText, issueRequest, limit, loadRequest, recordLitCode, REQUEST_EXPIRED, sendCode, signGroups, verifyCode, type SigningContext } from "./general-signing.ts";
 import { litPolicyEnabled, parseLitEmailCode, policySendCode, setEmailBinding } from "./lit-policy.ts";
+import { recordPendingTransaction } from "./pending-transactions.ts";
 import { feeRateCap, formatCkb } from "./transaction-policy.ts";
 import type { User } from "./auth-user.ts";
 import { readWallet, saveWallet, type PendingRecoveryChange, type ReadyWallet } from "./user-wallet.ts";
@@ -155,6 +156,8 @@ export async function recoverySetup(context: RecoveryContext, body: Record<strin
 
 /** Sends the transaction; a refused send clears the pending change. */
 async function broadcast(context: RecoveryContext, client: ccc.Client, signed: ccc.Transaction, clear: () => Promise<void>): Promise<void> {
+  // Listed for the account's other clients until the node reports it committed or gone (pending-transactions.ts).
+  await recordPendingTransaction(context.user.id, signed);
   try {
     await (context.broadcast ?? ((transaction) => client.sendTransaction(transaction, "passthrough")))(signed);
   } catch (error) {

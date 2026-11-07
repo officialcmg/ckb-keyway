@@ -82,6 +82,7 @@ export function createManagedKeyWay(options: {
     api,
     options.recovery,
     (error) => options.approvals?.().settled?.("funding", error),
+    options.requestEmailCode,
   );
   // The hosted node settles force-closed channels with its own key, so the reserve goes there.
   const feeReserve = createFeeReserve({

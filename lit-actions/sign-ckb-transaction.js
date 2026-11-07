@@ -10,8 +10,10 @@
 //   transaction  { transaction, enableTransactionHash?, email?, emailCode?, backups?, previousListRecord? } signs
 //                the account's lock groups.
 //   send-code    { transaction, enableTransactionHash?, email?, backups?, emailApiKey, appName } emails a code for
-//                a recovery list change and returns the ticket (and, when turning recovery on, the email binding
-//                the transaction must carry).
+//                a recovery list change or a limited send and returns the ticket (and, when turning recovery or
+//                send limits on, the email binding or fingerprint the transaction must carry).
+//   plan         { publicKey, transaction } signs nothing and uses no key: whether the transaction needs a code
+//                under the account's send limits, and the chain record it must carry (see "send limits" below).
 // A recovery list change that needs a code also needs `email`, the account's address. The chain never holds it:
 // turning recovery on records only a keyed fingerprint of it, and every later code goes only to an address whose
 // fingerprint matches.
@@ -347,7 +349,7 @@ async function fetchTransactions(hashes, urls = RPC_URLS) {
         if (hash === undefined || !view?.transaction) continue;
         const tx = parseTransaction(view.transaction);
         if (bytesToHex(rawTransactionHash(tx)) !== hash) throw new Error("CKB RPC returned a transaction that doesn't match its hash");
-        found.set(hash, { tx, status: view.tx_status?.status });
+        found.set(hash, { tx, status: view.tx_status?.status, blockHash: view.tx_status?.block_hash ?? undefined });
       }
       for (const hash of unique) if (!found.has(hash)) throw new Error(`Transaction ${hash} isn't on chain`);
       return found;
@@ -432,7 +434,7 @@ async function rpcBatch(calls, urls = RPC_URLS) {
  * key's own lock history in just the blocks that hold them. Only the key can add inputs to that history, and
  * however long it grows, only these blocks are read.
  */
-async function madeByKey(account, candidates, urls) {
+async function madeByKey(account, candidates, urls, options = {}) {
   const blocks = [...new Set(candidates.map(({ block }) => block))];
   const calls = blocks.flatMap((block) => [account.secp, account.listLock].map((lock) => ({
     method: "get_transactions",
@@ -447,7 +449,7 @@ async function madeByKey(account, candidates, urls) {
       // A full page can't be read past here; outsiders can only fill it by giving this key 1024 cells in one block.
       if (result.objects.length >= 0x400) throw new Error("A block holds too much of this key's history to check");
       for (const entry of result.objects) {
-        if (entry?.io_type === "input" && num(entry.io_index, "io index") === 0n) made.add(String(entry.tx_hash).toLowerCase());
+        if (entry?.io_type === "input" && (options.anyInput || num(entry.io_index, "io index") === 0n)) made.add(String(entry.tx_hash).toLowerCase());
       }
     }
   }
@@ -525,10 +527,11 @@ async function enableView(account) {
 async function inputCellsOf(tx) {
   const found = await fetchTransactions(tx.inputs.map((input) => bytesToHex(input.previousOutput.txHash)));
   return tx.inputs.map((input) => {
-    const previous = found.get(bytesToHex(input.previousOutput.txHash)).tx;
+    const hash = bytesToHex(input.previousOutput.txHash);
+    const { tx: previous, status, blockHash } = found.get(hash);
     const index = input.previousOutput.index;
     if (index >= previous.outputs.length) throw new Error("An input doesn't exist");
-    return { output: previous.outputs[index], data: previous.outputsData[index], createdBy: previous, outputIndex: index };
+    return { output: previous.outputs[index], data: previous.outputsData[index], createdBy: previous, createdByHash: hash, createdStatus: status, createdBlockHash: blockHash, outputIndex: index };
   });
 }
 
@@ -537,7 +540,12 @@ async function inputCellsOf(tx) {
 async function accountOf(pkpId) {
   const privateKey = await Lit.Actions.getPrivateKey({ pkpId });
   const signingKey = new ethers.utils.SigningKey(privateKey);
-  const publicKey = hexToBytes(signingKey.compressedPublicKey, "public key");
+  return accountFromKey(hexToBytes(signingKey.compressedPublicKey, "public key"), signingKey);
+}
+
+/** The account of a compressed public key. Without a signing key it can only plan, never sign. */
+function accountFromKey(publicKey, signingKey) {
+  if (publicKey.length !== 33 || (publicKey[0] !== 2 && publicKey[0] !== 3)) throw new Error("publicKey must be a compressed secp256k1 key");
   const blake160 = ckbHash(publicKey).slice(0, 20);
   return {
     signingKey,
@@ -799,7 +807,8 @@ async function analyse(pkpId, params) {
   const tx = parseTransaction(params.transaction);
   if (tx.version !== 0) throw new Error("Only transaction version 0 is allowed");
   if (tx.inputs.length === 0 || tx.inputs.length > 256 || tx.outputs.length > 256) throw new Error("transaction size is out of range");
-  const account = await accountOf(pkpId);
+  const planning = params.mode === "plan";
+  const account = planning ? accountFromKey(hexToBytes(params.publicKey, "publicKey")) : await accountOf(pkpId);
   const inputs = await inputCellsOf(tx);
   const inputLocks = inputs.map((cell) => cell.output.lock);
   const refs = adminRefs(account, [...inputLocks, ...tx.outputs.map((output) => output.lock)]);
@@ -876,10 +885,11 @@ async function analyse(pkpId, params) {
     // Every auth before and after must be a KeyWay backup under this list's salt; the change names the one that moves.
     const backups = resolveBackups(params.backups, [...new Map([...before, ...after].map((auth) => [bytesToHex(auth), auth])).values()], scriptHash(input.output.type));
     const change = added.length ? { kind: "add", backup: backups.get(bytesToHex(added[0])) } : { kind: "remove", backup: backups.get(bytesToHex(removed[0])) };
-    const email = await boundEmail(pkpId, account, input.output.type, params.enableTransactionHash, params.email);
+    // Planning only describes the transaction; the bound address is checked when the code is sent and signed.
+    const email = planning ? undefined : await boundEmail(pkpId, account, input.output.type, params.enableTransactionHash, params.email);
     op = { ...change, members: after, email };
   }
-  return { tx, account, inputLocks, groups, op, txHash: rawTransactionHash(tx) };
+  return { tx, account, inputs, inputLocks, groups, op, txHash: rawTransactionHash(tx) };
 }
 
 /** Whether the operation needs the emailed code, and the address it goes to. */
@@ -893,6 +903,454 @@ async function codeTarget(pkpId, analysis, params) {
   }
   // A list made before this Action existed has no binding; it keeps the server's checks and the shape rules above.
   return op.email;
+}
+
+// ---------- send limits ----------
+//
+// An account that turns limits on gets one send-limit cell: at its key's secp256k1 address, with a Type ID, holding
+// "KWSL" ‖ 0x01 ‖ email fingerprint (32) ‖ flags (1) ‖ CKB amount (u64) ‖ n (1) ‖ n × (token type hash (32) ‖ amount
+// (u128)). Every transaction that moves value out must spend it and create its successor (a "chained" send), so any
+// two sends that could both commit descend one from the other. The input's witness carries the chain record:
+// "KWSR" ‖ 0x01 ‖ count (1) ‖ entries of tx hash (32) ‖ commit time ms (u64, 0 if not known yet) ‖ CKB (u64) ‖
+// k (1) ‖ k × (asset (32) ‖ amount (u128)). The last entry is the transaction itself, the others its ancestors in the
+// chain that may still be within 24 hours. The 24-hour total is read from those, and past the amount the Action
+// asks for the code it emails itself. See research/send-limits/README.md.
+
+const SETTINGS_MAGIC = "4b57534c"; // "KWSL"
+const SETTINGS_VERSION = 1;
+const RECORD_MAGIC = "4b575352"; // "KWSR"
+const RECORD_VERSION = 1;
+const UNLIMITED = (1n << 64n) - 1n;
+const MAX_LIMIT_TOKENS = 8;
+const MAX_ENTRIES = 255;
+const WINDOW_MS = 24 * 60 * 60_000;
+// Planning keeps entries a little past the window, so one that expires between the preview and the signature is
+// still allowed to be in the record (an entry may be dropped only once it is older than 24 hours).
+const PLAN_MARGIN_MS = 30 * 60_000;
+// A transaction that moves at most this much CKB out, and no tokens, needs no place in the chain: self-transfers,
+// merging cells, the legacy sweep, recovery changes. At worst it burns this much as fee.
+const EXEMPT_OUTFLOW = 100_000n;
+const XUDT_CODE_HASHES = [
+  "0x25c29dc317811a6f6f3985a7a9ebc4838bd388d19d0feeecf0bcd60f6c0975bb", // CCC's testnet xUDT
+  "0x1142755a044bf2ee358cba9f2da187ce928c91cd4dc8692ded0337efa677d21a", // Stable++'s xUDT copy (RUSD)
+  "0xc5e5dcf215925f7ef4dfaf5f4b4f105bc321c02776d6e7d52a1db3fcd9d011a4", // testnet sUDT
+];
+const DAO_CODE_HASH = "0x82d76d1b75fe2fd9a27dfbaa65a039221a380d76c926f378d3f81cf3e7e13f2e";
+
+function readU64(bytes, at) {
+  if (at + 8 > bytes.length) throw new Error("send-limit data is truncated");
+  let value = 0n;
+  for (let i = 7; i >= 0; i--) value = (value << 8n) | BigInt(bytes[at + i]);
+  return value;
+}
+
+function readU128(bytes, at) {
+  return readU64(bytes, at) | (readU64(bytes, at + 8) << 64n);
+}
+
+function u128(value) {
+  return concat(u64(value & ((1n << 64n) - 1n)), u64(value >> 64n));
+}
+
+const startsWith = (bytes, magic) => bytes.length >= 4 && bytesToHex(bytes.slice(0, 4)) === `0x${magic}`;
+
+/** A send-limit cell's settings: { fingerprint, tokensUnlimited, ckb (UNLIMITED for none), tokens: Map(asset → amount) }. */
+function parseSettings(data) {
+  if (!startsWith(data, SETTINGS_MAGIC) || data.length < 47 || data[4] !== SETTINGS_VERSION) throw new Error("The send-limit cell's data is malformed");
+  const flags = data[37];
+  if (flags & ~0x01) throw new Error("The send-limit cell's data is malformed");
+  const count = data[46];
+  if (count > MAX_LIMIT_TOKENS || data.length !== 47 + count * 48) throw new Error("The send-limit cell's data is malformed");
+  const tokens = new Map();
+  for (let i = 0; i < count; i++) {
+    const at = 47 + i * 48;
+    const asset = bytesToHex(data.slice(at, at + 32));
+    if (tokens.has(asset)) throw new Error("The send-limit cell's data is malformed");
+    tokens.set(asset, readU128(data, at + 32));
+  }
+  return { fingerprint: data.slice(5, 37), tokensUnlimited: (flags & 0x01) === 0x01, ckb: readU64(data, 38), tokens };
+}
+
+const isSettingsShaped = (account, output, data) => sameScript(output.lock, account.secp) && isTypeId(output.type) && startsWith(data, SETTINGS_MAGIC);
+
+/** How much of an asset may leave in 24 hours without the code; undefined means no limit. */
+function allowance(settings, asset) {
+  if (asset === "ckb") return settings.ckb === UNLIMITED ? undefined : settings.ckb;
+  if (settings.tokens.has(asset)) return settings.tokens.get(asset);
+  return settings.tokensUnlimited ? undefined : 0n;
+}
+
+/** Whether a settings change lets any asset (a token without an amount of its own included) send more. */
+function weakens(before, after) {
+  if (after.tokensUnlimited && !before.tokensUnlimited) return true;
+  const assets = new Set(["ckb", ...before.tokens.keys(), ...after.tokens.keys()]);
+  for (const asset of assets) {
+    const was = allowance(before, asset);
+    const now = allowance(after, asset);
+    if (was !== undefined && (now === undefined || now > was)) return true;
+  }
+  return false;
+}
+
+const isUdt = (type) => type.hashType === "type" && XUDT_CODE_HASHES.includes(bytesToHex(type.codeHash));
+const isDao = (type) => type.hashType === "type" && bytesToHex(type.codeHash) === DAO_CODE_HASH;
+
+/**
+ * What leaves the account: CKB over all of its locks (the fee included, change back excluded) and, per type script
+ * hash, tokens (a UDT's 16-byte amount, any other type by cell). The send-limit cell, the recovery list and Nervos
+ * DAO cells aren't tokens; their CKB counts like any other.
+ */
+function outflowOf(account, tx, inputs) {
+  let ckb = 0n;
+  const tokens = new Map();
+  const count = (output, data, sign) => {
+    const kind = lockKind(account, output.lock);
+    if (!kind) return;
+    ckb += sign * output.capacity;
+    const type = output.type;
+    if (!type || isDao(type)) return;
+    if (isTypeId(type) && (kind === "list" || isSettingsShaped(account, output, data))) return;
+    const asset = bytesToHex(scriptHash(type));
+    const amount = isUdt(type) && data.length >= 16 ? readU128(data, 0) : 1n;
+    tokens.set(asset, (tokens.get(asset) ?? 0n) + sign * amount);
+  };
+  inputs.forEach((cell) => count(cell.output, cell.data, 1n));
+  tx.outputs.forEach((output, index) => count(output, tx.outputsData[index], -1n));
+  const leaving = [...tokens].filter(([, amount]) => amount > 0n).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([asset, amount]) => ({ asset, amount }));
+  return { ckb: ckb > 0n ? ckb : 0n, tokens: leaving };
+}
+
+// ---------- the chain record ----------
+
+function encodeEntry(entry) {
+  return concat(entry.hash, u64(entry.time), u64(entry.ckb), [entry.tokens.length], ...entry.tokens.map((token) => concat(hexToBytes(token.asset), u128(token.amount))));
+}
+
+function encodeRecord(entries) {
+  if (entries.length > MAX_ENTRIES) throw new Error("More than 254 limited sends in 24 hours; wait for older ones to leave the window");
+  return concat(hexToBytes(`0x${RECORD_MAGIC}`), [RECORD_VERSION, entries.length], ...entries.map(encodeEntry));
+}
+
+function parseRecord(bytes) {
+  if (!startsWith(bytes, RECORD_MAGIC) || bytes.length < 6 || bytes[4] !== RECORD_VERSION) throw new Error("The send-limit record is malformed");
+  const entries = [];
+  let at = 6;
+  for (let i = 0; i < bytes[5]; i++) {
+    if (at + 49 > bytes.length) throw new Error("The send-limit record is malformed");
+    const k = bytes[at + 48];
+    const end = at + 49 + k * 48;
+    if (end > bytes.length) throw new Error("The send-limit record is malformed");
+    const tokens = [];
+    for (let t = 0; t < k; t++) {
+      const from = at + 49 + t * 48;
+      tokens.push({ asset: bytesToHex(bytes.slice(from, from + 32)), amount: readU128(bytes, from + 32) });
+    }
+    entries.push({ hash: bytes.slice(at, at + 32), time: readU64(bytes, at + 32), ckb: readU64(bytes, at + 40), tokens, bytes: bytes.slice(at, end) });
+    at = end;
+  }
+  if (at !== bytes.length) throw new Error("The send-limit record is malformed");
+  return entries;
+}
+
+/** The record in a witness, if its input_type holds one. */
+function recordIn(witness) {
+  if (!witness || witness.length === 0) return undefined;
+  let args;
+  try { args = parseWitnessArgs(witness); } catch { return undefined; }
+  return args.inputType && startsWith(args.inputType, RECORD_MAGIC) ? args.inputType : undefined;
+}
+
+/**
+ * The entries the send-limit input's previous record holds, once that input is shown to be one this key made: the
+ * transaction that created it either spent the previous send-limit cell (its record sits on that input) or is a
+ * genesis whose input 0 was a plain cell at the key's secp256k1 address. Both need the key's signature, and the
+ * Action checked each earlier step when it signed it.
+ */
+async function previousEntries(account, input) {
+  const created = input.createdBy;
+  const records = [];
+  created.witnesses.forEach((witness, index) => { const record = recordIn(witness); if (record) records.push({ index, record }); });
+  if (records.length > 1) throw new Error("The send-limit cell's history is malformed");
+  if (records.length === 0) {
+    if (!equalBytes(input.output.type.args, typeIdArgs(created.inputs[0], input.outputIndex))) throw new Error("The send-limit cell isn't one this account made");
+    const [first] = await inputCellsOf({ inputs: [created.inputs[0]] });
+    if (lockKind(account, first.output.lock) !== "secp256k1" || !isPlain(first.output, first.data)) throw new Error("The send-limit cell isn't one this account made");
+    return [];
+  }
+  const { index, record } = records[0];
+  if (index >= created.inputs.length) throw new Error("The send-limit cell isn't one this account made");
+  const [spent] = await inputCellsOf({ inputs: [created.inputs[index]] });
+  if (!sameScript(spent.output.lock, account.secp) || !sameScript(spent.output.type, input.output.type)) throw new Error("The send-limit cell isn't one this account made");
+  const entries = parseRecord(record);
+  if (entries.length === 0 || bytesToHex(entries[entries.length - 1].hash) !== input.createdByHash) throw new Error("The send-limit record is malformed");
+  return entries;
+}
+
+/**
+ * The commit time (ms) of each entry: the record's own when it has one, otherwise the block timestamp of the entry's
+ * transaction, or 0 while it is pending (or the node doesn't know it), which counts it as sent now.
+ */
+async function entryTimes(entries, input) {
+  const times = new Map();
+  const blocks = new Map();
+  const unknown = [];
+  for (const entry of entries) {
+    const hash = bytesToHex(entry.hash);
+    if (entry.time !== 0n) times.set(hash, Number(entry.time));
+    else if (hash === input.createdByHash) {
+      if (input.createdStatus === "committed" && input.createdBlockHash) blocks.set(hash, input.createdBlockHash);
+      else times.set(hash, 0);
+    } else unknown.push(hash);
+  }
+  if (unknown.length > 0) {
+    const statuses = await rpcBatch(unknown.map((hash) => ({ method: "get_transaction", params: [hash, "0x1"] })));
+    unknown.forEach((hash, i) => {
+      const status = statuses[i]?.tx_status;
+      if (status?.status === "committed" && typeof status.block_hash === "string") blocks.set(hash, status.block_hash);
+      else times.set(hash, 0);
+    });
+  }
+  if (blocks.size > 0) {
+    const hashes = [...blocks.keys()];
+    const headers = await rpcBatch(hashes.map((hash) => ({ method: "get_header", params: [blocks.get(hash)] })));
+    hashes.forEach((hash, i) => {
+      const time = Number(num(headers[i]?.timestamp, "block timestamp"));
+      if (!(time > 0)) throw new Error("CKB RPC returned an invalid block timestamp");
+      times.set(hash, time);
+    });
+  }
+  return times;
+}
+
+/** Sums each asset over entries still in the window. */
+function windowTotals(entries, times, now) {
+  const totals = new Map([["ckb", 0n]]);
+  for (const entry of entries) {
+    const time = times.get(bytesToHex(entry.hash)) ?? 0;
+    if (time !== 0 && now - time >= WINDOW_MS) continue;
+    totals.set("ckb", totals.get("ckb") + entry.ckb);
+    for (const token of entry.tokens) totals.set(token.asset, (totals.get(token.asset) ?? 0n) + token.amount);
+  }
+  return totals;
+}
+
+/** Whether, for any asset leaving, the window's total plus this transaction reaches its amount. */
+function overAmount(settings, totals, flow) {
+  const leaving = [...(flow.ckb > 0n ? [{ asset: "ckb", amount: flow.ckb }] : []), ...flow.tokens];
+  return leaving.some(({ asset, amount }) => {
+    const limit = allowance(settings, asset);
+    return limit !== undefined && (totals.get(asset) ?? 0n) + amount >= limit;
+  });
+}
+
+/**
+ * Checks the record a chained transaction carries: the previous entries it keeps are, in order and unchanged
+ * (except a time filled in once its transaction committed), a subsequence of the previous record; every previous
+ * entry younger than 24 hours is kept; and the last entry is this transaction with the outflow computed here.
+ */
+function checkRecord(given, previous, times, self, now) {
+  const last = given[given.length - 1];
+  if (!last || !equalBytes(last.bytes, encodeEntry(self))) throw new Error("The send-limit record doesn't match this transaction");
+  let at = 0;
+  for (const entry of given.slice(0, -1)) {
+    while (at < previous.length && !equalBytes(previous[at].hash, entry.hash)) {
+      const time = times.get(bytesToHex(previous[at].hash)) ?? 0;
+      if (time === 0 || now - time < WINDOW_MS) throw new Error("The send-limit record leaves out a recent send");
+      at++;
+    }
+    const before = previous[at];
+    if (!before) throw new Error("The send-limit record holds a send that isn't in this account's chain");
+    const filled = before.time === 0n && entry.time !== 0n;
+    if (filled ? !equalBytes(entry.bytes, encodeEntry({ ...before, time: BigInt(times.get(bytesToHex(before.hash)) ?? -1) })) : !equalBytes(entry.bytes, before.bytes)) {
+      throw new Error("The send-limit record changes an earlier send");
+    }
+    at++;
+  }
+  for (; at < previous.length; at++) {
+    const time = times.get(bytesToHex(previous[at].hash)) ?? 0;
+    if (time === 0 || now - time < WINDOW_MS) throw new Error("The send-limit record leaves out a recent send");
+  }
+}
+
+/** The record planning writes: every previous entry not yet well past the window, with known times filled in. */
+function plannedRecord(previous, times, self, now) {
+  const kept = previous.filter((entry) => {
+    const time = times.get(bytesToHex(entry.hash)) ?? 0;
+    return time === 0 || now - time < WINDOW_MS + PLAN_MARGIN_MS;
+  }).map((entry) => ({ ...entry, time: BigInt(times.get(bytesToHex(entry.hash)) ?? 0) }));
+  return encodeRecord([...kept, self]);
+}
+
+/** The live send-limit cells this key made at its secp256k1 address, as the indexer shows them. */
+async function liveSettingsAt(account, urls) {
+  const candidates = (await indexerCells(account.secp, 1024, TYPE_ID_FILTER, urls)).map((object) => {
+    const lock = parseScript(object?.output?.lock, "cell lock");
+    const type = object?.output?.type ? parseScript(object.output.type, "cell type") : undefined;
+    const data = hexToBytes(object?.output_data ?? "0x", "cell data");
+    if (!sameScript(lock, account.secp) || !isTypeId(type)) throw new Error("CKB RPC returned a cell that isn't at this key's address");
+    return { txHash: object?.out_point?.tx_hash, index: object?.out_point?.index, block: num(object?.block_number, "block number"), data };
+  }).filter((cell) => startsWith(cell.data, SETTINGS_MAGIC));
+  if (candidates.length === 0) return [];
+  // Anyone can put such a cell here; it counts only if the transaction that made it spent a cell of this key's
+  // own (any input), which needs the key's signature.
+  const made = await madeByKey(account, candidates, urls, { anyInput: true });
+  return candidates.filter((cell) => typeof cell.txHash === "string" && made.has(cell.txHash.toLowerCase()));
+}
+
+async function liveSettings(account) {
+  let lastError;
+  for (const url of RPC_URLS) {
+    try { return await liveSettingsAt(account, [url]); } catch (error) { lastError = error; }
+  }
+  throw lastError ?? new Error("CKB RPC is unavailable");
+}
+
+/**
+ * For a genesis: the oldest live plain cell at the key's secp256k1 address, then the live send-limit cells, from
+ * one node. A genesis that commits between the two reads still shows its input 0 in the first (so this one must
+ * spend the same cell), and one that commits before is in the second.
+ */
+async function genesisView(account) {
+  let lastError;
+  for (const url of RPC_URLS) {
+    try {
+      const body = JSON.stringify({ id: 0, jsonrpc: "2.0", method: "get_cells", params: [lockSearchKey(account.secp, PLAIN_FILTER), "asc", "0x1"] });
+      const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body, redirect: "error" });
+      if (!response.ok) throw new Error(`CKB RPC returned HTTP ${response.status}`);
+      const result = (await response.json())?.result;
+      if (!result || !Array.isArray(result.objects)) throw new Error("CKB RPC returned an invalid get_cells page");
+      const oldest = result.objects[0];
+      const settings = await liveSettingsAt(account, [url]);
+      return { oldest, settings };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError ?? new Error("CKB RPC is unavailable");
+}
+
+/** The transaction's hash with the genesis output's fingerprint zeroed: what a genesis code is for. */
+function genesisCodeHash(tx) {
+  const data = tx.outputsData[0].slice();
+  data.fill(0, 5, 37);
+  return rawTransactionHash({ ...tx, outputsData: [data, ...tx.outputsData.slice(1)] });
+}
+
+/**
+ * Applies the send limits. Returns { kind, flow, needsCode, settings?, totals?, record? } where kind is "exempt",
+ * "legacy" (no send-limit cell), "chained", "unchained" or "genesis". When not planning, a chained transaction's
+ * record is checked here.
+ */
+async function limitAnalysis(analysis, params) {
+  const { tx, account, inputs, op } = analysis;
+  const planning = params.mode === "plan";
+  const flow = outflowOf(account, tx, inputs);
+  const exempt = flow.ckb <= EXEMPT_OUTFLOW && flow.tokens.length === 0;
+  const settingsInputs = inputs.map((cell, index) => ({ ...cell, index })).filter((cell) => isSettingsShaped(account, cell.output, cell.data));
+  if (settingsInputs.length > 1) throw new Error("A transaction may spend only one send-limit cell");
+  const input = settingsInputs[0];
+  const settingsOutputs = tx.outputs.map((output, index) => ({ output, data: tx.outputsData[index], index }))
+    .filter(({ output, data }) => isSettingsShaped(account, output, data) || (input && sameScript(output.type, input.output.type)));
+  if (settingsOutputs.length > 1) throw new Error("A transaction may create only one send-limit cell");
+  // A record may only sit on the send-limit input, so the next transaction finds exactly one.
+  tx.witnesses.forEach((witness, index) => {
+    if (recordIn(witness) && index !== input?.index) throw new Error("A send-limit record is only allowed on the send-limit input");
+  });
+
+  if (input) {
+    if (op.kind !== "plain") throw new Error("A recovery change can't also spend the send-limit cell");
+    const output = settingsOutputs[0];
+    if (!output) throw new Error("The send-limit cell can't be destroyed");
+    if (!sameScript(output.output.lock, account.secp) || !sameScript(output.output.type, input.output.type)) throw new Error("The send-limit cell's lock and Type ID can't change");
+    const before = parseSettings(input.data);
+    const after = parseSettings(output.data);
+    if (!equalBytes(before.fingerprint, after.fingerprint)) throw new Error("The email bound to send limits can't change");
+    const previous = await previousEntries(account, input);
+    const times = await entryTimes(previous, input);
+    const now = Date.now();
+    const totals = windowTotals(previous, times, now);
+    const self = { hash: analysis.txHash, time: 0n, ckb: flow.ckb, tokens: flow.tokens };
+    const weakening = weakens(before, after);
+    const result = { kind: "chained", flow, settings: before, next: after, totals, weakening, inputIndex: input.index, needsCode: weakening || overAmount(before, totals, flow) };
+    if (planning) return { ...result, record: plannedRecord(previous, times, self, now) };
+    const record = recordIn(tx.witnesses[input.index]);
+    if (!record) throw new Error("The send-limit input carries no record");
+    // Every entry the record keeps must have a known time if it claims one; filled-in times were looked up above.
+    checkRecord(parseRecord(record), previous, times, self, now);
+    return result;
+  }
+
+  if (settingsOutputs.length === 1) {
+    const { output, data, index } = settingsOutputs[0];
+    if (op.kind !== "plain") throw new Error("A recovery change can't also turn send limits on");
+    if (index !== 0) throw new Error("The new send-limit cell must be output 0");
+    if (!sameScript(output.lock, account.secp) || !isTypeId(output.type) || !equalBytes(output.type.args, typeIdArgs(tx.inputs[0], 0))) throw new Error("The new send-limit cell must be at this key's address with its Type ID from input 0");
+    if (lockKind(account, inputs[0].output.lock) !== "secp256k1" || !isPlain(inputs[0].output, inputs[0].data)) throw new Error("Input 0 must be a plain CKB cell at this key's address");
+    if (!exempt) throw new Error("Turning send limits on can't also send value out of the account");
+    const settings = parseSettings(data);
+    const view = await genesisView(account);
+    if (view.settings.length > 0) throw new Error("Send limits are already on for this account");
+    const oldest = view.oldest;
+    if (!oldest || oldest.out_point?.tx_hash !== bytesToHex(tx.inputs[0].previousOutput.txHash) || Number(num(oldest.out_point?.index, "out point index")) !== tx.inputs[0].previousOutput.index) {
+      throw new Error("Turning send limits on must spend the oldest plain cell at this key's address as input 0");
+    }
+    return { kind: "genesis", flow, settings, next: settings, needsCode: true, codeHash: genesisCodeHash(tx) };
+  }
+
+  if (exempt) return { kind: "exempt", flow, needsCode: false };
+  if (op.kind !== "plain") throw new Error("A recovery change can't send value out of the account");
+  const live = await liveSettings(account);
+  if (live.length === 0) return { kind: "legacy", flow, needsCode: false };
+  if (live.length > 1) throw new Error("This account has more than one send-limit cell");
+  // A transaction that doesn't chain on the cell (a Fiber channel funding, whose inputs Fiber chooses) can't be
+  // counted against the others, so it always needs the code.
+  return { kind: "unchained", flow, settings: parseSettings(live[0].data), needsCode: true };
+}
+
+function formatCkb(shannons) {
+  const whole = shannons / 100_000_000n;
+  const fraction = (shannons % 100_000_000n).toString().padStart(8, "0").replace(/0+$/, "");
+  return fraction ? `${whole}.${fraction}` : whole.toString();
+}
+
+const shortAsset = (asset) => `${asset.slice(0, 10)}…${asset.slice(-6)}`;
+
+function describeAllowance(settings, asset) {
+  const limit = allowance(settings, asset);
+  if (limit === undefined) return "no limit";
+  if (limit === 0n) return "a code for every transfer";
+  return asset === "ckb" ? `${formatCkb(limit)} CKB a day` : `${limit} a day`;
+}
+
+function limitLines(limits) {
+  const { flow, settings, next, totals } = limits;
+  if (limits.kind === "genesis") {
+    return ["Turn on daily send limits", `CKB: ${describeAllowance(next, "ckb")}`, ...[...next.tokens.keys()].map((asset) => `Token ${shortAsset(asset)}: ${describeAllowance(next, asset)}`), `Other tokens: ${next.tokensUnlimited ? "no limit" : "a code for every transfer"}`];
+  }
+  const lines = [limits.weakening && flow.ckb <= EXEMPT_OUTFLOW && flow.tokens.length === 0 ? "Change your daily send limits" : "Confirm a send"];
+  if (flow.ckb > 0n) lines.push(`Sending ${formatCkb(flow.ckb)} CKB, network fee included`);
+  for (const token of flow.tokens) lines.push(`Sending ${token.amount} of token ${shortAsset(token.asset)}`);
+  if (limits.kind === "unchained") lines.push("This transaction (such as opening a Fiber channel) can't count toward your daily amount, so it always needs a code");
+  if (totals) lines.push(`Already sent in the last 24 hours: ${formatCkb(totals.get("ckb") ?? 0n)} CKB`);
+  lines.push(`Your daily amount: ${describeAllowance(settings, "ckb")}`);
+  if (limits.weakening) {
+    lines.push(`New daily amount: ${describeAllowance(next, "ckb")}`);
+    for (const asset of new Set([...settings.tokens.keys(), ...next.tokens.keys()])) lines.push(`Token ${shortAsset(asset)}: ${describeAllowance(settings, asset)} → ${describeAllowance(next, asset)}`);
+    if (next.tokensUnlimited !== settings.tokensUnlimited) lines.push(`Other tokens: ${next.tokensUnlimited ? "no limit" : "a code for every transfer"}`);
+  }
+  return lines;
+}
+
+/** The email a send-limit code goes to: one whose fingerprint is bound in the send-limit cell (or, at genesis, the one being bound). */
+async function limitEmail(pkpId, limits, params) {
+  const email = checkEmail(params.email);
+  const given = await emailFingerprint(pkpId, email);
+  const bound = limits.kind === "genesis" ? limits.next.fingerprint : limits.settings.fingerprint;
+  if (limits.kind === "genesis" && params.mode === "send-code") return email;
+  let diff = 0;
+  for (let i = 0; i < 32; i++) diff |= bound[i] ^ given[i];
+  if (diff !== 0) throw new Error("This isn't the email address bound to this account's send limits");
+  return email;
 }
 
 // ---------- codes ----------
@@ -919,10 +1377,14 @@ function parseTicket(ticket) {
   return expiresAt;
 }
 
-async function verifyCode(pkpId, analysis, email, emailCode) {
+function requireCodeShape(emailCode) {
   if (!emailCode || typeof emailCode.code !== "string" || !/^\d{8}$/.test(emailCode.code)) throw new Error("Enter the eight-digit code from your email");
+}
+
+async function verifyCode(pkpId, codeHash, email, emailCode) {
+  requireCodeShape(emailCode);
   parseTicket(emailCode.ticket);
-  const expected = await codeFor(pkpId, analysis.txHash, email, emailCode.ticket);
+  const expected = await codeFor(pkpId, codeHash, email, emailCode.ticket);
   let diff = 0;
   for (let i = 0; i < 8; i++) diff |= expected.charCodeAt(i) ^ emailCode.code.charCodeAt(i);
   if (diff !== 0) throw new Error("That email code isn't right");
@@ -940,13 +1402,13 @@ function escapeHtml(value) {
   return value.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 }
 
-async function sendCode(pkpId, analysis, email, params) {
+async function sendCode(pkpId, codeHash, email, emailLinesFor, params) {
   if (typeof params.emailApiKey !== "string" || !/^re_[A-Za-z0-9_]{8,128}$/.test(params.emailApiKey)) throw new Error("emailApiKey is required");
   const appName = typeof params.appName === "string" && /^[A-Za-z0-9 .'-]{1,40}$/.test(params.appName) ? params.appName : "CKB KeyWay";
   const random = crypto.getRandomValues(new Uint8Array(16));
   const ticket = `v1.${Date.now() + CODE_TTL_MS}.${bytesToHex(random).slice(2)}`;
-  const code = await codeFor(pkpId, analysis.txHash, email, ticket);
-  const lines = [...emailLines(analysis.op), `Transaction ${bytesToHex(analysis.txHash).slice(0, 12)}…`, "Network CKB testnet"];
+  const code = await codeFor(pkpId, codeHash, email, ticket);
+  const lines = [...emailLinesFor, `Transaction ${bytesToHex(codeHash).slice(0, 12)}…`, "Network CKB testnet"];
   const heading = lines[0];
   const text = `${heading} in ${appName}\n\n${lines.slice(1).join("\n")}\n\nYour confirmation code is ${code}\n\nThis code expires in 10 minutes. Only enter it if you started this change. It was made and sent by KeyWay's Lit Action, so KeyWay's server never sees it.\n\nSecured by CKB KeyWay`;
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(heading)}</title></head><body style="font-family:Arial,Helvetica,sans-serif;color:#111827;background:#f3f4f6;padding:32px 16px"><div style="max-width:560px;margin:0 auto;background:#fff;border-radius:16px;padding:32px 24px"><p style="color:#6b7280;font-size:14px;margin:0 0 12px">${escapeHtml(appName)}</p><h1 style="font-size:22px;font-weight:500;margin:0 0 16px">${escapeHtml(heading)}</h1>${lines.slice(1).map((line) => `<p style="font-size:14px;margin:6px 0;border-top:1px solid #e5e7eb;padding-top:6px">${escapeHtml(line)}</p>`).join("")}<p style="font-size:14px;margin:24px 0 8px">Your confirmation code</p><p style="font-family:monospace;font-size:36px;font-weight:700;letter-spacing:6px;margin:0">${code}</p><p style="font-size:14px;margin:20px 0 0">This code expires in 10 minutes. Only enter it if you started this change.</p></div></body></html>`;
@@ -979,6 +1441,23 @@ function signGroups(analysis) {
   });
 }
 
+/** Limit kinds whose code goes to the address bound in the send-limit cell. */
+const LIMITED = ["chained", "unchained", "genesis"];
+
+/** What planning tells the server: the kind, whether a code is needed, the outflow, the totals and the record. */
+function planResult(analysis, limits) {
+  const totals = limits.totals ? Object.fromEntries([...limits.totals].map(([asset, amount]) => [asset, amount.toString()])) : undefined;
+  return {
+    transactionHash: bytesToHex(analysis.txHash),
+    operation: analysis.op.kind,
+    limits: limits.kind,
+    needsCode: limits.needsCode,
+    outflow: { ckb: limits.flow.ckb.toString(), tokens: limits.flow.tokens.map(({ asset, amount }) => ({ asset, amount: amount.toString() })) },
+    ...(totals ? { totals } : {}),
+    ...(limits.record ? { record: bytesToHex(limits.record), recordIndex: limits.inputIndex } : {}),
+  };
+}
+
 async function main(params) {
   const { mode, pkpId } = params ?? {};
   if (typeof pkpId !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(pkpId)) throw new Error("pkpId must be a 20-byte EVM address");
@@ -994,22 +1473,40 @@ async function main(params) {
     const account = await accountOf(pkpId);
     return signDigest(account, ckbHash(utf8(`Nervos Message:${params.message}`)));
   }
+  if (mode === "plan") {
+    // No key is used: the server runs this to learn, from the same rules, whether a code is needed and which record
+    // the transaction must carry. Lit checks both again when it signs.
+    const analysis = await analyse(pkpId, params);
+    const limits = await limitAnalysis(analysis, params);
+    return planResult(analysis, limits);
+  }
   if (mode === "send-code") {
     const analysis = await analyse(pkpId, params);
-    const email = await codeTarget(pkpId, analysis, params);
-    if (!email) throw new Error("This transaction doesn't need an email code");
-    const ticket = await sendCode(pkpId, analysis, email, params);
-    const result = { ticket, sentTo: email, transactionHash: bytesToHex(analysis.txHash) };
+    const recoveryEmail = await codeTarget(pkpId, analysis, params);
+    const limits = await limitAnalysis(analysis, params);
+    let target;
+    if (recoveryEmail) target = { email: recoveryEmail, lines: emailLines(analysis.op), codeHash: analysis.txHash };
+    else if (LIMITED.includes(limits.kind)) target = { email: await limitEmail(pkpId, limits, params), lines: limitLines(limits), codeHash: limits.codeHash ?? analysis.txHash };
+    else throw new Error("This transaction doesn't need an email code");
+    const ticket = await sendCode(pkpId, target.codeHash, target.email, target.lines, params);
+    const result = { ticket, sentTo: target.email, transactionHash: bytesToHex(analysis.txHash) };
     if (analysis.op.kind === "enable") {
-      result.binding = bytesToHex(encodeBinding(await emailFingerprint(pkpId, email)));
+      result.binding = bytesToHex(encodeBinding(await emailFingerprint(pkpId, target.email)));
     }
+    // A genesis carries the fingerprint in the cell's data; the code is for the transaction with that field zeroed.
+    if (limits.kind === "genesis") result.fingerprint = bytesToHex(await emailFingerprint(pkpId, target.email));
     return result;
   }
   if (mode === "transaction") {
     const analysis = await analyse(pkpId, params);
-    const email = await codeTarget(pkpId, analysis, params);
-    if (email) await verifyCode(pkpId, analysis, email, params.emailCode);
-    return { transactionHash: bytesToHex(analysis.txHash), operation: analysis.op.kind, signatures: signGroups(analysis) };
+    const recoveryEmail = await codeTarget(pkpId, analysis, params);
+    const limits = await limitAnalysis(analysis, params);
+    if (recoveryEmail) await verifyCode(pkpId, analysis.txHash, recoveryEmail, params.emailCode);
+    else if (limits.needsCode || (LIMITED.includes(limits.kind) && params.emailCode !== undefined)) {
+      requireCodeShape(params.emailCode);
+      await verifyCode(pkpId, limits.codeHash ?? analysis.txHash, await limitEmail(pkpId, limits, params), params.emailCode);
+    }
+    return { transactionHash: bytesToHex(analysis.txHash), operation: analysis.op.kind, limits: limits.kind, signatures: signGroups(analysis) };
   }
-  throw new Error("mode must be identity, message, transaction or send-code");
+  throw new Error("mode must be identity, message, transaction, send-code or plan");
 }

@@ -369,4 +369,22 @@ export const migrations: Array<{
       await sql`create index keyway_v2_watchtower_channels_active on keyway_v2_watchtower_channels (state, checked_at)`;
     },
   },
+  {
+    version: 20, name: "pending-transactions",
+    up: async (sql) => {
+      // Every transaction KeyWay signs for an account until the node reports it committed, rejected or gone, so a
+      // client that didn't make it (another tab, device, or an app's backend) can skip its spent cells and use its
+      // change. `seq` keeps the order they were signed in, which a client marks them in.
+      await sql`create table keyway_v2_pending_transactions (
+        user_id uuid not null,
+        transaction_hash text not null check (transaction_hash ~ '^0x[0-9a-f]{64}$'),
+        transaction jsonb not null,
+        seq bigserial not null,
+        signed_at timestamptz not null default now(),
+        seen_at timestamptz,
+        primary key (user_id, transaction_hash)
+      )`;
+      await sql`create index keyway_v2_pending_transactions_user on keyway_v2_pending_transactions (user_id, seq)`;
+    },
+  },
 ];

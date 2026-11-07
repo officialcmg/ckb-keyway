@@ -6,6 +6,7 @@ import type { User } from "./auth-user.ts";
 import { database, type DatabaseSql } from "./database.ts";
 import type { SigningGroup } from "./funding-transaction.ts";
 import { signGroups, type SigningContext } from "./general-signing.ts";
+import { recordPendingTransaction } from "./pending-transactions.ts";
 import { recordSigningEvent } from "./security-alerts.ts";
 import { feeRateCap, formatCkb } from "./transaction-policy.ts";
 import { readWallet, type ReadyWallet } from "./user-wallet.ts";
@@ -94,6 +95,7 @@ export async function sweepLegacyAddress(context: LegacySweepContext): Promise<L
       }
       const transactionHash = signed.hash();
       // Recorded before sending, so a crash in between can't lead to a second, conflicting transaction.
+      await recordPendingTransaction(context.user.id, signed);
       await sql`
         insert into keyway_v2_legacy_sweeps (user_id, transaction_hash, sent_at) values (${context.user.id}, ${transactionHash}, now())
         on conflict (user_id) do update set transaction_hash = excluded.transaction_hash, sent_at = excluded.sent_at

@@ -131,7 +131,7 @@ export async function policySignTransaction(
   return transaction;
 }
 
-export type LitCodeSent = { ticket: string; sentTo: string; binding?: ccc.Hex };
+export type LitCodeSent = { ticket: string; sentTo: string; binding?: ccc.Hex; fingerprint?: ccc.Hex };
 
 /**
  * Has the policy Action email a code for a recovery list change. The Action makes the code and sends it from
@@ -165,7 +165,10 @@ export async function policySendCode(
   if (binding !== undefined && (typeof binding !== "string" || !/^0x[0-9a-f]*$/.test(binding) || (binding.length - 2) / 2 !== EMAIL_BINDING_SIZE)) {
     throw new Error("Lit Action returned an invalid email binding");
   }
-  return { ticket: response.ticket, sentTo: String(response.sentTo ?? ""), ...(binding ? { binding: binding as ccc.Hex } : {}) };
+  // Turning send limits on: the keyed fingerprint of the address, which goes into the new cell's data.
+  const fingerprint = response.fingerprint;
+  if (fingerprint !== undefined && (typeof fingerprint !== "string" || !/^0x[0-9a-f]{64}$/.test(fingerprint))) throw new Error("Lit Action returned an invalid email fingerprint");
+  return { ticket: response.ticket, sentTo: String(response.sentTo ?? ""), ...(binding ? { binding: binding as ccc.Hex } : {}), ...(fingerprint ? { fingerprint: fingerprint as ccc.Hex } : {}) };
 }
 
 /** Puts an email binding (or, for planning the fee, its zero placeholder) in witness 0's input_type. */
