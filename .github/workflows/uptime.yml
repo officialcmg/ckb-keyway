@@ -1,0 +1,47 @@
+name: Uptime
+
+# Opens an issue (which emails the repository owner) when the API or the hosted Fiber node host stops answering,
+# and closes it once both are back.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the API and the hosted node host
+        id: check
+        run: |
+          failed=""
+          for path in readyz managed-readyz; do
+            code=000
+            for attempt in 1 2 3; do
+              code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 "https://keyway-api-production.up.railway.app/$path" || true)
+              [ "$code" = "200" ] && break
+              sleep 20
+            done
+            echo "$path: $code"
+            [ "$code" = "200" ] || failed="$failed /$path ($code)"
+          done
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
+      - name: Open or close the outage issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FAILED: ${{ steps.check.outputs.failed }}
+        run: |
+          open=$(gh issue list --repo "$GITHUB_REPOSITORY" --label outage --state open --json number -q '.[0].number')
+          if [ -n "$FAILED" ]; then
+            if [ -z "$open" ]; then
+              gh label create outage --repo "$GITHUB_REPOSITORY" --color B60205 --force >/dev/null
+              gh issue create --repo "$GITHUB_REPOSITORY" --label outage --title "Outage:$FAILED" \
+                --body "Uptime check failed at $(date -u +%FT%TZ):$FAILED. Hosted Fiber nodes depend on /managed-readyz."
+            fi
+            exit 1
+          elif [ -n "$open" ]; then
+            gh issue close "$open" --repo "$GITHUB_REPOSITORY" --comment "Back up at $(date -u +%FT%TZ)."
+          fi
