@@ -258,7 +258,8 @@ Plainly, after the switch:
 
 - **On-chain sends.** Plain transfers, tokens, channel funding and sweeps are still policed only by the server. A
   compromised server, or the usage key, can still drain an account, with or without recovery. The goal "the
-  server alone can't move funds" is **not** met yet; see (d).
+  server alone can't move funds" is **not** met yet; see (d). Update: `research/send-limits/README.md` moves the
+  daily amount into the Action for accounts that turn limits on.
 - **Fiber channel funds.** `wrap-fiber-key.js` re-encrypts the Fiber key to whatever browser key the server
   relays. A compromised server can obtain a user's Fiber key.
 - **Creation and first use.** The server chooses the email bound when recovery is turned on.

@@ -49,7 +49,9 @@ export function fakeLit(options: {
   privateKey: Uint8Array;
   pkpId: string;
   actionKey?: Uint8Array;
-  lookup: (hash: string) => { tx: ccc.Transaction; status: string } | undefined;
+  lookup: (hash: string) => { tx: ccc.Transaction; status: string; blockHash?: string } | undefined;
+  /** Block timestamps (ms) by block hash, for get_header. */
+  header?: (blockHash: string) => number | undefined;
   /** Every transaction the chain has, for the indexer's live cells and lock histories. */
   transactions: () => ccc.Transaction[];
   /** RPC methods whose calls fail with HTTP 500, as an unreachable node would. */
@@ -137,11 +139,18 @@ export function fakeLit(options: {
         .map(({ tx, output, index, block }) => ({ block_number: ccc.numToHex(block), out_point: { tx_hash: hashOf(tx), index: ccc.numToHex(index) }, output: { capacity: ccc.numToHex(output.capacity), lock: script(output.lock), type: output.type ? script(output.type) : null }, output_data: tx.outputsData[index] }));
       return new Response(JSON.stringify({ id: parsed.id, jsonrpc: "2.0", result: page(objects, parsed.params[2], parsed.params[3]) }), { status: 200 });
     }
-    const calls = parsed as Array<{ id: number; params: [string] }>;
-    return new Response(JSON.stringify(calls.map(({ id, params: [hash] }) => {
-      fetched.push(hash);
+    const calls = parsed as Array<{ id: number; method: string; params: [string, string?] }>;
+    return new Response(JSON.stringify(calls.map(({ id, method, params: [hash, verbosity] }) => {
+      if (method === "get_header") {
+        const timestamp = options.header?.(hash);
+        return { id, jsonrpc: "2.0", result: timestamp === undefined ? null : { hash, timestamp: ccc.numToHex(timestamp) } };
+      }
       const found = options.lookup(hash);
-      return { id, jsonrpc: "2.0", result: found ? { transaction: rpcTx(found.tx), tx_status: { status: found.status } } : null };
+      const status = found ? { status: found.status, block_hash: found.blockHash ?? null } : { status: "unknown", block_hash: null };
+      // Verbosity 1 is the status alone, as CKB answers it.
+      if (verbosity === "0x1") return { id, jsonrpc: "2.0", result: { transaction: null, tx_status: status } };
+      fetched.push(hash);
+      return { id, jsonrpc: "2.0", result: found ? { transaction: rpcTx(found.tx), tx_status: status } : null };
     })), { status: 200 });
   };
   const Lit = {

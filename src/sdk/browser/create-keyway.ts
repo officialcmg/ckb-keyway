@@ -159,7 +159,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     });
     if (approved) activationProgress?.("signing");
     return approved;
-  }, undefined, api, options.recovery, (error) => options.approvals?.().settled?.("funding", error));
+  }, undefined, api, options.recovery, (error) => options.approvals?.().settled?.("funding", error), options.requestEmailCode);
   const resolveCccFunding = createCccExternalFundingResolver({
     signer: fundingSigner,
     knownScripts: FUNDING_LOCK_KNOWN_SCRIPTS,

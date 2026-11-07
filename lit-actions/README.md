@@ -24,6 +24,10 @@ Replaces `sign-ckb-digest.js`. It never signs a digest it is handed:
   id, and the Action rebuilds every listed auth with the account's salt and KeyWay's verifiers.
 - **Recovery list changes:** each one needs a code the Action makes, emails and checks itself. The address is bound
   on chain when recovery is turned on.
+- **Send limits:** for an account with a send-limit cell, every send must chain on it; the Action sums the last
+  24 hours from that chain and asks for its own emailed code once the daily amount is reached. Sends that can't
+  chain (Fiber channel funding) always need the code. See `research/send-limits/README.md`.
+- **plan:** the same rules without a key, which the server runs locally to know whether a code is needed.
 - **identity:** signs only the fixed identity digest.
 - **message:** hashes a CKB "Nervos Message:" itself.
 

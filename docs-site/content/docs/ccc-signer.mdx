@@ -54,9 +54,13 @@ Messages use CKB's standard `Nervos Message:` format and are shown to the user w
 
 ## Email confirmation
 
-Users can require a code from their inbox once what leaves their account within 24 hours reaches a daily amount they choose. Each asset has its own amount: one for CKB, and one for each token. Everything signed in the last 24 hours counts toward it, so splitting a transfer into smaller ones doesn't avoid the code. With a hosted Fiber node, Fiber payments count toward the same totals. Channel funding doesn't count, because a channel can only close back to the user's own account.
+Users can require a code from their inbox once what leaves their account within 24 hours reaches a daily amount they choose. Each asset has its own amount: one for CKB, and one for each token. Everything signed in the last 24 hours counts toward it, so splitting a transfer into smaller ones doesn't avoid the code. With a hosted Fiber node, Fiber payments count toward the same totals.
 
 It's off until the user (or your app) sets an amount. Once any amount is set, a token with no amount of its own always needs the code, and so does any cell KeyWay can't read that leaves the account.
+
+The amounts are enforced by KeyWay's Lit Action, not only by KeyWay's server. Setting the first amount writes a small send-limit cell to the user's account (about 174 CKB that stays theirs) holding the amounts and a keyed fingerprint of their email, never the address; that first change asks for a code, which binds the address. From then on, every send spends that cell and creates its successor, which the signer does for you in `prepareTransaction` (CCC calls it before computing the fee). The Lit Action counts the last 24 hours from that chain and emails its own 8-digit code once the amount is reached. Opening a Fiber channel always needs the code while an amount is set: Fiber chooses the funding transaction's inputs, so it can't join the chain.
+
+Sends right after each other work from any tab, device or backend: KeyWay lists the account's transactions that haven't confirmed yet, and the signer loads them before it picks inputs, so it never spends a cell another client already spent.
 
 ```ts
 import { ccc } from "@ckb-ccc/core";
@@ -73,7 +77,7 @@ await signer.getDailyConfirmationAmounts(); // { ckb: 50000000000n, "0x45b3…df
 await signer.setDailyConfirmationAmount("ckb", null); // remove the CKB amount
 ```
 
-Changes that make confirmation stricter, such as turning it on or lowering an amount, apply at once. Changes that loosen it email the user a code first: raising or removing an amount, or giving a token its own amount while it still needs the code for every transfer. The code prompt is always the SDK's own, even when you replace the approval dialogs. `TransactionPreview.requiresEmailCode` tells your own dialog whether a code will follow.
+Changes that make confirmation stricter, such as lowering an amount, apply at once. Changes that loosen it, and turning it on the first time, email the user a code first: raising or removing an amount, or giving a token its own amount while it still needs the code for every transfer. The code prompt is always the SDK's own, even when you replace the approval dialogs. `TransactionPreview.requiresEmailCode` tells your own dialog whether a code will follow.
 
 ## Silent signing
 

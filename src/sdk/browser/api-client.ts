@@ -1,3 +1,6 @@
+import type * as ccc from "@ckb-ccc/core";
+import type { SendLimitHead } from "./send-limits";
+
 export type KeyWayApiClientOptions = {
   fetch?: typeof globalThis.fetch;
   appId?: string;
@@ -106,6 +109,14 @@ export class KeyWayApiClient {
     return body.operation === "apply"
       ? this.idempotentJson(`${KEYWAY_API_PATH}/recovery-backups`, authToken, body)
       : this.json(`${KEYWAY_API_PATH}/recovery-backups`, authToken, body);
+  }
+
+  /**
+   * The account's transactions KeyWay signed that may still be in the node's pool, oldest first, and its newest
+   * send-limit cell. A signer loads them before it builds a send, so it never picks a cell another client spent.
+   */
+  pendingTransactions(authToken: string): Promise<{ transactions: ccc.TransactionLike[]; sendLimit?: SendLimitHead }> {
+    return this.json(`${KEYWAY_API_PATH}/pending-transactions`, authToken, {});
   }
 
   signingSettings(authToken: string, body: Record<string, unknown>) {

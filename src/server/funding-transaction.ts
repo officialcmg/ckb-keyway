@@ -5,7 +5,7 @@ import { isXudtCompatible } from "../sdk/browser/tokens.ts";
 import { loadLitAction } from "./lit-actions.ts";
 import { LIT_ACTION_CIDS } from "./lit-config.ts";
 import { signCkbDigest } from "./lit.ts";
-import { litPolicyEnabled, policySignTransaction } from "./lit-policy.ts";
+import { litPolicyEnabled, policySignTransaction, type LitEmailCode } from "./lit-policy.ts";
 import { recoverPkpPublicKey } from "./pkp-identity.ts";
 import type { ReadyWallet } from "./user-wallet.ts";
 
@@ -154,8 +154,10 @@ export async function signFundingTransaction(
   _user: User,
   wallet: ReadyWallet,
   validated: ValidatedFunding,
+  /** The Lit code, which a funding needs once the account has send limits (Fiber chooses its inputs, so it can't chain). */
+  options: { email?: string; emailCode?: LitEmailCode } = {},
 ): Promise<ccc.Transaction> {
-  if (litPolicyEnabled()) return policySignTransaction(validated.transaction, validated.groups, validated.signer.client, wallet);
+  if (litPolicyEnabled()) return policySignTransaction(validated.transaction, validated.groups, validated.signer.client, wallet, options);
   return signAccountGroups(validated.transaction, validated.groups, validated.signer.client, async (digest) => {
     const signature = await signCkbDigest(digest, wallet.litPkpId, {
       apiKey: requiredEnv("LIT_USAGE_API_KEY"),

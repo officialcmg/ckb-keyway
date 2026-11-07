@@ -3,6 +3,8 @@ import { KeyWayAccountSigner, type KeyWayRecovery } from "./account-lock";
 import { KeyWayApiClient } from "./api-client";
 import { serializeCccTransaction } from "./ccc-transaction";
 import { withEmailCode, type RequestEmailCode } from "./email-code";
+import { PendingTransactions } from "./pending-transactions";
+import { chainOnSendLimit } from "./send-limits";
 
 export type { RequestEmailCode };
 
@@ -58,6 +60,9 @@ export type KeyWaySignerHandlers = {
  * `recovery` when it has one, so addresses and placeholders follow its Omnilock.
  */
 export class KeyWaySigner extends KeyWayAccountSigner {
+  /** The account's transactions other clients had signed and its newest send-limit cell, loaded before each send. */
+  readonly pending: PendingTransactions;
+
   constructor(
     private readonly authToken: string,
     publicKey: ccc.HexLike,
@@ -67,6 +72,27 @@ export class KeyWaySigner extends KeyWayAccountSigner {
     recovery?: KeyWayRecovery,
   ) {
     super(client, publicKey, recovery);
+    this.pending = new PendingTransactions(() => this.api.pendingTransactions(this.authToken), this.client);
+    // Loaded as soon as the signer starts, so the first send is built on it.
+    void this.pending.refresh(true);
+  }
+
+  /** CCC picks inputs here: first load what other clients sent, so their spent cells are skipped and their change used. */
+  async *findCells(filter: Parameters<ccc.Signer["findCells"]>[0], withData?: boolean | null, order?: "asc" | "desc", limit?: number): AsyncGenerator<ccc.Cell> {
+    await this.pending.refresh();
+    yield* super.findCells(filter, withData, order, limit);
+  }
+
+  /**
+   * Chains the transaction on the account's newest send-limit cell, when it has limits on: the cell goes in as an
+   * input and out unchanged, with room in its witness for the record KeyWay fills in. CCC calls this before
+   * computing the fee, so the fee covers it, and the transaction's hash doesn't change when the record is filled in.
+   */
+  async prepareTransaction(transactionLike: ccc.TransactionLike): Promise<ccc.Transaction> {
+    const transaction = ccc.Transaction.from(transactionLike);
+    const { sendLimit } = await this.pending.refresh();
+    if (sendLimit) chainOnSendLimit(transaction, sendLimit);
+    return super.prepareTransaction(transaction);
   }
 
   async signOnlyTransaction(transactionLike: ccc.TransactionLike): Promise<ccc.Transaction> {
@@ -87,7 +113,10 @@ export class KeyWaySigner extends KeyWayAccountSigner {
       : await sign();
     const result = signed as { transaction?: ccc.TransactionLike };
     if (!result?.transaction) throw new Error("KeyWay returned an invalid signed transaction");
-    return ccc.Transaction.from(result.transaction);
+    const signedTransaction = ccc.Transaction.from(result.transaction);
+    // The next send, from this page, chains on this one straight away.
+    await this.pending.signed(signedTransaction, (await super.getAddressObjSecp256k1()).script);
+    return signedTransaction;
   }
 
   /** Signs in CKB's "Nervos Message:" format, so `signMessage` and `verifyMessage` work as usual in CCC. */
