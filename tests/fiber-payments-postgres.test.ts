@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { fiberPayment, type PaymentContext } from "../src/server/fiber-payments.ts";
+import { fiberPayment, PAYMENT_STALE_MS, type PaymentContext } from "../src/server/fiber-payments.ts";
+import { MAX_WAITING_REPEATS } from "../src/server/idempotency.ts";
 import { database } from "../src/server/database.ts";
 import { signingSettings, type SigningContext } from "../src/server/general-signing.ts";
 
@@ -191,6 +192,162 @@ test("hosted Fiber payments: daily amount, email codes and overlapping approvals
     release();
     assert.deepEqual(await again, await first);
     assert.equal(calls, 1);
+  });
+
+  await t.test("a repeat that arrives while a failing send runs waits for it and returns the same failure", async () => {
+    const failing = harness(10n * CKB, { failSend: true });
+    const preview = await pay(failing, { stage: "preview" });
+    const body = { method: "sendPayment", params: { invoice: "fibt1test" }, stage: "send", confirmationNonce: preview.confirmationNonce };
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const slow = { call: async <T>(method: string, params?: unknown[]): Promise<T> => {
+      if (method === "send_payment") { calls++; entered(); await gate; }
+      return failing.node.call<T>(method, params as never);
+    } };
+    const key = `retry-${crypto.randomUUID()}`;
+    const first = fiberPayment(failing.context, slow, body, key);
+    await started;
+    const again = fiberPayment(failing.context, slow, body, key);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    release();
+    await assert.rejects(first, /no route/);
+    await assert.rejects(again, /no route/);
+    assert.equal(calls, 1);
+  });
+
+  await t.test("only a bounded number of repeats wait for a running send; the rest answer at once and none pays", async () => {
+    const h = harness(10n * CKB);
+    const preview = await pay(h, { stage: "preview" });
+    const body = { method: "sendPayment", params: { invoice: "fibt1test" }, stage: "send", confirmationNonce: preview.confirmationNonce };
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const slow = { call: async <T>(method: string, params?: unknown[]): Promise<T> => {
+      if (method === "send_payment") { calls++; entered(); await gate; }
+      return h.node.call<T>(method, params as never);
+    } };
+    const key = `burst-${crypto.randomUUID()}`;
+    const first = fiberPayment(h.context, slow, body, key);
+    await started;
+    const waiting = Array.from({ length: MAX_WAITING_REPEATS }, () => fiberPayment(h.context, slow, body, key));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    // One more repeat than may wait: it doesn't poll for 30 seconds, it says the send is still running.
+    const startedAt = Date.now();
+    await assert.rejects(() => fiberPayment(h.context, slow, body, key), /still in progress/);
+    assert.ok(Date.now() - startedAt < 2_000, "the extra repeat answers at once");
+    release();
+    const result = await first;
+    for (const repeat of waiting) assert.deepEqual(await repeat, result);
+    assert.equal(calls, 1);
+  });
+
+  await t.test("a send whose result can't be stored still answers, and a later repeat recovers it from the node without paying again", async () => {
+    const sql = await database();
+    const h = harness(10n * CKB);
+    const preview = await pay(h, { stage: "preview" });
+    const body = { method: "sendPayment", params: { invoice: "fibt1test" }, stage: "send", confirmationNonce: preview.confirmationNonce };
+    const hash = `0x${"ab".repeat(32)}`;
+    let sends = 0;
+    let createdAt = 0;
+    const node = { call: async <T>(method: string, params: Array<Record<string, unknown>> = []): Promise<T> => {
+      if (method === "send_payment" && !params[0]?.dry_run) { sends++; createdAt = Date.now(); return { payment_hash: hash, status: "Created", fee: "0x0", created_at: `0x${createdAt.toString(16)}` } as T; }
+      if (method === "get_payment") {
+        assert.equal(params[0]?.payment_hash, hash);
+        if (!createdAt) throw new Error("Payment session not found");
+        return { payment_hash: hash, status: "Success", fee: "0x0", created_at: `0x${createdAt.toString(16)}` } as T;
+      }
+      return h.node.call<T>(method, params);
+    } };
+    const key = `nostore-${crypto.randomUUID()}`;
+    // The database refuses to store this key's result, as if it failed right after the payment went through.
+    await sql.unsafe(`
+      create or replace function keyway_test_refuse_completion() returns trigger language plpgsql as $$
+      begin
+        if new.status = 'completed' and new.idempotency_key like 'nostore-%' then raise exception 'storage is down'; end if;
+        return new;
+      end $$;
+      drop trigger if exists keyway_test_refuse_completion on keyway_v2_idempotency_keys;
+      create trigger keyway_test_refuse_completion before update on keyway_v2_idempotency_keys
+        for each row execute function keyway_test_refuse_completion();
+    `);
+    let first: Record<string, unknown>;
+    try {
+      first = await fiberPayment(h.context, node, body, key) as Record<string, unknown>;
+    } finally {
+      await sql.unsafe(`drop trigger if exists keyway_test_refuse_completion on keyway_v2_idempotency_keys; drop function if exists keyway_test_refuse_completion();`);
+    }
+    assert.equal(first.payment_hash, hash);
+    const [row] = await sql<Array<{ status: string }>>`select status from keyway_v2_idempotency_keys where user_id = ${h.context.user.id} and idempotency_key = ${key}`;
+    assert.equal(row.status, "running", "an unstored success is never recorded as a failure");
+    // A minute on (the process could equally have exited after paying), a repeat asks the node and stores what it says.
+    await sql`update keyway_v2_idempotency_keys set updated_at = now() - ${`${PAYMENT_STALE_MS + 1_000} milliseconds`}::interval where user_id = ${h.context.user.id} and idempotency_key = ${key}`;
+    const again = await fiberPayment(h.context, node, body, key) as Record<string, unknown>;
+    assert.equal(again.payment_hash, hash);
+    assert.equal(again.status, "Success");
+    assert.deepEqual(await fiberPayment(h.context, node, body, key), again);
+    assert.equal(sends, 1);
+  });
+
+  await t.test("a stale send is only matched to a payment the node made after it began, and a keysend is never guessed", async () => {
+    const sql = await database();
+    const stale = async (h: ReturnType<typeof harness>, key: string) => {
+      await sql`
+        update keyway_v2_idempotency_keys set updated_at = now() - ${`${PAYMENT_STALE_MS + 1_000} milliseconds`}::interval
+        where user_id = ${h.context.user.id} and idempotency_key = ${key}
+      `;
+    };
+    // An invoice paid long ago: the node's old payment of the same hash isn't this send's outcome.
+    const h = harness(10n * CKB);
+    const preview = await pay(h, { stage: "preview" });
+    const body = { method: "sendPayment", params: { invoice: "fibt1test" }, stage: "send", confirmationNonce: preview.confirmationNonce };
+    let sends = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const old = `0x${(Date.now() - 60 * 60_000).toString(16)}`;
+    const node = { call: async <T>(method: string, params: Array<Record<string, unknown>> = []): Promise<T> => {
+      if (method === "send_payment" && !params[0]?.dry_run) { sends++; entered(); await gate; }
+      if (method === "get_payment") return { payment_hash: params[0]?.payment_hash, status: "Success", fee: "0x0", created_at: old } as T;
+      return h.node.call<T>(method, params);
+    } };
+    const key = `old-${crypto.randomUUID()}`;
+    const first = fiberPayment(h.context, node, body, key);
+    await started;
+    await stale(h, key);
+    await assert.rejects(() => fiberPayment(h.context, node, body, key), /outcome isn't known yet/);
+    release();
+    await first;
+    assert.equal(sends, 1);
+
+    // A keysend has no payment hash until the node makes one, so a stale keysend stays unknown rather than repaid.
+    const k = harness(10n * CKB);
+    const keysend = { method: "sendPayment", params: { target_pubkey: `0x02${"11".repeat(32)}`, amount: "0x3b9aca00", keysend: true } };
+    const kPreview = await fiberPayment(k.context, k.node, { ...keysend, stage: "preview" }) as Record<string, unknown>;
+    const kBody = { ...keysend, stage: "send", confirmationNonce: kPreview.confirmationNonce };
+    let kRelease!: () => void;
+    const kGate = new Promise<void>((resolve) => { kRelease = resolve; });
+    let kEntered!: () => void;
+    const kStarted = new Promise<void>((resolve) => { kEntered = resolve; });
+    let kSends = 0;
+    const kNode = { call: async <T>(method: string, params: Array<Record<string, unknown>> = []): Promise<T> => {
+      if (method === "send_payment" && !params[0]?.dry_run) { kSends++; kEntered(); await kGate; }
+      if (method === "get_payment") throw new Error("a keysend can't be looked up before it has a hash");
+      return k.node.call<T>(method, params);
+    } };
+    const kKey = `keysend-${crypto.randomUUID()}`;
+    const kFirst = fiberPayment(k.context, kNode, kBody, kKey);
+    await kStarted;
+    await stale(k, kKey);
+    await assert.rejects(() => fiberPayment(k.context, kNode, kBody, kKey), /outcome isn't known yet/);
+    kRelease();
+    await kFirst;
+    assert.equal(kSends, 1);
   });
 
   await t.test("refuses payments with neither an invoice nor a keysend target", async () => {
