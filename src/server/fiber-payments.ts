@@ -80,6 +80,17 @@ async function lookupPayment(node: FiberCaller, { paymentHash, sentAfter }: Paym
   return { kind: "made", payment };
 }
 
+/**
+ * Whether a send's error is the node's own answer, which proves it refused the payment, rather than a timeout or a
+ * lost connection, after which the node may still be making it. The SDK raises both as FiberRpcError -32000, but
+ * Fiber attaches the request's params as `data` to the errors it returns (`handle_actor_call!`), and parameter
+ * errors use other codes; its transport errors carry neither.
+ */
+function nodeRefused(error: unknown): boolean {
+  const { code, data } = (error ?? {}) as { code?: unknown; data?: unknown };
+  return typeof code === "number" && (code !== -32000 || data !== undefined);
+}
+
 /** The payment hash a send will use, when it is known before sending: given, or the invoice's. A keysend has none. */
 async function paymentHashOf(node: FiberCaller, params: Record<string, unknown>): Promise<string | undefined> {
   if (typeof params.payment_hash === "string") return params.payment_hash;
@@ -142,18 +153,21 @@ async function payOnce(context: PaymentContext, node: FiberCaller, body: Record<
   try {
     return await node.call(FIBER_METHODS[method].rpc, [params]);
   } catch (error) {
-    // A timeout or dropped connection looks like a rejection, but the node may have taken the payment. With its
-    // hash recorded, ask the node: a payment it made is this send's result; one it says it never made is a
-    // rejection; anything else keeps the reservation and leaves the outcome for a repeat to reconcile.
-    if (handle) {
-      const found = await lookupPayment(node, handle);
-      if (found.kind === "made") return found.payment;
-      if (found.kind === "unknown") {
-        throw new OutcomeUnknownError(`The payment's outcome isn't known yet (${error instanceof Error ? error.message : "the node didn't answer"}). Repeat the request with the same idempotency key to check it`);
-      }
+    // A timeout or dropped connection looks like a rejection, but the node may have taken the payment, or still be
+    // making it. With its hash recorded, ask the node: a payment it made is this send's result. Otherwise only
+    // the node's own refusal is a rejection, released and recorded as failed; a "not found" after a timeout may
+    // just be early, so the amount stays counted and the outcome is left for a repeat to reconcile.
+    const found = handle ? await lookupPayment(node, handle) : undefined;
+    if (found?.kind === "made") return found.payment;
+    if (nodeRefused(error) && (!found || found.kind === "absent")) {
+      await release();
+      throw error;
     }
-    await release();
-    throw error;
+    if (!record) {
+      await release();
+      throw error;
+    }
+    throw new OutcomeUnknownError(`The payment's outcome isn't known yet (${error instanceof Error ? error.message : "the node didn't answer"}). Repeat the request with the same idempotency key to check it`);
   }
 }
 
