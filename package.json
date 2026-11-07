@@ -20,7 +20,7 @@
     "start": "next start",
     "test": "node --import tsx --test tests/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "verify:lit": "node --experimental-strip-types --env-file=.env.local scripts/verify-lit.ts",
+    "verify:lit": "node --import tsx --env-file=.env.local scripts/verify-lit.ts",
     "build:package": "npm run build:sdk && node scripts/prepare-package.mjs",
     "pack:sdk": "npm run build:package && npm pack ./dist/package",
     "publish:sdk": "npm run build:package && npm publish ./dist/package"

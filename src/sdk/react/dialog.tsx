@@ -135,8 +135,10 @@ export function Row({ palette, label, value, mono = true }: { palette: ModalPale
  * The six-box code entry of the login and email confirmation dialogs. One real input sits over the boxes,
  * so typing, pasting a whole code, backspace and the browser's one-time-code autofill all work as usual.
  */
-export function CodeInput({ palette, value, onChange, state = "idle", readOnly, inputRef, label = "Confirmation code", describedBy }: {
+export function CodeInput({ palette, value, onChange, state = "idle", readOnly, inputRef, label = "Confirmation code", describedBy, length = 6 }: {
   palette: ModalPalette;
+  /** Digits in the code: 6, or 8 for a code KeyWay's Lit Action sent. */
+  length?: 6 | 8;
   value: string;
   onChange: (code: string) => void;
   state?: "idle" | "success" | "error";
@@ -152,8 +154,8 @@ export function CodeInput({ palette, value, onChange, state = "idle", readOnly, 
     <label style={otpLabel}>
       <span style={visuallyHidden}>{label}</span>
       <span style={otpSlots} aria-hidden="true">
-        {Array.from({ length: 6 }, (_, index) => {
-          const active = focused && !readOnly && value.length < 6 && index === value.length;
+        {Array.from({ length }, (_, index) => {
+          const active = focused && !readOnly && value.length < length && index === value.length;
           return (
             <span key={index} style={{
               ...otpSlot,
@@ -174,15 +176,15 @@ export function CodeInput({ palette, value, onChange, state = "idle", readOnly, 
         required
         inputMode="numeric"
         autoComplete="one-time-code"
-        pattern="[0-9]{6}"
-        maxLength={6}
+        pattern={`[0-9]{${length}}`}
+        maxLength={length}
         value={value}
         readOnly={readOnly}
         aria-invalid={state === "error" || undefined}
         aria-describedby={describedBy}
         onFocus={() => setFocused(true)}
         onBlur={() => setFocused(false)}
-        onChange={(event) => onChange(event.target.value.replace(/\D/g, "").slice(0, 6))}
+        onChange={(event) => onChange(event.target.value.replace(/\D/g, "").slice(0, length))}
         style={otpInput}
       />
     </label>

@@ -1,3 +1,4 @@
+import type { RecoveryBackup } from "../sdk/browser/recovery-backups.ts";
 import { createHmac, randomInt, timingSafeEqual } from "node:crypto";
 import * as ccc from "@ckb-ccc/core";
 import { sha256 } from "@noble/hashes/sha2.js";
@@ -5,9 +6,11 @@ import type { User } from "./auth-user.ts";
 import type { TransactionSql } from "postgres";
 import { database, type DatabaseSql } from "./database.ts";
 import { createConfirmationEmailTemplate } from "./email-template.ts";
-import { formatCkbSignature, serializeTransaction, signAccountGroups } from "./funding-transaction.ts";
+import { formatCkbSignature, serializeTransaction, signAccountGroups, type SigningGroup } from "./funding-transaction.ts";
 import { loadLitAction } from "./lit-actions.ts";
+import { LIT_ACTION_CIDS } from "./lit-config.ts";
 import { signCkbDigest } from "./lit.ts";
+import { litPolicyEnabled, policySignMessage, policySignTransaction, type LitEmailCode } from "./lit-policy.ts";
 import { recoverPkpPublicKey } from "./pkp-identity.ts";
 import { formatCkb, previewGeneralTransaction, previewSummaryLines, type ValidatedTransaction } from "./transaction-policy.ts";
 import type { ReadyWallet } from "./user-wallet.ts";
@@ -177,7 +180,9 @@ export async function messageSigning(context: SigningContext, body: Record<strin
   await loadRequest(context.user, "message", nonce, digest);
   await consumeRequest(context.user, "message", nonce);
   await context.recordSigning(context.user.id);
-  const signature = await sign(context, ccc.messageHashCkbSecp256k1(message));
+  const signature = !context.signDigest && litPolicyEnabled()
+    ? await policySignMessage(context.wallet, message)
+    : await sign(context, ccc.messageHashCkbSecp256k1(message));
   return { signature, identity: context.wallet.litPublicKey };
 }
 
@@ -257,7 +262,25 @@ function parseAsset(value: unknown): string {
 }
 
 async function signTransaction(context: SigningContext, validated: ValidatedTransaction): Promise<ccc.Transaction> {
-  return signAccountGroups(validated.transaction, validated.groups, validated.signer.client, (digest) => sign(context, digest));
+  return signGroups(context, validated.transaction, validated.groups, validated.signer.client);
+}
+
+/**
+ * Signs the account's lock groups in a transaction: with the policy Action (the whole transaction, which it
+ * checks itself) once LIT_SIGNER is "policy", otherwise digest by digest. A test's `signDigest` always wins.
+ */
+export async function signGroups(
+  context: Pick<SigningContext, "wallet" | "signDigest">,
+  transaction: ccc.Transaction,
+  groups: SigningGroup[],
+  client: ccc.Client,
+  options: { enableTransactionHash?: string; email?: string; emailCode?: LitEmailCode; previousListRecord?: ccc.Hex; backups?: RecoveryBackup[]; missingGroup?: string } = {},
+): Promise<ccc.Transaction> {
+  if (!context.signDigest && litPolicyEnabled()) {
+    if (groups.length === 0) throw new Error(options.missingGroup ?? "Transaction has no KeyWay signing group");
+    return policySignTransaction(transaction, groups, client, context.wallet, options);
+  }
+  return signAccountGroups(transaction, groups, client, (digest) => sign(context, digest), options.missingGroup);
 }
 
 /** Signs a digest the backend computed itself, then checks the recovered key before releasing it. */
@@ -265,7 +288,7 @@ export async function sign(context: Pick<SigningContext, "wallet" | "signDigest"
   if (context.signDigest) return context.signDigest(digest, context.wallet);
   const signature = await signCkbDigest(digest, context.wallet.litPkpId, {
     apiKey: requiredEnv("LIT_USAGE_API_KEY"),
-    actionCid: requiredEnv("LIT_SIGN_ACTION_CID"),
+    actionCid: LIT_ACTION_CIDS["sign-ckb-digest"],
     actionCode: await loadLitAction("sign-ckb-digest"),
   });
   const recovered = ccc.hexFrom(recoverPkpPublicKey(ccc.bytesFrom(digest), signature));
@@ -346,8 +369,37 @@ export async function sendCode(context: Pick<SigningContext, "user" | "appName" 
   return to;
 }
 
+/**
+ * Records that the policy Action emailed a code for a pending request: the ticket (and any binding) go in the
+ * request's summary, and the request gets the code's lifetime and a fresh attempt count. The code itself never
+ * reaches this server; the Action checks it when signing.
+ */
+export async function recordLitCode(user: User, purpose: Purpose, nonce: string, details: Record<string, unknown>): Promise<void> {
+  const sql = await database();
+  const rows = await sql`
+    update keyway_v2_signature_requests
+    set summary = summary || ${sql.json(details as never)}, email_code_hash = null,
+      email_code_expires_at = now() + ${`${CODE_TTL_MS} milliseconds`}::interval, email_attempts = 0,
+      expires_at = greatest(expires_at, now() + ${`${CODE_TTL_MS} milliseconds`}::interval)
+    where user_id = ${user.id} and purpose = ${purpose} and nonce = ${nonce} and expires_at > now() returning 1
+  `;
+  if (!rows[0]) throw new Error(REQUEST_EXPIRED);
+}
+
+/** Counts one try of a Lit-sent code, so this server still stops a browser after five wrong codes. */
+export async function countLitCodeAttempt(user: User, purpose: Purpose, nonce: string): Promise<void> {
+  const sql = await database();
+  const [row] = await sql<Array<{ email_attempts: number }>>`
+    update keyway_v2_signature_requests set email_attempts = email_attempts + 1
+    where user_id = ${user.id} and purpose = ${purpose} and nonce = ${nonce} and expires_at > now() and email_code_expires_at > now()
+    returning email_attempts
+  `;
+  if (!row) throw new Error("The email code has expired. Request a new one");
+  if (row.email_attempts > MAX_CODE_ATTEMPTS) throw new Error("Too many wrong codes. Request a new one");
+}
+
 /** Up to 5 emailed codes per user every 10 minutes, across all purposes. */
-async function codeLimit(context: Pick<SigningContext, "user" | "rateLimit">): Promise<void> {
+export async function codeLimit(context: Pick<SigningContext, "user" | "rateLimit">): Promise<void> {
   const allowed = await context.rateLimit(`step-up-email:${context.user.id}`, { max: 5, window: 600 });
   if (!allowed.allowed) throw new Error(`Too many codes sent. Try again in ${waitText(allowed.retryAfter ?? 600)}`);
 }
