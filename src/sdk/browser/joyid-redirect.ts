@@ -50,7 +50,83 @@ export type PendingJoyIdBackup = {
   operation: "enable" | "add";
   status: "checking" | "continuing" | "applying" | "done" | "cancelled" | "failed";
   error?: Error;
+  /**
+   * With "failed": the wallet didn't start, so the checked JoyID proof is still held. Starting the wallet again
+   * (`startFiber`) applies it; `dismissPendingJoyIdBackup` drops it.
+   */
+  waitingForWallet?: boolean;
 };
+
+/** A checked JoyID proof from a full-page redirect, to apply once the wallet is ready. */
+export type JoyIdProofJob = { op: JoyIdOperation; proof: RecoveryBackupProof; otherProofs: RecoveryBackupProof[] };
+
+/**
+ * Holds a checked JoyID proof from a full-page redirect until the wallet is ready, and reports where it is. If the
+ * wallet fails to start, the proof stays held (`waitingForWallet`) so a later start applies it; dismissing drops it,
+ * and an apply already running then reports nothing.
+ */
+export class PendingJoyIdProof {
+  private job: JoyIdProofJob | undefined;
+  private failedWith: Error | undefined;
+  private generation = 0;
+
+  constructor(private readonly report: (pending: PendingJoyIdBackup | undefined) => void) {}
+
+  /** A proof is waiting for the wallet. */
+  get holding(): boolean {
+    return this.job !== undefined;
+  }
+
+  /** The redirect's answer checked out: hold its proof until the wallet is ready. */
+  hold(job: JoyIdProofJob): void {
+    this.generation++;
+    this.job = job;
+    this.failedWith = undefined;
+    this.report({ operation: proofOperation(job.op), status: "applying" });
+  }
+
+  /** The wallet failed to start. Says so once per failure, and keeps the proof for the next start. */
+  walletFailed(cause: Error): void {
+    const job = this.job;
+    if (!job || this.failedWith === cause) return;
+    this.failedWith = cause;
+    const error = new Error(`The wallet didn't start, so the JoyID backup isn't applied yet. Start it again to finish, or dismiss it. ${cause.message}`.trim(), { cause });
+    this.report({ operation: proofOperation(job.op), status: "failed", error, waitingForWallet: true });
+  }
+
+  /** The wallet is ready: applies a held proof, once. */
+  apply(work: (job: JoyIdProofJob) => Promise<unknown>): void {
+    const job = this.job;
+    if (!job) return;
+    this.job = undefined;
+    this.failedWith = undefined;
+    const generation = this.generation;
+    const operation = proofOperation(job.op);
+    this.report({ operation, status: "applying" });
+    let running: Promise<unknown>;
+    try { running = Promise.resolve(work(job)); } catch (cause) { running = Promise.reject(cause); }
+    void running.then(
+      () => { if (generation === this.generation) this.report({ operation, status: "done" }); },
+      (cause) => {
+        if (generation !== this.generation) return;
+        const failure = cause instanceof Error ? cause : new Error("The JoyID backup couldn't be finished");
+        this.report({ operation, status: /cancelled/i.test(failure.message) ? "cancelled" : "failed", error: failure });
+      },
+    );
+  }
+
+  /** Drops a held proof, so it can't apply later, and clears the report. */
+  dismiss(): void {
+    this.generation++;
+    this.job = undefined;
+    this.failedWith = undefined;
+    this.report(undefined);
+  }
+}
+
+function proofOperation(op: JoyIdOperation): PendingJoyIdBackup["operation"] {
+  return op === "backup-add" ? "add" : "enable";
+}
 
 export type JoyIdOperation = "backup-enable" | "backup-add";
 type Step = "auth" | "sign";
@@ -417,6 +493,11 @@ type HelperMessage =
 export function startJoyIdBackup(run: JoyIdBackupRun, transport: "popup" | "window" | "redirect"): Promise<RecoveryBackupProof> {
   const stage = (next: JoyIdBackupStage) => { try { run.options.onStage?.(next); } catch { /* the app's callback */ } };
   if (run.options.signal?.aborted) return Promise.reject(new JoyIdCancelledError());
+  // A window or a redirect returns to joyIdReturnPath. Refuse a bad one now, before a window opens, a request is
+  // saved or a browser node stops for the redirect.
+  if (transport !== "popup") {
+    try { joyIdReturnUrl(run.returnPath); } catch (error) { return Promise.reject(error); }
+  }
   const known = knownJoyIdAddress(run.app.joyIdAppURL);
   if (transport === "popup") {
     if (joyIdPage().isolated) return Promise.reject(new Error("JoyID's own window can't answer this page, because it is cross-origin isolated. Use the \"window\" or \"redirect\" transport"));

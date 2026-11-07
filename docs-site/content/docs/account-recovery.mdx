@@ -180,6 +180,8 @@ JoyID normally answers in its own window, which reports back to the page that op
 | `cancelled` | The user cancelled in JoyID or in the dialog. Nothing changed. |
 | `failed` | See `error`. Nothing changed. |
 
+If the wallet fails to start after the page returns, the status is `failed` with `waitingForWallet: true`: the checked JoyID proof is still held, so starting the wallet again (`startFiber()`) applies it, and `dismissPendingJoyIdBackup()` drops it.
+
 Call `recovery.dismissPendingJoyIdBackup()` once you've shown the outcome. Other options: `onStage(stage)` reports `connecting`, `signing` or `leaving`, and `signal` (an `AbortSignal`) stops waiting for JoyID.
 
 JoyID returns to the page the user started on, or to the provider's `joyIdReturnPath` (a path on your site, such as `/wallet`). That page must render `KeyWayProvider`. A window KeyWay opens for JoyID shows only a short status: the provider doesn't restore the session or start Fiber in it, and replaces your page with that status once it hydrates (your page's own code runs once before that).

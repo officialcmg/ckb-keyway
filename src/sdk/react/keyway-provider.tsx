@@ -54,6 +54,7 @@ import {
   type JoyIdRequestRecord,
   type JoyIdResponse,
   type PendingJoyIdBackup,
+  PendingJoyIdProof,
 } from "../browser/joyid-redirect";
 import { KeyWaySigner, type ApproveCkbMessage, type ApproveCkbTransaction, type MessagePreview, type TransactionPreview } from "../browser/keyway-signer";
 import { KeyWayChannelCloseModal, KeyWayChannelSettingsModal, KeyWayEmailCodeModal, KeyWayFundingModal, KeyWayMessageModal, KeyWayBackupChangeModal, KeyWayPeerModal, KeyWayRecoveryModal, KeyWayTransactionModal } from "./signing-modals";
@@ -283,7 +284,8 @@ export function KeyWayProvider({
   // Holds Fiber autostart while a JoyID answer from a full-page redirect is checked or continued.
   const [joyIdHold, setJoyIdHold] = useState(false);
   const joyIdReturnRef = useRef<{ response: JoyIdResponse; record?: JoyIdRequestRecord }>(undefined);
-  const joyIdProofRef = useRef<{ op: JoyIdRequestRecord["op"]; proof: RecoveryBackupProof; otherProofs: RecoveryBackupProof[] }>(undefined);
+  // A checked JoyID proof from a full-page redirect, held until the wallet is ready.
+  const [joyIdProof] = useState(() => new PendingJoyIdProof(setPendingJoyIdBackup));
   const fiberOperationsRef = useRef(0);
   // The SDK took any JoyID answer out of the address bar when it loaded. A router hydrating can put it back, so
   // it goes again before this provider's (or its children's) first fetch, and once more after the router mounts.
@@ -533,6 +535,8 @@ export function KeyWayProvider({
 
   useEffect(() => {
     if (!authenticated) {
+      // A JoyID proof held for this session's wallet must not apply to the next sign-in's.
+      if (joyIdProof.holding) joyIdProof.dismiss();
       setConnection(undefined);
       setError(undefined);
       setWallet(undefined);
@@ -608,8 +612,7 @@ export function KeyWayProvider({
         setPendingJoyIdBackup({ operation, status: "continuing" });
         return;
       }
-      joyIdProofRef.current = { op: result.record.op, proof: result.proof, otherProofs: result.record.otherProofs ?? [] };
-      setPendingJoyIdBackup({ operation, status: "applying" });
+      joyIdProof.hold({ op: result.record.op, proof: result.proof, otherProofs: result.record.otherProofs ?? [] });
       setJoyIdHold(false);
     }).catch((cause) => {
       const failure = cause instanceof Error ? cause : new Error("The JoyID backup couldn't be finished");
@@ -652,19 +655,14 @@ export function KeyWayProvider({
 
   // A JoyID backup proof from a full-page redirect goes into the usual flow: the preview, then the emailed code.
   useEffect(() => {
-    const job = joyIdProofRef.current;
-    if (!job || !wallet || !authToken) return;
-    joyIdProofRef.current = undefined;
-    const operation = job.op === "backup-add" ? "add" as const : "enable" as const;
-    const work = operation === "add" ? changeBackup("add", job.proof) : turnOnRecovery([...job.otherProofs, job.proof]);
-    void work.then(
-      () => setPendingJoyIdBackup({ operation, status: "done" }),
-      (cause) => {
-        const failure = cause instanceof Error ? cause : new Error("The JoyID backup couldn't be finished");
-        setPendingJoyIdBackup({ operation, status: /cancelled/i.test(failure.message) ? "cancelled" : "failed", error: failure });
-      },
-    );
-  }, [wallet, authToken, pendingJoyIdBackup]);
+    if (!joyIdProof.holding) return;
+    if (wallet && authToken) {
+      joyIdProof.apply((job) => job.op === "backup-add" ? changeBackup("add", job.proof) : turnOnRecovery([...job.otherProofs, job.proof]));
+      return;
+    }
+    // The wallet failed to start: say so rather than stay at "applying". The proof stays held for the next start.
+    if (error && status !== "connecting") joyIdProof.walletFailed(error);
+  }, [wallet, authToken, error, status, pendingJoyIdBackup]);
 
   /** Before the whole page goes to JoyID: a browser Fiber node stops cleanly, and never in the middle of a payment. */
   function leaveForJoyId() {
@@ -764,7 +762,7 @@ export function KeyWayProvider({
       requestBackupChallenge: backupChallenge,
       createJoyIdBackup: joyIdBackup,
       pendingJoyIdBackup,
-      dismissPendingJoyIdBackup: () => setPendingJoyIdBackup(undefined),
+      dismissPendingJoyIdBackup: () => joyIdProof.dismiss(),
       trackFiberOperation,
     }}>
       {children}

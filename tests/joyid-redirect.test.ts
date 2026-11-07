@@ -24,6 +24,8 @@ import {
   isReturnPath,
   joyIdRequest,
   JoyIdCancelledError,
+  PendingJoyIdProof,
+  type PendingJoyIdBackup,
   joyIdStateId,
   joyIdReturnUrl,
   readJoyIdReturn,
@@ -479,4 +481,86 @@ test("turning recovery on by redirect keeps the other backups through a first co
     Object.assign(globals, saved);
     if (saved.window === undefined) delete globals.window;
   }
+});
+
+test("a bad joyIdReturnPath is refused before a window opens, a request is saved or the browser node stops", async () => {
+  const globals = globalThis as Record<string, unknown>;
+  const saved = { location: globals.location, sessionStorage: globals.sessionStorage, localStorage: globals.localStorage, window: globals.window, BroadcastChannel: globals.BroadcastChannel };
+  const assigned: string[] = [];
+  const opened: string[] = [];
+  const storage = new MemoryStorage();
+  globals.location = { origin: APP, assign: (url: string) => assigned.push(url) };
+  globals.sessionStorage = storage;
+  globals.localStorage = new MemoryStorage();
+  globals.BroadcastChannel = class { onmessage: unknown = null; postMessage() { /* none */ } close() { /* none */ } };
+  globals.window = {
+    screenX: 0, screenY: 0, innerWidth: 800, innerHeight: 600,
+    open: (url: string) => { opened.push(url); return { closed: false, close: () => undefined }; },
+    addEventListener: () => undefined, removeEventListener: () => undefined,
+  };
+  try {
+    for (const transport of ["window", "redirect"] as const) {
+      for (const returnPath of ["//evil.example/app", "https://evil.example/app", "app"]) {
+        let stopped = 0;
+        let asked = 0;
+        await assert.rejects(startJoyIdBackup({
+          client, app: { joyIdAppURL: "https://testnet.joyid.dev", name: "Acme", logo: `${APP}/icon.svg` }, userId: "user-1", op: "backup-add", returnPath,
+          account: async () => { asked++; return "ckt1account"; }, requestChallenge: async () => { asked++; return freshNonce(); },
+          beforeLeaving: async () => { stopped++; }, options: {},
+        }, transport), /joyIdReturnPath must be a path on this site/);
+        assert.equal(stopped, 0, `${transport} ${returnPath}: the browser node stopped`);
+        assert.equal(asked, 0, `${transport} ${returnPath}: the flow started`);
+      }
+    }
+    assert.deepEqual(opened, []);
+    assert.deepEqual(assigned, []);
+    assert.equal(storage.length, 0);
+  } finally {
+    Object.assign(globals, saved);
+    for (const key of ["window", "BroadcastChannel"] as const) if (saved[key] === undefined) delete globals[key];
+  }
+});
+
+test("a JoyID proof from a redirect doesn't stay at \"applying\" when the wallet fails to start: it reports, retries and can be dismissed", async () => {
+  const proof = { kind: "joyid" as const, address: "ckt1joyid", signature: "{}", identity: "{}", challengeNonce: freshNonce() };
+  const reports: Array<PendingJoyIdBackup | undefined> = [];
+  const pending = new PendingJoyIdProof((next) => reports.push(next));
+  pending.hold({ op: "backup-add", proof, otherProofs: [] });
+  assert.equal(reports.at(-1)?.status, "applying");
+
+  // The wallet fails to start: the failure is reported once, and the proof stays held.
+  const startup = new Error("Lit is unreachable");
+  pending.walletFailed(startup);
+  pending.walletFailed(startup);
+  assert.equal(reports.length, 2);
+  assert.equal(reports.at(-1)?.status, "failed");
+  assert.equal(reports.at(-1)?.waitingForWallet, true);
+  assert.match(reports.at(-1)!.error!.message, /wallet didn't start.*Lit is unreachable/);
+  assert.equal(pending.holding, true);
+
+  // Starting the wallet again applies the held proof, once.
+  const applied: unknown[] = [];
+  pending.apply(async (job) => { applied.push(job.proof); });
+  pending.apply(async (job) => { applied.push(job.proof); });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(applied, [proof]);
+  assert.deepEqual(reports.slice(-2).map((report) => report?.status), ["applying", "done"]);
+
+  // Dismissed while waiting for the wallet: the proof can't apply later.
+  pending.hold({ op: "backup-enable", proof, otherProofs: [] });
+  pending.walletFailed(new Error("again"));
+  pending.dismiss();
+  assert.equal(reports.at(-1), undefined);
+  assert.equal(pending.holding, false);
+  pending.apply(async () => { (applied as unknown[]).push("late"); });
+  assert.deepEqual(applied, [proof]);
+
+  // Dismissed while an apply runs: its outcome isn't reported over the dismissal.
+  let finish!: () => void;
+  pending.hold({ op: "backup-add", proof, otherProofs: [] });
+  pending.apply(() => new Promise<void>((resolve) => { finish = resolve; }));
+  pending.dismiss();
+  finish();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(reports.at(-1), undefined);
 });
