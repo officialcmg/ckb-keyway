@@ -14,7 +14,7 @@ import {
   verifyCode,
   type SigningContext,
 } from "./general-signing.ts";
-import { runIdempotentMutation, type RecordHandle } from "./idempotency.ts";
+import { OutcomeUnknownError, runIdempotentMutation, type RecordHandle } from "./idempotency.ts";
 
 export type FiberCaller = { call<T>(method: string, params?: unknown[]): Promise<T> };
 export type PaymentContext = Pick<SigningContext, "user" | "appName" | "email" | "sendEmail" | "rateLimit">;
@@ -57,15 +57,27 @@ type PaymentHandle = { paymentHash: string; sentAfter: number };
 async function reconcilePayment(node: FiberCaller, handle: unknown): Promise<{ completed: unknown } | undefined> {
   const { paymentHash, sentAfter } = (handle ?? {}) as Partial<PaymentHandle>;
   if (typeof paymentHash !== "string" || typeof sentAfter !== "number") return undefined;
+  const found = await lookupPayment(node, { paymentHash, sentAfter });
+  return found.kind === "made" ? { completed: found.payment } : undefined;
+}
+
+/**
+ * What the node says about a send's payment: "made" (a payment with its hash, made after the send began),
+ * "absent" (the node answered that it has no payment with that hash) or "unknown" (it couldn't be asked, or
+ * answered something else, such as an older payment of the same invoice).
+ */
+async function lookupPayment(node: FiberCaller, { paymentHash, sentAfter }: PaymentHandle): Promise<{ kind: "made"; payment: unknown } | { kind: "absent" | "unknown" }> {
   let payment: { payment_hash?: unknown; created_at?: unknown } | undefined;
   try {
     payment = await node.call<{ payment_hash?: unknown; created_at?: unknown }>("get_payment", [{ payment_hash: paymentHash }]);
-  } catch {
-    return undefined;
+  } catch (error) {
+    // Fiber answers an unknown hash with "Payment session not found". Transport failures share its error type
+    // and code, so only that answer counts as the node saying it never made the payment.
+    return { kind: error instanceof Error && /payment session not found/i.test(error.message) ? "absent" : "unknown" };
   }
-  if (!payment || payment.payment_hash !== paymentHash || typeof payment.created_at !== "string" || !/^0x[0-9a-f]{1,16}$/i.test(payment.created_at)) return undefined;
-  if (Number(BigInt(payment.created_at)) < sentAfter - CLOCK_SKEW_MS) return undefined;
-  return { completed: payment };
+  if (!payment || payment.payment_hash !== paymentHash || typeof payment.created_at !== "string" || !/^0x[0-9a-f]{1,16}$/i.test(payment.created_at)) return { kind: "unknown" };
+  if (Number(BigInt(payment.created_at)) < sentAfter - CLOCK_SKEW_MS) return { kind: "unknown" };
+  return { kind: "made", payment };
 }
 
 /** The payment hash a send will use, when it is known before sending: given, or the invoice's. A keysend has none. */
@@ -114,13 +126,32 @@ async function payOnce(context: PaymentContext, node: FiberCaller, body: Record<
   await consumeRequest(context.user, "payment", nonce);
   const outflow = { id: `payment:${nonce}`, ...paymentOutflow(String(request.summary.asset ?? "ckb"), BigInt(String(request.summary.outflow ?? "0"))) };
   const release = await reserveOutflow(context.user, outflow, request.requires_email_code);
+  let handle: PaymentHandle | undefined;
   try {
     if (record) {
       const paymentHash = await paymentHashOf(node, params);
-      if (paymentHash) await record({ paymentHash, sentAfter: Date.now() } satisfies PaymentHandle);
+      if (paymentHash) {
+        handle = { paymentHash, sentAfter: Date.now() };
+        await record(handle);
+      }
     }
+  } catch (error) {
+    await release();
+    throw error;
+  }
+  try {
     return await node.call(FIBER_METHODS[method].rpc, [params]);
   } catch (error) {
+    // A timeout or dropped connection looks like a rejection, but the node may have taken the payment. With its
+    // hash recorded, ask the node: a payment it made is this send's result; one it says it never made is a
+    // rejection; anything else keeps the reservation and leaves the outcome for a repeat to reconcile.
+    if (handle) {
+      const found = await lookupPayment(node, handle);
+      if (found.kind === "made") return found.payment;
+      if (found.kind === "unknown") {
+        throw new OutcomeUnknownError(`The payment's outcome isn't known yet (${error instanceof Error ? error.message : "the node didn't answer"}). Repeat the request with the same idempotency key to check it`);
+      }
+    }
     await release();
     throw error;
   }
