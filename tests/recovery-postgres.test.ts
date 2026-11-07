@@ -13,6 +13,7 @@ import { formatCkbSignature } from "../src/server/funding-transaction.ts";
 import { signingSettings } from "../src/server/general-signing.ts";
 import { issueBackupChallenge, recoveryBackupChange, recoverySetup, settleRecoveryChange, type RecoveryContext } from "../src/server/recovery.ts";
 import { readWallet, saveWallet, type ReadyWallet } from "../src/server/user-wallet.ts";
+import { litSignerOverride } from "../src/server/lit-config.ts";
 import { litPolicyRunner } from "../src/server/lit-policy.ts";
 import { fakeLit, litCodeIn } from "./lit-action-fixture.ts";
 
@@ -396,11 +397,11 @@ test("adding and removing backups: preview, emailed code, apply", { skip: !enabl
 test("with the policy Action: Lit emails the code, binds the email on chain, and checks the code itself", { skip: !enabled }, async (t) => {
   process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
   process.env.LIT_USAGE_API_KEY ??= "test-usage-key";
-  process.env.LIT_EMAIL_API_KEY ??= "re_test_sending_key";
-  const previous = { signer: process.env.KEYWAY_LIT_SIGNER, run: litPolicyRunner.run };
-  process.env.KEYWAY_LIT_SIGNER = "policy";
+  process.env.RESEND_API_KEY ??= "re_test_sending_key";
+  const previous = { signer: litSignerOverride.mode, run: litPolicyRunner.run };
+  litSignerOverride.mode = "policy";
   t.after(() => {
-    if (previous.signer === undefined) delete process.env.KEYWAY_LIT_SIGNER; else process.env.KEYWAY_LIT_SIGNER = previous.signer;
+    litSignerOverride.mode = previous.signer;
     litPolicyRunner.run = previous.run;
   });
 
@@ -517,9 +518,9 @@ test("with the policy Action: Lit emails the code, binds the email on chain, and
   // A request opened under one signer can't be finished under the other: the user is asked to start again.
   const updated = current;
   const third = h.sign(evmWallet());
-  delete process.env.KEYWAY_LIT_SIGNER;
+  litSignerOverride.mode = "digest";
   const opened = await recoveryBackupChange(context(updated), { operation: "preview", change: "add", backup: third }) as { confirmationNonce: string };
-  process.env.KEYWAY_LIT_SIGNER = "policy";
+  litSignerOverride.mode = "policy";
   await assert.rejects(recoveryBackupChange(context(updated), { operation: "request-email-code", change: "add", backup: third, confirmationNonce: opened.confirmationNonce }), /switched signers/);
   await assert.rejects(recoveryBackupChange(context(updated), { operation: "apply", change: "add", backup: third, confirmationNonce: opened.confirmationNonce, emailCode: "12345678" }), /switched signers/);
 });

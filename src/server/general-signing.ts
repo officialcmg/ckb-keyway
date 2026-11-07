@@ -8,6 +8,7 @@ import { database, type DatabaseSql } from "./database.ts";
 import { createConfirmationEmailTemplate } from "./email-template.ts";
 import { formatCkbSignature, serializeTransaction, signAccountGroups, type SigningGroup } from "./funding-transaction.ts";
 import { loadLitAction } from "./lit-actions.ts";
+import { LIT_ACTION_CIDS } from "./lit-config.ts";
 import { signCkbDigest } from "./lit.ts";
 import { litPolicyEnabled, policySignMessage, policySignTransaction, type LitEmailCode } from "./lit-policy.ts";
 import { recoverPkpPublicKey } from "./pkp-identity.ts";
@@ -266,7 +267,7 @@ async function signTransaction(context: SigningContext, validated: ValidatedTran
 
 /**
  * Signs the account's lock groups in a transaction: with the policy Action (the whole transaction, which it
- * checks itself) once KEYWAY_LIT_SIGNER=policy, otherwise digest by digest. A test's `signDigest` always wins.
+ * checks itself) once LIT_SIGNER is "policy", otherwise digest by digest. A test's `signDigest` always wins.
  */
 export async function signGroups(
   context: Pick<SigningContext, "wallet" | "signDigest">,
@@ -287,7 +288,7 @@ export async function sign(context: Pick<SigningContext, "wallet" | "signDigest"
   if (context.signDigest) return context.signDigest(digest, context.wallet);
   const signature = await signCkbDigest(digest, context.wallet.litPkpId, {
     apiKey: requiredEnv("LIT_USAGE_API_KEY"),
-    actionCid: requiredEnv("LIT_SIGN_ACTION_CID"),
+    actionCid: LIT_ACTION_CIDS["sign-ckb-digest"],
     actionCode: await loadLitAction("sign-ckb-digest"),
   });
   const recovered = ccc.hexFrom(recoverPkpPublicKey(ccc.bytesFrom(digest), signature));

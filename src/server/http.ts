@@ -17,6 +17,7 @@ import {
 } from "./auth.ts";
 import { acquireLease, heartbeatLease, releaseLease, requireLease } from "./device-lease.ts";
 import { loadLitAction } from "./lit-actions.ts";
+import { LIT_ACTION_CIDS } from "./lit-config.ts";
 import { wrapFiberKey } from "./lit.ts";
 import {
   previewFundingTransaction,
@@ -234,7 +235,7 @@ async function fiberKeyRequest(request: Request): Promise<Response> {
   // Lit seals the key to the browser's one-time key, so this server only relays ciphertext.
   const bundle = await wrapFiberKey(wallet.encryptedFiberKey, wallet.litPkpId, recipientPublicKey, deviceIdHash, {
     apiKey: requiredEnv("LIT_USAGE_API_KEY"),
-    actionCid: requiredEnv("LIT_WRAP_ACTION_CID"),
+    actionCid: LIT_ACTION_CIDS["wrap-fiber-key"],
     actionCode: await loadLitAction("wrap-fiber-key"),
   });
   return Response.json(bundle, { headers: { "Cache-Control": "no-store" } });

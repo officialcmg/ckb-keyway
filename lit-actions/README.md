@@ -27,8 +27,8 @@ Replaces `sign-ckb-digest.js`. It never signs a digest it is handed:
 - **identity:** signs only the fixed identity digest.
 - **message:** hashes a CKB "Nervos Message:" itself.
 
-The server uses it once `KEYWAY_LIT_SIGNER=policy`. Its CID is pinned in `src/server/lit-policy.ts` and
-`.env.example`. Register it the same way as above, as `keyway-ckb-policy-signer`, then remove the
+The server uses it once `LIT_SIGNER` is `"policy"` in `src/server/lit-config.ts`, where every Action's CID is
+pinned. Register it the same way as above, as `keyway-ckb-policy-signer`, then remove the
 `sign-ckb-digest` CID from the group. The full steps, the design and what stays trusted are in
 `research/lit-policy/README.md`.
 

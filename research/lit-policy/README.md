@@ -218,16 +218,17 @@ Both change send UX and every transaction builder. Neither is safe to ship in th
 
 ## 3. The chosen design
 
-(a) and (b) together, in `lit-actions/sign-ckb-transaction.js` (pinned CID in `src/server/lit-policy.ts`
-`POLICY_ACTION_CID` and `.env.example` `LIT_POLICY_ACTION_CID`, checked by `tests/lit-action-packaging.test.ts`).
+(a) and (b) together, in `lit-actions/sign-ckb-transaction.js` (CID pinned in `src/server/lit-config.ts`
+`LIT_ACTION_CIDS`, checked by `tests/lit-action-packaging.test.ts`).
 
 Server side:
 
-- `KEYWAY_LIT_SIGNER=policy` switches every signing path to the policy Action:
+- `LIT_SIGNER = "policy"` in `src/server/lit-config.ts` switches every signing path to the policy Action. It is a
+  constant in code, not an environment variable, so a deploy can't change the signer:
   - general transactions, messages, channel funding, the legacy sweep, recovery, and identity at account creation
     (`general-signing.ts` `signGroups`, `funding-transaction.ts`, `legacy-sweep.ts`, `recovery.ts`,
     `bootstrap.ts`, `pkp-identity.ts`).
-- Unset, the server uses `sign-ckb-digest` exactly as before. The server works with either during the switch.
+- With `"digest"` (the value this PR ships), the server uses `sign-ckb-digest` exactly as before.
 - With the policy signer on:
   - Turning recovery on and backup changes on bound accounts use `policySendCode`. The server stores only the
     ticket and the binding, and replies `codeLength: 8`. The SDK's code dialog then takes 8 digits.
@@ -289,33 +290,31 @@ Plainly, after the switch:
 
 You run these locally. The server has no Lit account credentials.
 
-1. **Resend.** Create a `sending_access` key restricted to `auth.ckbkeyway.dev`. Set it as `LIT_EMAIL_API_KEY` on
-   the API service. Make sure every Resend key the server holds, including `RESEND_API_KEY`, is `sending_access`.
+1. **Resend.** The Action sends codes with the server's existing `RESEND_API_KEY`. Make sure that key is a
+   `sending_access` key restricted to `auth.ckbkeyway.dev`: a `full_access` key could read sent emails, codes
+   included, back from Resend.
 2. **Check the provisioning key.** In the Chipotle dashboard, confirm that `LIT_PROVISIONING_API_KEY` can't add
    actions to groups.
 3. **Register the policy Action.**
    1. In the Chipotle dashboard, open **Action Runner** and paste `lit-actions/sign-ckb-transaction.js` exactly.
    2. Click **Get Lit Action IPFS CID**. It must be `QmXEKyvWa2MwCSY9qMBGUp3aawRrWeSW6xqP4SS2w8x2gd`, the same as
-      `LIT_POLICY_ACTION_CID` in `.env.example` and `POLICY_ACTION_CID` in `src/server/lit-policy.ts`. Any other
+      `LIT_ACTION_CIDS["sign-ckb-transaction"]` in `src/server/lit-config.ts`. Any other
       CID means the pasted source differs from this branch.
    3. Under **IPFS Actions**, register the CID as `keyway-ckb-policy-signer`.
    4. Add the CID to group 1, `CKB Keyway`. The PKPs are already in that group.
-4. **Smoke test on staging.**
-   1. Set `KEYWAY_LIT_SIGNER=policy` on `keyway-api-staging`.
-   2. Run `KEYWAY_LIT_SIGNER=policy npm run verify:lit` with a staging PKP. It should print "policy Action".
-   3. Sign in, sign a message, send a small transaction, turn recovery on, and add and remove a backup. The codes
-      should arrive from `security@auth.ckbkeyway.dev` with 8 digits.
-5. **Switch production.** Set `KEYWAY_LIT_SIGNER=policy` and `LIT_EMAIL_API_KEY` on the production API, then
-   deploy. No migration is needed.
+4. **Check it against real Lit.** Run `npm run verify:lit -- --policy`. It should print "policy Action".
+5. **Switch.** Change `LIT_SIGNER` to `"policy"` in `src/server/lit-config.ts`, merge and deploy. No migration is
+   needed. Then sign in, sign a message, send a small transaction, turn recovery on, and add and remove a backup.
+   The codes should arrive from `security@auth.ckbkeyway.dev` with 8 digits.
 6. **Remove the old signer.** Once production signs through the policy Action, remove the `sign-ckb-digest` CID
-   (`LIT_SIGN_ACTION_CID`, `QmXJAW3CKLUuKa9RjEZKCMzEmLYcT7z4tmrzxZvGGfm6Q3`) from group 1. Until you do, the server
+   (`QmXJAW3CKLUuKa9RjEZKCMzEmLYcT7z4tmrzxZvGGfm6Q3`) from group 1. Until you do, the server
    can still sign any digest, and nothing above holds. Then rotate `LIT_USAGE_API_KEY`.
 7. Keep `generate-fiber-key` and `wrap-fiber-key` in the group. They are unchanged.
 
 ## Rollback
 
 1. Re-add the `sign-ckb-digest` CID to group 1.
-2. Unset `KEYWAY_LIT_SIGNER` and redeploy.
+2. Set `LIT_SIGNER` back to `"digest"` in `src/server/lit-config.ts` and deploy.
 
 Accounts that turned recovery on under the policy signer keep their on-chain binding. With the digest signer back,
 their list changes use the server's 6-digit code again, as before. Nothing in the database needs undoing.

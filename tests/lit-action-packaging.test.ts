@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { loadLitAction } from "../src/server/lit-actions.ts";
 import { litActionCid } from "../src/server/lit-cid.ts";
+import { LIT_ACTION_CIDS } from "../src/server/lit-config.ts";
 import { POLICY_ACTION_CID } from "../src/server/lit-policy.ts";
 
 test("the API runtime includes all wallet recovery and signing actions", async () => {
@@ -14,16 +15,9 @@ test("the API runtime includes all wallet recovery and signing actions", async (
   }
 });
 
-test("each Action's pinned CID in .env.example matches its source", async () => {
-  const env = await readFile(new URL("../.env.example", import.meta.url), "utf8");
-  const pinned = (name: string) => new RegExp(`^${name}=(\\S+)$`, "m").exec(env)?.[1];
-  for (const [variable, action] of [
-    ["LIT_SIGN_ACTION_CID", "sign-ckb-digest"],
-    ["LIT_POLICY_ACTION_CID", "sign-ckb-transaction"],
-    ["LIT_GENERATE_ACTION_CID", "generate-fiber-key"],
-    ["LIT_WRAP_ACTION_CID", "wrap-fiber-key"],
-  ] as const) {
-    assert.equal(litActionCid(await loadLitAction(action)), pinned(variable), variable);
+test("each Action's CID in lit-config.ts matches its source", async () => {
+  for (const [action, cid] of Object.entries(LIT_ACTION_CIDS) as [keyof typeof LIT_ACTION_CIDS, string][]) {
+    assert.equal(litActionCid(await loadLitAction(action)), cid, action);
   }
 });
 
