@@ -244,13 +244,13 @@ Separate small fix: a hosted Fiber payment `send` that carries an `Idempotency-K
 first error, and never pays twice. A repeat that arrives while the first send is still running waits up to 30
 seconds for its outcome.
 
-If a payment succeeds but its result can't be stored, the record stays "running" and is never marked failed.
-A repeat then never reports a failure for a payment that went through. It reports "still in progress", then,
-after 24 hours, that the record expired. Neither means the payment failed: check the payment's status before
-retrying it with a new key. Not handled: the server crashing after Fiber accepted a payment but before the result was stored. A retry then
-says "still in progress" until the key expires in 24 hours. It never pays twice, but checking the outcome with
-Fiber's `get_payment` is left for later. The SDK already retries once with the same key on network errors and 5xx
-(`api-client.ts`).
+If a payment's result can't be stored, or the server stops after Fiber accepted the payment but before the
+result was saved, the record stays "running" and is never marked failed. A repeat with the same key that arrives
+within a minute reports "still in progress". After that, the repeat asks Fiber with `get_payment`, using the
+payment hash recorded before the send. If Fiber has the payment, the repeat returns it and stores it as the
+result. If not, or for a keysend (which has no hash to look up), it reports that the outcome isn't known yet. It
+never pays twice. After 24 hours the key expires. The SDK already retries once with the same key on network errors
+and 5xx (`api-client.ts`).
 
 ## What stays trusted
 
