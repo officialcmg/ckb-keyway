@@ -1061,29 +1061,33 @@ function recordIn(witness) {
 }
 
 /**
- * The entries the send-limit input's previous record holds, once that input is shown to be one this key made: the
- * transaction that created it either spent the previous send-limit cell (its record sits on that input) or is a
- * genesis whose input 0 was a plain cell at the key's secp256k1 address. Both need the key's signature, and the
- * Action checked each earlier step when it signed it.
+ * The entries the send-limit input's previous record holds, and a check (run alongside the time lookups) that the
+ * input is one this key made: the transaction that created it either spent the previous send-limit cell (its
+ * record sits on that input) or is a genesis whose input 0 was a plain cell at the key's secp256k1 address. Both
+ * need the key's signature, and the Action checked each earlier step when it signed it.
  */
-async function previousEntries(account, input) {
+function previousEntries(account, input) {
   const created = input.createdBy;
   const records = [];
   created.witnesses.forEach((witness, index) => { const record = recordIn(witness); if (record) records.push({ index, record }); });
   if (records.length > 1) throw new Error("The send-limit cell's history is malformed");
   if (records.length === 0) {
     if (!equalBytes(input.output.type.args, typeIdArgs(created.inputs[0], input.outputIndex))) throw new Error("The send-limit cell isn't one this account made");
-    const [first] = await inputCellsOf({ inputs: [created.inputs[0]] });
-    if (lockKind(account, first.output.lock) !== "secp256k1" || !isPlain(first.output, first.data)) throw new Error("The send-limit cell isn't one this account made");
-    return [];
+    const check = async () => {
+      const [first] = await inputCellsOf({ inputs: [created.inputs[0]] });
+      if (lockKind(account, first.output.lock) !== "secp256k1" || !isPlain(first.output, first.data)) throw new Error("The send-limit cell isn't one this account made");
+    };
+    return { entries: [], check };
   }
   const { index, record } = records[0];
   if (index >= created.inputs.length) throw new Error("The send-limit cell isn't one this account made");
-  const [spent] = await inputCellsOf({ inputs: [created.inputs[index]] });
-  if (!sameScript(spent.output.lock, account.secp) || !sameScript(spent.output.type, input.output.type)) throw new Error("The send-limit cell isn't one this account made");
   const entries = parseRecord(record);
   if (entries.length === 0 || bytesToHex(entries[entries.length - 1].hash) !== input.createdByHash) throw new Error("The send-limit record is malformed");
-  return entries;
+  const check = async () => {
+    const [spent] = await inputCellsOf({ inputs: [created.inputs[index]] });
+    if (!sameScript(spent.output.lock, account.secp) || !sameScript(spent.output.type, input.output.type)) throw new Error("The send-limit cell isn't one this account made");
+  };
+  return { entries, check };
 }
 
 /**
@@ -1265,8 +1269,9 @@ async function limitAnalysis(analysis, params) {
     const before = parseSettings(input.data);
     const after = parseSettings(output.data);
     if (!equalBytes(before.fingerprint, after.fingerprint)) throw new Error("The email bound to send limits can't change");
-    const previous = await previousEntries(account, input);
-    const times = await entryTimes(previous, input);
+    const { entries: previous, check } = previousEntries(account, input);
+    // The proof the input is the account's own and the ancestors' times are independent lookups: run them together.
+    const [times] = await Promise.all([entryTimes(previous, input), check()]);
     const now = Date.now();
     const totals = windowTotals(previous, times, now);
     const self = { hash: analysis.txHash, time: 0n, ckb: flow.ckb, tokens: flow.tokens };

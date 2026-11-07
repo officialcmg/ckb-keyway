@@ -189,7 +189,10 @@ counted send, and fund channels only from there.
 ## 5. What stays trusted
 
 - **Turning limits on.** Whoever runs the server at genesis picks the bound address (trust on first use), as for
-  recovery. An account that never turned limits on is exactly as exposed as today.
+  recovery. An account that never turned limits on is exactly as exposed as today. Limits take effect once the
+  genesis is committed (about one block): the "does this account have limits?" check reads the indexer, which
+  only sees committed cells, so a send that leaves the cell out is treated as before during that block. The live
+  proof shows both sides of it (section 6).
 - **Accounts whose amounts live only on the server** (set before this change, or without 175 free CKB). Their
   limits stay server-enforced until the cell exists.
 - **Fiber.** Payments and channel balances are moved by the Fiber key, which a compromised server can obtain
@@ -203,10 +206,37 @@ counted send, and fund channels only from there.
 - **The Lit clock**, the TEE network, the founder's Lit account, and everything else listed in the lit-policy
   README. The `sign-ckb-digest` CID must still be removed from the group, or none of this holds.
 
-## 6. Latency
+## 6. Live proof and latency
 
-Measured on testnet with the Action under the fake Lit runtime against live RPC (`research/send-limits/live.ts`);
-real Lit adds its own overhead on top. See section 8 for the numbers.
+`research/send-limits/live.ts` runs on CKB testnet with two faucet-funded throwaway keys standing in for two
+accounts' PKPs. The Action runs unchanged under a stand-in Lit runtime (key operations use the test key, email goes
+to a log) against the live RPC; everything else is the production code: the server's preview, local planning and
+Lit code flow, the pending-transaction list in Postgres, and `KeyWaySigner` with a fresh CCC client per send (a new
+tab or device). Output: `research/send-limits/live.out`.
+
+| Step | What happened on testnet |
+|---|---|
+| 1 | Account A turns on 300 CKB a day: the Action emails an 8-digit code; the genesis (`0x91b1acbd…31cd`) carries 47 bytes, the fingerprint and the amount, no address. |
+| 2 | Two 100 CKB sends from two fresh clients, the second while the first (and the genesis) are still pending. Both chain on the pending send-limit cell and are accepted (730 ms and 834 ms end to end). |
+| 3 | A "compromised server" asks for two 90 CKB sends at once; each is under the amount on its own (200 + 90 < 300) and the Action signs both. The node accepts one and refuses the other (`PoolRejectedRBF`): they spend the same cell. |
+| 4 | The next send (70 CKB) needs the code; with it, it goes through. Without it, the client's prompt is cancelled and nothing is signed. |
+| 5 | A send that leaves the cell out: while the genesis is pending it is treated as before limits (see section 5); once the genesis commits (63 s here) the plan says "unchained", and Lit refuses without the code. |
+| 6 | Account B (no limits): two sends from two fresh clients back to back, the second before the first confirms, both accepted. A client without the pending list builds the same transaction again and the node refuses it with `PoolRejectedDuplicatedTransaction`: the reported bug. |
+
+Latency of one Action run, median of five, against the live RPC from the machine that ran the proof (about 80 ms a
+round trip to `testnet.ckb.dev`). This is the Action's own time; real Lit adds its fixed overhead on top, and its
+nodes' distance to the RPC changes the round trips.
+
+| | ms |
+|---|---|
+| Previous policy Action, plain send | 81 |
+| This Action, account without limits (one extra indexer read: "does it have limits?") | 160 |
+| This Action, chained send with limits on (the proof the cell is the account's, and the ancestors' times, in parallel) | 237 |
+| Server-side plan at preview (keyless, same rules, before the user approves) | 237 |
+
+So a send gets about 0.08 s (no limits) or 0.16 s (limits on) slower inside Lit, plus about 0.24 s at preview on the
+server: roughly +0.4 s per send with limits on. Today's policy signer takes 0.65 to 2.4 s, so expect about 1.05 to
+2.8 s. Back-to-back sends don't wait for a block.
 
 ## 7. Founder steps
 

@@ -387,7 +387,12 @@ async function signAndSendSettings(context: SigningContext, client: ccc.Client, 
   await context.recordSigning(context.user.id);
   const signed = await signGroups(context, transaction, groups, client, options);
   await recordPendingTransaction(context.user.id, signed);
-  await (context.broadcast ?? ((tx: ccc.Transaction) => client.sendTransaction(tx, "passthrough")))(signed);
+  try {
+    await (context.broadcast ?? ((tx: ccc.Transaction) => client.sendTransaction(tx, "passthrough")))(signed);
+  } catch (error) {
+    // The same transaction already in the pool (a repeated request built it again) is what we wanted.
+    if (!(error instanceof Error && /PoolRejectedDuplicatedTransaction/.test(error.message))) throw error;
+  }
 }
 
 /**

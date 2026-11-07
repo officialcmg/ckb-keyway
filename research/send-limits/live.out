@@ -1,0 +1,33 @@
+11:40:04.048 account A ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq0rzw8lqtpy6gdwyjcyj6gns4m3259sz4qxsflln balance 10000
+11:40:04.138 account B ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsq2dhwx6hc3k4h0fhz5khcvs66he2nl8zasjg2y9u balance 10000
+11:40:04.984 1. turning limits on (300 CKB a day): code needed true, 8-digit Lit code emailed
+11:40:05.450    genesis 0x91b1acbd723e5584593eb9d1b01807be5861dbb43ada63fa42b72d3a2cb931cd sent in 1200 ms; send-limit cell 0x91b1acbd723e5584593eb9d1b01807be5861dbb43ada63fa42b72d3a2cb931cd:0, data 47 bytes (fingerprint only)
+11:40:05.909   approve: send 100 CKB, fee 0.00032492, code not needed
+11:40:06.181 2. send 1 from client X: 100 CKB sent in 730 ms end to end (Lit Action 167 ms), tx 0xfd8b1979b46374799a1be51adb3fc9bc9cce019e80d610db39378a5be0eb553a
+11:40:06.735   approve: send 100 CKB, fee 0.00034119, code not needed
+11:40:07.015    send 2 from fresh client Y (send 1 still pending): 100 CKB sent in 834 ms end to end (Lit Action 176 ms), tx 0xbfb1f27631e3b79129b1498e2c309f5a371b2408e2d908bc26182b1a0a20bbb5
+11:40:07.187    status now: send 1 pending, send 2 pending
+11:40:08.196 3. two parallel requests, each planned under the amount (code needed: false, false), both signed by the Action
+11:40:08.288    broadcast 1: accepted 0xf300a6ebdcc9af7522bb5a713fdf7f2d6cc3cdd9b4cbceac442f8dcf1b0423d9
+11:40:08.376    broadcast 2: refused by the node: Client request error PoolRejectedRBF: RBF rejected: Tx's current fee is 35747, expect it to >= 37142 to replace old txs
+11:40:08.839   approve: send 70 CKB, fee 0.00037375, code needed
+11:40:09.018   code prompt: 8-digit code sent to a@example.com
+11:40:09.309 4. send over the amount from fresh client Z (code entered): 70 CKB sent in 933 ms end to end (Lit Action 190 ms), tx 0x01964d304673cc9bd46afac2694afc879dda444854f3802f68233b2b1a1c9316
+11:40:09.758   approve: send 70 CKB, fee 0.00039003, code needed
+11:40:09.944    without the code: refused (Email confirmation was cancelled)
+11:40:10.553 5. a send without the send-limit cell: plan says legacy, code needed false
+11:40:10.554    the genesis isn't committed yet, so the indexer can't show the cell; waiting for it
+11:41:13.568    after 63015 ms: plan says unchained, code needed true
+11:41:13.834    Lit refuses: Enter the eight-digit code from your email
+11:41:14.347   approve: send 100 CKB, fee 0.00015416, code not needed
+11:41:14.620 6. B send 1 from client P: 100 CKB sent in 786 ms end to end (Lit Action 165 ms), tx 0x2f1aa47ab9b0b233032bd9fd56becfb44ce2a01050521469a1479a33afa521ba
+11:41:15.119   approve: send 100 CKB, fee 0.00015416, code not needed
+11:41:15.383    B send 2 from fresh client Q (send 1 still pending): 100 CKB sent in 763 ms end to end (Lit Action 161 ms), tx 0x4ae7423c4be3c4108745842aab74133e52f01802403cd028ec37ccc4ec62e027
+11:41:15.542    status: pending, pending
+11:41:16.031    a client without the list picks a spent cell and the node refuses it: Client request error PoolRejectedDuplicatedTransaction: Transaction(Byte32(0x2f1aa47ab9b0b233032bd9fd56becfb44ce2a01050521469a1479a33afa521ba)) already exists i
+11:41:21.086 7. one Action run, median of 5 against live testnet RPC from this machine:
+11:41:21.086    previous policy Action, plain send: 81 ms
+11:41:21.086    this Action, send from an account without limits: 160 ms
+11:41:21.086    this Action, chained send with limits on: 237 ms
+11:41:21.086    server-side plan at preview (keyless, same rules): 237 ms
+11:41:21.086 Lit runs during the proof: send-code 275, transaction 270, transaction 167, transaction 176, send-code 173, transaction 190, send-code 183, transaction 165, transaction 161
