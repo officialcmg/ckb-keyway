@@ -175,8 +175,16 @@ try {
   }
 
   if (plan.forceClose) {
-    // A run stopped while (or just after) asking for the force close may find the funding already spent.
-    const closedBy = resuming ? await spender(state.funding.txHash, state.funding.index) : undefined;
+    // A run stopped while (or just after) asking for the force close may find the funding already spent. "unknown"
+    // (spent, but the spender isn't found yet, or the cell is in flux after a reorganization) proves nothing: wait
+    // until the cell is live again or its spender is known, and never record a close on it.
+    let closedBy = resuming ? await spender(state.funding.txHash, state.funding.index) : undefined;
+    for (let tries = 0; closedBy === "unknown"; tries++) {
+      if (tries >= 30) throw new Error("the funding cell is spent but its spender can't be found yet; run again later");
+      log("funding spent, spender not found yet; checking again in a minute");
+      await new Promise((r) => setTimeout(r, 60_000));
+      closedBy = await spender(state.funding.txHash, state.funding.index);
+    }
     if (closedBy) {
       state.forceCloseAt = now(); save();
       record(`funding already spent by ${closedBy}; following it`);

@@ -39,6 +39,7 @@ test("a missing or unreadable state file starts from nothing", () => {
   assert.deepEqual(loadSettlementState(undefined), {});
   assert.deepEqual(loadSettlementState("{not json"), {});
   assert.deepEqual(loadSettlementState("[]"), {});
+  for (const scalar of ["null", "42", '"state"', "true"]) assert.deepEqual(loadSettlementState(scalar), {}, scalar);
 });
 
 test("a restart resumes an unfinished run that reached its force close, on the same account and channel", () => {
