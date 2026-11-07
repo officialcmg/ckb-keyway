@@ -17,6 +17,14 @@ export function loadSettlementState(text) {
   return saved;
 }
 
+/**
+ * An unfinished run that got as far as its force close: a restart signs in to the same account and follows the same
+ * channel instead of setting up new ones.
+ */
+export function resumableRun(state) {
+  return !state.finished && Boolean(state.email && state.password && state.address && state.channelId && state.funding && state.forceCloseAt);
+}
+
 /** Records the run's account. A different account than the saved one starts from nothing. */
 export function forAccount(state, address) {
   if (state.address !== address) for (const field of [...ACCOUNT_FIELDS, "finished"]) delete state[field];

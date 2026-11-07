@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { forAccount, forChannel, loadSettlementState } from "../research/e2e/settlement-state.mjs";
+import { forAccount, forChannel, loadSettlementState, resumableRun } from "../research/e2e/settlement-state.mjs";
 
 const finishedRun = {
   email: "st-old@example.test", password: "x", address: "ckt1old", channelId: "0xold",
@@ -39,4 +39,19 @@ test("a missing or unreadable state file starts from nothing", () => {
   assert.deepEqual(loadSettlementState(undefined), {});
   assert.deepEqual(loadSettlementState("{not json"), {});
   assert.deepEqual(loadSettlementState("[]"), {});
+});
+
+test("a restart resumes an unfinished run that reached its force close, on the same account and channel", () => {
+  const saved = { ...finishedRun, finished: undefined };
+  const state = loadSettlementState(JSON.stringify(saved));
+  assert.equal(resumableRun(state), true);
+  // Signing in again to the saved account keeps the channel, its funding and the commitment found so far.
+  forAccount(state, saved.address);
+  assert.equal(state.channelId, saved.channelId);
+  assert.equal(state.commitment, saved.commitment);
+  assert.deepEqual(state.funding, saved.funding);
+  // A finished run, or one that never reached its force close, starts fresh.
+  assert.equal(resumableRun(loadSettlementState(JSON.stringify(finishedRun))), false);
+  assert.equal(resumableRun(loadSettlementState(JSON.stringify({ ...saved, forceCloseAt: undefined }))), false);
+  assert.equal(resumableRun(loadSettlementState(JSON.stringify({ ...saved, password: undefined }))), false);
 });

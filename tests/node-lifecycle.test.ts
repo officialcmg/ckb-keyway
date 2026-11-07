@@ -17,6 +17,7 @@ function harness() {
   let finishStart: (() => void) | undefined;
   let claimFails: Error | undefined;
   let startFails: Error | undefined;
+  let holdClaim: Promise<void> | undefined;
   const node = {
     get isRunning() { return running; },
     start() {
@@ -37,6 +38,7 @@ function harness() {
     node,
     async claim() {
       log.push("claim");
+      await holdClaim;
       if (claimFails) throw claimFails;
     },
     openBridge() { bridgeOpen = true; log.push("bridge.open"); },
@@ -57,6 +59,8 @@ function harness() {
     startPending: () => finishStart !== undefined,
     failClaim: (error: Error) => { claimFails = error; },
     failStart: (error: Error) => { startFails = error; },
+    /** Makes claim() wait until the returned function is called. */
+    deferClaim: () => { let finish!: () => void; holdClaim = new Promise((resolve) => { finish = resolve; }); return () => { log.push("claimed"); finish(); }; },
   };
 }
 
@@ -124,6 +128,24 @@ test("a stop while the device is being claimed keeps the node down, and lets go 
   await assert.rejects(started, /stopped while it was starting/);
   await stopping;
   assert.deepEqual(h.log, ["timers.stop", "node.stop (not running)", "release"]);
+});
+
+test("a stop while the claim is still pending waits for it, never starts the node, and lets go of the device once", async () => {
+  const h = harness();
+  const finishClaim = h.deferClaim();
+  const started = h.lifecycle.start();
+  await until(() => h.log.includes("claim"));
+  let stopped = false;
+  const stopping = h.lifecycle.stop().then(() => { stopped = true; });
+  await tick();
+  await tick();
+  assert.equal(stopped, false, "stop returned while the claim was still pending");
+  finishClaim();
+  await assert.rejects(started, /stopped while it was starting/);
+  await stopping;
+  assert.equal(h.log.includes("node.start"), false);
+  assert.equal(h.log.filter((entry) => entry.startsWith("release")).length, 1);
+  assert.deepEqual(h.log, ["claim", "timers.stop", "node.stop (not running)", "claimed", "release"]);
 });
 
 test("starts don't race: a second call joins the first, and a start after a stop waits for it", async () => {

@@ -31,6 +31,14 @@ export async function newMailbox(label) {
   return { email, password, token, seen: new Set() };
 }
 
+/** Signs in to a mailbox newMailbox made earlier (a resumed run), with every message already in it marked seen. */
+export async function openMailbox(email, password) {
+  const token = (await json("https://api.mail.tm/token", { address: email, password })).token;
+  const mailbox = { email, password, token, seen: new Set() };
+  await markSeen(mailbox);
+  return mailbox;
+}
+
 export async function markSeen(mailbox) {
   for (const message of (await json("https://api.mail.tm/messages", undefined, mailbox.token))["hydra:member"]) mailbox.seen.add(message.id);
 }
