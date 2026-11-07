@@ -367,11 +367,14 @@ function lockSearchKey(lock, filter) {
   };
 }
 
-/** Live cells under a lock, from the indexer, a page of 64 at a time, only those matching `filter`; refuses more than `maxCells`. */
+/**
+ * Live cells under a lock, from the indexer, a page of 256 at a time, only those matching `filter`; refuses more
+ * than `maxCells`. Large pages keep a run within Lit's limit on outbound requests.
+ */
 async function indexerCells(lock, maxCells, filter, urls = RPC_URLS) {
   const searchKey = lockSearchKey(lock, filter);
   const method = "get_cells";
-  const pageSize = 0x40;
+  const pageSize = 0x100;
   const cells = [];
   let cursor = null;
   for (;;) {
@@ -432,8 +435,10 @@ async function madeByKey(account, candidates, urls) {
     params: [lockSearchKey(lock, { block_range: [`0x${block.toString(16)}`, `0x${(block + 1n).toString(16)}`] }), "asc", "0x400"],
   })));
   const made = new Set();
-  for (let at = 0; at < calls.length; at += 64) {
-    for (const result of await rpcBatch(calls.slice(at, at + 64), urls)) {
+  // 256 calls a batch: at most 1024 candidates take 8 requests, so the whole run stays well within Lit's request
+  // limit, with room for the code email.
+  for (let at = 0; at < calls.length; at += 256) {
+    for (const result of await rpcBatch(calls.slice(at, at + 256), urls)) {
       if (!Array.isArray(result?.objects)) throw new Error("CKB RPC returned an invalid get_transactions page");
       // A full page can't be read past here; outsiders can only fill it by giving this key 1024 cells in one block.
       if (result.objects.length >= 0x400) throw new Error("A block holds too much of this key's history to check");
@@ -455,6 +460,20 @@ async function madeByKey(account, candidates, urls) {
  * cells are live, and the history, are the node's word; the indexer only follows committed blocks.
  */
 async function liveLists(account, urls = RPC_URLS) {
+  // The candidates and the history must come from the same node: history from a node behind the one that listed a
+  // list could leave the list out. A node that fails retries the whole check on the next.
+  let lastError;
+  for (const url of urls) {
+    try {
+      return await liveListsAt(account, [url]);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError ?? new Error("CKB RPC is unavailable");
+}
+
+async function liveListsAt(account, urls) {
   // Only Type ID cells are asked for, so plain cells sent to the lock can't crowd out the check. Each fake list
   // locks its capacity under this key for good, so blocking with more than 1024 costs an attacker about 131k CKB.
   const objects = (await indexerCells(account.listLock, 1024, TYPE_ID_FILTER, urls)).map((object) => {

@@ -543,6 +543,7 @@ test("a key with a long history still signs: only the blocks holding candidate l
   });
   const result = await action.main({ mode: "transaction", pkpId, transaction: JSON.parse(ccc.stringify(spend)) }) as { operation: string };
   assert.equal(result.operation, "plain");
+  assert.ok(env.historyReads.length > 0, "the history is read");
   assert.ok(Math.max(...env.historyReads) < 10, "only the enable's block is read");
 });
 
@@ -558,6 +559,50 @@ test("typed cells sent to the key's address don't count toward the plain-cell li
   const action = await loadAction(env);
   const sent = await policySendCode(plan.transaction, wallet, { email: "user@example.com", appName: "Demo", backups: [evm(48)], client }, runner(action));
   assert.ok(sent.ticket);
+});
+
+test("the list check reads candidates and history from the same node, retrying both on the next", async () => {
+  const { funding, signed: enable, plan } = await enableWithPolicy([evm(49)]);
+  // The first node lists cells but fails history queries; the check must not pair its candidates with the second
+  // node's history, which could be behind.
+  const env = fakeLit({
+    privateKey, pkpId, actionKey,
+    lookup: (hash) => [funding, enable].find((tx) => tx.hash() === hash) && { tx: [funding, enable].find((tx) => tx.hash() === hash)!, status: "committed" },
+    transactions: () => [funding, enable],
+    failingAt: (url, methods) => url === "https://testnet.ckb.dev/" && methods.includes("get_transactions"),
+  });
+  const action = await env.load();
+  const index = enable.outputs.findIndex((output) => output.lock.eq(plan.omnilock));
+  const spend = ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: enable.hash(), index } }],
+    outputs: [{ lock: plan.omnilock, capacity: enable.outputs[index].capacity - 100_000n }],
+    outputsData: ["0x"],
+    witnesses: [ccc.hexFrom(ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(85)) }).toBytes())],
+  });
+  assert.equal((await action.main({ mode: "transaction", pkpId, transaction: JSON.parse(ccc.stringify(spend)) }) as { operation: string }).operation, "plain");
+  const second = env.requests.filter(({ url }) => url === "https://testnet.ckbapp.dev/");
+  assert.ok(second.some(({ methods }) => methods.includes("get_cells")), "the second node lists the candidates too");
+  assert.ok(second.some(({ methods }) => methods.includes("get_transactions")));
+});
+
+test("an enable stays within Lit's request limit, code email included, however many fake lists there are", async () => {
+  const { funding, client } = await funded();
+  const env = world([funding]);
+  const plan = await planRecovery(client, walletFor(), [evm(50)], { emailBinding: true });
+  const listLock = plan.transaction.outputs[0].lock;
+  // 1,000 fake lists, each in its own block, so each needs its own history query.
+  for (let i = 0; i < 1_000; i++) {
+    env.add(ccc.Transaction.from({
+      inputs: [{ previousOutput: { txHash: `0x${(seed++).toString(16).padStart(64, "0")}`, index: 0 } }],
+      outputs: [{ lock: listLock, type: adminListTypeScript({ adminListTypeArgs: ccc.hexFrom(ccc.hashCkb(ccc.numLeToBytes(i + 10_000, 4))) }), capacity: 200n * CKB }],
+      outputsData: [adminListData(`0x${"78".repeat(32)}`)],
+    }));
+  }
+  const action = await loadAction(env);
+  const sent = await policySendCode(plan.transaction, wallet, { email: "user@example.com", appName: "Demo", backups: [evm(50)], client }, runner(action));
+  assert.ok(sent.ticket);
+  // Lit allows 50 outbound requests a run by default; the email is one more.
+  assert.ok(env.requests.length + env.emails.length <= 25, `${env.requests.length} RPC requests`);
 });
 
 test("no output may go to an administrator-mode Omnilock of the key in another shape: other flags or the official deployment", async () => {

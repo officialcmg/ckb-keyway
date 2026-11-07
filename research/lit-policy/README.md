@@ -82,7 +82,9 @@ It also enforces these invariants on the recovery list:
   own secp256k1 address or its list lock (a change must spend the list as input 0 for the same reason). The
   Action reads that from the key's own lock history (indexer `get_transactions` on those two locks, inputs at
   index 0), which only the key can add inputs to, and only in the blocks that hold candidate lists (a
-  `block_range` filter, in batches of 64 queries). It never downloads a candidate's transaction, so an outsider
+  `block_range` filter, in batches of 256 queries). Candidates and history come from the same node, so a node
+  behind can't leave a list out. With the indexer read 256 cells a page, even 1024 fake lists keep an enable to
+  about 15 requests, well within Lit's limit on outbound requests per run, with room for the code email. It never downloads a candidate's transaction, so an outsider
   can't make the check slow or exhaust memory by planting lists from huge, witness-padded transactions, and a
   long account history costs nothing. The indexer is queried with `script_search_mode: "exact"`:
   its default prefix search would also return unspendable cells planted under longer args, which would block
@@ -283,7 +285,7 @@ You run these locally. The server has no Lit account credentials.
    actions to groups.
 3. **Register the policy Action.**
    1. In the Chipotle dashboard, open **Action Runner** and paste `lit-actions/sign-ckb-transaction.js` exactly.
-   2. Click **Get Lit Action IPFS CID**. It must be `QmdenFdHhgK8THUEBDDatEyhxbXTU3M8c7Jd4P74xBsK8Y`, the same as
+   2. Click **Get Lit Action IPFS CID**. It must be `QmXoAYg81gzWvX3wg7oCiaT3JzJcrHMw2eogfNWLrz3Loo`, the same as
       `LIT_POLICY_ACTION_CID` in `.env.example` and `POLICY_ACTION_CID` in `src/server/lit-policy.ts`. Any other
       CID means the pasted source differs from this branch.
    3. Under **IPFS Actions**, register the CID as `keyway-ckb-policy-signer`.

@@ -54,11 +54,22 @@ export function fakeLit(options: {
   transactions: () => ccc.Transaction[];
   /** RPC methods whose calls fail with HTTP 500, as an unreachable node would. */
   failing?: (method: string) => boolean;
+  /** Requests to fail with HTTP 500, by node and methods. */
+  failingAt?: (url: string, methods: string[]) => boolean;
 }) {
   /** Every transaction hash the Action fetched with get_transaction. */
   const fetched: string[] = [];
   /** How many history entries each get_transactions call returned. */
   const historyReads: number[] = [];
+  /** Every RPC request: the node it went to and the methods in it. */
+  const requests: Array<{ url: string; methods: string[] }> = [];
+  /** As ckb-indexer pages: `limit` objects after the cursor (here an offset), and the cursor to continue from. */
+  const page = <T>(objects: T[], limit: string | undefined, cursor: string | undefined) => {
+    const from = cursor ? Number(cursor) : 0;
+    const size = limit ? Number(limit) : objects.length;
+    const slice = objects.slice(from, from + size);
+    return { objects: slice, last_cursor: ccc.numToHex(from + slice.length) };
+  };
   // Hashing is the fixture's main cost with large transactions, so each transaction is hashed once.
   const hashes = new WeakMap<ccc.Transaction, string>();
   const hashOf = (tx: ccc.Transaction) => { let hash = hashes.get(tx); if (!hash) { hash = tx.hash(); hashes.set(tx, hash); } return hash; };
@@ -83,6 +94,8 @@ export function fakeLit(options: {
     assert.ok(["https://testnet.ckb.dev/", "https://testnet.ckbapp.dev/"].includes(url), url);
     const parsed = JSON.parse(init.body);
     const methods = Array.isArray(parsed) ? parsed.map((call: { method: string }) => call.method) : [parsed.method];
+    if (url !== "https://api.resend.com/emails") requests.push({ url, methods });
+    if (options.failingAt?.(url, methods)) return new Response("node unavailable", { status: 500 });
     if (options.failing && methods.some(options.failing)) return new Response("node unavailable", { status: 500 });
     // Each transaction is in its own block, numbered by its place in `transactions()`.
     const history = (key: { script: { code_hash: string; hash_type: string; args: string }; script_search_mode?: string; filter?: { block_range?: [string, string] } }) => {
@@ -99,13 +112,13 @@ export function fakeLit(options: {
         ...tx.outputs.flatMap((output, index) => matches(output.lock) ? [{ tx_hash: hashOf(tx), io_type: "output", io_index: ccc.numToHex(index), block_number: ccc.numToHex(block) }] : []),
       ]);
       historyReads.push(objects.length);
-      return { objects, last_cursor: "0x" };
+      return objects;
     };
     if (Array.isArray(parsed) && parsed.every((call: { method: string }) => call.method === "get_transactions")) {
-      return new Response(JSON.stringify(parsed.map((call: { id: number; params: [Parameters<typeof history>[0]] }) => ({ id: call.id, jsonrpc: "2.0", result: history(call.params[0]) }))), { status: 200 });
+      return new Response(JSON.stringify(parsed.map((call: { id: number; params: [Parameters<typeof history>[0], string, string?, string?] }) => ({ id: call.id, jsonrpc: "2.0", result: page(history(call.params[0]), call.params[2], call.params[3]) }))), { status: 200 });
     }
     if (!Array.isArray(parsed) && parsed.method === "get_transactions") {
-      return new Response(JSON.stringify({ id: parsed.id, jsonrpc: "2.0", result: history(parsed.params[0]) }), { status: 200 });
+      return new Response(JSON.stringify({ id: parsed.id, jsonrpc: "2.0", result: page(history(parsed.params[0]), parsed.params[2], parsed.params[3]) }), { status: 200 });
     }
     if (!Array.isArray(parsed) && parsed.method === "get_cells") {
       const [{ script: wanted, filter, script_search_mode: mode }] = parsed.params as [{ script: { code_hash: string; hash_type: string; args: string }; script_search_mode?: string; filter?: { script?: { code_hash: string; hash_type: string; args: string }; script_len_range?: [string, string]; output_data_len_range?: [string, string] } }];
@@ -122,7 +135,7 @@ export function fakeLit(options: {
           && (!typeFilter || (output.type?.codeHash === typeFilter.code_hash && output.type.hashType === typeFilter.hash_type && output.type.args.startsWith(typeFilter.args)))
           && inRange(filter?.script_len_range, typeLength(output)) && inRange(filter?.output_data_len_range, ccc.bytesFrom(tx.outputsData[index]).length))
         .map(({ tx, output, index, block }) => ({ block_number: ccc.numToHex(block), out_point: { tx_hash: hashOf(tx), index: ccc.numToHex(index) }, output: { capacity: ccc.numToHex(output.capacity), lock: script(output.lock), type: output.type ? script(output.type) : null }, output_data: tx.outputsData[index] }));
-      return new Response(JSON.stringify({ id: parsed.id, jsonrpc: "2.0", result: { objects, last_cursor: "0x" } }), { status: 200 });
+      return new Response(JSON.stringify({ id: parsed.id, jsonrpc: "2.0", result: page(objects, parsed.params[2], parsed.params[3]) }), { status: 200 });
     }
     const calls = parsed as Array<{ id: number; params: [string] }>;
     return new Response(JSON.stringify(calls.map(({ id, params: [hash] }) => {
@@ -152,7 +165,7 @@ export function fakeLit(options: {
     const action = await load();
     return async (_config: unknown, params: Record<string, unknown>) => action.main(params);
   };
-  return { emails, fetch, Lit, load, runner, fetched, historyReads };
+  return { emails, fetch, Lit, load, runner, fetched, historyReads, requests };
 }
 
 /** The code in the last email the Action sent. */
