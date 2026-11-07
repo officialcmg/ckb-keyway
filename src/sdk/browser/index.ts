@@ -20,6 +20,7 @@ export {
   KeyWaySigner,
   type ApproveCkbMessage,
   type ApproveCkbTransaction,
+  type ApproveDailyLimit,
   type CellSummary,
   type MessagePreview,
   type TransactionPreview,
@@ -28,5 +29,6 @@ export type { ApproveFiberPayment, FiberPaymentPreview } from "./fiber-payment";
 export type { ApproveFiberChannelClose, ApproveFiberChannelSettings, ApproveFiberPeer, FiberChannelClosePreview, FiberChannelSettingsPreview, FiberPeerPreview } from "./fiber-actions";
 export type { KeyWayFiberNode, KeyWayNewInvoiceParams, ListPaymentsParams, ListPaymentsResult, OpenChannelParams } from "./fiber-node";
 export { FIBER_METHODS, type FiberMethod, type FiberMethodKind } from "./fiber-methods";
+export type { SendLimitOffer } from "./send-limits";
 export { friendlyKeyWayError } from "./friendly-error";
 export { KeyWayError, toKeyWayError, type KeyWayErrorCode } from "./keyway-error";

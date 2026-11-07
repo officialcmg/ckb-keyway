@@ -101,6 +101,18 @@ Only a transaction the account's key signed can create or change it, and the key
   lock-history proof (`madeByKey`), with one difference: any input, not only input 0, spent from the key's own
   address counts, because a send-limit transaction spends the cell wherever it sits.
 
+### On by default
+
+Before an account's first send, KeyWay offers to turn limits on: the pending-transactions answer carries
+`sendLimitOffer` (100,000 CKB a day, `DEFAULT_DAILY_LIMIT_CKB`, or the account's own CKB amount if it set one) when
+the policy signer is on, the account has no send-limit cell, it has no recovery, and it holds at least 236 CKB of plain
+CKB at its key's secp256k1 address. The SDK signer asks the user once (the "Protect your account" dialog, which they
+can edit, or an app's `approveDailyLimit`), runs the usual genesis with the Lit code, and builds the send on the new
+cell. It asks while CCC collects inputs, before any are chosen, so the genesis can take the oldest plain cell. A
+cancel cancels the send; an account whose oldest cell a pending send holds sends as before and is asked again next
+time. Channel fundings never ask: Fiber picks their inputs, so a genesis just before one would race it. Live run on
+testnet: `default-on.ts`, output in `default-on.out`.
+
 ### What every transaction must do
 
 The Action works out each transaction's outflow itself, from the input cells it fetches and checks against their

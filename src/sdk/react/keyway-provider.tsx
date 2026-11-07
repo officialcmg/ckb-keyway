@@ -56,8 +56,9 @@ import {
   type PendingJoyIdBackup,
   PendingJoyIdProof,
 } from "../browser/joyid-redirect";
-import { KeyWaySigner, type ApproveCkbMessage, type ApproveCkbTransaction, type MessagePreview, type TransactionPreview } from "../browser/keyway-signer";
-import { KeyWayChannelCloseModal, KeyWayChannelSettingsModal, KeyWayEmailCodeModal, KeyWayFundingModal, KeyWayMessageModal, KeyWayBackupChangeModal, KeyWayPeerModal, KeyWayRecoveryModal, KeyWayTransactionModal } from "./signing-modals";
+import { KeyWaySigner, type ApproveCkbMessage, type ApproveCkbTransaction, type ApproveDailyLimit, type MessagePreview, type TransactionPreview } from "../browser/keyway-signer";
+import type { SendLimitOffer } from "../browser/send-limits";
+import { KeyWayChannelCloseModal, KeyWayChannelSettingsModal, KeyWayDailyLimitModal, KeyWayEmailCodeModal, KeyWayFundingModal, KeyWayMessageModal, KeyWayBackupChangeModal, KeyWayPeerModal, KeyWayRecoveryModal, KeyWayTransactionModal } from "./signing-modals";
 import type { ApproveFiberChannelClose, ApproveFiberChannelSettings, ApproveFiberPeer, FiberApprovedAction, FiberChannelClosePreview, FiberChannelSettingsPreview, FiberPeerPreview } from "../browser/fiber-actions";
 import { CodeInput, ResendLine, Shell, StatusLine, type ApprovalStep } from "./dialog";
 import {
@@ -99,6 +100,12 @@ export type KeyWayProviderProps = {
   approveCkbTransaction?: ApproveCkbTransaction;
   /** Replaces the built-in dialog for signing a message. Return false to cancel. */
   approveCkbMessage?: ApproveCkbMessage;
+  /**
+   * Replaces the built-in "Protect your account" dialog shown before an account's first send, which turns daily send
+   * limits on. Return the daily CKB amount in shannons (`offer.ckb` is 100,000 CKB, or the user's own amount), or
+   * null to cancel the send. The emailed code follows.
+   */
+  approveDailyLimit?: ApproveDailyLimit;
   /** Replaces the built-in dialog for turning account recovery on. Return false to cancel. The emailed code follows. */
   approveRecovery?: ApproveRecovery;
   /** Replaces the built-in dialog for adding or removing a recovery backup. Return false to cancel. The emailed code follows. */
@@ -250,6 +257,7 @@ export function KeyWayProvider({
   approveFiberChannelSettings,
   approveCkbTransaction,
   approveCkbMessage,
+  approveDailyLimit,
   approveRecovery,
   approveBackupChange,
   autoStartFiber = false,
@@ -263,8 +271,11 @@ export function KeyWayProvider({
   const connectionRef = useRef<KeyWayConnection | undefined>(undefined);
   const operationRef = useRef<Promise<void>>(Promise.resolve());
   const runRef = useRef(0);
-  const callbacksRef = useRef({ approveFiberChannelOpen, approveFiberPayment, approveFiberChannelClose, approveFiberPeerConnect, approveFiberChannelSettings, approveCkbTransaction, approveCkbMessage, approveRecovery, approveBackupChange, onError, onFiberStartup });
-  callbacksRef.current = { approveFiberChannelOpen, approveFiberPayment, approveFiberChannelClose, approveFiberPeerConnect, approveFiberChannelSettings, approveCkbTransaction, approveCkbMessage, approveRecovery, approveBackupChange, onError, onFiberStartup };
+  const callbacksRef = useRef({ approveFiberChannelOpen, approveFiberPayment, approveFiberChannelClose, approveFiberPeerConnect, approveFiberChannelSettings, approveCkbTransaction, approveCkbMessage, approveDailyLimit, approveRecovery, approveBackupChange, onError, onFiberStartup });
+  callbacksRef.current = { approveFiberChannelOpen, approveFiberPayment, approveFiberChannelClose, approveFiberPeerConnect, approveFiberChannelSettings, approveCkbTransaction, approveCkbMessage, approveDailyLimit, approveRecovery, approveBackupChange, onError, onFiberStartup };
+  // The "Protect your account" dialog: answered with the chosen daily amount, or null to cancel the send.
+  const [limitRequest, setLimitRequest] = useState<{ offer: SendLimitOffer; resolve: (amount: bigint | null) => void }>();
+  const askDailyLimit = (offer: SendLimitOffer) => new Promise<bigint | null>((resolve) => setLimitRequest({ offer, resolve }));
   const [connection, setConnection] = useState<KeyWayConnection>();
   const [wallet, setWallet] = useState<PublicWallet>();
   const [status, setStatus] = useState<KeyWayStatus>("idle");
@@ -629,6 +640,7 @@ export function KeyWayProvider({
     return new ProviderSigner(authToken, wallet.litPublicKey, {
       approveCkbTransaction: (preview) => callbacksRef.current.approveCkbTransaction?.(preview) ?? approvalsRef.current.transaction.ask(preview),
       approveCkbMessage: (preview) => callbacksRef.current.approveCkbMessage?.(preview) ?? approvalsRef.current.message.ask(preview),
+      approveDailyLimit: (offer) => callbacksRef.current.approveDailyLimit?.(offer) ?? askDailyLimit(offer),
       requestEmailCode,
     }, undefined, new KeyWayApiClient({ appId }), wallet.recovery, {
       transaction: (error) => approvalsRef.current.transaction.settle(error),
@@ -783,6 +795,14 @@ export function KeyWayProvider({
             setUser(session.user);
             setLoginOpen(false);
           }}
+        />
+      ) : null}
+      {limitRequest ? (
+        <KeyWayDailyLimitModal
+          theme={theme}
+          appName={resolvedAppName}
+          offer={limitRequest.offer}
+          answer={(amount) => { limitRequest.resolve(amount); setLimitRequest(undefined); }}
         />
       ) : null}
       {transaction.request ? <KeyWayTransactionModal theme={theme} appName={resolvedAppName} preview={transaction.request.preview} step={transaction.request} answer={transaction.answer} /> : null}

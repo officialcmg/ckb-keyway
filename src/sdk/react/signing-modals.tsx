@@ -1,11 +1,13 @@
 "use client";
 
 import { useEffect, useRef, useState, type CSSProperties } from "react";
+import * as ccc from "@ckb-ccc/core";
 import type { BackupChangePreview, RecoveryPreview } from "../browser/account-recovery";
 import { canRetryCode, isRequestExpired, type EmailCodeReason } from "../browser/email-code";
 import type { MessagePreview, TransactionPreview } from "../browser/keyway-signer";
 import type { FiberChannelClosePreview, FiberChannelSettingsPreview, FiberPeerPreview } from "../browser/fiber-actions";
 import type { FiberChannelOpenPreview } from "../browser/remote-ckb-signer";
+import type { SendLimitOffer } from "../browser/send-limits";
 import { formatAsset } from "../browser/tokens";
 import { Actions, CodeInput, errorNote, ResendLine, Row, Shell, StatusLine, type ApprovalStep, type Theme } from "./dialog";
 import {
@@ -14,6 +16,8 @@ import {
   modalButton,
   modalCopy,
   modalEyebrow,
+  modalInput,
+  modalLabel,
   modalPrimaryButton,
   modalTitle,
   type ModalPalette,
@@ -438,6 +442,78 @@ export function KeyWayFundingModal({ theme, appName, preview, step, answer }: Ap
           <p style={note(palette)}>{preview.token ? "This locks the token, and some CKB as a reserve," : "This locks testnet CKB"} into a payment channel. It does not send funds to another wallet, and a normal close returns your side to your own account.</p>
           {preview.feeReserveCkb && <p style={note(palette)}>The fee reserve stays on your own Fiber node so it can claim your funds if a channel is ever force-closed. You get it back once all your channels are closed.</p>}
           <Actions palette={palette} confirm="Activate" busyLabel="Signing…" step={step} answer={answer} />
+        </>
+      )}
+    </Shell>
+  );
+}
+
+/** CKB a person typed ("100,000" or "2500.5") in shannons, or undefined if it isn't a positive amount. */
+export function parseCkbAmount(text: string): bigint | undefined {
+  const value = text.replace(/[\s,_]/g, "");
+  if (!/^\d{1,12}(\.\d{1,8})?$/.test(value)) return undefined;
+  const shannons = ccc.fixedPointFrom(value);
+  return shannons > 0n ? shannons : undefined;
+}
+
+/** A CKB amount for the field: whole CKB with thousands separators, decimals kept as they are. */
+export function formatCkbInput(shannons: bigint): string {
+  const [whole, fraction] = ccc.fixedPointToString(shannons).split(".");
+  return `${BigInt(whole).toLocaleString("en-US")}${fraction ? `.${fraction}` : ""}`;
+}
+
+/**
+ * The built-in dialog before an account's first send: turns daily send limits on, with the amount the user chooses.
+ * Anything above it within 24 hours needs the code KeyWay's Lit Action emails, and KeyWay's server can't skip it.
+ */
+export function KeyWayDailyLimitModal({ theme, appName, offer, answer }: {
+  theme: Theme;
+  appName: string;
+  offer: SendLimitOffer;
+  answer: (amount: bigint | null) => void;
+}) {
+  const [text, setText] = useState(() => formatCkbInput(offer.ckb));
+  const [invalid, setInvalid] = useState(false);
+  const amount = parseCkbAmount(text);
+  const confirm = (approved: boolean) => {
+    if (!approved) return answer(null);
+    if (amount === undefined) return setInvalid(true);
+    answer(amount);
+  };
+  return (
+    <Shell theme={theme} labelId="keyway-limit-title" onEscape={() => answer(null)}>
+      {(palette) => (
+        <>
+          <p style={{ ...modalEyebrow, color: palette.muted }}>{appName} · DAILY LIMIT</p>
+          <h2 id="keyway-limit-title" style={modalTitle}>Protect your account</h2>
+          <p style={{ ...modalCopy, color: palette.muted }}>
+            Sending more than this within 24 hours will need a code from your email.
+          </p>
+          <form style={{ margin: "20px 0 4px" }} onSubmit={(event) => { event.preventDefault(); confirm(true); }}>
+            <label style={{ ...modalLabel, color: palette.muted }}>
+              Daily limit
+              <span style={{ position: "relative", display: "block" }}>
+                <input
+                  autoFocus
+                  inputMode="decimal"
+                  autoComplete="off"
+                  aria-invalid={invalid && amount === undefined ? true : undefined}
+                  aria-describedby={invalid && amount === undefined ? "keyway-limit-error" : undefined}
+                  value={text}
+                  onChange={(event) => { setText(event.target.value); setInvalid(false); }}
+                  style={{ ...modalInput, paddingRight: 64, background: palette.surface, borderColor: invalid && amount === undefined ? palette.error : palette.border, color: palette.text }}
+                />
+                <span aria-hidden="true" style={{ position: "absolute", right: 16, top: "50%", transform: "translateY(-50%)", color: palette.muted, fontSize: 15, fontWeight: 600 }}>CKB</span>
+              </span>
+            </label>
+            {invalid && amount === undefined && (
+              <p id="keyway-limit-error" role="alert" style={{ ...errorNote(palette), margin: "10px 0 0" }}>Enter an amount above 0 CKB.</p>
+            )}
+          </form>
+          <p style={{ ...note(palette), margin: "16px auto 0" }}>
+            This keeps 174 CKB of your balance in a small record on CKB. It stays yours. We&apos;ll email you a code next.
+          </p>
+          <Actions palette={palette} confirm="Continue" busyLabel="Sending code…" answer={confirm} />
         </>
       )}
     </Shell>

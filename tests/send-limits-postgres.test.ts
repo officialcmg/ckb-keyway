@@ -6,9 +6,9 @@ import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { secp256k1Lock } from "../src/sdk/browser/account-lock.ts";
-import { chainOnSendLimit, decodeSendLimitSettings, isSendLimitCell, type SendLimitHead } from "../src/sdk/browser/send-limits.ts";
+import { chainOnSendLimit, decodeSendLimitSettings, DEFAULT_DAILY_LIMIT_SHANNONS, isSendLimitCell, type SendLimitHead } from "../src/sdk/browser/send-limits.ts";
 import { database } from "../src/server/database.ts";
-import { fundingCode, fundingNeedsLitCode, issueFundingCodeRequest, sendFundingCode, signingSettings, transactionSigning, type SigningContext } from "../src/server/general-signing.ts";
+import { fundingCode, fundingNeedsLitCode, issueFundingCodeRequest, sendFundingCode, sendLimitOffer, signingSettings, transactionSigning, type SigningContext } from "../src/server/general-signing.ts";
 import { litSignerOverride } from "../src/server/lit-config.ts";
 import { litPolicyRunner } from "../src/server/lit-policy.ts";
 import { listPendingTransactions } from "../src/server/pending-transactions.ts";
@@ -204,4 +204,25 @@ test("send limits through the server: turning them on, sending under and over th
     const sql = await database();
     await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
   });
+});
+
+test("send limits are offered by default to an account that could have them", { skip: !enabled }, async (t) => {
+  const { world, user, wallet } = await setUp();
+  t.after(() => { litSignerOverride.mode = undefined; });
+  // The indexer's capacity sum over the same committed cells the fake client lists.
+  const withCapacity = (plain: bigint) => Object.assign(world.client(), { getCellsCapacity: async () => plain });
+  const head = { outPoint: { txHash: `0x${"ab".repeat(32)}`, index: 0 }, cellOutput: { lock: wallet.litPublicKey, capacity: 0n }, outputData: "0x", recordEntriesBytes: 0 } as unknown as SendLimitHead;
+
+  assert.deepEqual(await sendLimitOffer(user, wallet, undefined, withCapacity(2_500n * CKB)), { ckb: DEFAULT_DAILY_LIMIT_SHANNONS }, "100,000 CKB a day by default");
+  assert.equal(await sendLimitOffer(user, wallet, head, withCapacity(2_500n * CKB)), undefined, "not once limits are on");
+  assert.equal(await sendLimitOffer(user, wallet, undefined, withCapacity(235n * CKB)), undefined, "not before the account can afford the cell");
+  assert.equal(await sendLimitOffer(user, { ...wallet, recovery: { omnilockArgs: "0x00" } } as unknown as ReadyWallet, undefined, withCapacity(2_500n * CKB)), undefined, "not for a recovery account, which can't hold the cell yet");
+
+  // An account that already chose an amount (kept by the server while it couldn't afford the cell) starts from it.
+  const sql = await database();
+  await sql`insert into keyway_v2_daily_amounts (user_id, asset, amount) values (${user.id}, 'ckb', ${(7_000n * CKB).toString()})`;
+  assert.deepEqual(await sendLimitOffer(user, wallet, undefined, withCapacity(2_500n * CKB)), { ckb: 7_000n * CKB });
+
+  litSignerOverride.mode = "digest";
+  assert.equal(await sendLimitOffer(user, wallet, undefined, withCapacity(2_500n * CKB)), undefined, "not without the policy signer, which enforces them");
 });

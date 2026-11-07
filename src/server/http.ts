@@ -38,7 +38,7 @@ import { managedFiberNode, managedNodeReady, managedNodeRequest, sweepHostedSett
 import { fiberPayment } from "./fiber-payments.ts";
 import { runIdempotentMutation } from "./idempotency.ts";
 import { recordSigningEvent } from "./security-alerts.ts";
-import { fundingCode, fundingNeedsLitCode, issueFundingCodeRequest, messageSigning, sendFundingCode, signingSettings, transactionSigning, type SigningContext } from "./general-signing.ts";
+import { fundingCode, fundingNeedsLitCode, issueFundingCodeRequest, messageSigning, sendFundingCode, sendLimitOffer, signingSettings, transactionSigning, type SigningContext } from "./general-signing.ts";
 import { litPolicyEnabled } from "./lit-policy.ts";
 import { listPendingTransactions, nodeStatus, recordPendingTransaction } from "./pending-transactions.ts";
 import { sendLimitHead } from "./send-limits.ts";
@@ -376,9 +376,12 @@ async function pendingTransactionsRequest(request: Request): Promise<Response> {
   const client = new ccc.ClientPublicTestnet();
   const pending = await listPendingTransactions(user.id, nodeStatus(client));
   const sendLimit = litPolicyEnabled() ? await sendLimitHead(client, wallet, pending) : undefined;
+  // Send limits are on by default: an account that could have them is offered them on its next send.
+  const offer = await sendLimitOffer(user, wallet, sendLimit, client).catch(() => undefined);
   return Response.json({
     transactions: pending.map(({ transaction }) => serializeTransaction(transaction)),
     ...(sendLimit ? { sendLimit: JSON.parse(ccc.stringify(sendLimit)) } : {}),
+    ...(offer ? { sendLimitOffer: { ckb: offer.ckb.toString() } } : {}),
   }, { headers: { "Cache-Control": "no-store" } });
 }
 

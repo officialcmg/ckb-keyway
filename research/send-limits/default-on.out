@@ -1,0 +1,15 @@
+13:11:30.707 fresh account ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqwzxapex2v0ntvrnnpjmqjt4lclk3kxeecrrxlr7 funded with 700 CKB: 0xc551b2bbc2b1433d526a81d9729be28ecf07ded8a1650855dab16d2b221a9929
+13:12:03.053   "Protect your account" dialog: offered 100000 CKB a day; the user edits it to 300 CKB
+13:12:06.654   code prompt (settings): 8-digit code sent to fresh@example.com
+13:12:10.156   approve: send 61 CKB, code not needed
+13:12:11.384 1. first send: 61 CKB sent in 9193 ms, tx 0xafdcb3ecf27e4aba9e50b25fec85a97a7a258af390eca124db23215e3cb03a52
+13:12:12.758    genesis 0xaee6f4a6eabd6afd7538669739bfdc5479210c7ccbecdb41b7a169df12ac0743: daily amount 300 CKB, data 47 bytes (fingerprint only)
+13:12:12.758    the first send spends the new send-limit cell: true; dialogs 1, codes 1
+13:12:48.346    both committed
+13:12:52.120   approve: send 100 CKB, code not needed
+13:12:53.916 2. second send (61 + 100 < 300): 100 CKB sent in 5570 ms, tx 0xd1b52bdfed828c75c15fca8cd63e13b7d0edb3021e0da6e356eb90667b7f8389
+13:12:54.335    dialogs 1, codes 1
+13:12:56.174   approve: send 200 CKB, code needed
+13:12:56.985   code prompt (transaction): 8-digit code sent to fresh@example.com
+13:12:58.318 3. third send (over 300 in 24 hours): 200 CKB sent in 3983 ms, tx 0x5965ee88d82e9cd93b9bab9687e86f1dbbc44340bdf18c1dda5f6831a9d07518
+13:12:58.721    dialogs 1, codes 2
