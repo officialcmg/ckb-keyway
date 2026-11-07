@@ -92,7 +92,7 @@ function recordOf(transaction: ccc.Transaction): ccc.Hex | undefined {
 export async function sendLimitHead(
   client: ccc.Client,
   wallet: Pick<ReadyWallet, "litPublicKey">,
-  pending: Array<{ transaction: ccc.Transaction; status: TransactionStatus }>,
+  pending: Array<{ transaction: ccc.Transaction; status: TransactionStatus; signedAt?: number }>,
   statusOf: (hash: string) => Promise<TransactionStatus | undefined> = async (hash) => (await client.getTransaction(hash))?.status,
 ): Promise<SendLimitHead | undefined> {
   const secp = await secp256k1Lock(client, wallet.litPublicKey);
@@ -100,8 +100,10 @@ export async function sendLimitHead(
   // A send-limit transaction signed moments ago that the node doesn't know yet: its client may still be sending it,
   // so give it a few seconds before building on what came before it.
   const inPool = (status: TransactionStatus | undefined) => status === "pending" || status === "proposed" || status === "committed";
-  const known = await Promise.all(pending.map(async ({ transaction, status }) => {
+  const known = await Promise.all(pending.map(async ({ transaction, status, signedAt }) => {
     if (inPool(status) || limitOutput(transaction) === -1) return { transaction, status };
+    // Only one signed moments ago can still be on its way; an older one was never sent.
+    if (signedAt !== undefined && Date.now() - signedAt > JUST_SIGNED_MS) return { transaction, status };
     for (let attempt = 0; attempt < 6; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 500));
       const now = await statusOf(transaction.hash()).catch(() => undefined);
@@ -140,6 +142,8 @@ export async function sendLimitHead(
 }
 
 const TYPE_ID_CODE_HASH = "0x00000000000000000000000000000000000000000000000000545950455f4944";
+/** How long after signing a transaction the node doesn't know yet is waited for: its client is sending it. */
+const JUST_SIGNED_MS = 10_000;
 const FEE_RATE = 1_500n;
 
 /** The capacity a send-limit cell with this data occupies, in shannons. */

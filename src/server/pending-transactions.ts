@@ -35,7 +35,9 @@ export function nodeStatus(client: ccc.Client): StatusOf {
  * and those it hasn't known for longer than the grace period (dropped from the pool, or never sent). A status the
  * node can't give right now keeps the entry.
  */
-export async function listPendingTransactions(userId: string, statusOf: StatusOf, now = Date.now()): Promise<Array<{ transaction: ccc.Transaction; status: TransactionStatus }>> {
+export type PendingTransaction = { transaction: ccc.Transaction; status: TransactionStatus; signedAt: number };
+
+export async function listPendingTransactions(userId: string, statusOf: StatusOf, now = Date.now()): Promise<PendingTransaction[]> {
   const sql = await database();
   await sql`delete from keyway_v2_pending_transactions where user_id = ${userId} and signed_at < now() - ${MAX_AGE}::interval`;
   const rows = await sql<Array<{ transaction_hash: string; transaction: ccc.TransactionLike; signed_at: Date; seen_at: Date | null }>>`
@@ -43,7 +45,7 @@ export async function listPendingTransactions(userId: string, statusOf: StatusOf
     where user_id = ${userId} order by seq limit ${MAX_LISTED}
   `;
   const statuses = await Promise.all(rows.map((row) => statusOf(row.transaction_hash).catch(() => undefined)));
-  const kept: Array<{ transaction: ccc.Transaction; status: TransactionStatus }> = [];
+  const kept: PendingTransaction[] = [];
   const gone: string[] = [];
   const seen: string[] = [];
   rows.forEach((row, index) => {
@@ -53,7 +55,7 @@ export async function listPendingTransactions(userId: string, statusOf: StatusOf
       const since = (row.seen_at ?? row.signed_at).getTime();
       if (now - since > UNSENT_GRACE_MS) { gone.push(row.transaction_hash); return; }
     } else if (status === "pending" || status === "proposed") seen.push(row.transaction_hash);
-    kept.push({ transaction: ccc.Transaction.from(row.transaction), status: status ?? "unknown" });
+    kept.push({ transaction: ccc.Transaction.from(row.transaction), status: status ?? "unknown", signedAt: row.signed_at.getTime() });
   });
   if (gone.length > 0) await sql`delete from keyway_v2_pending_transactions where user_id = ${userId} and transaction_hash in ${sql(gone)}`;
   // A transaction the pool held and then lost is gone once it stays unknown for the grace period from then.
