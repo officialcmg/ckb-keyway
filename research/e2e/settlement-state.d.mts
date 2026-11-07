@@ -6,5 +6,6 @@ export type SettlementState = Record<string, unknown> & {
 };
 export function loadSettlementState(text: string | undefined): SettlementState;
 export function resumableRun(state: SettlementState): boolean;
+export function startupPlan(state: SettlementState): { resume: boolean; keepProfile: boolean; setUp: boolean; forceClose: boolean };
 export function forAccount(state: SettlementState, address: string): SettlementState;
 export function forChannel(state: SettlementState, channelId: string): SettlementState;

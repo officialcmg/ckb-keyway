@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { forAccount, forChannel, loadSettlementState, resumableRun } from "../research/e2e/settlement-state.mjs";
+import { forAccount, forChannel, loadSettlementState, resumableRun, startupPlan } from "../research/e2e/settlement-state.mjs";
 
 const finishedRun = {
   email: "st-old@example.test", password: "x", address: "ckt1old", channelId: "0xold",
@@ -50,8 +50,23 @@ test("a restart resumes an unfinished run that reached its force close, on the s
   assert.equal(state.channelId, saved.channelId);
   assert.equal(state.commitment, saved.commitment);
   assert.deepEqual(state.funding, saved.funding);
-  // A finished run, or one that never reached its force close, starts fresh.
+  // A finished run, or one that never opened its channel, starts fresh.
   assert.equal(resumableRun(loadSettlementState(JSON.stringify(finishedRun))), false);
-  assert.equal(resumableRun(loadSettlementState(JSON.stringify({ ...saved, forceCloseAt: undefined }))), false);
+  assert.equal(resumableRun(loadSettlementState(JSON.stringify({ ...saved, channelId: undefined, funding: undefined }))), false);
   assert.equal(resumableRun(loadSettlementState(JSON.stringify({ ...saved, password: undefined }))), false);
+});
+
+test("the script's startup plan: resume on the kept profile once a channel is saved, and force-close only if that hadn't happened", () => {
+  const saved = { ...finishedRun, finished: undefined };
+  const plan = (state: Record<string, unknown>) => startupPlan(loadSettlementState(JSON.stringify(state)));
+  // No state, a finished run, or one stopped before its channel opened: a fresh account, channel and profile.
+  const fresh = { resume: false, keepProfile: false, setUp: true, forceClose: true };
+  assert.deepEqual(plan({}), fresh);
+  assert.deepEqual(plan(finishedRun), fresh);
+  assert.deepEqual(plan({ email: saved.email, password: saved.password, address: saved.address }), fresh);
+  // Stopped after the channel opened but before the force close was recorded: same account, channel and profile,
+  // and the force close still to do.
+  assert.deepEqual(plan({ ...saved, forceCloseAt: undefined, commitment: undefined }), { resume: true, keepProfile: true, setUp: false, forceClose: true });
+  // Stopped after the force close: only following remains.
+  assert.deepEqual(plan(saved), { resume: true, keepProfile: true, setUp: false, forceClose: false });
 });

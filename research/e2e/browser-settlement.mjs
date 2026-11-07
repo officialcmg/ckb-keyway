@@ -12,7 +12,7 @@
 import { createRequire } from "node:module";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { DEMO_APP_ID, EVIDENCE, json, launchPersistent, markSeen, newMailbox, nextCode, openMailbox } from "./lib.mjs";
-import { forAccount, forChannel, loadSettlementState, resumableRun } from "./settlement-state.mjs";
+import { forAccount, forChannel, loadSettlementState, startupPlan } from "./settlement-state.mjs";
 
 const repo = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
 mkdirSync(EVIDENCE, { recursive: true, mode: 0o700 });
@@ -76,13 +76,14 @@ const statePath = `${EVIDENCE}/settlement-state.json`;
 // Kept across restarts so an unfinished run resumes on its account and channel; a finished run's state is never reused.
 const state = loadSettlementState(existsSync(statePath) ? readFileSync(statePath, "utf8") : undefined);
 const save = () => writeFileSync(statePath, JSON.stringify(state, null, 2), { mode: 0o600 });
-// A restart of an unfinished run signs in to the same account and follows the same channel.
-const resuming = resumableRun(state);
+// A restart of an unfinished run signs in to the same account and carries on with the same channel.
+const plan = startupPlan(state);
+const resuming = plan.resume;
 
 // The browser profile is kept with the run: a resumed run needs this device's ID, its session and the node's channel
 // databases, or the node can't come back to claim the settlement. A fresh run starts from an empty profile.
 const profile = `${EVIDENCE}/settlement-profile`;
-if (!resuming) rmSync(profile, { recursive: true, force: true });
+if (!plan.keepProfile) rmSync(profile, { recursive: true, force: true });
 const context = await launchPersistent(profile);
 let currentBundle = await bundle();
 const isolation = { "Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Embedder-Policy": "require-corp" };
@@ -116,7 +117,7 @@ const redact = (rows) => JSON.stringify(rows, (key, value) => key === "localSett
 
 try {
   const mailbox = resuming ? await openMailbox(state.email, state.password) : await newMailbox("st");
-  if (resuming) log(`resuming the run for ${state.address}, channel ${state.channelId}, force-closed at ${state.forceCloseAt}`);
+  if (resuming) log(`resuming the run for ${state.address}, channel ${state.channelId}, force-closed at ${state.forceCloseAt ?? "(not yet)"}`);
   await page.goto(url);
   await page.waitForFunction(() => window.probe?.auth.ready);
   // A resumed run's profile may still hold its session.
@@ -134,7 +135,7 @@ try {
   state.email = mailbox.email; state.password = mailbox.password; save();
   record(`user address ${state.address}`);
 
-  if (resuming) {
+  if (!plan.setUp) {
     // The kept profile brings the node back with its channels; if it doesn't start now, the loop below retries.
     await startNode().then(() => record("browser node running again"), (error) => log("WARN the browser node did not start yet", error.message));
   } else {
@@ -169,13 +170,23 @@ try {
       if (i === 29) log("WARN the in-page watchtower has no data for the channel");
       await new Promise((r) => setTimeout(r, 2000));
     }
+  }
 
-    await page.evaluate((id) => { window.closing = window.probe.fiber.node.shutdownChannel({ channel_id: id, force: true }).then(() => "ok", (e) => e.message); }, state.channelId);
-    const dialog = page.getByRole("dialog");
-    await dialog.waitFor({ timeout: 60_000 });
-    await dialog.getByRole("button", { name: "Force close", exact: true }).click();
-    state.forceCloseAt = now(); save();
-    record(`force close requested: ${await page.evaluate(() => window.closing)}`);
+  if (plan.forceClose) {
+    // A run stopped while (or just after) asking for the force close may find the funding already spent.
+    const closedBy = resuming ? await spender(state.funding.txHash, state.funding.index) : undefined;
+    if (closedBy) {
+      state.forceCloseAt = now(); save();
+      record(`funding already spent by ${closedBy}; following it`);
+    } else {
+      if (resuming) await startNode();
+      await page.evaluate((id) => { window.closing = window.probe.fiber.node.shutdownChannel({ channel_id: id, force: true }).then(() => "ok", (e) => e.message); }, state.channelId);
+      const dialog = page.getByRole("dialog");
+      await dialog.waitFor({ timeout: 60_000 });
+      await dialog.getByRole("button", { name: "Force close", exact: true }).click();
+      state.forceCloseAt = now(); save();
+      record(`force close requested: ${await page.evaluate(() => window.closing)}`);
+    }
   }
 
   const seen = new Set();
