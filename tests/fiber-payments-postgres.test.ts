@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { fiberPayment, PAYMENT_STALE_MS, type PaymentContext } from "../src/server/fiber-payments.ts";
-import { MAX_WAITING_REPEATS } from "../src/server/idempotency.ts";
+import { DEFAULT_STALE_MS, MAX_WAITING_REPEATS, runIdempotentMutation, waitingRepeatCount } from "../src/server/idempotency.ts";
 import { database } from "../src/server/database.ts";
 import { signingSettings, type SigningContext } from "../src/server/general-signing.ts";
 
@@ -29,6 +29,8 @@ function harness(amount: bigint, options: { failSend?: boolean } = {}) {
         sent.push(params[0]);
         return { payment_hash: `0x${"cd".repeat(32)}`, status: "Created", fee: "0x0" } as T;
       }
+      // As Fiber answers for a payment it never made (a rejected send leaves none).
+      if (method === "get_payment") throw new Error(`Invalid parameter: Payment session not found: ${String(params[0]?.payment_hash)}`);
       throw new Error(`unexpected ${method}`);
     },
   };
@@ -235,7 +237,11 @@ test("hosted Fiber payments: daily amount, email codes and overlapping approvals
     const first = fiberPayment(h.context, slow, body, key);
     await started;
     const waiting = Array.from({ length: MAX_WAITING_REPEATS }, () => fiberPayment(h.context, slow, body, key));
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // Every waiting slot is taken before the extra repeat starts.
+    for (let i = 0; waitingRepeatCount() < MAX_WAITING_REPEATS; i++) {
+      assert.ok(i < 200, "the repeats all start waiting");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     // One more repeat than may wait: it doesn't poll for 30 seconds, it says the send is still running.
     const startedAt = Date.now();
     await assert.rejects(() => fiberPayment(h.context, slow, body, key), /still in progress/);
@@ -348,6 +354,83 @@ test("hosted Fiber payments: daily amount, email codes and overlapping approvals
     kRelease();
     await kFirst;
     assert.equal(kSends, 1);
+  });
+
+  await t.test("a send that errors after the node took the payment returns the payment, and keeps it counted", async () => {
+    const sql = await database();
+    const hash = `0x${"ab".repeat(32)}`;
+    // Three nodes whose send_payment call fails (a timeout, say). What get_payment then says decides the outcome.
+    const run = async (afterError: "made" | "absent" | "unreachable") => {
+      const h = harness(10n * CKB);
+      const preview = await pay(h, { stage: "preview" });
+      const body = { method: "sendPayment", params: { invoice: "fibt1test" }, stage: "send", confirmationNonce: preview.confirmationNonce };
+      let sends = 0;
+      let createdAt = 0;
+      let reachable = afterError !== "unreachable";
+      const node = { call: async <T>(method: string, params: Array<Record<string, unknown>> = []): Promise<T> => {
+        if (method === "send_payment" && !params[0]?.dry_run) {
+          sends++;
+          if (afterError !== "absent") createdAt = Date.now();
+          throw new Error("Request timeout");
+        }
+        if (method === "get_payment") {
+          if (!reachable) throw new Error("HTTP error: 502 Bad Gateway");
+          if (!createdAt) throw new Error("Invalid parameter: Payment session not found: Hash256(0xab)");
+          return { payment_hash: hash, status: "Inflight", fee: "0x0", created_at: `0x${createdAt.toString(16)}` } as T;
+        }
+        return h.node.call<T>(method, params);
+      } };
+      const key = `timeout-${crypto.randomUUID()}`;
+      const counted = async () => (await sql<Array<{ n: number }>>`select count(*)::int as n from keyway_v2_signed_outflows where user_id = ${h.context.user.id} and transaction_hash = ${`payment:${preview.confirmationNonce}`}`)[0].n;
+      const status = async () => (await sql<Array<{ status: string }>>`select status from keyway_v2_idempotency_keys where user_id = ${h.context.user.id} and idempotency_key = ${key}`)[0].status;
+      return { h, node, body, key, counted, status, sends: () => sends, reconnect: () => { reachable = true; } };
+    };
+
+    // The node has it: that's the send's result, and it counts toward the 24-hour total.
+    const made = await run("made");
+    const result = await fiberPayment(made.h.context, made.node, made.body, made.key) as Record<string, unknown>;
+    assert.equal(result.payment_hash, hash);
+    assert.deepEqual(await fiberPayment(made.h.context, made.node, made.body, made.key), result);
+    assert.equal(await made.counted(), 1);
+    assert.equal(made.sends(), 1);
+
+    // The node says it never made it: a rejection, recorded and released as before.
+    const absent = await run("absent");
+    await assert.rejects(() => fiberPayment(absent.h.context, absent.node, absent.body, absent.key), /Request timeout/);
+    assert.equal(await absent.status(), "failed");
+    assert.equal(await absent.counted(), 0);
+    await assert.rejects(() => fiberPayment(absent.h.context, absent.node, absent.body, absent.key), /Request timeout/);
+    assert.equal(absent.sends(), 1);
+
+    // The node can't be asked: unknown, not failed. The amount stays counted, and once the node answers a repeat
+    // gets the payment, without paying again.
+    const unknown = await run("unreachable");
+    await assert.rejects(() => fiberPayment(unknown.h.context, unknown.node, unknown.body, unknown.key), /outcome isn't known yet/);
+    assert.equal(await unknown.status(), "running");
+    assert.equal(await unknown.counted(), 1);
+    unknown.reconnect();
+    await sql`update keyway_v2_idempotency_keys set updated_at = now() - ${`${PAYMENT_STALE_MS + 1_000} milliseconds`}::interval where user_id = ${unknown.h.context.user.id} and idempotency_key = ${unknown.key}`;
+    const recovered = await fiberPayment(unknown.h.context, unknown.node, unknown.body, unknown.key) as Record<string, unknown>;
+    assert.equal(recovered.payment_hash, hash);
+    assert.equal(unknown.sends(), 1);
+  });
+
+  await t.test("an operation without reconciliation whose result was never stored says its outcome is unknown, not that it still runs", async () => {
+    const sql = await database();
+    const userId = crypto.randomUUID();
+    const key = `channel-${crypto.randomUUID()}`;
+    // As if the process had exited after opening the channel, before storing the result.
+    await sql`
+      insert into keyway_v2_idempotency_keys (user_id, operation, idempotency_key, request_digest, status, expires_at)
+      values (${userId}, 'managed:open-channel', ${key}, ${"0".repeat(64)}, 'running', now() + interval '24 hours')
+    `;
+    let runs = 0;
+    const repeat = () => runIdempotentMutation(userId, "managed:open-channel", key, { peer: "a" }, async () => { runs++; return {}; });
+    await sql`update keyway_v2_idempotency_keys set request_digest = encode(sha256(convert_to(${JSON.stringify({ peer: "a" })}, 'UTF8')), 'hex') where user_id = ${userId} and idempotency_key = ${key}`;
+    await assert.rejects(repeat, /still in progress/);
+    await sql`update keyway_v2_idempotency_keys set updated_at = now() - ${`${DEFAULT_STALE_MS + 1_000} milliseconds`}::interval where user_id = ${userId} and idempotency_key = ${key}`;
+    await assert.rejects(repeat, /outcome isn't known yet/);
+    assert.equal(runs, 0);
   });
 
   await t.test("refuses payments with neither an invoice nor a keysend target", async () => {
