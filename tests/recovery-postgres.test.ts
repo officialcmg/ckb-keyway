@@ -443,7 +443,8 @@ test("with the policy Action: Lit emails the code, binds the email on chain, and
   assert.equal(result.transactionHash, preview.preview.transactionHash, "the binding doesn't change the transaction hash");
   assert.equal(h.broadcasts.length, 1);
   const enable = h.broadcasts[0];
-  assert.equal(ccc.bytesFrom(enable.getWitnessArgsAt(0)!.inputType!).length, 1024);
+  // Witness 0 holds only the 37-byte fingerprint of the address, never the address.
+  assert.equal(ccc.bytesFrom(enable.getWitnessArgsAt(0)!.inputType!).length, 37);
   await h.settle();
   const enabled = await readWallet(h.user) as ReadyWallet;
   assert.equal(enabled.recovery?.litEmailBound, true);

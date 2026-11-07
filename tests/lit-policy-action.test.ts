@@ -88,7 +88,7 @@ async function enableWithPolicy(backups: RecoveryBackup[], email = "user@example
   const plan = await planRecovery(client, walletFor(), backups, { emailBinding: true });
   const sent = await policySendCode(plan.transaction, wallet, { email, appName: "Demo", backups, client }, runner(action));
   setEmailBinding(plan.transaction, sent.binding!);
-  const signed = await policySignTransaction(plan.transaction, [{ script: plan.secp, kind: "secp256k1" }], client, wallet, { emailCode: { code: codeIn(env.emails[0]), ticket: sent.ticket }, backups }, runner(action));
+  const signed = await policySignTransaction(plan.transaction, [{ script: plan.secp, kind: "secp256k1" }], client, wallet, { email, emailCode: { code: codeIn(env.emails[0]), ticket: sent.ticket }, backups }, runner(action));
   const recovery: KeyWayRecovery = {
     omnilockArgs: plan.omnilock.args, omnilock: KEYWAY_OMNILOCK.testnet, adminListTypeArgs: plan.adminListType.args, adminListTypeHash: plan.adminListType.hash(),
     adminListOutPoint: { txHash: signed.hash(), index: 0 }, enableTransactionHash: signed.hash(), legacyAddress: plan.preview.legacyAddress,
@@ -166,7 +166,7 @@ test("turning recovery on needs the code the Action emailed, to the address boun
   const plan = await planRecovery(client, walletFor(), backups, { emailBinding: true });
   const groups = [{ script: plan.secp, kind: "secp256k1" as const }];
   const sign = (transaction: ccc.Transaction, emailCode?: { code: string; ticket: string }) =>
-    policySignTransaction(transaction.clone(), groups, client, wallet, { backups, ...(emailCode ? { emailCode } : {}) }, runner(action));
+    policySignTransaction(transaction.clone(), groups, client, wallet, { email: "user@example.com", backups, ...(emailCode ? { emailCode } : {}) }, runner(action));
 
   // Without a binding (only its zero placeholder) or a code it refuses.
   await assert.rejects(sign(plan.transaction), /email binding is malformed/);
@@ -185,11 +185,11 @@ test("turning recovery on needs the code the Action emailed, to the address boun
   setEmailBinding(bound, sent.binding!);
   await assert.rejects(sign(bound), /eight-digit code/);
   await assert.rejects(sign(bound, { code: code === "00000000" ? "00000001" : "00000000", ticket: sent.ticket }), /isn't right/);
-  // A binding for another address doesn't take this address's code, and the code is for this transaction only.
+  // A binding for another address isn't this account's address, and the code is for this transaction only.
   const other = await policySendCode(plan.transaction, wallet, { email: "attacker@example.com", appName: "Demo", backups, client }, runner(action));
   const swapped = plan.transaction.clone();
   setEmailBinding(swapped, other.binding!);
-  await assert.rejects(sign(swapped, { code, ticket: sent.ticket }), /isn't right/);
+  await assert.rejects(sign(swapped, { code, ticket: sent.ticket }), /isn't the email address bound/);
   const changed = bound.clone();
   changed.outputs[changed.outputs.length - 1].capacity -= 1n;
   await assert.rejects(sign(changed, { code, ticket: sent.ticket }), /isn't right/);
@@ -198,6 +198,42 @@ test("turning recovery on needs the code the Action emailed, to the address boun
   await assert.rejects(sign(bound, { code, ticket: `v1.${Date.now() + 3_600_000}.${"0".repeat(32)}` }), /ticket is invalid/);
   const signed = await sign(bound, { code, ticket: sent.ticket });
   assert.equal(signed.hash(), plan.transaction.hash());
+});
+
+test("the enabling transaction carries only a 37-byte fingerprint of the email, never the address", async () => {
+  const email = "Private.Person@example.com";
+  const { signed } = await enableWithPolicy([evm(60)], email);
+  const binding = ccc.bytesFrom(signed.getWitnessArgsAt(0)!.inputType!);
+  assert.equal(binding.length, 37);
+  assert.equal(ccc.hexFrom(binding.slice(0, 5)), "0x4b57454202");
+  const bytes = signed.toBytes();
+  const contains = (needle: Uint8Array) => {
+    outer: for (let i = 0; i + needle.length <= bytes.length; i++) {
+      for (let j = 0; j < needle.length; j++) if (bytes[i + j] !== needle[j]) continue outer;
+      return true;
+    }
+    return false;
+  };
+  for (const form of [email, email.toLowerCase(), "example.com", "private.person"]) {
+    assert.equal(contains(new TextEncoder().encode(form)), false, `the transaction holds "${form}"`);
+  }
+});
+
+test("an email's fingerprint differs per account and survives a new version of the Action", async () => {
+  const email = "user@example.com";
+  const action = await loadAction(world());
+  const mine = await action.emailFingerprint(pkpId, email);
+  assert.equal(mine.length, 32);
+  assert.equal(hex(await action.emailFingerprint(pkpId, "USER@example.com")), hex(mine));
+  assert.notEqual(hex(await action.emailFingerprint(pkpId, "other@example.com")), hex(mine));
+  // Another account with the same email gets an unrelated fingerprint, so the chain can't link the two.
+  const otherKey = secp256k1.utils.randomSecretKey();
+  const otherPkp = ccc.hexFrom(keccak_256(secp256k1.getPublicKey(otherKey, false).slice(1)).slice(12));
+  const other = await fakeLit({ privateKey: otherKey, pkpId: otherPkp, actionKey, lookup: () => undefined, transactions: () => [] }).load();
+  assert.notEqual(hex(await other.emailFingerprint(otherPkp, email)), hex(mine));
+  // A later Action (a new CID, so a new action key) still computes the same fingerprint for this account.
+  const upgraded = await fakeLit({ privateKey, pkpId, actionKey: secp256k1.utils.randomSecretKey(), lookup: () => undefined, transactions: () => [] }).load();
+  assert.equal(hex(await upgraded.emailFingerprint(pkpId, email)), hex(mine));
 });
 
 test("a bound account's backup change needs the Action's code, sent to the bound address, never one the server picks", async () => {
@@ -210,16 +246,22 @@ test("a bound account's backup change needs the Action's code, sent to the bound
   const groups = [{ script: plan.listLock, kind: "omnilock" as const }, { script: plan.omnilock, kind: "omnilock" as const }];
   const all = [...backups, evm(6)];
   const sign = (transaction: ccc.Transaction, emailCode?: { code: string; ticket: string }, enableTransactionHash = recovery.enableTransactionHash) =>
-    policySignTransaction(transaction.clone(), groups, client, wallet, { enableTransactionHash, backups: all, ...(emailCode ? { emailCode } : {}) }, runner(action));
+    policySignTransaction(transaction.clone(), groups, client, wallet, { enableTransactionHash, email: "user@example.com", backups: all, ...(emailCode ? { emailCode } : {}) }, runner(action));
 
   await assert.rejects(sign(plan.transaction), /eight-digit code/);
   await assert.rejects(sign(plan.transaction, undefined, funding.hash()), /isn't the transaction that made this recovery list/);
+  // A code for a wrong address isn't accepted either: signing needs the bound address too.
+  await assert.rejects(policySignTransaction(plan.transaction.clone(), groups, client, wallet, { enableTransactionHash: recovery.enableTransactionHash, email: "attacker@example.com", backups: all, emailCode: { code: "00000000", ticket: `v1.${Date.now() + 60_000}.${"0".repeat(32)}` } }, runner(action)), /isn't the email address bound/);
   const before = env.emails.length;
-  // The server can't redirect the code: the address comes from the chain, whatever email it passes.
-  const sent = await policySendCode(plan.transaction, wallet, { enableTransactionHash: recovery.enableTransactionHash, email: "attacker@example.com", appName: "Demo", backups: all, client }, runner(action));
-  assert.equal(sent.sentTo, "user@example.com");
+  // The server can't redirect the code: an address whose fingerprint isn't the one bound on chain gets nothing.
+  await assert.rejects(policySendCode(plan.transaction, wallet, { enableTransactionHash: recovery.enableTransactionHash, email: "attacker@example.com", appName: "Demo", backups: all, client }, runner(action)), /isn't the email address bound/);
+  assert.equal(env.emails.length, before);
+  // Case doesn't matter: the fingerprint is of the lowercased address.
+  const sent = await policySendCode(plan.transaction, wallet, { enableTransactionHash: recovery.enableTransactionHash, email: "User@Example.com", appName: "Demo", backups: all, client }, runner(action));
+  assert.equal(sent.sentTo.toLowerCase(), "user@example.com");
   const email = env.emails[before];
-  assert.deepEqual(email.to, ["user@example.com"]);
+  assert.equal(email.to.length, 1);
+  assert.equal(email.to[0].toLowerCase(), "user@example.com");
   assert.match(email.text, /Add a recovery backup in Demo\n\nAdding: EVM wallet 0x/);
   const signed = await sign(plan.transaction, { code: codeIn(email), ticket: sent.ticket });
   assert.equal(signed.hash(), plan.transaction.hash());
@@ -235,7 +277,7 @@ test("the Action refuses moving, retyping, destroying or rewriting the recovery 
   const attempt = (mutate: (tx: ccc.Transaction) => void | Promise<void>) => async () => {
     const tx = plan.transaction.clone();
     await mutate(tx);
-    return action.main({ mode: "transaction", pkpId, transaction: JSON.parse(ccc.stringify(tx)), enableTransactionHash: recovery.enableTransactionHash, backups: ids });
+    return action.main({ mode: "transaction", pkpId, transaction: JSON.parse(ccc.stringify(tx)), enableTransactionHash: recovery.enableTransactionHash, email: "user@example.com", backups: ids });
   };
   await assert.rejects(attempt((tx) => { tx.outputs[0].lock = enablePlan.secp; }), /lock can't change/);
   await assert.rejects(attempt((tx) => { tx.outputs[0].type = adminListTypeScript({ adminListTypeArgs: `0x${"12".repeat(32)}` }); }), /Type ID can't change|can't be destroyed/);
@@ -265,7 +307,7 @@ test("the Action refuses moving, retyping, destroying or rewriting the recovery 
   const oldVerifier = execAuth(execPreimage("0x33bd1c699b633d685a6f60f6b0ca16fe8bb896f81323926ca6e0671bf8ab3c88", saltedBackupId(evm(9).address, recovery.adminListTypeHash)));
   await assert.rejects(attempt(added(oldVerifier)), /names a backup KeyWay doesn't support/);
   // The true change, but the caller leaves out the backup being added.
-  await assert.rejects(action.main({ mode: "transaction", pkpId, transaction: JSON.parse(ccc.stringify(plan.transaction)), enableTransactionHash: recovery.enableTransactionHash, backups: ids.slice(0, 2) }), /names a backup KeyWay doesn't support/);
+  await assert.rejects(action.main({ mode: "transaction", pkpId, transaction: JSON.parse(ccc.stringify(plan.transaction)), enableTransactionHash: recovery.enableTransactionHash, email: "user@example.com", backups: ids.slice(0, 2) }), /names a backup KeyWay doesn't support/);
 });
 
 test("an account that turned recovery on before the policy Action keeps its server checks and the list rules, no code", async () => {
@@ -347,7 +389,7 @@ test("cells under longer lock args (which the indexer's prefix search would retu
   }));
   const sent = await policySendCode(plan.transaction, wallet, { email: "user@example.com", appName: "Demo", backups, client }, runner(action));
   setEmailBinding(plan.transaction, sent.binding!);
-  const enable = await policySignTransaction(plan.transaction, [{ script: plan.secp, kind: "secp256k1" }], client, wallet, { emailCode: { code: codeIn(env.emails[0]), ticket: sent.ticket }, backups }, runner(action));
+  const enable = await policySignTransaction(plan.transaction, [{ script: plan.secp, kind: "secp256k1" }], client, wallet, { email: "user@example.com", emailCode: { code: codeIn(env.emails[0]), ticket: sent.ticket }, backups }, runner(action));
   env.add(enable);
   // An ordinary send from the new address, with change to it, still signs.
   const index = enable.outputs.findIndex((output) => output.lock.eq(plan.omnilock));
@@ -370,7 +412,7 @@ test("a backup change must spend the recovery list as input 0", async () => {
   const plan = await planBackupChange(client, walletFor(recovery), { change: "add", backup: evm(33) });
   const swapped = plan.transaction.clone();
   swapped.inputs.reverse();
-  await assert.rejects(action.main({ mode: "transaction", pkpId, transaction: JSON.parse(ccc.stringify(swapped)), enableTransactionHash: recovery.enableTransactionHash, backups: await litBackupIds(client, [...backups, evm(33)]) }), /must be input 0/);
+  await assert.rejects(action.main({ mode: "transaction", pkpId, transaction: JSON.parse(ccc.stringify(swapped)), enableTransactionHash: recovery.enableTransactionHash, email: "user@example.com", backups: await litBackupIds(client, [...backups, evm(33)]) }), /must be input 0/);
 });
 
 test("a cell anyone sends to the list lock doesn't count as a list, and an enable must spend every plain cell", async () => {

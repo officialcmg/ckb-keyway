@@ -7,11 +7,14 @@
 // Modes:
 //   identity     signs the fixed KeyWay identity digest, so the server can learn the PKP's public key.
 //   message      signs CKB's "Nervos Message:" hash of a text message it hashes itself.
-//   transaction  { transaction, enableTransactionHash?, emailCode?, backups?, previousListRecord? } signs the
-//                account's lock groups.
+//   transaction  { transaction, enableTransactionHash?, email?, emailCode?, backups?, previousListRecord? } signs
+//                the account's lock groups.
 //   send-code    { transaction, enableTransactionHash?, email?, backups?, emailApiKey, appName } emails a code for
-//                a recovery list change and returns the ticket (and, when turning recovery on, the encrypted
-//                email binding the transaction must carry).
+//                a recovery list change and returns the ticket (and, when turning recovery on, the email binding
+//                the transaction must carry).
+// A recovery list change that needs a code also needs `email`, the account's address. The chain never holds it:
+// turning recovery on records only a keyed fingerprint of it, and every later code goes only to an address whose
+// fingerprint matches.
 // A transaction that creates or changes the recovery list needs `backups`: [{ kind: "evm" | "joyid", id }], the
 // 20-byte id (EVM address, or blake160 of the JoyID passkey's public key) of every backup on the list before and
 // after. The on-chain record holds only salted auths, so the Action rebuilds each auth from its id, the account's
@@ -34,7 +37,8 @@ const MAX_BACKUPS = 8;
 const SECP_WITNESS_LOCK = 65;
 const OMNILOCK_WITNESS_LOCK = 85;
 const BINDING_MAGIC = "4b574542"; // "KWEB"
-const BINDING_SIZE = 1024;
+const BINDING_VERSION = 2;
+const BINDING_SIZE = 37;
 const LIST_MAGIC = "4b57524c"; // "KWRL"
 const LIST_VERSION = 3;
 const AUTH_LENGTH = 21;
@@ -710,22 +714,18 @@ function recordAt(tx, index) {
 
 // ---------- the email binding ----------
 
-/** "KWEB" ‖ 0x01 ‖ u16 length ‖ the PKP-encrypted email ‖ zero padding, BINDING_SIZE bytes in all. */
-function encodeBinding(ciphertext) {
-  const bytes = utf8(ciphertext);
-  if (bytes.length > BINDING_SIZE - 7) throw new Error("The encrypted email is too long");
+/** "KWEB" ‖ 0x02 ‖ the 32-byte fingerprint of the account's email, BINDING_SIZE bytes. The email itself is never on chain. */
+function encodeBinding(fingerprint) {
   const out = new Uint8Array(BINDING_SIZE);
   out.set(hexToBytes(`0x${BINDING_MAGIC}`), 0);
-  out[4] = 1; out[5] = bytes.length & 0xff; out[6] = bytes.length >> 8;
-  out.set(bytes, 7);
+  out[4] = BINDING_VERSION;
+  out.set(fingerprint, 5);
   return out;
 }
 
 function decodeBinding(bytes) {
-  if (!bytes || bytes.length !== BINDING_SIZE || bytesToHex(bytes.slice(0, 4)) !== `0x${BINDING_MAGIC}` || bytes[4] !== 1) throw new Error("The email binding is malformed");
-  const length = bytes[5] | (bytes[6] << 8);
-  if (length === 0 || 7 + length > BINDING_SIZE || bytes.slice(7 + length).some((b) => b !== 0)) throw new Error("The email binding is malformed");
-  return new TextDecoder().decode(bytes.slice(7, 7 + length));
+  if (!bytes || bytes.length !== BINDING_SIZE || bytesToHex(bytes.slice(0, 4)) !== `0x${BINDING_MAGIC}` || bytes[4] !== BINDING_VERSION) throw new Error("The email binding is malformed");
+  return bytes.slice(5);
 }
 
 function checkEmail(email) {
@@ -733,12 +733,33 @@ function checkEmail(email) {
   return email;
 }
 
-async function emailFromBinding(pkpId, binding) {
-  const plaintext = await Lit.Actions.Decrypt({ pkpId, ciphertext: decodeBinding(binding) });
-  let parsed;
-  try { parsed = JSON.parse(plaintext); } catch { throw new Error("The email binding is malformed"); }
-  if (parsed?.v !== 1 || parsed.purpose !== "keyway-email-binding") throw new Error("The email binding is malformed");
-  return checkEmail(parsed.email);
+/**
+ * The fingerprint of an email for this account: HMAC-SHA256 under a key derived from the PKP's own private key.
+ * Only an Action holding this PKP can compute it, so nobody can test guesses against the chain, the same email
+ * gives unrelated fingerprints on different accounts, and it doesn't depend on this Action's CID, so a later
+ * version of the Action still recognises it.
+ */
+async function emailFingerprint(pkpId, email) {
+  const raw = String(await Lit.Actions.getPrivateKey({ pkpId }));
+  const secret = hexToBytes(raw.startsWith("0x") ? raw : `0x${raw}`, "private key");
+  if (secret.length !== 32) throw new Error("The PKP's private key has the wrong length");
+  const material = concat(utf8("keyway-email-binding-key/v1"), secret);
+  secret.fill(0);
+  const keyBytes = new Uint8Array(await crypto.subtle.digest("SHA-256", material));
+  material.fill(0);
+  const key = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  keyBytes.fill(0);
+  return new Uint8Array(await crypto.subtle.sign("HMAC", key, utf8(`keyway-email-binding/v2|${pkpId.toLowerCase()}|${email.toLowerCase()}`)));
+}
+
+/** The address the server passed, if its fingerprint is the one bound on chain. */
+async function emailMatchingBinding(pkpId, binding, email) {
+  const bound = decodeBinding(binding);
+  const given = await emailFingerprint(pkpId, checkEmail(email));
+  let diff = 0;
+  for (let i = 0; i < 32; i++) diff |= bound[i] ^ given[i];
+  if (diff !== 0) throw new Error("This isn't the email address bound to this account's recovery");
+  return email;
 }
 
 /**
@@ -746,7 +767,7 @@ async function emailFromBinding(pkpId, binding) {
  * this Action existed. The enabling transaction is the only one that could spend the input its Type ID comes
  * from, and its witness 0 must carry a valid signature by this account's key over the binding.
  */
-async function boundEmail(pkpId, account, listType, enableHash) {
+async function boundEmail(pkpId, account, listType, enableHash, email) {
   if (typeof enableHash !== "string" || !/^0x[0-9a-f]{64}$/.test(enableHash)) throw new Error("enableTransactionHash is required for a recovery list change");
   const enable = (await fetchTransactions([enableHash])).get(enableHash);
   if (enable.status !== "committed") throw new Error("The transaction that turned recovery on isn't committed");
@@ -764,7 +785,7 @@ async function boundEmail(pkpId, account, listType, enableHash) {
   const signature = witness.lock;
   const recovered = ethers.utils.recoverPublicKey(digest, { r: bytesToHex(signature.slice(0, 32)), s: bytesToHex(signature.slice(32, 64)), recoveryParam: signature[64] });
   if (!equalBytes(hexToBytes(ethers.utils.computePublicKey(recovered, true)), account.publicKey)) throw new Error("The email binding isn't signed by this account");
-  return emailFromBinding(pkpId, witness.inputType);
+  return emailMatchingBinding(pkpId, witness.inputType, email);
 }
 
 // ---------- policy ----------
@@ -855,7 +876,7 @@ async function analyse(pkpId, params) {
     // Every auth before and after must be a KeyWay backup under this list's salt; the change names the one that moves.
     const backups = resolveBackups(params.backups, [...new Map([...before, ...after].map((auth) => [bytesToHex(auth), auth])).values()], scriptHash(input.output.type));
     const change = added.length ? { kind: "add", backup: backups.get(bytesToHex(added[0])) } : { kind: "remove", backup: backups.get(bytesToHex(removed[0])) };
-    const email = await boundEmail(pkpId, account, input.output.type, params.enableTransactionHash);
+    const email = await boundEmail(pkpId, account, input.output.type, params.enableTransactionHash, params.email);
     op = { ...change, members: after, email };
   }
   return { tx, account, inputLocks, groups, op, txHash: rawTransactionHash(tx) };
@@ -868,7 +889,7 @@ async function codeTarget(pkpId, analysis, params) {
   if (op.kind === "enable") {
     if (params.mode === "send-code") return checkEmail(params.email);
     if (!op.binding) throw new Error("Turning recovery on must bind the account's email");
-    return emailFromBinding(pkpId, op.binding);
+    return emailMatchingBinding(pkpId, op.binding, params.email);
   }
   // A list made before this Action existed has no binding; it keeps the server's checks and the shape rules above.
   return op.email;
@@ -980,8 +1001,7 @@ async function main(params) {
     const ticket = await sendCode(pkpId, analysis, email, params);
     const result = { ticket, sentTo: email, transactionHash: bytesToHex(analysis.txHash) };
     if (analysis.op.kind === "enable") {
-      const ciphertext = await Lit.Actions.Encrypt({ pkpId, message: JSON.stringify({ v: 1, purpose: "keyway-email-binding", email }) });
-      result.binding = bytesToHex(encodeBinding(ciphertext));
+      result.binding = bytesToHex(encodeBinding(await emailFingerprint(pkpId, email)));
     }
     return result;
   }

@@ -133,21 +133,31 @@ What it doesn't stop:
 - Sends to anywhere other than an address naming a different list of the same key.
 - A list change of the allowed shape, such as adding one attacker backup, unless (b) applies.
 
-### (b) Lit makes, emails and checks the code for list changes, with the email bound on chain (shipped)
+### (b) Lit makes, emails and checks the code for list changes, with a fingerprint of the email bound on chain (shipped)
 
 How it works:
 
+- The email address never goes on chain, in the clear or encrypted. Only a fingerprint of it does:
+  `HMAC-SHA256(SHA-256("keyway-email-binding-key/v1" ‖ PKP private key), "keyway-email-binding/v2|" ‖ pkp ‖ "|" ‖
+  lowercase email)`. The binding is `"KWEB" ‖ 0x02 ‖ fingerprint`, 37 bytes.
+  - Only an Action holding the PKP can compute it, so nobody can test guessed addresses against the chain.
+  - The key is per account, so the same email gives unrelated fingerprints on different accounts.
+  - The key comes from the PKP, not from `getLitActionPrivateKey`. That key is derived from the Action's CID, so a
+    later version of the Action couldn't check fingerprints made by this one. The PKP-derived key survives upgrades.
+  - An earlier draft stored the address encrypted to the PKP (`Lit.Actions.Encrypt`, 1 KB). That was dropped: a
+    ciphertext on a public chain is permanent, and a single key leak would expose every bound address at once.
 - When recovery is turned on, the Action:
   - emails a code to the address it is given;
-  - returns an encrypted binding of that address, `Lit.Actions.Encrypt` to the PKP, padded to 1024 bytes;
-  - signs only if the transaction carries that binding in witness 0's `input_type` and the code matches.
+  - returns the binding of that address;
+  - signs only if the transaction carries that binding in witness 0's `input_type`, the server passes the same
+    address, and the code matches.
 - Witness 0 is covered by the account's own signature. The enabling transaction is the only transaction that can
   ever spend input 0, which the list's Type ID is derived from. So the binding is fixed for the life of the list.
-- For every later list change, the Action:
+- For every later list change, the server passes the account's address and the Action:
   - finds that enabling transaction from the list's Type ID, which the server can't substitute;
   - checks it is committed and that witness 0 carries a valid signature by the account key;
-  - decrypts the bound address and emails the code there.
-  The server can't choose the address.
+  - refuses unless the address's fingerprint matches the binding, then emails the code there.
+  The server can't choose the address: any other address is refused before an email is sent.
 - Code: `HMAC-SHA256(action key, pkp | tx hash | email | ticket)`, as 8 digits. The action key comes from
   `getLitActionPrivateKey`, so only this exact Action can compute it. The ticket is `v1.<expiry ms>.<random>`,
   expiring within 10 minutes, with a minute's slack for clock differences between Lit nodes. The code never leaves
@@ -221,7 +231,7 @@ Server side:
 - With the policy signer on:
   - Turning recovery on and backup changes on bound accounts use `policySendCode`. The server stores only the
     ticket and the binding, and replies `codeLength: 8`. The SDK's code dialog then takes 8 digits.
-  - `planRecovery` reserves the 1024-byte binding in witness 0 before computing the fee. Witnesses aren't in the
+  - `planRecovery` reserves the 37-byte binding in witness 0 before computing the fee. Witnesses aren't in the
     transaction hash, so the hash the code is for doesn't change when the binding goes in.
   - The request is used up only after the Action has signed, so a mistyped code doesn't end the request.
   - Recovery records gain `litEmailBound: true`.
@@ -271,8 +281,8 @@ Plainly, after the switch:
   A lying node, not the KeyWay server, could exploit those.
 - **The Resend account.** A sending-only key can't read mail back, but anyone with KeyWay's Resend dashboard can
   read the sent codes.
-- **Real Lit API shapes.** The Action assumes `Lit.Actions.Encrypt` returns a string of at most 1017 bytes and
-  `getLitActionPrivateKey` returns hex. The tests use a stand-in for Lit, so step 4 below has to run on staging
+- **Real Lit API shapes.** The Action assumes `Lit.Actions.getPrivateKey` and `getLitActionPrivateKey` return hex
+  (with or without `0x` for the PKP key). The tests use a stand-in for Lit, so step 4 below has to run on staging
   before production.
 
 ## Founder steps
@@ -285,7 +295,7 @@ You run these locally. The server has no Lit account credentials.
    actions to groups.
 3. **Register the policy Action.**
    1. In the Chipotle dashboard, open **Action Runner** and paste `lit-actions/sign-ckb-transaction.js` exactly.
-   2. Click **Get Lit Action IPFS CID**. It must be `QmXoAYg81gzWvX3wg7oCiaT3JzJcrHMw2eogfNWLrz3Loo`, the same as
+   2. Click **Get Lit Action IPFS CID**. It must be `QmXEKyvWa2MwCSY9qMBGUp3aawRrWeSW6xqP4SS2w8x2gd`, the same as
       `LIT_POLICY_ACTION_CID` in `.env.example` and `POLICY_ACTION_CID` in `src/server/lit-policy.ts`. Any other
       CID means the pasted source differs from this branch.
    3. Under **IPFS Actions**, register the CID as `keyway-ckb-policy-signer`.
@@ -318,7 +328,9 @@ their list changes use the server's 6-digit code again, as before. Nothing in th
   - identity and message modes, and that there is no digest mode;
   - plain signing from chain cells;
   - turning recovery on: wrong code, a binding for another address, a changed transaction, and expired tickets;
-  - a bound backup change, where the server can't redirect the code;
+  - that the enabling transaction holds only the 37-byte fingerprint and no part of the address;
+  - that a fingerprint differs per account and stays the same under a new Action CID;
+  - a bound backup change, where the server can't redirect the code: a wrong address is refused;
   - every list invariant, including adds under another salt or the old verifiers;
   - accounts that turned recovery on before this Action, and lists without a record.
 - `tests/lit-policy-v3-parity.test.ts` checks the Action against KeyWay's own encoders: the testnet proof's

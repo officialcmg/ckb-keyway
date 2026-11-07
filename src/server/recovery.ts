@@ -90,7 +90,8 @@ export async function recoverySetup(context: RecoveryContext, body: Record<strin
     });
     checkSignerMode(request.summary, policy ? "policy" : "digest");
     if (policy) {
-      // The policy Action emails the code and binds this address to the account on chain; the code never comes here.
+      // The policy Action emails the code and returns a keyed fingerprint of this address for the chain (never the
+      // address itself); the code never comes here.
       await codeLimit(context);
       const sent = await policySendCode(planned.transaction, context.wallet, { email: await context.email(), appName: context.appName, backups, client });
       await recordLitCode(context.user, "recovery", nonce, { litTicket: sent.ticket, litBinding: sent.binding });
@@ -122,7 +123,7 @@ export async function recoverySetup(context: RecoveryContext, body: Record<strin
       await checkRecoveryTransaction(client, planned.transaction, wallet.litPublicKey, backups);
       await countLitCodeAttempt(context.user, "recovery", nonce);
       await context.recordSigning(context.user.id);
-      signed = await signGroups({ ...context, wallet }, planned.transaction, [{ script: planned.secp, kind: "secp256k1" }], client, { emailCode, backups });
+      signed = await signGroups({ ...context, wallet }, planned.transaction, [{ script: planned.secp, kind: "secp256k1" }], client, { email: await context.email(), emailCode, backups });
       await consumeRequest(context.user, "recovery", nonce);
     } else {
       await verifyCode(context.user, "recovery", nonce, body.emailCode);
@@ -498,9 +499,9 @@ export async function recoveryBackupChange(context: RecoveryContext, body: Recor
     const mode: SignerMode = litPolicyEnabled() && !context.signDigest && context.wallet.recovery.litEmailBound ? "policy" : "digest";
     checkSignerMode(request.summary, mode);
     if (mode === "policy") {
-      // The policy Action emails the code to the address bound on chain when recovery was turned on.
+      // The policy Action emails the code only if this address matches the fingerprint bound when recovery was turned on.
       await codeLimit(context);
-      const sent = await policySendCode(plan.transaction, context.wallet, { enableTransactionHash: context.wallet.recovery.enableTransactionHash, appName: context.appName, backups: litBackups(plan), client });
+      const sent = await policySendCode(plan.transaction, context.wallet, { enableTransactionHash: context.wallet.recovery.enableTransactionHash, email: await context.email(), appName: context.appName, backups: litBackups(plan), client });
       await recordLitCode(context.user, "recovery", nonce, { litTicket: sent.ticket });
       return { sent: true, sentTo: sent.sentTo, codeLength: 8 };
     }
@@ -529,7 +530,7 @@ export async function recoveryBackupChange(context: RecoveryContext, body: Recor
       await checkBackupChangeTransaction(client, plan.transaction, wallet.recovery, plan.backups);
       await countLitCodeAttempt(context.user, "recovery", nonce);
       await context.recordSigning(context.user.id);
-      signed = await signGroups({ ...context, wallet }, plan.transaction, groups, client, { enableTransactionHash, emailCode, previousListRecord: plan.previousRecord, backups: litBackups(plan) });
+      signed = await signGroups({ ...context, wallet }, plan.transaction, groups, client, { enableTransactionHash, email: await context.email(), emailCode, previousListRecord: plan.previousRecord, backups: litBackups(plan) });
       await consumeRequest(context.user, "recovery", nonce);
     } else {
       await verifyCode(context.user, "recovery", nonce, body.emailCode);
