@@ -17,7 +17,7 @@ import type { ReadyWallet } from "../src/server/user-wallet.ts";
 import { recoverPkpPublicKey } from "../src/server/pkp-identity.ts";
 
 process.env.LIT_USAGE_API_KEY ??= "test-usage-key";
-process.env.LIT_EMAIL_API_KEY ??= "re_test_sending_key";
+process.env.RESEND_API_KEY ??= "re_test_sending_key";
 
 const CKB = 100_000_000n;
 const privateKey = secp256k1.utils.randomSecretKey();

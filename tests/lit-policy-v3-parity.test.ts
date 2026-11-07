@@ -17,7 +17,7 @@ import { planRecovery } from "../src/server/recovery.ts";
 import type { ReadyWallet } from "../src/server/user-wallet.ts";
 import { fakeLit, type ActionModule } from "./lit-action-fixture.ts";
 
-process.env.LIT_EMAIL_API_KEY ??= "re_test_sending_key";
+process.env.RESEND_API_KEY ??= "re_test_sending_key";
 
 const CKB = 100_000_000n;
 /** The verifiers before backup unlinking (unsalted identities), which a list may no longer name. */

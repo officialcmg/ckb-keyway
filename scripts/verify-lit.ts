@@ -1,16 +1,18 @@
 import * as ccc from "@ckb-ccc/core";
 import { signCkbDigest } from "../src/server/lit.ts";
 import { loadLitAction } from "../src/server/lit-actions.ts";
+import { LIT_ACTION_CIDS, litSignerOverride } from "../src/server/lit-config.ts";
 import { litPolicyEnabled, policyIdentitySignature } from "../src/server/lit-policy.ts";
 import { derivePkpIdentity, recoverPkpPublicKey } from "../src/server/pkp-identity.ts";
 
+// `npm run verify:lit -- --policy` checks the policy Action before LIT_SIGNER is switched in lit-config.ts.
+if (process.argv.includes("--policy")) litSignerOverride.mode = "policy";
 const apiKey = process.env.LIT_USAGE_API_KEY ?? "";
-const actionCid = process.env.LIT_SIGN_ACTION_CID ?? "";
+const actionCid = LIT_ACTION_CIDS["sign-ckb-digest"];
 const pkpId = process.env.LIT_PKP_ID ?? "";
 const policy = litPolicyEnabled();
 
-// A well-formed signature isn't enough: the identity digest's signer must be this PKP. With KEYWAY_LIT_SIGNER=policy
-// this checks the policy Action's identity mode; otherwise the digest signer.
+// A well-formed signature isn't enough: the identity digest's signer must be this PKP.
 const identity = await derivePkpIdentity(pkpId, { apiKey, actionCid }, policy ? policyIdentitySignature : undefined);
 if (!policy) {
   // The digest signer must also sign an arbitrary digest as the same key.

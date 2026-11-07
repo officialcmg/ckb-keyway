@@ -3,6 +3,7 @@ import { omnilockOwnerWitnessLock, witnessLockLength } from "../sdk/browser/acco
 import { joyIdLock, joyIdPubkeyHash, normalizeEvmAddress, type RecoveryBackup } from "../sdk/browser/recovery-backups.ts";
 import type { SigningGroup } from "./funding-transaction.ts";
 import { loadLitAction } from "./lit-actions.ts";
+import { LIT_ACTION_CIDS, litSignerMode } from "./lit-config.ts";
 import { runLitAction, type LitRuntimeConfig, type LitSignature } from "./lit.ts";
 import { recoverPkpPublicKey } from "./pkp-identity.ts";
 
@@ -12,11 +13,11 @@ import { recoverPkpPublicKey } from "./pkp-identity.ts";
  * the recovery list's rules and checks the code it emailed for every list change. The pinned CID below is the
  * hash of that source (tests/lit-action-packaging.test.ts); the founder registers it in the Lit group.
  */
-export const POLICY_ACTION_CID = "QmXEKyvWa2MwCSY9qMBGUp3aawRrWeSW6xqP4SS2w8x2gd";
+export const POLICY_ACTION_CID = LIT_ACTION_CIDS["sign-ckb-transaction"];
 
-/** Set KEYWAY_LIT_SIGNER=policy once the policy Action's CID is in the Lit group; until then the digest signer is used. */
+/** Whether the policy Action signs (`LIT_SIGNER` in lit-config.ts); otherwise the digest signer does. */
 export function litPolicyEnabled(): boolean {
-  return process.env.KEYWAY_LIT_SIGNER === "policy";
+  return litSignerMode() === "policy";
 }
 
 /**
@@ -145,8 +146,9 @@ export async function policySendCode(
   run = defaultRun,
 ): Promise<LitCodeSent> {
   const backups = options.backups ? await litBackupIds(options.client ?? new ccc.ClientPublicTestnet(), options.backups) : undefined;
-  const emailApiKey = process.env.LIT_EMAIL_API_KEY;
-  if (!emailApiKey) throw new Error("Missing server configuration: LIT_EMAIL_API_KEY");
+  // The same Resend key as sign-in email. It must be a sending-only key, so the server can't read the code back.
+  const emailApiKey = process.env.RESEND_API_KEY;
+  if (!emailApiKey) throw new Error("Missing server configuration: RESEND_API_KEY");
   const response = await run(await policyConfig(), {
     mode: "send-code",
     pkpId: wallet.litPkpId,

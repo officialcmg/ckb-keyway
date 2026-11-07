@@ -3,6 +3,7 @@ import type { User } from "./auth-user.ts";
 import { accountLocks, omnilockOwnerWitnessLock, refuseAdminListSpend, refuseForeignOmnilockOutputs, verifyRecoveryAnchor, witnessLockLength, type KeyWayLockKind } from "../sdk/browser/account-lock.ts";
 import { isXudtCompatible } from "../sdk/browser/tokens.ts";
 import { loadLitAction } from "./lit-actions.ts";
+import { LIT_ACTION_CIDS } from "./lit-config.ts";
 import { signCkbDigest } from "./lit.ts";
 import { litPolicyEnabled, policySignTransaction } from "./lit-policy.ts";
 import { recoverPkpPublicKey } from "./pkp-identity.ts";
@@ -158,7 +159,7 @@ export async function signFundingTransaction(
   return signAccountGroups(validated.transaction, validated.groups, validated.signer.client, async (digest) => {
     const signature = await signCkbDigest(digest, wallet.litPkpId, {
       apiKey: requiredEnv("LIT_USAGE_API_KEY"),
-      actionCid: requiredEnv("LIT_SIGN_ACTION_CID"),
+      actionCid: LIT_ACTION_CIDS["sign-ckb-digest"],
       actionCode: await loadLitAction("sign-ckb-digest"),
     });
     const recovered = ccc.hexFrom(recoverPkpPublicKey(ccc.bytesFrom(digest), signature));

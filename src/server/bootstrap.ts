@@ -1,6 +1,7 @@
 import type { User } from "./auth-user.ts";
 import { addPkpToGroup, createPkp, findGroupId } from "./chipotle";
 import { loadLitAction } from "./lit-actions";
+import { LIT_ACTION_CIDS } from "./lit-config";
 import { generateFiberKey } from "./lit";
 import { litPolicyEnabled, policyIdentitySignature } from "./lit-policy";
 import { derivePkpIdentity } from "./pkp-identity";
@@ -81,12 +82,12 @@ async function bootstrapLocked(
     wallet.litPkpId,
   );
   const policy = litPolicyEnabled();
-  const signing = { apiKey: runtimeApiKey, actionCid: policy ? "" : requiredEnv("LIT_SIGN_ACTION_CID") };
+  const signing = { apiKey: runtimeApiKey, actionCid: policy ? "" : LIT_ACTION_CIDS["sign-ckb-digest"] };
   const identity = await derivePkpIdentity(wallet.litPkpId, signing, policy ? (pkpId) => policyIdentitySignature(pkpId) : undefined);
   // Lit creates the Fiber key and returns it encrypted to the PKP; this server never sees it.
   const encryptedFiberKey = await generateFiberKey(wallet.litPkpId, {
     apiKey: runtimeApiKey,
-    actionCid: requiredEnv("LIT_GENERATE_ACTION_CID"),
+    actionCid: LIT_ACTION_CIDS["generate-fiber-key"],
     actionCode: await loadLitAction("generate-fiber-key"),
   });
   const ready: ReadyWallet = {
