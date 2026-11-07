@@ -19,7 +19,7 @@ export type LitSignerMode = "digest" | "policy";
  * "policy" is `sign-ckb-transaction`, which checks every transaction itself. Switch to "policy" in a commit once
  * its CID is in the Lit group.
  */
-export const LIT_SIGNER: LitSignerMode = "digest";
+export const LIT_SIGNER: LitSignerMode = "policy";
 
 /** Tests run both signers; production code never writes this. */
 export const litSignerOverride: { mode?: LitSignerMode } = {};

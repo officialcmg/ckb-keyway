@@ -178,7 +178,8 @@ test("reproduces the testnet proof: two accounts, one EVM and one JoyID-style ba
     const recorded = fixture[`enable${name}`];
     const enable = ccc.Transaction.from(recorded.transaction);
     const client = await offlineClient(recorded.inputCells, [ccc.Transaction.from(recorded.funding)]);
-    const plan = await planRecovery(client, walletFor(fixture[`publicKey${name}`]), [evm, joy]);
+    // These enables predate the policy signer, so they carry no email binding.
+    const plan = await planRecovery(client, walletFor(fixture[`publicKey${name}`]), [evm, joy], { emailBinding: false });
     assert.equal(plan.transaction.hash(), hash);
     assert.equal(enable.hash(), hash);
     await checkRecoveryTransaction(client, enable, fixture[`publicKey${name}`], [evm, joy]);
