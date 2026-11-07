@@ -12,15 +12,18 @@ import { recoverPkpPublicKey } from "./pkp-identity.ts";
  * the recovery list's rules and checks the code it emailed for every list change. The pinned CID below is the
  * hash of that source (tests/lit-action-packaging.test.ts); the founder registers it in the Lit group.
  */
-export const POLICY_ACTION_CID = "QmXoAYg81gzWvX3wg7oCiaT3JzJcrHMw2eogfNWLrz3Loo";
+export const POLICY_ACTION_CID = "QmXEKyvWa2MwCSY9qMBGUp3aawRrWeSW6xqP4SS2w8x2gd";
 
 /** Set KEYWAY_LIT_SIGNER=policy once the policy Action's CID is in the Lit group; until then the digest signer is used. */
 export function litPolicyEnabled(): boolean {
   return process.env.KEYWAY_LIT_SIGNER === "policy";
 }
 
-/** The size of the email binding a transaction turning recovery on carries in witness 0's input_type. */
-export const EMAIL_BINDING_SIZE = 1024;
+/**
+ * The size of the email binding a transaction turning recovery on carries in witness 0's input_type: "KWEB", a
+ * version byte and a 32-byte keyed fingerprint of the account's email. The email itself never goes on chain.
+ */
+export const EMAIL_BINDING_SIZE = 37;
 
 export type LitEmailCode = { code: string; ticket: string };
 
@@ -93,7 +96,7 @@ export async function policySignTransaction(
   groups: SigningGroup[],
   client: ccc.Client,
   wallet: WalletKeys,
-  options: { enableTransactionHash?: string; emailCode?: LitEmailCode; previousListRecord?: ccc.Hex; backups?: RecoveryBackup[] } = {},
+  options: { enableTransactionHash?: string; email?: string; emailCode?: LitEmailCode; previousListRecord?: ccc.Hex; backups?: RecoveryBackup[] } = {},
   run = defaultRun,
 ): Promise<ccc.Transaction> {
   if (groups.length === 0) throw new Error("Transaction has no KeyWay signing group");
@@ -108,6 +111,7 @@ export async function policySignTransaction(
     pkpId: wallet.litPkpId,
     transaction: JSON.parse(ccc.stringify(transaction)),
     ...(options.enableTransactionHash ? { enableTransactionHash: options.enableTransactionHash } : {}),
+    ...(options.email ? { email: options.email } : {}),
     ...(options.emailCode ? { emailCode: options.emailCode } : {}),
     ...(options.previousListRecord ? { previousListRecord: options.previousListRecord } : {}),
     ...(options.backups ? { backups: await litBackupIds(client, options.backups) } : {}),
@@ -130,8 +134,9 @@ export type LitCodeSent = { ticket: string; sentTo: string; binding?: ccc.Hex };
 
 /**
  * Has the policy Action email a code for a recovery list change. The Action makes the code and sends it from
- * inside Lit, so this server only gets a ticket back. When turning recovery on, `email` is the address to bind,
- * and the Action returns the encrypted binding the transaction must carry.
+ * inside Lit, so this server only gets a ticket back. `email` is the account's address. When turning recovery on,
+ * the Action returns the binding the transaction must carry: a keyed fingerprint of that address, not the address.
+ * For a later change, the Action sends the code only if the address matches the fingerprint bound on chain.
  */
 export async function policySendCode(
   transaction: ccc.Transaction,
@@ -155,7 +160,7 @@ export async function policySendCode(
   if (typeof response?.ticket !== "string" || !/^v1\.\d{13}\.[0-9a-f]{32}$/.test(response.ticket)) throw new Error("Lit Action returned an invalid code ticket");
   if (response.transactionHash !== transaction.hash()) throw new Error("Lit Action sent a code for a different transaction");
   const binding = response.binding;
-  if (binding !== undefined && (typeof binding !== "string" || !/^0x[0-9a-f]+$/.test(binding) || (binding.length - 2) / 2 !== EMAIL_BINDING_SIZE)) {
+  if (binding !== undefined && (typeof binding !== "string" || !/^0x[0-9a-f]*$/.test(binding) || (binding.length - 2) / 2 !== EMAIL_BINDING_SIZE)) {
     throw new Error("Lit Action returned an invalid email binding");
   }
   return { ticket: response.ticket, sentTo: String(response.sentTo ?? ""), ...(binding ? { binding: binding as ccc.Hex } : {}) };

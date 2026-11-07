@@ -39,11 +39,11 @@ export type ActionModule = {
   backupAuth: (backup: { kind: string; id: Uint8Array }, salt: Uint8Array) => Uint8Array;
   rawTransactionHash: (tx: unknown) => Uint8Array;
   parseTransaction: (tx: unknown) => unknown;
+  emailFingerprint: (pkpId: string, email: string) => Promise<Uint8Array>;
 };
 
 /**
  * A Lit runtime for one PKP. `lookup` answers the chain: a known transaction and its status, or undefined.
- * Encryption is a reversible stand-in, as only the Action and Lit ever see the plaintext.
  */
 export function fakeLit(options: {
   privateKey: Uint8Array;
@@ -148,17 +148,11 @@ export function fakeLit(options: {
     Actions: {
       getPrivateKey: async ({ pkpId }: { pkpId: string }) => { assert.equal(pkpId, options.pkpId); return hex(options.privateKey); },
       getLitActionPrivateKey: async () => hex(actionKey),
-      Encrypt: async ({ pkpId, message }: { pkpId: string; message: string }) => { assert.equal(pkpId, options.pkpId); return `enc:${Buffer.from(message).toString("base64")}`; },
-      Decrypt: async ({ pkpId, ciphertext }: { pkpId: string; ciphertext: string }) => {
-        assert.equal(pkpId, options.pkpId);
-        if (!ciphertext.startsWith("enc:")) throw new Error("decryption failed");
-        return Buffer.from(ciphertext.slice(4), "base64").toString();
-      },
     },
   };
   const load = async (): Promise<ActionModule> => {
     const source = await loadLitAction("sign-ckb-transaction");
-    return new Function("Lit", "ethers", "fetch", `${source}\nreturn { main, ckbHash, whitelistRoot, rawTransactionHash, parseTransaction, parseListRecord, listMembers, backupAuth, resolveBackups };`)(Lit, fakeEthers, fetch) as ActionModule;
+    return new Function("Lit", "ethers", "fetch", `${source}\nreturn { main, ckbHash, whitelistRoot, rawTransactionHash, parseTransaction, parseListRecord, listMembers, backupAuth, resolveBackups, emailFingerprint };`)(Lit, fakeEthers, fetch) as ActionModule;
   };
   /** Runs the Action the way `runLitAction` would. */
   const runner = async () => {

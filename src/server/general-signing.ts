@@ -273,7 +273,7 @@ export async function signGroups(
   transaction: ccc.Transaction,
   groups: SigningGroup[],
   client: ccc.Client,
-  options: { enableTransactionHash?: string; emailCode?: LitEmailCode; previousListRecord?: ccc.Hex; backups?: RecoveryBackup[]; missingGroup?: string } = {},
+  options: { enableTransactionHash?: string; email?: string; emailCode?: LitEmailCode; previousListRecord?: ccc.Hex; backups?: RecoveryBackup[]; missingGroup?: string } = {},
 ): Promise<ccc.Transaction> {
   if (!context.signDigest && litPolicyEnabled()) {
     if (groups.length === 0) throw new Error(options.missingGroup ?? "Transaction has no KeyWay signing group");
