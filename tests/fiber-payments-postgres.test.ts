@@ -25,7 +25,8 @@ function harness(amount: bigint, options: { failSend?: boolean } = {}) {
       }
       if (method === "send_payment" && params[0]?.dry_run) return { fee: "0x0" } as T;
       if (method === "send_payment") {
-        if (options.failSend) throw new Error("no route");
+        // As Fiber refuses: its own error, with the request's params attached as data.
+        if (options.failSend) throw Object.assign(new Error("no route"), { code: -32000, data: params[0] });
         sent.push(params[0]);
         return { payment_hash: `0x${"cd".repeat(32)}`, status: "Created", fee: "0x0" } as T;
       }
@@ -360,7 +361,7 @@ test("hosted Fiber payments: daily amount, email codes and overlapping approvals
     const sql = await database();
     const hash = `0x${"ab".repeat(32)}`;
     // Three nodes whose send_payment call fails (a timeout, say). What get_payment then says decides the outcome.
-    const run = async (afterError: "made" | "absent" | "unreachable") => {
+    const run = async (afterError: "made" | "absent" | "refused" | "unreachable") => {
       const h = harness(10n * CKB);
       const preview = await pay(h, { stage: "preview" });
       const body = { method: "sendPayment", params: { invoice: "fibt1test" }, stage: "send", confirmationNonce: preview.confirmationNonce };
@@ -370,8 +371,9 @@ test("hosted Fiber payments: daily amount, email codes and overlapping approvals
       const node = { call: async <T>(method: string, params: Array<Record<string, unknown>> = []): Promise<T> => {
         if (method === "send_payment" && !params[0]?.dry_run) {
           sends++;
+          if (afterError === "refused") throw Object.assign(new Error("Failed to send payment: no path found"), { code: -32000, data: params[0] });
           if (afterError !== "absent") createdAt = Date.now();
-          throw new Error("Request timeout");
+          throw Object.assign(new Error("Request timeout"), { code: -32000 });
         }
         if (method === "get_payment") {
           if (!reachable) throw new Error("HTTP error: 502 Bad Gateway");
@@ -394,13 +396,20 @@ test("hosted Fiber payments: daily amount, email codes and overlapping approvals
     assert.equal(await made.counted(), 1);
     assert.equal(made.sends(), 1);
 
-    // The node says it never made it: a rejection, recorded and released as before.
-    const absent = await run("absent");
-    await assert.rejects(() => fiberPayment(absent.h.context, absent.node, absent.body, absent.key), /Request timeout/);
-    assert.equal(await absent.status(), "failed");
-    assert.equal(await absent.counted(), 0);
-    await assert.rejects(() => fiberPayment(absent.h.context, absent.node, absent.body, absent.key), /Request timeout/);
-    assert.equal(absent.sends(), 1);
+    // The node refused it, and has no such payment: a rejection, recorded and released as before.
+    const refused = await run("refused");
+    await assert.rejects(() => fiberPayment(refused.h.context, refused.node, refused.body, refused.key), /no path found/);
+    assert.equal(await refused.status(), "failed");
+    assert.equal(await refused.counted(), 0);
+    await assert.rejects(() => fiberPayment(refused.h.context, refused.node, refused.body, refused.key), /no path found/);
+    assert.equal(refused.sends(), 1);
+
+    // A timeout, then "not found": the node may not have made the session yet, so it isn't a rejection.
+    const early = await run("absent");
+    await assert.rejects(() => fiberPayment(early.h.context, early.node, early.body, early.key), /outcome isn't known yet/);
+    assert.equal(await early.status(), "running");
+    assert.equal(await early.counted(), 1);
+    assert.equal(early.sends(), 1);
 
     // The node can't be asked: unknown, not failed. The amount stays counted, and once the node answers a repeat
     // gets the payment, without paying again.
@@ -413,6 +422,45 @@ test("hosted Fiber payments: daily amount, email codes and overlapping approvals
     const recovered = await fiberPayment(unknown.h.context, unknown.node, unknown.body, unknown.key) as Record<string, unknown>;
     assert.equal(recovered.payment_hash, hash);
     assert.equal(unknown.sends(), 1);
+  });
+
+  await t.test("a slow send that a repeat already reconciled can't replace that answer with its own late error", async () => {
+    const sql = await database();
+    const h = harness(10n * CKB);
+    const preview = await pay(h, { stage: "preview" });
+    const body = { method: "sendPayment", params: { invoice: "fibt1test" }, stage: "send", confirmationNonce: preview.confirmationNonce };
+    const hash = `0x${"ab".repeat(32)}`;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const createdAt = Date.now();
+    const node = { call: async <T>(method: string, params: Array<Record<string, unknown>> = []): Promise<T> => {
+      if (method === "send_payment" && !params[0]?.dry_run) {
+        entered();
+        await gate;
+        throw Object.assign(new Error("Failed to send payment: late"), { code: -32000, data: params[0] });
+      }
+      if (method === "get_payment") {
+        // The owner's own late lookup gets nothing, so it ends in its refusal and tries to record a failure.
+        if (lookupsFail) throw new Error("Invalid parameter: Payment session not found");
+        return { payment_hash: hash, status: "Success", fee: "0x0", created_at: `0x${createdAt.toString(16)}` } as T;
+      }
+      return h.node.call<T>(method, params);
+    } };
+    let lookupsFail = false;
+    const key = `late-${crypto.randomUUID()}`;
+    const first = fiberPayment(h.context, node, body, key);
+    await started;
+    await sql`update keyway_v2_idempotency_keys set updated_at = now() - ${`${PAYMENT_STALE_MS + 1_000} milliseconds`}::interval where user_id = ${h.context.user.id} and idempotency_key = ${key}`;
+    const reconciled = await fiberPayment(h.context, node, body, key) as Record<string, unknown>;
+    assert.equal(reconciled.status, "Success");
+    lookupsFail = true;
+    release();
+    await assert.rejects(first, /late/);
+    assert.deepEqual(await fiberPayment(h.context, node, body, key), reconciled);
+    const [row] = await sql<Array<{ status: string }>>`select status from keyway_v2_idempotency_keys where user_id = ${h.context.user.id} and idempotency_key = ${key}`;
+    assert.equal(row.status, "completed");
   });
 
   await t.test("an operation without reconciliation whose result was never stored says its outcome is unknown, not that it still runs", async () => {

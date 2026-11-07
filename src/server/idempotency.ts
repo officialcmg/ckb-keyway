@@ -131,10 +131,12 @@ export async function runIdempotentMutation<T>(
     await sql`
       update keyway_v2_idempotency_keys
       set status = 'failed', error_message = ${message}, updated_at = now()
-      where user_id = ${userId} and operation = ${operation} and idempotency_key = ${key}
+      where user_id = ${userId} and operation = ${operation} and idempotency_key = ${key} and status = 'running'
     `;
     throw error;
   }
+  // Both writes only touch a running record: a repeat may already have reconciled a slow request, and what it
+  // stored stays the answer for this key.
   // The operation succeeded, so its result goes back to the caller even if it can't be stored. The record then
   // stays "running", never "failed": a repeat never reports a failure for something that went through, never
   // runs it again, and, with `reconcile`, recovers the outcome from the handle once the record is stale.
@@ -143,7 +145,7 @@ export async function runIdempotentMutation<T>(
       await sql`
         update keyway_v2_idempotency_keys
         set status = 'completed', response = ${sql.json(result as never)}, updated_at = now()
-        where user_id = ${userId} and operation = ${operation} and idempotency_key = ${key}
+        where user_id = ${userId} and operation = ${operation} and idempotency_key = ${key} and status = 'running'
       `;
       break;
     } catch (error) {
