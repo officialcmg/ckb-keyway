@@ -50,9 +50,13 @@ export function fakeLit(options: {
   pkpId: string;
   actionKey?: Uint8Array;
   lookup: (hash: string) => { tx: ccc.Transaction; status: string } | undefined;
-  /** Every transaction the chain has, for the indexer's live cells. */
+  /** Every transaction the chain has, for the indexer's live cells and lock histories. */
   transactions: () => ccc.Transaction[];
+  /** RPC methods whose calls fail with HTTP 500, as an unreachable node would. */
+  failing?: (method: string) => boolean;
 }) {
+  /** Every transaction hash the Action fetched with get_transaction. */
+  const fetched: string[] = [];
   const actionKey = options.actionKey ?? secp256k1.utils.randomSecretKey();
   const emails: SentEmail[] = [];
   const script = (s: ccc.Script) => ({ code_hash: s.codeHash, hash_type: s.hashType, args: s.args });
@@ -73,6 +77,22 @@ export function fakeLit(options: {
     }
     assert.ok(["https://testnet.ckb.dev/", "https://testnet.ckbapp.dev/"].includes(url), url);
     const parsed = JSON.parse(init.body);
+    const methods = Array.isArray(parsed) ? parsed.map((call: { method: string }) => call.method) : [parsed.method];
+    if (options.failing && methods.some(options.failing)) return new Response("node unavailable", { status: 500 });
+    if (!Array.isArray(parsed) && parsed.method === "get_transactions") {
+      const [{ script: wanted, script_search_mode: mode }] = parsed.params as [{ script: { code_hash: string; hash_type: string; args: string }; script_search_mode?: string }];
+      const matches = (lock: ccc.Script) => lock.codeHash === wanted.code_hash && lock.hashType === wanted.hash_type && (mode === "exact" ? lock.args === wanted.args : lock.args.startsWith(wanted.args));
+      const all = options.transactions();
+      const byHash = new Map(all.map((tx) => [tx.hash(), tx]));
+      const objects = all.flatMap((tx) => [
+        ...tx.inputs.flatMap((input, index) => {
+          const previous = byHash.get(input.previousOutput.txHash)?.outputs[Number(input.previousOutput.index)];
+          return previous && matches(previous.lock) ? [{ tx_hash: tx.hash(), io_type: "input", io_index: ccc.numToHex(index) }] : [];
+        }),
+        ...tx.outputs.flatMap((output, index) => matches(output.lock) ? [{ tx_hash: tx.hash(), io_type: "output", io_index: ccc.numToHex(index) }] : []),
+      ]);
+      return new Response(JSON.stringify({ id: parsed.id, jsonrpc: "2.0", result: { objects, last_cursor: "0x" } }), { status: 200 });
+    }
     if (!Array.isArray(parsed) && parsed.method === "get_cells") {
       const [{ script: wanted, filter, script_search_mode: mode }] = parsed.params as [{ script: { code_hash: string; hash_type: string; args: string }; script_search_mode?: string; filter?: { script?: { code_hash: string; hash_type: string; args: string } } }];
       // As ckb-indexer: the lock's args match by prefix unless the request asks for "exact".
@@ -88,6 +108,7 @@ export function fakeLit(options: {
     }
     const calls = parsed as Array<{ id: number; params: [string] }>;
     return new Response(JSON.stringify(calls.map(({ id, params: [hash] }) => {
+      fetched.push(hash);
       const found = options.lookup(hash);
       return { id, jsonrpc: "2.0", result: found ? { transaction: rpcTx(found.tx), tx_status: { status: found.status } } : null };
     })), { status: 200 });
@@ -113,7 +134,7 @@ export function fakeLit(options: {
     const action = await load();
     return async (_config: unknown, params: Record<string, unknown>) => action.main(params);
   };
-  return { emails, fetch, Lit, load, runner };
+  return { emails, fetch, Lit, load, runner, fetched };
 }
 
 /** The code in the last email the Action sent. */
