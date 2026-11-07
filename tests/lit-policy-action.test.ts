@@ -523,6 +523,43 @@ test("fake lists made by huge transactions are ruled out from the key's history,
   assert.deepEqual(env.fetched.filter((hash) => planted.includes(hash)), [], "no planted transaction is fetched");
 });
 
+test("a key with a long history still signs: only the blocks holding candidate lists are read", async () => {
+  const { funding, signed: enable, plan } = await enableWithPolicy([evm(47)]);
+  const env = world([funding, enable]);
+  // More than 9,000 entries in the key's secp256k1 history, from cells sent to it (spending them wouldn't remove
+  // the entries either).
+  env.add(ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: `0x${(seed++).toString(16).padStart(64, "0")}`, index: 0 } }],
+    outputs: Array.from({ length: 9_000 }, () => ({ lock: plan.secp, capacity: 61n * CKB })),
+    outputsData: Array.from({ length: 9_000 }, () => "0x"),
+  }));
+  const action = await loadAction(env);
+  const index = enable.outputs.findIndex((output) => output.lock.eq(plan.omnilock));
+  const spend = ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: enable.hash(), index } }],
+    outputs: [{ lock: plan.omnilock, capacity: enable.outputs[index].capacity - 100_000n }],
+    outputsData: ["0x"],
+    witnesses: [ccc.hexFrom(ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(85)) }).toBytes())],
+  });
+  const result = await action.main({ mode: "transaction", pkpId, transaction: JSON.parse(ccc.stringify(spend)) }) as { operation: string };
+  assert.equal(result.operation, "plain");
+  assert.ok(Math.max(...env.historyReads) < 10, "only the enable's block is read");
+});
+
+test("typed cells sent to the key's address don't count toward the plain-cell limit an enable checks", async () => {
+  const { funding, client } = await funded();
+  const env = world([funding]);
+  const plan = await planRecovery(client, walletFor(), [evm(48)], { emailBinding: true });
+  env.add(ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: `0x${(seed++).toString(16).padStart(64, "0")}`, index: 0 } }],
+    outputs: Array.from({ length: 300 }, (_, i) => ({ lock: plan.secp, type: ccc.Script.from({ codeHash: `0x${"77".repeat(32)}`, hashType: "type", args: ccc.numToHex(i) }), capacity: 100n * CKB })),
+    outputsData: Array.from({ length: 300 }, () => "0x"),
+  }));
+  const action = await loadAction(env);
+  const sent = await policySendCode(plan.transaction, wallet, { email: "user@example.com", appName: "Demo", backups: [evm(48)], client }, runner(action));
+  assert.ok(sent.ticket);
+});
+
 test("no output may go to an administrator-mode Omnilock of the key in another shape: other flags or the official deployment", async () => {
   const { funding, signed: enable, plan } = await enableWithPolicy([evm(46)]);
   const env = world([funding, enable]);
