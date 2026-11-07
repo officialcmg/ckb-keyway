@@ -57,6 +57,11 @@ export function fakeLit(options: {
 }) {
   /** Every transaction hash the Action fetched with get_transaction. */
   const fetched: string[] = [];
+  /** How many history entries each get_transactions call returned. */
+  const historyReads: number[] = [];
+  // Hashing is the fixture's main cost with large transactions, so each transaction is hashed once.
+  const hashes = new WeakMap<ccc.Transaction, string>();
+  const hashOf = (tx: ccc.Transaction) => { let hash = hashes.get(tx); if (!hash) { hash = tx.hash(); hashes.set(tx, hash); } return hash; };
   const actionKey = options.actionKey ?? secp256k1.utils.randomSecretKey();
   const emails: SentEmail[] = [];
   const script = (s: ccc.Script) => ({ code_hash: s.codeHash, hash_type: s.hashType, args: s.args });
@@ -79,31 +84,44 @@ export function fakeLit(options: {
     const parsed = JSON.parse(init.body);
     const methods = Array.isArray(parsed) ? parsed.map((call: { method: string }) => call.method) : [parsed.method];
     if (options.failing && methods.some(options.failing)) return new Response("node unavailable", { status: 500 });
-    if (!Array.isArray(parsed) && parsed.method === "get_transactions") {
-      const [{ script: wanted, script_search_mode: mode }] = parsed.params as [{ script: { code_hash: string; hash_type: string; args: string }; script_search_mode?: string }];
+    // Each transaction is in its own block, numbered by its place in `transactions()`.
+    const history = (key: { script: { code_hash: string; hash_type: string; args: string }; script_search_mode?: string; filter?: { block_range?: [string, string] } }) => {
+      const { script: wanted, script_search_mode: mode, filter } = key;
       const matches = (lock: ccc.Script) => lock.codeHash === wanted.code_hash && lock.hashType === wanted.hash_type && (mode === "exact" ? lock.args === wanted.args : lock.args.startsWith(wanted.args));
       const all = options.transactions();
-      const byHash = new Map(all.map((tx) => [tx.hash(), tx]));
-      const objects = all.flatMap((tx) => [
+      const byHash = new Map(all.map((tx) => [hashOf(tx), tx]));
+      const [from, to] = filter?.block_range ? filter.block_range.map(Number) : [0, Infinity];
+      const objects = all.flatMap((tx, block) => block < from || block >= to ? [] : [
         ...tx.inputs.flatMap((input, index) => {
           const previous = byHash.get(input.previousOutput.txHash)?.outputs[Number(input.previousOutput.index)];
-          return previous && matches(previous.lock) ? [{ tx_hash: tx.hash(), io_type: "input", io_index: ccc.numToHex(index) }] : [];
+          return previous && matches(previous.lock) ? [{ tx_hash: hashOf(tx), io_type: "input", io_index: ccc.numToHex(index), block_number: ccc.numToHex(block) }] : [];
         }),
-        ...tx.outputs.flatMap((output, index) => matches(output.lock) ? [{ tx_hash: tx.hash(), io_type: "output", io_index: ccc.numToHex(index) }] : []),
+        ...tx.outputs.flatMap((output, index) => matches(output.lock) ? [{ tx_hash: hashOf(tx), io_type: "output", io_index: ccc.numToHex(index), block_number: ccc.numToHex(block) }] : []),
       ]);
-      return new Response(JSON.stringify({ id: parsed.id, jsonrpc: "2.0", result: { objects, last_cursor: "0x" } }), { status: 200 });
+      historyReads.push(objects.length);
+      return { objects, last_cursor: "0x" };
+    };
+    if (Array.isArray(parsed) && parsed.every((call: { method: string }) => call.method === "get_transactions")) {
+      return new Response(JSON.stringify(parsed.map((call: { id: number; params: [Parameters<typeof history>[0]] }) => ({ id: call.id, jsonrpc: "2.0", result: history(call.params[0]) }))), { status: 200 });
+    }
+    if (!Array.isArray(parsed) && parsed.method === "get_transactions") {
+      return new Response(JSON.stringify({ id: parsed.id, jsonrpc: "2.0", result: history(parsed.params[0]) }), { status: 200 });
     }
     if (!Array.isArray(parsed) && parsed.method === "get_cells") {
-      const [{ script: wanted, filter, script_search_mode: mode }] = parsed.params as [{ script: { code_hash: string; hash_type: string; args: string }; script_search_mode?: string; filter?: { script?: { code_hash: string; hash_type: string; args: string } } }];
+      const [{ script: wanted, filter, script_search_mode: mode }] = parsed.params as [{ script: { code_hash: string; hash_type: string; args: string }; script_search_mode?: string; filter?: { script?: { code_hash: string; hash_type: string; args: string }; script_len_range?: [string, string]; output_data_len_range?: [string, string] } }];
+      // As ckb-indexer: with a lock search, script_len_range is the type script's length, 0 with no type.
+      const inRange = (range: [string, string] | undefined, length: number) => !range || (length >= Number(range[0]) && length < Number(range[1]));
+      const typeLength = (output: ccc.CellOutput) => output.type ? output.type.toBytes().length : 0;
       // As ckb-indexer: the lock's args match by prefix unless the request asks for "exact".
       const argsMatch = (args: string) => mode === "exact" ? args === wanted.args : args.startsWith(wanted.args);
       const typeFilter = filter?.script;
       const all = options.transactions();
       const spent = new Set(all.flatMap((tx) => tx.inputs.map((input) => `${input.previousOutput.txHash}:${input.previousOutput.index}`)));
-      const objects = all.flatMap((tx) => tx.outputs.map((output, index) => ({ tx, output, index })))
-        .filter(({ tx, output, index }) => !spent.has(`${tx.hash()}:${index}`) && output.lock.codeHash === wanted.code_hash && output.lock.hashType === wanted.hash_type && argsMatch(output.lock.args)
-          && (!typeFilter || (output.type?.codeHash === typeFilter.code_hash && output.type.hashType === typeFilter.hash_type && output.type.args.startsWith(typeFilter.args))))
-        .map(({ tx, output, index }) => ({ out_point: { tx_hash: tx.hash(), index: ccc.numToHex(index) }, output: { capacity: ccc.numToHex(output.capacity), lock: script(output.lock), type: output.type ? script(output.type) : null }, output_data: tx.outputsData[index] }));
+      const objects = all.flatMap((tx, block) => tx.outputs.map((output, index) => ({ tx, output, index, block })))
+        .filter(({ tx, output, index }) => !spent.has(`${hashOf(tx)}:${index}`) && output.lock.codeHash === wanted.code_hash && output.lock.hashType === wanted.hash_type && argsMatch(output.lock.args)
+          && (!typeFilter || (output.type?.codeHash === typeFilter.code_hash && output.type.hashType === typeFilter.hash_type && output.type.args.startsWith(typeFilter.args)))
+          && inRange(filter?.script_len_range, typeLength(output)) && inRange(filter?.output_data_len_range, ccc.bytesFrom(tx.outputsData[index]).length))
+        .map(({ tx, output, index, block }) => ({ block_number: ccc.numToHex(block), out_point: { tx_hash: hashOf(tx), index: ccc.numToHex(index) }, output: { capacity: ccc.numToHex(output.capacity), lock: script(output.lock), type: output.type ? script(output.type) : null }, output_data: tx.outputsData[index] }));
       return new Response(JSON.stringify({ id: parsed.id, jsonrpc: "2.0", result: { objects, last_cursor: "0x" } }), { status: 200 });
     }
     const calls = parsed as Array<{ id: number; params: [string] }>;
@@ -134,7 +152,7 @@ export function fakeLit(options: {
     const action = await load();
     return async (_config: unknown, params: Record<string, unknown>) => action.main(params);
   };
-  return { emails, fetch, Lit, load, runner, fetched };
+  return { emails, fetch, Lit, load, runner, fetched, historyReads };
 }
 
 /** The code in the last email the Action sent. */

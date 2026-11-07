@@ -40,9 +40,9 @@ const LIST_VERSION = 3;
 const AUTH_LENGTH = 21;
 const CODE_TTL_MS = 10 * 60_000;
 const MAX_MESSAGE_BYTES = 4096;
-// Entries of the key's own lock history read per check. Only the key can add inputs to it; anyone can add
-// outputs, but each costs them a cell's capacity given to this key.
-const MAX_HISTORY = 8192;
+// The indexer's filters for plain cells (no type script, empty data) and for cells with a Type ID type.
+const PLAIN_FILTER = { script_len_range: ["0x0", "0x1"], output_data_len_range: ["0x0", "0x1"] };
+const TYPE_ID_FILTER = { script: { code_hash: TYPE_ID_CODE_HASH, hash_type: "type", args: "0x" } };
 
 // ---------- bytes ----------
 
@@ -355,28 +355,23 @@ async function fetchTransactions(hashes, urls = RPC_URLS) {
   throw lastError ?? new Error("CKB RPC is unavailable");
 }
 
-/**
- * Live cells under a lock, from the indexer, a page of 64 at a time; refuses more than `maxCells`. With `typeId`,
- * only cells whose type is a Type ID are returned.
- */
-async function indexerCells(lock, maxCells, typeId = false, urls = RPC_URLS) {
-  return indexerPages("get_cells", lock, maxCells, typeId, urls, 0x40);
-}
-
-/** The lock's history from the indexer, committed transactions only: { tx_hash, io_type, io_index } entries. */
-async function lockHistory(lock, maxEntries, urls = RPC_URLS) {
-  return indexerPages("get_transactions", lock, maxEntries, false, urls, 0x400);
-}
-
-async function indexerPages(method, lock, maxCells, typeId, urls, pageSize) {
-  const searchKey = {
+/** The indexer's search key for cells or history under exactly this lock, with an optional filter. */
+function lockSearchKey(lock, filter) {
+  return {
     script: { code_hash: bytesToHex(lock.codeHash), hash_type: lock.hashType, args: bytesToHex(lock.args) },
     script_type: "lock",
     // Exact: the indexer's default is prefix, which would also return cells under longer args that no key of this
     // account can spend, so anyone could plant one to block every check below.
     script_search_mode: "exact",
-    ...(typeId ? { filter: { script: { code_hash: TYPE_ID_CODE_HASH, hash_type: "type", args: "0x" } } } : {}),
+    ...(filter ? { filter } : {}),
   };
+}
+
+/** Live cells under a lock, from the indexer, a page of 64 at a time, only those matching `filter`; refuses more than `maxCells`. */
+async function indexerCells(lock, maxCells, filter, urls = RPC_URLS) {
+  const searchKey = lockSearchKey(lock, filter);
+  const method = "get_cells";
+  const pageSize = 0x40;
   const cells = [];
   let cursor = null;
   for (;;) {
@@ -403,36 +398,79 @@ async function indexerPages(method, lock, maxCells, typeId, urls, pageSize) {
   }
 }
 
+/** One JSON-RPC batch, each call's result in order; any error or missing result fails the batch. */
+async function rpcBatch(calls, urls = RPC_URLS) {
+  const body = JSON.stringify(calls.map((call, id) => ({ id, jsonrpc: "2.0", ...call })));
+  let lastError;
+  for (const url of urls) {
+    try {
+      const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body, redirect: "error" });
+      if (!response.ok) throw new Error(`CKB RPC returned HTTP ${response.status}`);
+      const replies = await response.json();
+      if (!Array.isArray(replies)) throw new Error("CKB RPC returned an invalid batch");
+      const results = new Array(calls.length);
+      for (const reply of replies) if (Number.isInteger(reply?.id) && reply.id >= 0 && reply.id < calls.length && reply.result) results[reply.id] = reply.result;
+      // A sparse array's holes are skipped by some(), so every index is checked.
+      for (let i = 0; i < calls.length; i++) if (results[i] === undefined) throw new Error("CKB RPC left a call in the batch unanswered");
+      return results;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError ?? new Error("CKB RPC is unavailable");
+}
+
+/**
+ * Which of these transactions spent one of the key's cells (secp256k1 address or list lock) as input 0, from the
+ * key's own lock history in just the blocks that hold them. Only the key can add inputs to that history, and
+ * however long it grows, only these blocks are read.
+ */
+async function madeByKey(account, candidates, urls) {
+  const blocks = [...new Set(candidates.map(({ block }) => block))];
+  const calls = blocks.flatMap((block) => [account.secp, account.listLock].map((lock) => ({
+    method: "get_transactions",
+    params: [lockSearchKey(lock, { block_range: [`0x${block.toString(16)}`, `0x${(block + 1n).toString(16)}`] }), "asc", "0x400"],
+  })));
+  const made = new Set();
+  for (let at = 0; at < calls.length; at += 64) {
+    for (const result of await rpcBatch(calls.slice(at, at + 64), urls)) {
+      if (!Array.isArray(result?.objects)) throw new Error("CKB RPC returned an invalid get_transactions page");
+      // A full page can't be read past here; outsiders can only fill it by giving this key 1024 cells in one block.
+      if (result.objects.length >= 0x400) throw new Error("A block holds too much of this key's history to check");
+      for (const entry of result.objects) {
+        if (entry?.io_type === "input" && num(entry.io_index, "io index") === 0n) made.add(String(entry.tx_hash).toLowerCase());
+      }
+    }
+  }
+  return made;
+}
+
 /**
  * The type hashes of the live recovery lists this key made, under its owner-only list lock. Anyone can send a
  * cell to that lock, so a cell only counts if the transaction that created it spent one of the account's own
  * cells as input 0, which needs this key's signature (an enable spends the secp256k1 cell there, a change the
- * list itself). That is read from the key's own lock history, so nothing an outsider made is ever downloaded:
- * a fake list costs one small indexer entry to rule out, however large the transaction that made it. Which
+ * list itself). That is read from the key's own lock history in the candidate's block, so nothing an outsider
+ * made is ever downloaded, and a long history costs nothing: a fake list costs one small indexer query to rule
+ * out, however large the transaction that made it. Which
  * cells are live, and the history, are the node's word; the indexer only follows committed blocks.
  */
 async function liveLists(account, urls = RPC_URLS) {
   // Only Type ID cells are asked for, so plain cells sent to the lock can't crowd out the check. Each fake list
   // locks its capacity under this key for good, so blocking with more than 1024 costs an attacker about 131k CKB.
-  const objects = (await indexerCells(account.listLock, 1024, true, urls)).map((object) => {
+  const objects = (await indexerCells(account.listLock, 1024, TYPE_ID_FILTER, urls)).map((object) => {
     const lock = parseScript(object?.output?.lock, "cell lock");
     const type = object?.output?.type ? parseScript(object.output.type, "cell type") : undefined;
     if (!sameScript(lock, account.listLock) || !isTypeId(type)) throw new Error("CKB RPC returned a cell that isn't under the recovery list lock");
-    return { txHash: object?.out_point?.tx_hash, type };
+    return { txHash: object?.out_point?.tx_hash, block: num(object?.block_number, "block number"), type };
   });
   if (objects.length === 0) return [];
   // Proof is input 0 spent from the key's own secp256k1 address or its owner-only list lock. An administrator-
   // mode Omnilock doesn't count: anyone can make one with this key's auth and their own list, and spend it with
   // their own backup. A failed lookup fails the whole check rather than leaving a list out.
-  const madeByKey = new Set();
-  for (const lock of [account.secp, account.listLock]) {
-    for (const entry of await lockHistory(lock, MAX_HISTORY, urls)) {
-      if (entry?.io_type === "input" && num(entry.io_index, "io index") === 0n) madeByKey.add(String(entry.tx_hash).toLowerCase());
-    }
-  }
+  const made = await madeByKey(account, objects, urls);
   const hashes = [];
   for (const { txHash, type } of objects) {
-    if (typeof txHash === "string" && madeByKey.has(txHash.toLowerCase())) hashes.push(bytesToHex(scriptHash(type)));
+    if (typeof txHash === "string" && made.has(txHash.toLowerCase())) hashes.push(bytesToHex(scriptHash(type)));
   }
   return [...new Set(hashes)];
 }
@@ -450,7 +488,8 @@ async function enableView(account) {
   let lastError;
   for (const url of RPC_URLS) {
     try {
-      const plain = (await indexerCells(account.secp, 256, false, [url])).filter((cell) => !cell?.output?.type && (cell?.output_data ?? "0x") === "0x");
+      // Only plain cells are asked for, so typed cells sent to the address can't push the count over the limit.
+      const plain = (await indexerCells(account.secp, 256, PLAIN_FILTER, [url])).filter((cell) => !cell?.output?.type && (cell?.output_data ?? "0x") === "0x");
       const lists = await liveLists(account, [url]);
       return { plain, lists };
     } catch (error) {

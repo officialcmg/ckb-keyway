@@ -81,18 +81,22 @@ It also enforces these invariants on the recovery list:
   A cell there only counts as a list if the transaction that created it spent, as input 0, a cell from the key's
   own secp256k1 address or its list lock (a change must spend the list as input 0 for the same reason). The
   Action reads that from the key's own lock history (indexer `get_transactions` on those two locks, inputs at
-  index 0), which only the key can add inputs to. It never downloads a candidate's transaction, so an outsider
-  can't make the check slow or exhaust memory by planting lists from huge, witness-padded transactions. The indexer is queried with `script_search_mode: "exact"`:
+  index 0), which only the key can add inputs to, and only in the blocks that hold candidate lists (a
+  `block_range` filter, in batches of 64 queries). It never downloads a candidate's transaction, so an outsider
+  can't make the check slow or exhaust memory by planting lists from huge, witness-padded transactions, and a
+  long account history costs nothing. The indexer is queried with `script_search_mode: "exact"`:
   its default prefix search would also return unspendable cells planted under longer args, which would block
   every enable or send. An administrator-mode Omnilock doesn't count, because anyone can make one
   with this key's auth and their own list. Anyone can send a cell to the list lock, so this stops outsiders
   blocking an account with fake lists. A failed lookup refuses the request rather than leaving a list out.
   Only Type ID cells are fetched, up to 1024. Every fake list locks its capacity under this key for good, so
-  blocking an account that way costs an attacker more than 1024 such cells, about 131k CKB. The history read is
-  capped at 8192 entries per lock; anyone can add output entries, but each one gives this key a cell.
+  blocking an account that way costs an attacker more than 1024 such cells, about 131k CKB. A candidate's block
+  is refused if it holds 1024 or more entries of this key's history, which an outsider can only cause by giving
+  the key that many cells in one block.
 - Dusting: an enable must spend every plain cell at the secp256k1 address, and the server plans at most 60 inputs.
-  Anyone can send many small cells there to stall turning recovery on. The user keeps the CKB and can merge the
-  cells with an ordinary send, so this is a nuisance, not a freeze.
+  Anyone can send many small plain cells there to stall turning recovery on. The Action only asks the indexer for
+  plain cells (no type, no data), so typed cells sent there don't count toward its limit of 256. The user keeps
+  the CKB and can merge the plain cells into fewer with an ordinary send, so this is a nuisance, not a freeze.
 - An enable must spend every live plain cell at the key's secp256k1 address. Two enables signed before either is
   indexed then spend the same cells, so at most one can commit. Input 0 being plain means every enable spends at
   least one plain cell, so two enables made only from typed cells someone sent to the address can't both pass.
@@ -164,10 +168,11 @@ What it doesn't stop:
   hardcoded, so only a Resend account with that domain verified can send the email.
 
 Brute force: there is no state, so the Action can't count attempts. The server still counts five tries for normal
-use. A ticket is stateless and valid for 10 minutes, so someone calling the Action directly with the usage key can
-guess against one ticket, one guess per Lit run, for those 10 minutes without another email. Only Lit's run
-latency limits the rate: with 10^8 codes, even 10,000 guesses have about a 1 in 10,000 chance per ticket, and each
-new ticket emails the user.
+use. A ticket is stateless: the Action checks its format and expiry, not that `send-code` issued it. So someone
+calling the Action directly with the usage key can make their own tickets and keep guessing without any email
+reaching the user. Each guess is one Lit run, and the code for a ticket is an HMAC under the Action's key, so a
+made-up ticket is no easier to guess than a real one: each guess has a 1 in 10^8 chance, and only the rate of Lit
+runs limits how many can be made.
 
 ### (c) A user-held factor the Action verifies (not shipped)
 
@@ -278,7 +283,7 @@ You run these locally. The server has no Lit account credentials.
    actions to groups.
 3. **Register the policy Action.**
    1. In the Chipotle dashboard, open **Action Runner** and paste `lit-actions/sign-ckb-transaction.js` exactly.
-   2. Click **Get Lit Action IPFS CID**. It must be `QmQ68VWxpGJ1YPHC9VJFuB5LZXLzGW4J2KEA9auaa7jopg`, the same as
+   2. Click **Get Lit Action IPFS CID**. It must be `QmdenFdHhgK8THUEBDDatEyhxbXTU3M8c7Jd4P74xBsK8Y`, the same as
       `LIT_POLICY_ACTION_CID` in `.env.example` and `POLICY_ACTION_CID` in `src/server/lit-policy.ts`. Any other
       CID means the pasted source differs from this branch.
    3. Under **IPFS Actions**, register the CID as `keyway-ckb-policy-signer`.
