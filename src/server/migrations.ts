@@ -387,4 +387,11 @@ export const migrations: Array<{
       await sql`create index keyway_v2_pending_transactions_user on keyway_v2_pending_transactions (user_id, seq)`;
     },
   },
+  {
+    // 22, not 21: the open session-origins change takes 21.
+    version: 22, name: "watchtower-closing-commitment",
+    // The commitment number of the peer's commitment that closed a channel, so a revocation that arrives after the
+    // close reopens it only when it can punish that commitment.
+    up: (sql) => sql`alter table keyway_v2_watchtower_channels add column closing_commitment_number numeric(20, 0)`,
+  },
 ];

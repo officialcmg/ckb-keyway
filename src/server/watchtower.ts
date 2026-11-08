@@ -1,6 +1,7 @@
 import * as ccc from "@ckb-ccc/core";
 import { schnorr, secp256k1 } from "@noble/curves/secp256k1.js";
 import { sha256 } from "@noble/hashes/sha2.js";
+import type { TransactionSql } from "postgres";
 import type { User } from "./auth-user.ts";
 import { database, type DatabaseSql } from "./database.ts";
 import { COMMITMENT_LOCK, XUDT_COMPATIBLE_WITNESS, blake160, commitmentLockCellDeps } from "../sdk/browser/watchtower-settle.ts";
@@ -223,6 +224,8 @@ type Row = {
   funding_seen: boolean;
   funding_spend: string | null;
   closing_tx: string | null;
+  /** When the peer force-closed with a commitment the stored revocation didn't cover: that commitment's number. */
+  closing_commitment_number: string | null;
   penalty_tx: string | null;
   resolution_confirmed: boolean;
   unwatch_requested_at: Date | null;
@@ -279,12 +282,7 @@ export async function watchtowerRequest(user: User, request: WatchtowerRequest, 
         }
         return { channel: publicStatus(existing) };
       }
-      // A close or penalty is checked every pass until it is confirmed, so it counts until then too.
-      const [{ count }] = await tx<Array<{ count: string }>>`
-        select count(*) from keyway_v2_watchtower_channels
-        where user_id = ${user.id} and (state in ('watching', 'penalty-sent') or (state in ('closed', 'penalized') and not resolution_confirmed))
-      `;
-      if (Number(count) >= MAX_WATCHED_CHANNELS) throw new Error(`The watchtower already watches ${MAX_WATCHED_CHANNELS} open channels for this account`);
+      if (await checkedChannels(tx, user.id) >= MAX_WATCHED_CHANNELS) throw new Error(`The watchtower already watches ${MAX_WATCHED_CHANNELS} open channels for this account`);
       const [row] = await tx<Row[]>`
         insert into keyway_v2_watchtower_channels (
           user_id, channel_id, local_funding_pubkey, remote_funding_pubkey, funding_lock_args, peer_commitment_key, funding_udt_type_script
@@ -313,16 +311,24 @@ export async function watchtowerRequest(user: User, request: WatchtowerRequest, 
       if (existing.commitment_number !== null && BigInt(existing.commitment_number) >= revocation.commitmentNumber) {
         return { channel: publicStatus(existing), stored: false };
       }
+      // The peer may have force-closed with a commitment this revocation covers (it arrived late): the next pass
+      // looks at the close again and punishes it. Only such a close reopens; a cooperative close or the user's own
+      // force-close never does.
+      let reopen = existing.state === "closed" && existing.closing_commitment_number !== null
+        && BigInt(existing.closing_commitment_number) <= revocation.commitmentNumber;
+      if (reopen && existing.resolution_confirmed) {
+        // A confirmed close no longer counts toward the cap, so reopening it must not take the account over it.
+        await tx`select pg_advisory_xact_lock(hashtextextended(${`watchtower:${user.id}`}, 0))`;
+        reopen = await checkedChannels(tx, user.id) < MAX_WATCHED_CHANNELS;
+      }
       const [row] = await tx<Row[]>`
         update keyway_v2_watchtower_channels set
           commitment_number = ${revocation.commitmentNumber.toString()},
           aggregated_signature = ${revocation.aggregatedSignature},
           revocation_output = ${revocation.output},
           revocation_output_data = ${revocation.outputData},
-          -- A close taken for the current state may be a commitment this revocation covers (it arrived late): the
-          -- next pass looks at the close again and punishes it if so.
-          state = case when state = 'closed' then 'watching' else state end,
-          resolution_confirmed = case when state = 'closed' then false else resolution_confirmed end,
+          state = case when ${reopen}::boolean then 'watching' else state end,
+          resolution_confirmed = case when ${reopen}::boolean then false else resolution_confirmed end,
           updated_at = now()
         where user_id = ${user.id} and channel_id = ${request.channelId}
         returning *
@@ -338,6 +344,15 @@ export async function watchtowerRequest(user: User, request: WatchtowerRequest, 
     returning *
   `;
   return { channel: row ? publicStatus(row) : null };
+}
+
+/** The account's channels that every pass checks: open ones, and closes and penalties until they are confirmed. */
+async function checkedChannels(sql: TransactionSql, userId: string): Promise<number> {
+  const [{ count }] = await sql<Array<{ count: string }>>`
+    select count(*) from keyway_v2_watchtower_channels
+    where user_id = ${userId} and (state in ('watching', 'penalty-sent') or (state in ('closed', 'penalized') and not resolution_confirmed))
+  `;
+  return Number(count);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -592,7 +607,7 @@ export type ScanState = Pick<Row, "history_cursor" | "recent_scan" | "funding_se
 
 export type Assessment = { scan: ScanState; backlog?: boolean } & (
   | { state: "watching"; detail: string }
-  | { state: "closed"; detail: string; closingTx: ccc.Hex; fundingOutPoint: string }
+  | { state: "closed"; detail: string; closingTx: ccc.Hex; fundingOutPoint: string; peerCommitmentNumber?: bigint }
   | { state: "revoked"; closingTx: ccc.Hex; fundingOutPoint: string; commitment: Commitment }
 );
 
@@ -664,7 +679,10 @@ export async function assessChannel(
     return { ...base, state: "closed", detail: "the user's node force-closed; the wallet claims the user's share when it next runs" };
   }
   if (row.commitment_number === null || BigInt(row.commitment_number) < args.commitmentNumber) {
-    return { ...base, state: "closed", detail: "the peer force-closed with the current state; the wallet claims the user's share when it next runs" };
+    return {
+      ...base, state: "closed", peerCommitmentNumber: args.commitmentNumber,
+      detail: "the peer force-closed with the current state; the wallet claims the user's share when it next runs",
+    };
   }
   return {
     ...base,
@@ -822,19 +840,21 @@ async function confirmResolution(deps: PassDependencies, row: Row, log: (message
   log(`${row.channel_id}: the closing transaction ${hash} left the chain; watching again`);
   await deps.sql`
     update keyway_v2_watchtower_channels set
-      state = 'watching', detail = 'the close left the chain; watching again', funding_spend = null, closing_tx = null, funding_out_point = null, updated_at = now()
+      state = 'watching', detail = 'the close left the chain; watching again', funding_spend = null, closing_tx = null, closing_commitment_number = null,
+      funding_out_point = null, updated_at = now()
     where user_id = ${row.user_id} and channel_id = ${row.channel_id} and state = 'closed'
   `;
 }
 
 async function checkChannel(deps: PassDependencies, row: Row, log: (message: string) => void, backlogBudgetMs: number): Promise<boolean> {
   const { sql, chain } = deps;
-  const save = (fields: Partial<Pick<Row, "state" | "detail" | "funding_out_point" | "closing_tx" | "penalty_tx">>, { unlessRevoked = false } = {}) => sql`
+  const save = (fields: Partial<Pick<Row, "state" | "detail" | "funding_out_point" | "closing_tx" | "closing_commitment_number" | "penalty_tx">>, { unlessRevoked = false } = {}) => sql`
     update keyway_v2_watchtower_channels set
       state = ${fields.state ?? row.state},
       detail = ${fields.detail ?? row.detail},
       funding_out_point = ${fields.funding_out_point ?? row.funding_out_point},
       closing_tx = ${fields.closing_tx ?? row.closing_tx},
+      closing_commitment_number = ${fields.closing_commitment_number === undefined ? row.closing_commitment_number : fields.closing_commitment_number},
       penalty_tx = ${fields.penalty_tx ?? row.penalty_tx},
       checked_at = now(),
       updated_at = case when ${fields.state ?? row.state} <> state or ${fields.detail ?? row.detail}::text is distinct from detail then now() else updated_at end
@@ -866,7 +886,10 @@ async function checkChannel(deps: PassDependencies, row: Row, log: (message: str
   if (assessment.state === "closed") {
     log(`${row.channel_id}: ${assessment.detail} (${assessment.closingTx})`);
     // Not if a revocation arrived during the check: it may cover this commitment, and the next pass decides with it.
-    await save({ state: "closed", detail: assessment.detail, closing_tx: assessment.closingTx, funding_out_point: assessment.fundingOutPoint }, { unlessRevoked: true });
+    await save({
+      state: "closed", detail: assessment.detail, closing_tx: assessment.closingTx, funding_out_point: assessment.fundingOutPoint,
+      closing_commitment_number: assessment.peerCommitmentNumber?.toString() ?? null,
+    }, { unlessRevoked: true });
     return false;
   }
   // The peer published a revoked commitment.
