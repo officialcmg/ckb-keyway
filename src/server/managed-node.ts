@@ -68,12 +68,13 @@ export async function managedNodeRequest(
     let dial = [params];
     if (method === "connectPeer") {
       // The node dials only what was checked here: a host name becomes its checked IP, and a peer named by key
-      // is dialed at its checked TCP addresses, or over TCP when it is official or already connected.
+      // is dialed at its checked TCP addresses, or by key over TCP only when it is an official peer. Any other
+      // peer that is already connected isn't dialed again: by key, the node would pick from addresses the peer
+      // announced itself, which nothing here checked.
       if (typeof params.address === "string") dial = [{ ...params, address: await pinPublicPeerAddress(params.address) }];
-      else {
-        const addresses = await assertKnownPublicPeer(node, String(params.pubkey));
-        dial = addresses.length > 0 ? addresses.map((address) => ({ address, save: false })) : [{ ...params, addr_type: "tcp" }];
-      }
+      else if (isOfficialPeer(String(params.pubkey))) dial = [{ ...params, addr_type: "tcp" }];
+      else dial = (await assertKnownPublicPeer(node, String(params.pubkey))).map((address) => ({ address, save: false }));
+      if (dial.length === 0) return { done: true };
       if ((await node.listPeers()).peers.length >= MAX_PEERS) throw new Error(`A hosted node can connect to at most ${MAX_PEERS} peers`);
     }
     // A peer named by key may have several checked addresses; one that works is enough.
@@ -303,9 +304,14 @@ const MAX_PEERS = 32;
  * Connecting by pubkey makes the node dial the addresses the peer announced to the network, so those must
  * be public too. A peer that is already connected, or one of the official peers, needs no check.
  */
+function isOfficialPeer(peer: string): boolean {
+  const bare = peer.toLowerCase().replace(/^0x/, "");
+  return TESTNET_CHANNEL_PEERS.some(({ pubkey }) => pubkey.slice(2) === bare);
+}
+
 async function assertKnownPublicPeer(node: ManagedNodeClient, peer: string): Promise<string[]> {
   const bare = peer.toLowerCase().replace(/^0x/, "");
-  if (TESTNET_CHANNEL_PEERS.some(({ pubkey }) => pubkey.slice(2) === bare)) return [];
+  if (isOfficialPeer(peer)) return [];
   if ((await node.listPeers()).peers.some(({ pubkey }) => pubkey.toLowerCase().replace(/^0x/, "") === bare)) return [];
   let after: string | undefined;
   for (let page = 0; page < 8; page++) {

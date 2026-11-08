@@ -65,6 +65,16 @@ test("connecting a hosted node by pubkey dials only the peer addresses that were
   assert.deepEqual(dialed, [{ pubkey: OFFICIAL, addr_type: "tcp", save: false }]);
 });
 
+test("connecting by pubkey to a peer that is already connected never dials it by key", async () => {
+  // The peer could drop the session before the node dials, and by key the node would pick from addresses
+  // the peer announced itself, such as one inside KeyWay's network.
+  const { node, dialed } = hostedNode(["/ip4/127.0.0.1/tcp/8227/p2p/Qm1"]);
+  node.listPeers = async () => ({ peers: [{ pubkey: PEER }] });
+  const result = await managedNodeRequest("connected-user", { operation: "act", method: "connectPeer", params: { pubkey: PEER } }, node as never);
+  assert.deepEqual(result, { done: true });
+  assert.deepEqual(dialed, []);
+});
+
 test("a hosted node dials the checked IP, not a host name it would resolve again", async (t) => {
   fakeDns(t, ["203.0.113.9"]);
   const { node, dialed } = hostedNode([]);
