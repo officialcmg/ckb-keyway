@@ -11,6 +11,9 @@ import { pathToFileURL } from "node:url";
 const USER_ID = /^[0-9a-f]{64}$/;
 const SNAPSHOT = /^snap-\d+$/;
 const CHANNELS_MARKER = "keyway-channels";
+// Written once a node's channels have been checked under the marker scheme. A node without it (one from before
+// markers existed) starts after a restart like a marked one, so its channels are found and marked.
+const CHECKED_MARKER = "keyway-channels-checked";
 // A node used this recently is never stopped to make room, so a user's steps that span several requests,
 // such as connecting to a peer and then opening a channel with it, can't lose the node in between.
 const RECENT_USE_MS = 5 * 60_000;
@@ -138,8 +141,24 @@ async function markChannels(userId, hasChannels) {
 }
 
 async function hasChannelsMarker(userId) {
-  try { await stat(join(managedDataDir(userId), CHANNELS_MARKER)); return true; }
+  return fileExists(join(managedDataDir(userId), CHANNELS_MARKER));
+}
+
+async function channelsChecked(userId) {
+  return fileExists(join(managedDataDir(userId), CHECKED_MARKER));
+}
+
+async function fileExists(path) {
+  try { await stat(path); return true; }
   catch (error) { if (error?.code === "ENOENT") return false; throw error; }
+}
+
+/** Marks a node by its current channels and records that it has been checked. */
+async function checkChannels(userId, node) {
+  let open = false;
+  try { requireClosedChannels(await nodeChannels(node)); } catch { open = true; }
+  await markChannels(userId, open);
+  await writeFile(join(managedDataDir(userId), CHECKED_MARKER), "", { mode: 0o600 });
 }
 
 export async function withUserOperation(userId, operation) {
@@ -204,9 +223,16 @@ async function makeRoom(userId) {
  * next request, so leftover nodes can't hold up the ones with channels.
  */
 export async function startKnownNodes(users) {
-  const marked = await Promise.all(users.map((userId) => hasChannelsMarker(userId).catch(() => true)));
-  const withChannels = users.filter((_, index) => marked[index]);
-  const start = (userId) => withUserOperation(userId, () => ensureNode(userId)).catch(logError);
+  const states = await Promise.all(users.map(async (userId) => ({
+    marked: await hasChannelsMarker(userId).catch(() => true),
+    checked: await channelsChecked(userId).catch(() => false),
+  })));
+  // Marked nodes, and nodes never checked under the marker scheme (they may hold channels from before it).
+  const withChannels = users.filter((_, index) => states[index].marked || !states[index].checked);
+  const start = (userId) => withUserOperation(userId, async () => {
+    const node = await ensureNode(userId);
+    if (!(await channelsChecked(userId))) await checkChannels(userId, node);
+  }).catch(logError);
   await Promise.all(withChannels.slice(0, maxNodes()).map(start));
   for (const userId of withChannels.slice(maxNodes())) await start(userId);
 }

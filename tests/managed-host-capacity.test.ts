@@ -129,7 +129,10 @@ test("opening a channel marks the node to start first after a restart", async (c
 test("after a restart, only nodes with channels start, however many idle ones are listed first", async (context) => {
   const { module, root, request, running } = await host(context);
   const idle = Array.from({ length: 20 }, (_, index) => index.toString(16).padStart(64, "0"));
-  for (const user of [...idle, F]) await mkdir(join(root, "users", user), { recursive: true });
+  for (const user of [...idle, F]) {
+    await mkdir(join(root, "users", user), { recursive: true });
+    await writeFile(join(root, "users", user, "keyway-channels-checked"), "");
+  }
   await writeFile(join(root, "users", F, "keyway-channels"), "");
 
   await module.startKnownNodes([...idle, F]);
@@ -137,6 +140,20 @@ test("after a restart, only nodes with channels start, however many idle ones ar
   // Any other node starts when its user next needs it.
   assert.equal(await request(idle[0]), 200);
   assert.deepEqual(running(), [idle[0], F]);
+});
+
+test("after a restart, nodes from before channel markers start once and are marked by their channels", async (context) => {
+  const { module, root, running, marked } = await host(context);
+  // Neither was ever checked: A holds an open channel, B has none.
+  for (const user of [A, B]) await mkdir(join(root, "users", user), { recursive: true });
+  await writeFile(join(root, "users", A, "channels.json"), JSON.stringify(OPEN_CHANNEL));
+
+  await module.startKnownNodes([A, B]);
+  assert.deepEqual(running().sort(), [A, B].sort());
+  assert.equal(await marked(A), true);
+  assert.equal(await marked(B), false);
+  assert.equal(await exists(join(root, "users", A, "keyway-channels-checked")), true);
+  assert.equal(await exists(join(root, "users", B, "keyway-channels-checked")), true);
 });
 
 test("a node making room keeps its channel marker until it has stopped", async (context) => {
