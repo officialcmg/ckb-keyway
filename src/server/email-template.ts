@@ -39,8 +39,12 @@ export function createConfirmationEmailTemplate(appName: string, code: string, h
   if (!name || !/^\d{6}$/.test(code) || !heading.trim()) throw new Error("Application name, heading and a six-digit code are required");
   const safeName = escapeHtml(name);
   const safeHeading = escapeHtml(heading);
-  const lines = summary.slice(0, 12).map((line) => line.slice(0, 160));
-  const rows = lines.map((line) => `<tr><td style="padding:6px 0;border-top:1px solid #e5e7eb;font-size:14px;line-height:20px;text-align:left">${escapeHtml(line)}</td></tr>`).join("");
+  // Up to 12 lines; past that the last one says how many more there are, so nothing is left out unannounced.
+  const shown = summary.length > 12 ? [...summary.slice(0, 11), `…and ${summary.length - 11} more not shown here. If you didn't start this, don't enter the code.`] : summary;
+  // Long enough for a whole address, which the email shows rather than its start and checksum. A longer line
+  // (an address with unusually long lock args) ends in "…" so the reader knows it was cut.
+  const lines = shown.map((line) => (line.length > 240 ? `${line.slice(0, 239)}…` : line));
+  const rows = lines.map((line) => `<tr><td style="padding:6px 0;border-top:1px solid #e5e7eb;font-size:14px;line-height:20px;text-align:left;overflow-wrap:anywhere;word-break:break-all">${escapeHtml(line)}</td></tr>`).join("");
   return {
     subject: `${heading} in ${name}`,
     plaintext: `${heading} in ${name}\n\n${lines.join("\n")}\n\nYour confirmation code is ${code}\n\nThis code expires in 10 minutes. Only enter it if you started this action. If you didn't, don't share the code, and sign in to ${name} to check your account.\n\nSecured by CKB KeyWay`,

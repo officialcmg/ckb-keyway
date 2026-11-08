@@ -11,6 +11,7 @@ import { COMMITMENT_LOCK, blake160 } from "../src/sdk/browser/watchtower-settle.
 const enabled = Boolean(process.env.KEYWAY_AUTH_TEST_DATABASE_URL);
 const K1 = "0x02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9";
 const K2 = "0x03dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659";
+const K3 = "0x023590a94e768f8e1815c2f24b4d80a8e3149316c3518ce7b7ad338368d038ca66";
 const userLock = { codeHash: `0x${"9b".repeat(32)}`, hashType: "type", args: `0x${"01".repeat(20)}` } as const;
 
 const channelId = () => ccc.hexFrom(crypto.getRandomValues(new Uint8Array(32)));
@@ -62,15 +63,16 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
   // The 2026-11-06 testnet run: real funding keys, the real signed revocation (number 2) and the on-chain lock
   // args of the revoked commitment (number 1) that the watchtower punished.
   const proof = JSON.parse(await readFile(new URL("./fixtures/watchtower-testnet-proof.json", import.meta.url), "utf8")).penalty;
-  async function revokedChannel(signature: string) {
+  const proofRevocation = (id: string, signature: string = proof.revocationSignature) => parseWatchtowerRequest({
+    operation: "revoke", channelId: id,
+    revocation: { commitment_number: `0x${BigInt(proof.revocationCommitmentNumber).toString(16)}`, aggregated_signature: signature, output: proof.revocationOutput, output_data: "0x00000000" },
+  });
+  async function revokedChannel(signature: string, { uploaded = true } = {}) {
     const user = { id: crypto.randomUUID() };
     const id = channelId();
     await sql`delete from keyway_v2_watchtower_channels where state in ('watching', 'penalty-sent')`;
     await watchtowerRequest(user, parseWatchtowerRequest({ operation: "watch", channelId: id, localFundingPubkey: proof.localFundingPubkey, remoteFundingPubkey: proof.remoteFundingPubkey, fundingUdtTypeScript: null }));
-    await watchtowerRequest(user, parseWatchtowerRequest({
-      operation: "revoke", channelId: id,
-      revocation: { commitment_number: `0x${BigInt(proof.revocationCommitmentNumber).toString(16)}`, aggregated_signature: signature, output: proof.revocationOutput, output_data: "0x00000000" },
-    }));
+    if (uploaded) await watchtowerRequest(user, proofRevocation(id, signature));
     const closing = ccc.Transaction.from({
       inputs: [{ previousOutput: { txHash: `0x${"f0".repeat(32)}`, index: 0 } }],
       outputs: [{ capacity: ccc.CellOutput.decode(proof.revocationOutput).capacity, lock: { codeHash: COMMITMENT_LOCK.testnet.codeHash, hashType: "type", args: ccc.hexFrom(ccc.bytesConcat(ccc.bytesFrom(proof.onChainCommitmentArgs), new Uint8Array(21))) } }],
@@ -179,13 +181,14 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
   await t.test("channels catching up on a long backlog never hold up another channel's penalty", async () => {
     const { id: revokedId, closing } = await revokedChannel(proof.revocationSignature);
     const user = { id: crypto.randomUUID() };
-    const backlogged = [channelId(), channelId()];
-    for (const id of backlogged) await watchtowerRequest(user, watch(id));
-    const paddedLock = fundingLockArgs(K1, K2);
+    // Two channels on their own funding locks (a pass reads a lock shared by channels once).
+    const backlogged = [[channelId(), K2], [channelId(), K3]] as const;
+    for (const [id, key] of backlogged) await watchtowerRequest(user, parseWatchtowerRequest({ operation: "watch", channelId: id, localFundingPubkey: K1, remoteFundingPubkey: key, fundingUdtTypeScript: null }));
+    const paddedLocks = new Set([fundingLockArgs(K1, K2), fundingLockArgs(K1, K3)]);
     const events: string[] = [];
     const chain: ChainView = {
       async fundingHistory(lock, _scan, options) {
-        if (lock.args !== paddedLock) return { sawOutput: true, spend: { txHash: closing.hash(), index: 0 } };
+        if (!paddedLocks.has(lock.args)) return { sawOutput: true, spend: { txHash: closing.hash(), index: 0 } };
         const budget = options?.backlogBudgetMs ?? 0;
         events.push(budget === 0 ? "check" : `catch-up ${Math.round(budget / 10) * 10}`);
         await new Promise((resolve) => setTimeout(resolve, budget)); // uses its whole budget
@@ -260,6 +263,137 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     await pass(); // the revoked commitment is found and punished
     assert.equal(await state(), "penalty-sent");
     assert.deepEqual(punished, [id]);
+  });
+
+  // The peer publishes commitment 1 before the revocation that covers it (number 2) reaches KeyWay, e.g. because the
+  // user's tab closed while the upload was being retried.
+  for (const when of ["after the pass", "during the check"] as const) {
+    await t.test(`a covering revocation that arrives ${when} gets the peer punished`, async () => {
+      const { user, id, closing } = await revokedChannel(proof.revocationSignature, { uploaded: false });
+      const penalty = `0x${"cd".repeat(32)}` as ccc.Hex;
+      let uploadDuringCheck = when === "during the check";
+      const chain: ChainView = {
+        fundingHistory: async () => ({ sawOutput: true, spend: { txHash: closing.hash(), index: 0 } }),
+        async transaction(hash) {
+          if (hash === closing.hash() && uploadDuringCheck) {
+            uploadDuringCheck = false;
+            assert.equal(((await watchtowerRequest(user, proofRevocation(id))) as { stored: boolean }).stored, true);
+          }
+          if (hash === closing.hash()) return { tx: closing, committed: true, status: "committed" };
+          if (hash === penalty) return { tx: ccc.Transaction.from({}), committed: false, status: "pending" };
+          return undefined;
+        },
+        isLive: async () => true,
+        spender: async () => undefined,
+      };
+      const punished: string[] = [];
+      const pass = () => runWatchtowerPass({ sql, chain, punish: async (row) => { punished.push(row.channel_id); return penalty; }, log: () => undefined });
+      const state = async () => (await sql<Array<{ state: string }>>`select state from keyway_v2_watchtower_channels where channel_id = ${id}`)[0].state;
+      await pass();
+      if (when === "after the pass") {
+        assert.equal(await state(), "closed", "without a revocation the close looks like the current state");
+        assert.equal(((await watchtowerRequest(user, proofRevocation(id))) as { stored: boolean }).stored, true);
+      }
+      assert.equal(await state(), "watching");
+      await pass();
+      await pass();
+      assert.equal(await state(), "penalty-sent");
+      assert.deepEqual(punished, [id]);
+    });
+  }
+
+  await t.test("a revocation reopens only a close it can punish, and never takes an account over the cap", async () => {
+    await sql`delete from keyway_v2_watchtower_channels`;
+    // The peer force-closes with commitment 1 (the testnet proof's) before any revocation reached KeyWay; the other
+    // two channels close cooperatively and by the user's own commitment.
+    const { user, id: peerClosed, closing: peerClose } = await revokedChannel(proof.revocationSignature, { uploaded: false });
+    const [cooperative, ownClose] = [channelId(), channelId()];
+    await watchtowerRequest(user, parseWatchtowerRequest({ operation: "watch", channelId: cooperative, localFundingPubkey: K1, remoteFundingPubkey: K2, fundingUdtTypeScript: null }));
+    await watchtowerRequest(user, parseWatchtowerRequest({ operation: "watch", channelId: ownClose, localFundingPubkey: K1, remoteFundingPubkey: K3, fundingUdtTypeScript: null }));
+    const closeWith = (byte: string, outputs: ccc.CellOutputLike[]) => ccc.Transaction.from({
+      inputs: [{ previousOutput: { txHash: `0x${byte.repeat(32)}`, index: 0 } }], outputs, outputsData: outputs.map(() => "0x"),
+    });
+    const ownNumber = new Uint8Array(8);
+    new DataView(ownNumber.buffer).setBigUint64(0, 1n);
+    const closes = new Map([
+      [fundingLockArgs(proof.localFundingPubkey, proof.remoteFundingPubkey), peerClose],
+      [fundingLockArgs(K1, K2), closeWith("e1", [{ capacity: 1000n, lock: userLock }, { capacity: 1000n, lock: userLock }])],
+      // The user's own commitment: another key hash than the peer's.
+      [fundingLockArgs(K1, K3), closeWith("e2", [{ capacity: 1000n, lock: { codeHash: COMMITMENT_LOCK.testnet.codeHash, hashType: "type", args: ccc.hexFrom(ccc.bytesConcat(new Uint8Array(20).fill(0xee), new Uint8Array(8), ownNumber)) } }])],
+    ]);
+    const chain: ChainView = {
+      fundingHistory: async (lock) => ({ sawOutput: true, spend: { txHash: closes.get(lock.args)!.hash(), index: 0 } }),
+      async transaction(hash) {
+        const tx = [...closes.values()].find((close) => close.hash() === hash);
+        return tx ? { tx, committed: true, status: "committed" } : undefined;
+      },
+      isLive: async () => true,
+      spender: async () => undefined,
+    };
+    await runWatchtowerPass({ sql, chain, punish: async () => { throw new Error("no"); }, log: () => undefined });
+    // The closes stayed on-chain through the window: they no longer count toward the cap.
+    await sql`update keyway_v2_watchtower_channels set resolution_confirmed = true where user_id = ${user.id} and state = 'closed'`;
+    const state = async (id: string) => ({ ...(await sql<Array<{ state: string; resolution_confirmed: boolean }>>`select state, resolution_confirmed from keyway_v2_watchtower_channels where channel_id = ${id}`)[0] });
+    const closed = { state: "closed", resolution_confirmed: true };
+    const stored = async (request: ReturnType<typeof revoke>) => ((await watchtowerRequest(user, request)) as { stored: boolean }).stored;
+
+    // Nothing a revocation covers closed these two, however new it is.
+    for (const id of [cooperative, ownClose]) {
+      assert.equal(await stored(revoke(id, 5)), true);
+      assert.deepEqual(await state(id), closed);
+    }
+    // Revocation 0 doesn't cover the peer's commitment 1.
+    assert.equal(await stored(revoke(peerClosed, 0)), true);
+    assert.deepEqual(await state(peerClosed), closed);
+
+    // Revocation 1 does, but the account already has as many channels checked every pass as it may.
+    await sql`insert into keyway_v2_watchtower_channels (user_id, channel_id, local_funding_pubkey, remote_funding_pubkey, funding_lock_args, peer_commitment_key)
+      select ${user.id}, '0x' || lpad(to_hex(n), 64, '0'), ${K1}, ${K2}, ${fundingLockArgs(K1, K2)}, ${peerCommitmentKey(K1, K2)} from generate_series(1, ${MAX_WATCHED_CHANNELS}) n`;
+    assert.equal(await stored(revoke(peerClosed, 1)), true);
+    assert.deepEqual(await state(peerClosed), closed);
+    const [{ count }] = await sql<Array<{ count: string }>>`
+      select count(*) from keyway_v2_watchtower_channels where user_id = ${user.id} and (state in ('watching', 'penalty-sent') or not resolution_confirmed)
+    `;
+    assert.equal(Number(count), MAX_WATCHED_CHANNELS);
+    // With room under the cap, the next one reopens it for the pass to punish.
+    await sql`delete from keyway_v2_watchtower_channels where user_id = ${user.id} and channel_id = ${`0x${"0".repeat(63)}1`}`;
+    assert.equal(await stored(proofRevocation(peerClosed)), true);
+    assert.deepEqual(await state(peerClosed), { state: "watching", resolution_confirmed: false });
+    await sql`delete from keyway_v2_watchtower_channels where user_id = ${user.id}`;
+  });
+
+  await t.test("closed channels count toward the cap until confirmed, and a pass reads each lock and transaction once", async () => {
+    await sql`delete from keyway_v2_watchtower_channels`;
+    const flooder = { id: crypto.randomUUID() };
+    // The same funding keys under many channel IDs: one funding lock.
+    const ids = Array.from({ length: MAX_WATCHED_CHANNELS }, channelId);
+    for (const id of ids) await watchtowerRequest(flooder, watch(id));
+    const honest = { id: crypto.randomUUID() };
+    const honestId = channelId();
+    await watchtowerRequest(honest, parseWatchtowerRequest({ operation: "watch", channelId: honestId, localFundingPubkey: K1, remoteFundingPubkey: K3, fundingUdtTypeScript: null }));
+    const close = `0x${"c1".repeat(32)}` as ccc.Hex;
+    const historyReads = new Map<string, number>();
+    const transactionReads = new Map<string, number>();
+    const chain: ChainView = {
+      async fundingHistory(lock) {
+        historyReads.set(lock.args, (historyReads.get(lock.args) ?? 0) + 1);
+        return { sawOutput: true };
+      },
+      async transaction(hash) {
+        transactionReads.set(hash, (transactionReads.get(hash) ?? 0) + 1);
+        return hash === close ? { tx: ccc.Transaction.from({}), committed: true, status: "committed" } : undefined;
+      },
+      isLive: async () => false,
+      spender: async () => undefined,
+    };
+    const pass = () => runWatchtowerPass({ sql, chain, punish: async () => { throw new Error("no"); }, log: () => undefined });
+    await pass();
+    assert.deepEqual([...historyReads.values()].sort(), [1, 1], "one read for the flooder's lock, one for the honest channel's");
+    // Every flooder channel closes by the same transaction; the honest one stays open.
+    await sql`update keyway_v2_watchtower_channels set state = 'closed', closing_tx = ${close}, funding_spend = ${`${close}:0`} where user_id = ${flooder.id}`;
+    await pass();
+    assert.equal(transactionReads.get(close), 1);
+    await assert.rejects(watchtowerRequest(flooder, watch(channelId())), /already watches/);
   });
 
   await t.test("a close is confirmed only by a check after the window, even after an outage", async () => {

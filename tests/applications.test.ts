@@ -49,18 +49,19 @@ test("records OTP usage and enforces each application's request limit", { skip: 
   };
   const context = await prepareOtpSend(request);
   await recordOtpResult(context, "sent");
-  await assert.rejects(prepareOtpSend(request), /too many/i);
+  await assert.rejects(prepareOtpSend({ ...request, email: `${crypto.randomUUID()}@example.com` }), /too many/i);
 
   const [updated] = await listApplications(owner);
   assert.equal(updated.usage.sent24h, 1);
   assert.equal(updated.usage.rateLimited24h, 1);
 });
 
-test("application quotas are atomic across distinct email and IP subjects", { skip: !process.env.DATABASE_URL }, async () => {
+test("application quotas are atomic across distinct emails", { skip: !process.env.DATABASE_URL }, async () => {
   const owner = { id: crypto.randomUUID() } as User;
   const app = await createApplication(owner, { name: "Concurrent App", otpLimitPerMinute: 2 });
+  const ipAddress = crypto.randomUUID();
   const results = await Promise.allSettled(Array.from({ length: 8 }, () => prepareOtpSend({
-    appId: app.appId, email: `${crypto.randomUUID()}@example.com`, ipAddress: crypto.randomUUID(),
+    appId: app.appId, email: `${crypto.randomUUID()}@example.com`, ipAddress,
   })));
   assert.equal(results.filter((result) => result.status === "fulfilled").length, 2);
 });

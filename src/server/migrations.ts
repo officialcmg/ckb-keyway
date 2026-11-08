@@ -387,4 +387,18 @@ export const migrations: Array<{
       await sql`create index keyway_v2_pending_transactions_user on keyway_v2_pending_transactions (user_id, seq)`;
     },
   },
+  {
+    version: 21, name: "session-origins",
+    up: async (sql) => {
+      // The origin each session was issued at, so removing an origin from an app ends its sessions. Sessions from
+      // before this have none and are not tied to an origin.
+      await sql`alter table keyway_auth_sessions add column if not exists "origin" text`;
+    },
+  },
+  {
+    version: 22, name: "watchtower-closing-commitment",
+    // The commitment number of the peer's commitment that closed a channel, so a revocation that arrives after the
+    // close reopens it only when it can punish that commitment.
+    up: (sql) => sql`alter table keyway_v2_watchtower_channels add column closing_commitment_number numeric(20, 0)`,
+  },
 ];

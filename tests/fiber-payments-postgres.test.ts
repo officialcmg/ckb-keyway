@@ -130,6 +130,26 @@ test("hosted Fiber payments: daily amount, email codes and overlapping approvals
     assert.equal(again.requiresEmailCode, false);
   });
 
+  await t.test("a send without an idempotency key that times out stays counted, since the node may still have paid", async () => {
+    const h = harness(60n * CKB);
+    await h.settings(100n * CKB);
+    // The node takes the payment, but the answer never arrives: the SDK reports a timeout, with no data.
+    const node = { call: async <T>(method: string, params: Array<Record<string, unknown>> = []): Promise<T> => {
+      if (method === "send_payment" && !params[0]?.dry_run) {
+        h.sent.push(params[0]);
+        throw Object.assign(new Error("Request timeout"), { code: -32000 });
+      }
+      return h.node.call<T>(method, params);
+    } };
+    const body = { method: "sendPayment", params: { invoice: "fibt1test" } };
+    const first = await fiberPayment(h.context, node, { ...body, stage: "preview" }) as { requiresEmailCode: boolean; confirmationNonce: string };
+    assert.equal(first.requiresEmailCode, false);
+    await assert.rejects(() => fiberPayment(h.context, node, { ...body, stage: "send", confirmationNonce: first.confirmationNonce }), /outcome isn't known yet/);
+    assert.equal(h.sent.length, 1);
+    const second = await pay(h, { stage: "preview" });
+    assert.equal(second.requiresEmailCode, true);
+  });
+
   await t.test("token payments count toward the token's own amount; with none, they need the code", async () => {
     const h = harness(5n);
     const rusd = { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" };

@@ -75,7 +75,8 @@ export function KeyWayTransactionModal({ theme, appName, preview, step, answer }
                 palette={palette}
                 label={<>To {recipient.kind === "wallet" ? `${recipient.walletType ?? "standard"} wallet` : recipient.kind}</>}
                 value={<>
-                  {shortAddress(recipient.address)}
+                  {/* The whole address: two look-alike addresses can share their start and their checksum. */}
+                  {recipient.address}
                   <span style={{ display: "block", color: palette.muted }}>
                     {[`${recipient.ckb} CKB`, ...recipient.tokens.map((token) => token.amountText ?? `${token.amount} of token ${token.id}`), ...recipient.nfts].join(" · ")}
                   </span>

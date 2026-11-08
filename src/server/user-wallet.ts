@@ -32,6 +32,8 @@ export type PendingRecoveryChange = {
   /** The account's address once the transaction commits. */
   ckbAddress: string;
   sentAt: string;
+  /** The signed transaction, molecule-encoded, so a change no node holds any more can be sent again. */
+  transaction?: string;
 };
 
 export type KeyWayWallet = ProvisioningWallet | ReadyWallet;
@@ -52,7 +54,8 @@ export function parseWallet(value: unknown): KeyWayWallet | undefined {
     const pending = candidate.recoveryPending;
     if (pending !== undefined && (
       !pending || !["enable", "add", "remove"].includes(pending.kind) || typeof pending.transactionHash !== "string" ||
-      typeof pending.ckbAddress !== "string" || typeof pending.sentAt !== "string" || !parseRecovery(pending.recovery, candidate.litPublicKey as string)
+      typeof pending.ckbAddress !== "string" || typeof pending.sentAt !== "string" || !parseRecovery(pending.recovery, candidate.litPublicKey as string) ||
+      (pending.transaction !== undefined && (typeof pending.transaction !== "string" || !/^0x(?:[0-9a-f]{2})+$/.test(pending.transaction)))
     )) throw new Error("KeyWay account recovery settings are invalid");
   }
   return candidate as KeyWayWallet;

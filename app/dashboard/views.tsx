@@ -60,11 +60,12 @@ export function SignInCard({ onSendCode, onVerify }: {
 
 /* Applications list */
 
-export function ApplicationsHeader({ email, onSignOut, onCreate }: { email?: string; onSignOut: () => void; onCreate: () => void }) {
+export function ApplicationsHeader({ email, signOutError, onSignOut, onCreate }: { email?: string; signOutError?: string; onSignOut: () => void; onCreate: () => void }) {
   return (
     <div className="dash-list-head">
       <div className="dash-list-head__copy">
         <p>{email && <>{email} · </>}<a href="#" onClick={(event) => { event.preventDefault(); onSignOut(); }}>Sign out</a></p>
+        {signOutError && <p role="alert" className="field-error"><AlertIcon />{signOutError}</p>}
         <h1>Applications</h1>
       </div>
       <button type="button" className="btn btn--route dash-new" onClick={onCreate}><PlusIcon />New application</button>
