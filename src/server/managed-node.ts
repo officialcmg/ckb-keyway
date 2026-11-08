@@ -12,7 +12,7 @@ import { connectCandidates, TESTNET_CHANNEL_PEERS } from "../sdk/browser/channel
 import { normalizeCkbTransactionForCcc } from "@fiber-pay/sdk/browser";
 import { serializeCccTransactionForRpc } from "../sdk/browser/ccc-transaction.ts";
 import { approveFiberParams, FIBER_METHODS, fundingFeeRate, freeFiberParams, paymentFiberParams, type FiberMethod } from "../sdk/browser/fiber-methods.ts";
-import { assertPublicPeerAddress } from "./peer-address.ts";
+import { pinPublicPeerAddress } from "./peer-address.ts";
 import * as ccc from "@ckb-ccc/core";
 import { FEE_RESERVE, needsFeeReserve, sweepSettlement } from "../sdk/browser/settlement-sweep.ts";
 
@@ -65,17 +65,27 @@ export async function managedNodeRequest(
       throw new Error(`${method} isn't available through KeyWay`);
     }
     const params = approveFiberParams(method, body.params);
+    let dial = [params];
     if (method === "connectPeer") {
-      if (typeof params.address === "string") await assertPublicPeerAddress(params.address);
-      else await assertKnownPublicPeer(node, String(params.pubkey));
+      // The node dials only what was checked here: a host name becomes its checked IP, and a peer named by key
+      // is dialed at its checked TCP addresses, or over TCP when it is official or already connected.
+      if (typeof params.address === "string") dial = [{ ...params, address: await pinPublicPeerAddress(params.address) }];
+      else {
+        const addresses = await assertKnownPublicPeer(node, String(params.pubkey));
+        dial = addresses.length > 0 ? addresses.map((address) => ({ address, save: false })) : [{ ...params, addr_type: "tcp" }];
+      }
       if ((await node.listPeers()).peers.length >= MAX_PEERS) throw new Error(`A hosted node can connect to at most ${MAX_PEERS} peers`);
     }
-    await serializeMutation(userId, () => node.call(FIBER_METHODS[method as FiberMethod].rpc, [params]));
+    // A peer named by key may have several checked addresses; one that works is enough.
+    await serializeMutation(userId, async () => {
+      const results = await Promise.allSettled(dial.map((each) => node.call(FIBER_METHODS[method as FiberMethod].rpc, [each])));
+      if (results.every((result) => result.status === "rejected")) throw (results[0] as PromiseRejectedResult).reason;
+    });
     return { done: true };
   }
   if (body.operation === "status") {
     return {
-      node: await node.nodeInfo(),
+      node: publicNodeInfo(await node.nodeInfo()),
       peers: (await node.listPeers()).peers,
       network: "testnet",
       custody: "keyway-managed",
@@ -304,8 +314,9 @@ async function assertKnownPublicPeer(node: ManagedNodeClient, peer: string): Pro
     if (found) {
       const tcp = found.addresses.filter((address) => /\/tcp\/\d+(\/p2p\/|$)/.test(address) && !/\/(ws|wss)(\/|$)/.test(address));
       if (tcp.length === 0) throw new Error("This peer announces no address a hosted node can reach; pass one with connectPeer");
-      for (const address of tcp) await assertPublicPeerAddress(address);
-      return tcp;
+      const pinned: string[] = [];
+      for (const address of tcp) pinned.push(await pinPublicPeerAddress(address));
+      return pinned;
     }
     if (result.nodes.length < 256) break;
     after = result.last_cursor;
@@ -316,10 +327,11 @@ async function assertKnownPublicPeer(node: ManagedNodeClient, peer: string): Pro
 async function connectManagedPeer(node: ManagedNodeClient, peer: Pubkey): Promise<void> {
   const candidate = TESTNET_CHANNEL_PEERS.find(({ pubkey }) => pubkey === peer.toLowerCase());
   if (!candidate) {
-    // Any public peer: its announced addresses must be public, and the handshake must match its key.
+    // Any public peer: its announced addresses must be public, and the handshake must match its key. Like any
+    // peer an app asks for, it isn't saved to the node's permanent peer store.
     const addresses = await assertKnownPublicPeer(node, peer);
     if (addresses.length === 0) return;
-    if ((await connectCandidates(node, [{ pubkey: peer as `0x${string}`, nodeName: "selected peer", addresses, minimumFunding: 0n }], 10_000, 250)).length === 0) {
+    if ((await connectCandidates(node, [{ pubkey: peer as `0x${string}`, nodeName: "selected peer", addresses, minimumFunding: 0n }], 10_000, 250, false)).length === 0) {
       throw new Error("Could not connect to the selected Fiber channel peer");
     }
     return;
