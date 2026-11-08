@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { backUpBeforeLogout, restoreBeforeStart } from "../src/sdk/browser/node-migration.ts";
+import { createRemoteWatchtower } from "../src/sdk/browser/watchtower-remote.ts";
 
 const payload = {
   formatVersion: 1 as const,
@@ -38,6 +39,48 @@ test("does not release ownership when backup upload fails", async () => {
   assert.equal(released, false);
   assert.deepEqual(key, new Uint8Array(32));
 });
+
+for (const failure of ["fails", "hangs"] as const) {
+  test(`does not back up or release ownership while a revocation that ${failure === "fails" ? "failed to send" : "is stuck"} hasn't reached KeyWay's watchtower`, async () => {
+    let reachable = false;
+    const remote = createRemoteWatchtower({
+      send: async () => {
+        if (reachable) return;
+        if (failure === "hangs") await new Promise(() => undefined);
+        throw Object.assign(new Error("KeyWay request failed"), { status: 500 });
+      },
+      retryMs: 60_000,
+      sendTimeoutMs: 100,
+      log: { info: () => undefined, warn: () => undefined },
+    });
+    const order: string[] = [];
+    const key = new Uint8Array(32).fill(7);
+    const logout = () => backUpBeforeLogout({
+      loadFiberKey: async () => key,
+      stopNode: async () => {
+        order.push("stop");
+        // The drained bridge hands over the peer's last revocation.
+        remote.enqueue({ operation: "revoke", channelId: `0x${"ab".repeat(32)}`, revocation: { commitment_number: "0x5", aggregated_signature: "0x", output: "0x", output_data: "0x" } });
+      },
+      flushWatchtower: () => remote.deliver(500),
+      createBackup: async () => { order.push("encrypt"); return payload; },
+      saveBackup: async () => { order.push("upload"); return { digest: payload.digest }; },
+      releaseOwnership: async () => { order.push("release"); },
+    });
+    try {
+      await assert.rejects(logout(), /watchtower/);
+      assert.deepEqual(order, ["stop"], "no backup and the device is kept");
+      assert.deepEqual(key, new Uint8Array(32));
+      reachable = true;
+      order.length = 0;
+      await logout();
+      assert.deepEqual(order, ["stop", "encrypt", "upload", "release"]);
+      assert.equal(remote.pending(), 0);
+    } finally {
+      remote.stop();
+    }
+  });
+}
 
 test("confirms a restore only after import succeeds", async () => {
   const order: string[] = [];

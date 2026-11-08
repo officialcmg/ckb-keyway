@@ -184,6 +184,46 @@ test("only the API's own refusals are final; other failures are retried", async 
   }
 });
 
+test("a send that gets through resets the backoff, and a rate-limited one waits only as long as KeyWay asks", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const settle = async () => { for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve)); };
+  const attempts: string[] = [];
+  // What each send meets, in turn. The first success comes with a newer revocation from the peer (churn).
+  const outcomes = ["down", "ok+newer", "down", "busy", "ok"];
+  const remote = createRemoteWatchtower({
+    async send(update) {
+      const outcome = outcomes.shift();
+      attempts.push(`${update.operation === "revoke" ? update.revocation.commitment_number : update.operation} ${outcome}`);
+      if (outcome === "down") throw Object.assign(new Error("KeyWay request failed"), { status: 502 });
+      if (outcome === "busy") throw Object.assign(new Error("Too many watchtower updates. Try again in 3 seconds"), { status: 429 });
+      if (outcome === "ok+newer") {
+        // The peer's next update arrives while this send is on its way.
+        await new Promise((resolve) => setImmediate(resolve));
+        remote.enqueue({ operation: "revoke", channelId: CHANNEL, revocation: revocationJson(2n) });
+      }
+    },
+    retryMs: 10_000,
+    log: { info: () => undefined, warn: () => undefined },
+  });
+  try {
+    remote.enqueue({ operation: "revoke", channelId: CHANNEL, revocation: revocationJson(1n) });
+    await settle();
+    t.mock.timers.tick(10_000);
+    await settle();
+    assert.deepEqual(attempts, ["0x1 down", "0x1 ok+newer", "0x2 down"]);
+    // The send in between got through, so this is a first failure again: 10 s, not 20.
+    t.mock.timers.tick(10_000);
+    await settle();
+    assert.deepEqual(attempts.slice(3), ["0x2 busy"]);
+    t.mock.timers.tick(3_000);
+    await settle();
+    assert.deepEqual(attempts.slice(4), ["0x2 ok"]);
+    assert.equal(remote.pending(), 0);
+  } finally {
+    remote.stop();
+  }
+});
+
 test("a revocation for a channel the device has no record of stops being retried", async () => {
   let lookups = 0;
   const remote = createRemoteWatchtower({

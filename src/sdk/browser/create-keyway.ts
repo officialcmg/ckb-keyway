@@ -397,6 +397,9 @@ export function createKeyWay(options: CreateKeyWayOptions) {
         loadFiberKey: () => options.loadFiberKey(lease.leaseId),
         // The backup is taken only after the bridge has drained, so it holds every watchtower call.
         stopNode: steps.stopNodeAndDrain,
+        // Once the session ends nothing more reaches KeyWay's watchtower from this page, so it must have every
+        // revocation first; until then the logout fails and the user stays signed in.
+        flushWatchtower: () => remoteWatchtower.deliver(10_000),
         createBackup: (fiberKey) => createEncryptedNodeBackup(databasePrefix, fiberKey),
         saveBackup: (backup) => api.saveNodeBackup(options.authToken, {
           deviceIdHash,

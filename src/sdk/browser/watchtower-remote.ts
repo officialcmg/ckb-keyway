@@ -99,6 +99,8 @@ export type RemoteWatchtower = {
   enqueue(update: RemoteWatchUpdate | undefined): void;
   /** Sends everything queued; resolves when the queue is empty or a send failed (it is then retried later). */
   flush(): Promise<void>;
+  /** Sends everything queued, and fails unless KeyWay has all of it within `timeoutMs` (e.g. before a logout). */
+  deliver(timeoutMs: number): Promise<void>;
   /** Channels with an update KeyWay doesn't have yet. */
   pending(): number;
   stop(): void;
@@ -109,6 +111,8 @@ export function createRemoteWatchtower(options: {
   /** The channel's registration, from the in-page store, for when KeyWay reports it doesn't know the channel. */
   registration?: (channelId: string) => Promise<RemoteWatchUpdate | undefined>;
   retryMs?: number;
+  /** A send that takes longer than this counts as failed and is retried, so a stuck request can't hold the queue. */
+  sendTimeoutMs?: number;
   log?: Pick<Console, "info" | "warn">;
 }): RemoteWatchtower {
   const queues = new Map<string, ChannelQueue>();
@@ -117,6 +121,8 @@ export function createRemoteWatchtower(options: {
   let retry: ReturnType<typeof setTimeout> | undefined;
   let stopped = false;
   let attempt = 0;
+  /** How long KeyWay asked us to wait when it last turned a send away for its rate limit. */
+  let retryAfterMs: number | undefined;
 
   function enqueue(update: RemoteWatchUpdate | undefined) {
     if (!update || !/^0x[0-9a-f]{64}$/.test(update.channelId) || rejectedChannels.has(update.channelId)) return;
@@ -158,7 +164,7 @@ export function createRemoteWatchtower(options: {
         const update = queue[kind];
         if (!update || stopped) continue;
         try {
-          await options.send(update);
+          await withTimeout(options.send(update), options.sendTimeoutMs ?? 30_000, "KeyWay's watchtower did not answer in time");
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           const notWatched = kind === "revoke" && /not watched/i.test(message);
@@ -180,9 +186,14 @@ export function createRemoteWatchtower(options: {
             continue;
           }
           log.warn(`[keyway] watchtower: could not update KeyWay's watchtower for channel ${channelId}; retrying`, message);
+          const wait = (error as { status?: unknown })?.status === 429 ? /Try again in (\d+) seconds/i.exec(message) : null;
+          if (wait) retryAfterMs = Math.max(retryAfterMs ?? 0, 1000, Number(wait[1]) * 1000);
           failed = true;
           break;
         }
+        // A send got through, so a failure after it starts the backoff over: a peer that keeps the updates coming
+        // can't push the wait to its longest.
+        attempt = 0;
         // A newer update may have replaced this one while it was being sent.
         if (queue[kind] === update) delete queue[kind];
       }
@@ -194,10 +205,13 @@ export function createRemoteWatchtower(options: {
   function scheduleRetry() {
     if (retry || stopped) return;
     attempt += 1;
+    // A rate-limited send is tried again when KeyWay says it can be, not after a growing wait.
+    const delay = retryAfterMs ?? Math.min(5 * 60_000, (options.retryMs ?? 15_000) * 2 ** Math.min(attempt - 1, 5));
+    retryAfterMs = undefined;
     retry = setTimeout(() => {
       retry = undefined;
       void run(false);
-    }, Math.min(5 * 60_000, (options.retryMs ?? 15_000) * 2 ** Math.min(attempt - 1, 5)));
+    }, delay);
   }
 
   /**
@@ -225,6 +239,11 @@ export function createRemoteWatchtower(options: {
   }
   const flush = () => run(true);
 
+  async function deliver(timeoutMs: number) {
+    await withTimeout(flush(), timeoutMs, "").catch(() => undefined);
+    if (pending() > 0) throw new Error("Fiber channel updates have not reached KeyWay's watchtower yet. Try again in a moment.");
+  }
+
   function pending() {
     return [...queues.values()].filter((queue) => queue.watch || queue.revoke || queue.unwatch).length;
   }
@@ -232,6 +251,7 @@ export function createRemoteWatchtower(options: {
   return {
     enqueue,
     flush,
+    deliver,
     pending,
     stop() {
       stopped = true;
@@ -239,4 +259,10 @@ export function createRemoteWatchtower(options: {
       retry = undefined;
     },
   };
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); })])
+    .finally(() => clearTimeout(timer));
 }

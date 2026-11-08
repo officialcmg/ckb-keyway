@@ -3,6 +3,8 @@ import type { ClaimedNodeBackup, NodeBackupPayload } from "./api-client";
 export async function backUpBeforeLogout(options: {
   loadFiberKey: () => Promise<Uint8Array>;
   stopNode: () => Promise<void>;
+  /** Fails while KeyWay's watchtower is still missing a channel update: the logout then stops, keeping the device. */
+  flushWatchtower?: () => Promise<void>;
   createBackup: (fiberKey: Uint8Array) => Promise<NodeBackupPayload>;
   saveBackup: (backup: NodeBackupPayload) => Promise<{ digest: string }>;
   releaseOwnership: () => Promise<void>;
@@ -10,6 +12,7 @@ export async function backUpBeforeLogout(options: {
   const fiberKey = await options.loadFiberKey();
   try {
     await options.stopNode();
+    await options.flushWatchtower?.();
     const backup = await options.createBackup(fiberKey);
     const saved = await options.saveBackup(backup);
     if (saved.digest !== backup.digest) throw new Error("Backend did not verify the Fiber node backup");
