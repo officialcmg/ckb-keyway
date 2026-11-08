@@ -19,12 +19,7 @@ import { acquireLease, heartbeatLease, releaseLease, requireLease } from "./devi
 import { loadLitAction } from "./lit-actions.ts";
 import { LIT_ACTION_CIDS } from "./lit-config.ts";
 import { wrapFiberKey } from "./lit.ts";
-import {
-  previewFundingTransaction,
-  serializeTransaction,
-  signFundingTransaction,
-} from "./funding-transaction.ts";
-import { consumeConfirmation, issueConfirmation } from "./signing-confirmation.ts";
+import { serializeTransaction } from "./funding-transaction.ts";
 import { database } from "./database.ts";
 import { confirmNodeBackupRestored, readClaimedNodeBackup, saveNodeBackup } from "./node-backup.ts";
 import {
@@ -38,9 +33,10 @@ import { managedFiberNode, managedNodeReady, managedNodeRequest, sweepHostedSett
 import { fiberPayment } from "./fiber-payments.ts";
 import { runIdempotentMutation } from "./idempotency.ts";
 import { recordSigningEvent } from "./security-alerts.ts";
-import { fundingCode, fundingNeedsLitCode, issueFundingCodeRequest, messageSigning, sendFundingCode, sendLimitOffer, signingSettings, transactionSigning, type SigningContext } from "./general-signing.ts";
+import { fundingSigning, type FundingContext } from "./funding-signing.ts";
+import { messageSigning, sendLimitOffer, signingSettings, transactionSigning, type SigningContext } from "./general-signing.ts";
 import { litPolicyEnabled } from "./lit-policy.ts";
-import { listPendingTransactions, nodeStatus, recordPendingTransaction } from "./pending-transactions.ts";
+import { listPendingTransactions, nodeStatus } from "./pending-transactions.ts";
 import { sendLimitHead } from "./send-limits.ts";
 import { recoveryBackupChange, recoverySetup, settleRecoveryChange } from "./recovery.ts";
 import { sweepLegacyAfterSignIn } from "./legacy-sweep.ts";
@@ -331,39 +327,20 @@ async function signTransactionRequest(request: Request): Promise<Response> {
   const body = await objectBody(request, "Invalid signing request");
   // General transactions go through the general policy; requests without a purpose are channel funding.
   if (body.purpose === "transaction") return generalSigningRequest(request, "transaction", body);
-  const { operation, transaction, confirmationNonce } = body;
   const wallet = await readWallet(user);
   if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
-  const validated = await previewFundingTransaction(wallet, transaction);
-  const serialized = JSON.stringify(serializeTransaction(validated.transaction));
   const scope = await resolveAuthScope(request);
-  const codeContext = { user, wallet, appName: scope.name, email: () => sessionEmail(request), rateLimit: consumeRateLimit };
-  if (operation === "preview") {
-    // Once the account has send limits, Lit signs a funding only with its code: Fiber chooses the inputs, so the
-    // funding can't chain on the send-limit cell and count toward the daily amount.
-    if (await fundingNeedsLitCode(wallet, validated.transaction)) {
-      return Response.json({ preview: validated.preview, confirmationNonce: await issueFundingCodeRequest(user, serialized), requiresEmailCode: true });
-    }
-    return Response.json({
-      preview: validated.preview,
-      confirmationNonce: await issueConfirmation(user, serialized),
-    });
-  }
-  if (operation === "request-email-code" && typeof confirmationNonce === "string") {
-    return Response.json(await sendFundingCode(codeContext, confirmationNonce, serialized, validated.transaction));
-  }
-  if (operation !== "sign" || typeof confirmationNonce !== "string") {
-    throw new Error("A valid signing operation is required");
-  }
-  return Response.json(await versionedMutation(request, user.id, "sign-transaction", body, async () => {
-    const coded = await fundingCode(codeContext, confirmationNonce, serialized, body.emailCode);
-    if (!coded) await consumeConfirmation(user, confirmationNonce, serialized);
-    await recordSigningEvent(user.id);
-    const signed = await signFundingTransaction(user, wallet, validated, coded ?? {});
-    await coded?.consume();
-    await recordPendingTransaction(user.id, signed);
-    return { transaction: serializeTransaction(signed) };
-  }));
+  const context: FundingContext = {
+    user,
+    wallet,
+    appName: scope.name,
+    email: () => sessionEmail(request),
+    sendEmail: sendTransactionalEmail,
+    rateLimit: consumeRateLimit,
+    recordSigning: recordSigningEvent,
+  };
+  if (body.operation === "sign") return Response.json(await versionedMutation(request, user.id, "sign-transaction", body, () => fundingSigning(context, body)));
+  return Response.json(await fundingSigning(context, body));
 }
 
 /** The account's pending transactions and its newest send-limit cell, which a client loads before it builds a send. */

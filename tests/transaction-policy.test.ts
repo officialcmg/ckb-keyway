@@ -2,20 +2,24 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
-import { formatCkbSignature } from "../src/server/funding-transaction.ts";
-import { describeTransaction, type KnownScripts } from "../src/server/transaction-policy.ts";
+import { secp256k1Lock, type KeyWayRecovery } from "../src/sdk/browser/account-lock.ts";
+import { formatCkbSignature, previewFundingTransaction, serializeTransaction } from "../src/server/funding-transaction.ts";
+import { describeTransaction, previewGeneralTransaction, previewSummaryLines, type KnownScripts } from "../src/server/transaction-policy.ts";
 import { parseThreshold } from "../src/server/general-signing.ts";
+import type { ReadyWallet } from "../src/server/user-wallet.ts";
 
 const client = new ccc.ClientPublicTestnet();
 const CKB = 100_000_000n;
 const info = (codeHash: string) => ({ codeHash: ccc.hexFrom(codeHash), hashType: "type", cellDeps: [] }) as unknown as ccc.ScriptInfo;
 const SECP = `0x${"9b".repeat(32)}`;
+const TYPE_ID = "0x00000000000000000000000000000000000000000000000000545950455f4944";
+const UNIQUE = `0x${"2c".repeat(32)}`;
 const known: KnownScripts = {
   xudt: info(`0x${"25".repeat(32)}`),
   sudt: info(`0x${"26".repeat(32)}`),
   dao: info(`0x${"82".repeat(32)}`),
   wallets: [{ name: "standard", info: info(SECP) }],
-  quiet: [],
+  quiet: [info(TYPE_ID), info(UNIQUE)],
 };
 const lock = (byte: string) => ccc.Script.from({ codeHash: SECP, hashType: "type", args: `0x${byte.repeat(20)}` });
 const own = lock("11");
@@ -29,7 +33,7 @@ const mystery = ccc.Script.from({ codeHash: `0x${"9f".repeat(32)}`, hashType: "t
 type Cell = { lock: ccc.Script; capacity: bigint; type?: ccc.Script; data?: ccc.Hex };
 const u128 = (value: bigint) => ccc.hexFrom(ccc.numLeToBytes(value, 16));
 
-function build(inputs: Cell[], outputs: Cell[]) {
+function build(inputs: Cell[], outputs: Cell[], recovery?: KeyWayRecovery) {
   const transaction = ccc.Transaction.from({
     inputs: inputs.map((_, index) => ({ previousOutput: { txHash: `0x${index.toString(16).padStart(64, "0")}`, index: 0 } })),
     outputs: outputs.map((cell) => ({ lock: cell.lock, capacity: cell.capacity, type: cell.type })),
@@ -37,7 +41,7 @@ function build(inputs: Cell[], outputs: Cell[]) {
     witnesses: [ccc.hexFrom(ccc.WitnessArgs.from({ lock: `0x${"00".repeat(65)}` }).toBytes())],
   });
   const inputCells = inputs.map((cell) => ({ cellOutput: ccc.CellOutput.from({ lock: cell.lock, capacity: cell.capacity, type: cell.type }), outputData: cell.data ?? "0x" as ccc.Hex }));
-  return describeTransaction(transaction, inputCells, own, known, client);
+  return describeTransaction(transaction, inputCells, own, known, client, undefined, recovery);
 }
 
 test("describes a plain CKB transfer, its recipient and the fee", () => {
@@ -171,4 +175,115 @@ test("with recovery on, the Omnilock and the old secp256k1 lock are both the use
   assert.equal(preview.otherSigners, 0);
   assert.deepEqual(preview.details.inputs.map(({ lock }) => lock), ["you", "you"]);
   assert.equal(preview.recipients.length, 1);
+});
+
+test("Spore, Cluster, Type ID and Unique cells leaving the account count as assets, per cell, like the Lit Action", () => {
+  const cluster = ccc.Script.from({ codeHash: "0x0bbe768b519d8ea7b96d58f1182eb7e6ef96c541fbd9526975077ee09f049058", hashType: "data1", args: `0x${"c1".repeat(32)}` });
+  const typeId = ccc.Script.from({ codeHash: TYPE_ID, hashType: "type", args: `0x${"71".repeat(32)}` });
+  const unique = ccc.Script.from({ codeHash: UNIQUE, hashType: "type", args: `0x${"81".repeat(20)}` });
+  for (const type of [spore, cluster, typeId, unique]) {
+    const { tokensLeaving, tokenOutflows } = build(
+      [{ lock: own, capacity: 300n * CKB, type, data: "0x01" }, { lock: own, capacity: 1_000n * CKB }],
+      [{ lock: alice, capacity: 300n * CKB, type, data: "0x01" }, { lock: own, capacity: 1_000n * CKB - 1_000n }],
+    );
+    assert.equal(tokensLeaving, true, type.codeHash);
+    assert.deepEqual(tokenOutflows, [{ asset: type.hash(), amount: 1n }], type.codeHash);
+  }
+  // Kept by the account, moved between its own cells: nothing leaves.
+  const kept = build(
+    [{ lock: own, capacity: 300n * CKB, type: spore, data: "0x01" }, { lock: own, capacity: 1_000n * CKB }],
+    [{ lock: own, capacity: 300n * CKB, type: spore, data: "0x01" }, { lock: own, capacity: 1_000n * CKB - 1_000n }],
+  );
+  assert.deepEqual(kept.tokenOutflows, []);
+  // Not assets: Nervos DAO cells, the send-limit settings cell and the recovery list.
+  const settings = ccc.Script.from({ codeHash: TYPE_ID, hashType: "type", args: `0x${"5e".repeat(32)}` });
+  const list = ccc.Script.from({ codeHash: TYPE_ID, hashType: "type", args: `0x${"a1".repeat(32)}` });
+  const recovery = { adminListTypeHash: list.hash() } as unknown as KeyWayRecovery;
+  const quiet = build(
+    [
+      { lock: own, capacity: 1_000n * CKB, type: dao, data: "0x0000000000000000" },
+      { lock: own, capacity: 200n * CKB, type: settings, data: "0x4b57534c01" },
+      { lock: own, capacity: 200n * CKB, type: list, data: "0x01" },
+    ],
+    [{ lock: alice, capacity: 1_400n * CKB - 2_000n }],
+    recovery,
+  );
+  assert.deepEqual(quiet.tokenOutflows, []);
+  assert.equal(quiet.tokensLeaving, false);
+});
+
+/** An offline client that answers getCell from these cells, and counts how often it is asked. */
+function chainOf(cells: ccc.Cell[]) {
+  const reads = { count: 0 };
+  const client = new ccc.ClientPublicTestnet({ url: "http://127.0.0.1:1/offline" });
+  Object.assign(client, {
+    getCell: async (outPoint: ccc.OutPointLike) => {
+      reads.count++;
+      return cells.find((cell) => cell.outPoint.eq(ccc.OutPoint.from(outPoint)));
+    },
+    findCells: async function* () {},
+    findCellsOnChain: async function* () {},
+  });
+  return { client, reads };
+}
+
+const offlineKey = secp256k1.utils.randomSecretKey();
+const offlineWallet = { litPkpId: `0x${"11".repeat(20)}`, litPublicKey: ccc.hexFrom(secp256k1.getPublicKey(offlineKey, true)), status: "ready" } as unknown as ReadyWallet;
+const live = (index: number, lock: ccc.Script, capacity: bigint, type?: ccc.Script, data: ccc.Hex = "0x") =>
+  ccc.Cell.from({ outPoint: { txHash: `0x${(index + 0x100).toString(16).padStart(64, "0")}`, index: 0 }, cellOutput: { lock, capacity, type }, outputData: data });
+const json = <T>(value: T): T => JSON.parse(JSON.stringify(value));
+
+test("a transaction's inputs are read from the chain, never from cell details the caller attached", async () => {
+  const { client: probe } = chainOf([]);
+  const mine = await secp256k1Lock(probe, offlineWallet.litPublicKey);
+  const other = ccc.Script.from({ codeHash: mine.codeHash, hashType: mine.hashType, args: `0x${"77".repeat(20)}` });
+  const token = await ccc.Script.fromKnownScript(probe, ccc.KnownScript.XUdt, `0x${"55".repeat(32)}`);
+  const cells = [live(1, mine, 200n * CKB, token, u128(1_000n)), live(2, mine, 500n * CKB)];
+  const { client, reads } = chainOf(cells);
+  const clean = serializeTransaction(ccc.Transaction.from({
+    inputs: cells.map(({ outPoint }) => ({ previousOutput: outPoint })),
+    outputs: [{ lock: other, type: token, capacity: 143n * CKB }, { lock: mine, capacity: 557n * CKB - 10_000n }],
+    outputsData: [u128(1_000n), "0x"],
+    witnesses: [ccc.hexFrom(ccc.WitnessArgs.from({ lock: `0x${"00".repeat(65)}` }).toBytes()), "0x"],
+  })) as { inputs: Array<Record<string, unknown>> };
+  // The same out points, with the token input described as plain CKB.
+  const forged = json(clean);
+  forged.inputs[0].cellOutput = { lock: JSON.parse(ccc.stringify(mine)), capacity: ccc.numToHex(200n * CKB) };
+  forged.inputs[0].outputData = "0x";
+
+  const honest = await previewGeneralTransaction(offlineWallet, json(clean), client);
+  reads.count = 0;
+  const attempted = await previewGeneralTransaction(offlineWallet, forged, client);
+  assert.ok(reads.count >= cells.length, "each input is looked up on chain");
+  assert.equal(attempted.preview.transactionHash, honest.preview.transactionHash);
+  assert.deepEqual(attempted.tokenOutflows, [{ asset: token.hash(), amount: 1_000n }]);
+  assert.deepEqual(attempted.tokenOutflows, honest.tokenOutflows);
+  assert.equal(attempted.outflowShannons, honest.outflowShannons);
+  assert.deepEqual(previewSummaryLines(attempted.preview), previewSummaryLines(honest.preview));
+});
+
+test("a channel funding's inputs are read from the chain, never from cell details the caller attached", async () => {
+  const { client: probe } = chainOf([]);
+  const mine = await secp256k1Lock(probe, offlineWallet.litPublicKey);
+  const peer = ccc.Script.from({ codeHash: mine.codeHash, hashType: mine.hashType, args: `0x${"77".repeat(20)}` });
+  const channel = ccc.Script.from({ codeHash: "0x6c67887fe201ee0c7853f1682c0b77c0e6214044c156c7558269390a8afa6d7c", hashType: "type", args: `0x${"cc".repeat(20)}` });
+  const cells = [live(3, mine, 2_000n * CKB), live(4, peer, 100n * CKB)];
+  const { client } = chainOf(cells);
+  const clean = serializeTransaction(ccc.Transaction.from({
+    inputs: cells.map(({ outPoint }) => ({ previousOutput: outPoint })),
+    outputs: [{ lock: channel, capacity: 1_600n * CKB }, { lock: mine, capacity: 500n * CKB - 10_000n }],
+    outputsData: ["0x", "0x"],
+    witnesses: [ccc.hexFrom(ccc.WitnessArgs.from({ lock: `0x${"00".repeat(65)}` }).toBytes()), "0x"],
+  })) as { inputs: Array<Record<string, unknown>> };
+  // The same out points, with capacity moved from the user's input to the peer's.
+  const forged = json(clean);
+  forged.inputs[0].cellOutput = { lock: JSON.parse(ccc.stringify(mine)), capacity: ccc.numToHex(1_100n * CKB) };
+  forged.inputs[0].outputData = "0x";
+  forged.inputs[1].cellOutput = { lock: JSON.parse(ccc.stringify(peer)), capacity: ccc.numToHex(1_000n * CKB) };
+  forged.inputs[1].outputData = "0x";
+
+  const honest = await previewFundingTransaction(offlineWallet, json(clean), client);
+  const attempted = await previewFundingTransaction(offlineWallet, forged, client);
+  assert.equal(honest.preview.amountCkb, "1500");
+  assert.deepEqual(attempted.preview, honest.preview);
 });

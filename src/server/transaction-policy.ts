@@ -1,13 +1,16 @@
 import * as ccc from "@ckb-ccc/core";
 import { formatAsset, isXudtCompatible } from "../sdk/browser/tokens.ts";
 import { accountLocks, refuseAdminListSpend, refuseForeignOmnilockOutputs, verifyRecoveryAnchor, type KeyWayRecovery } from "../sdk/browser/account-lock.ts";
-import { signingGroups, type SigningGroup } from "./funding-transaction.ts";
+import { signingGroups, withChainInputs, type SigningGroup } from "./funding-transaction.ts";
 import type { ReadyWallet } from "./user-wallet.ts";
 
 const SHANNONS_PER_CKB = 100_000_000n;
 const MIN_FEE_CAP = SHANNONS_PER_CKB / 100n; // 0.01 CKB
 /** How the details label the account's AdminList cell. */
 const RECOVERY_LIST = "recovery list";
+const TYPE_ID_CODE_HASH = "0x00000000000000000000000000000000000000000000000000545950455f4944";
+/** "KWSL", the start of the send-limit settings cell's data. */
+const SEND_LIMIT_SETTINGS_MAGIC = "0x4b57534c";
 const FIBER_FUNDING_LOCK_CODE_HASH = "0x6c67887fe201ee0c7853f1682c0b77c0e6214044c156c7558269390a8afa6d7c";
 
 // Spore protocol testnet scripts (sporeprotocol/spore-sdk predefined config).
@@ -107,7 +110,7 @@ export async function previewGeneralTransaction(
   client: ccc.Client = new ccc.ClientPublicTestnet(),
 ): Promise<ValidatedTransaction> {
   if (!input || typeof input !== "object") throw new Error("A complete CKB transaction is required");
-  const transaction = ccc.Transaction.from(input as ccc.TransactionLike);
+  const transaction = withChainInputs(ccc.Transaction.from(input as ccc.TransactionLike));
   if (transaction.version !== 0n) throw new Error("Only CKB transaction version 0 is allowed");
   if (transaction.inputs.length === 0 || transaction.inputs.length > 64) throw new Error("Transaction input count is invalid");
   if (transaction.outputs.length > 64) throw new Error("Transaction output count is invalid");
@@ -175,6 +178,18 @@ export function describeTransaction(
     if (CLUSTER_CODE_HASHES.has(type.codeHash)) return "Cluster";
     if (known.quiet.some((info) => matches(type, info))) return "quiet";
     return "unknown";
+  };
+  // Typed cells that count as an asset, one per cell, as the Lit Action counts them: every type other than a token
+  // (counted by amount) and Nervos DAO, except the recovery list and the send-limit settings cell (a Type ID cell
+  // under the account's secp256k1 lock whose data starts with "KWSL").
+  const standardLock = known.wallets.find(({ name }) => name === "standard")?.info;
+  const countsPerCell = (cell: { cellOutput: ccc.CellOutput; outputData: ccc.Hex }) => {
+    const type = cell.cellOutput.type;
+    const kind = typeKind(type);
+    if (kind === "none" || kind === "xUDT" || kind === "sUDT" || kind === "dao" || isRecoveryList(type)) return false;
+    const settings = type!.codeHash === TYPE_ID_CODE_HASH && type!.hashType === "type"
+      && Boolean(standardLock && matches(cell.cellOutput.lock, standardLock)) && cell.outputData.startsWith(SEND_LIMIT_SETTINGS_MAGIC);
+    return !settings;
   };
 
   // CKB: everything the account puts in versus gets back, across all of its cells.
@@ -288,12 +303,12 @@ export function describeTransaction(
 
   return {
     outflowShannons: outflow,
-    tokensLeaving: [...tokenTotals.values()].some(({ delta }) => delta < 0n) || unrecognizedLeaving(ownInputs, ownOutputs, typeKind).length > 0,
-    // Cells with a type script KeyWay can't read leave as "tokens" with no daily amount, counted per cell,
-    // so they always need the email code once confirmation is on.
+    tokensLeaving: [...tokenTotals.values()].some(({ delta }) => delta < 0n) || cellsLeaving(ownInputs, ownOutputs, countsPerCell).length > 0,
+    // Other typed cells (NFTs, Type ID and Unique cells, scripts KeyWay can't read) leave as "tokens" with no daily
+    // amount, counted per cell, so they always need the email code once confirmation is on.
     tokenOutflows: [
       ...[...tokenTotals].filter(([, { delta }]) => delta < 0n).map(([asset, { delta }]) => ({ asset, amount: -delta })),
-      ...unrecognizedLeaving(ownInputs, ownOutputs, typeKind),
+      ...cellsLeaving(ownInputs, ownOutputs, countsPerCell),
     ],
     preview: {
       network: "CKB testnet",
@@ -312,16 +327,20 @@ export function describeTransaction(
   };
 }
 
-/** Lines for the confirmation email, written from the backend's own decoding. */
+/**
+ * Lines for the confirmation email, written from the backend's own decoding. What happens to the account's assets
+ * comes before the recipients, so a long list of recipients can't push it out of the email. Each recipient is shown
+ * by its whole address: the start and the checksum are all two look-alike addresses need to share.
+ */
 export function previewSummaryLines(preview: TransactionPreview): string[] {
-  const lines = [`Send ${preview.sendingCkb} CKB`, `Network fee ${preview.feeCkb} CKB`];
-  for (const recipient of preview.recipients) lines.push(`To ${shortAddress(recipient.address)} (${recipient.kind}): ${recipient.ckb} CKB`);
+  const lines = [`Send ${preview.sendingCkb} CKB`, `Network fee ${preview.feeCkb} CKB`, `Network ${preview.network}`];
   for (const token of preview.tokens) lines.push(`Token ${token.amountText} (${token.standard} ${token.id})`);
   for (const nft of preview.nfts) lines.push(`${nft.kind} ${nft.id}: ${nft.change}`);
   for (const action of preview.dao) lines.push(`Nervos DAO ${action.action}: ${action.amountCkb} CKB`);
   for (const script of preview.unrecognized) lines.push(`Unrecognized script ${script.codeHash} (${script.cells} cells)`);
   if (preview.details.outputs.some(({ type }) => type === RECOVERY_LIST)) lines.push("Writes the account's recovery list");
-  lines.push(`Network ${preview.network}`);
+  // The amount comes before the address, so an address too long for the email's line can't push it out.
+  for (const recipient of preview.recipients) lines.push(`${recipient.ckb} CKB to ${recipient.address} (${recipient.kind})`);
   return lines;
 }
 
@@ -351,10 +370,6 @@ function shortHash(value: string): string {
   return value.length <= 14 ? value : `${value.slice(0, 8)}…${value.slice(-4)}`;
 }
 
-function shortAddress(value: string): string {
-  return value.length <= 24 ? value : `${value.slice(0, 12)}…${value.slice(-6)}`;
-}
-
 function sum(values: readonly bigint[]): bigint {
   return values.reduce((total, value) => total + value, 0n);
 }
@@ -363,17 +378,17 @@ function maxBig(a: bigint, b: bigint): bigint {
   return a > b ? a : b;
 }
 
-function unrecognizedLeaving(
-  ownInputs: Array<{ cellOutput: ccc.CellOutput }>,
-  ownOutputs: Array<{ cellOutput: ccc.CellOutput }>,
-  typeKind: (type: ccc.Script | undefined) => string,
+function cellsLeaving(
+  ownInputs: Array<{ cellOutput: ccc.CellOutput; outputData: ccc.Hex }>,
+  ownOutputs: Array<{ cellOutput: ccc.CellOutput; outputData: ccc.Hex }>,
+  countsPerCell: (cell: { cellOutput: ccc.CellOutput; outputData: ccc.Hex }) => boolean,
 ): TokenOutflow[] {
   const counts = new Map<string, bigint>();
-  for (const { cellOutput } of ownInputs) {
-    if (typeKind(cellOutput.type) === "unknown") counts.set(cellOutput.type!.hash(), (counts.get(cellOutput.type!.hash()) ?? 0n) + 1n);
+  for (const cell of ownInputs) {
+    if (countsPerCell(cell)) counts.set(cell.cellOutput.type!.hash(), (counts.get(cell.cellOutput.type!.hash()) ?? 0n) + 1n);
   }
-  for (const { cellOutput } of ownOutputs) {
-    if (typeKind(cellOutput.type) === "unknown" && counts.has(cellOutput.type!.hash())) counts.set(cellOutput.type!.hash(), counts.get(cellOutput.type!.hash())! - 1n);
+  for (const cell of ownOutputs) {
+    if (countsPerCell(cell) && counts.has(cell.cellOutput.type!.hash())) counts.set(cell.cellOutput.type!.hash(), counts.get(cell.cellOutput.type!.hash())! - 1n);
   }
   return [...counts].filter(([, left]) => left > 0n).map(([asset, amount]) => ({ asset, amount }));
 }

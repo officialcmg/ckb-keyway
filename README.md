@@ -126,7 +126,7 @@ const estimate = await fiber.estimatePayment({ invoice: fiberInvoice, max_fee_am
 if (estimate.routable) await fiber.payInvoice(fiberInvoice, { max_fee_amount: "0x5f5e100" });
 ```
 
-`openChannel()` defaults to 1,000 CKB, accepts `peer`, and opens a token channel (for example RUSD) with `udtTypeScript` and `fundingAmount`. Channel funding doesn't count toward the email-confirmation total. `estimatePayment()` performs Fiber's dry run and returns `{ routable, fee }` or a typed, retryable `KeyWayError`. `fiber.channels` lists each channel's `canSend`, `canReceive`, `capacity` and `asset`. `closeChannel()` closes after the user approves.
+`openChannel()` defaults to 1,000 CKB, accepts `peer`, and opens a token channel (for example RUSD) with `udtTypeScript` and `fundingAmount`. Channel funding counts toward the email-confirmation total like any other transfer, and past the daily amount it needs the emailed code. `estimatePayment()` performs Fiber's dry run and returns `{ routable, fee }` or a typed, retryable `KeyWayError`. `fiber.channels` lists each channel's `canSend`, `canReceive`, `capacity` and `asset`. `closeChannel()` closes after the user approves.
 
 A hosted node runs on KeyWay's servers, which hold its key, in an isolated persistent native Fiber process and data directory for each user, subject to host capacity limits. Select `<KeyWayProvider fiberNode="browser">` to run the node in the page; the demo retains it at `/app?mode=browser`. Switching modes does not migrate channels: hosted and browser nodes have separate identities and state. Existing dedicated-node assignments are preserved.
 

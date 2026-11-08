@@ -163,9 +163,9 @@ async function payOnce(context: PaymentContext, node: FiberCaller, body: Record<
       await release();
       throw error;
     }
+    // Without an idempotency key there is nothing to repeat, so the amount simply stays counted for 24 hours.
     if (!record) {
-      await release();
-      throw error;
+      throw new OutcomeUnknownError(`The payment's outcome isn't known yet (${error instanceof Error ? error.message : "the node didn't answer"}). It stays counted toward your daily amount`);
     }
     throw new OutcomeUnknownError(`The payment's outcome isn't known yet (${error instanceof Error ? error.message : "the node didn't answer"}). Repeat the request with the same idempotency key to check it`);
   }

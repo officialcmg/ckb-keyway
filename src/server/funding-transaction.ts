@@ -26,13 +26,15 @@ export type FundingPreview = {
 /** One of the account's lock groups in a transaction, signed with the witness its lock expects. */
 export type SigningGroup = { script: ccc.Script; kind: KeyWayLockKind };
 
-type ValidatedFunding = {
+export type ValidatedFunding = {
   transaction: ccc.Transaction;
   signer: ccc.SignerCkbPublicKey;
   script: ccc.Script;
   /** Every lock group of the account in the transaction, the current lock first. */
   groups: SigningGroup[];
   preview: FundingPreview;
+  /** All CKB leaving the account, the fee included; it counts toward the daily email-confirmation amount. */
+  outflowShannons: bigint;
 };
 
 export async function previewFundingTransaction(
@@ -41,7 +43,8 @@ export async function previewFundingTransaction(
   client: ccc.Client = new ccc.ClientPublicTestnet(),
 ): Promise<ValidatedFunding> {
   if (!input || typeof input !== "object") throw new Error("A complete CKB transaction is required");
-  const transaction = ccc.Transaction.from(input as ccc.TransactionLike);
+  // Every input cell is read from the chain, never from details the caller attached.
+  const transaction = withChainInputs(ccc.Transaction.from(input as ccc.TransactionLike));
   if (transaction.version !== 0n) throw new Error("Only CKB transaction version 0 is allowed");
   if (transaction.inputs.length === 0 || transaction.inputs.length > 64) throw new Error("Funding input count is invalid");
   if (transaction.outputs.length < 1 || transaction.outputs.length > 64) throw new Error("Funding output count is invalid");
@@ -94,6 +97,7 @@ export async function previewFundingTransaction(
       transactionHash: transaction.hash(),
       ...(token ? { token: { asset: token.asset, amount: token.amount.toString() } } : {}),
     },
+    outflowShannons: spend.fundingAmount + spend.fee,
   };
 }
 
@@ -170,6 +174,15 @@ export async function signFundingTransaction(
     }
     return formatCkbSignature(signature);
   }, "Funding transaction has no KeyWay signing group");
+}
+
+/**
+ * Keeps only each input's out point and since, so every input cell is read from the chain. CCC would otherwise use
+ * any cell details the caller attached to an input, and those would decide what the account sends.
+ */
+export function withChainInputs(transaction: ccc.Transaction): ccc.Transaction {
+  transaction.inputs = transaction.inputs.map(({ previousOutput, since }) => ccc.CellInput.from({ previousOutput, since }));
+  return transaction;
 }
 
 /** The account's lock groups that have inputs in the transaction, in the order of `locks`. */

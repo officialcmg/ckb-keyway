@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
-import { formatCkbSignature } from "../src/server/funding-transaction.ts";
+import { formatCkbSignature, type ValidatedFunding } from "../src/server/funding-transaction.ts";
+import { fundingSigning, type FundingContext } from "../src/server/funding-signing.ts";
 import { database } from "../src/server/database.ts";
-import { countLitCodeAttempt, issueRequest, loadRequest, messageSigning, recordLitCode, signingSettings, transactionSigning, type SigningContext } from "../src/server/general-signing.ts";
+import { countLitCodeAttempt, issueRequest, loadRequest, messageSigning, outflowNeedsEmailCode, recordLitCode, reserveOutflow, signingSettings, transactionSigning, type SigningContext } from "../src/server/general-signing.ts";
 import type { ValidatedTransaction } from "../src/server/transaction-policy.ts";
 import type { ReadyWallet } from "../src/server/user-wallet.ts";
 
@@ -65,6 +66,35 @@ async function age(nonce: string, minutes: number) {
     set expires_at = expires_at - ${shift}::interval, email_code_expires_at = email_code_expires_at - ${shift}::interval
     where nonce = ${nonce}
   `;
+}
+
+/** Channel funding with the preview and signer replaced: `debit` is the CKB leaving the account, fee included. */
+function fundingHarness(user: { id: string }, emails: Array<{ subject: string; plaintext: string }>) {
+  const wallet = { litPkpId: `0x${"11".repeat(20)}`, litPublicKey: publicKey, status: "ready" } as unknown as ReadyWallet;
+  let debit = 0n;
+  const context: FundingContext = {
+    user,
+    wallet,
+    appName: "Acme Pay",
+    email: async () => "ana@acmepay.example",
+    sendEmail: async (_to, message) => { emails.push({ subject: message.subject, plaintext: message.plaintext }); },
+    rateLimit: async () => ({ allowed: true, retryAfter: null }),
+    recordSigning: async () => undefined,
+    preview: async (_wallet, input) => {
+      const transaction = ccc.Transaction.from(input as ccc.TransactionLike);
+      const script = ccc.Script.from({ codeHash: `0x${"9b".repeat(32)}`, hashType: "type", args: "0x" });
+      return {
+        transaction,
+        signer: { client: new ccc.ClientPublicTestnet() } as unknown as ccc.SignerCkbPublicKey,
+        script,
+        groups: [{ script, kind: "secp256k1" }],
+        preview: { amountCkb: ccc.fixedPointToString(debit - 10_000n, 8), feeCkb: "0.0001", destination: `0x6c67887fe201ee0c7853f1682c0b77c0e6214044c156c7558269390a8afa6d7c:0x${"cc".repeat(20)}`, transactionHash: transaction.hash() },
+        outflowShannons: debit,
+      } as ValidatedFunding;
+    },
+    sign: async (validated) => validated.transaction,
+  };
+  return { context, funding: (shannons: bigint, body: Record<string, unknown>) => { debit = shannons; return fundingSigning(context, body) as Promise<Record<string, unknown>>; } };
 }
 
 const tx = (marker: number) => ({ outputs: [{ lock: { codeHash: `0x${"9b".repeat(32)}`, hashType: "type", args: "0x" }, capacity: 100n * CKB + BigInt(marker) }], witnesses: ["0x"] });
@@ -151,6 +181,87 @@ test("general signing binds approvals, email codes and threshold changes", { ski
     assert.equal(preview.requiresEmailCode, false);
     await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (10n * CKB).toString() });
     await assert.rejects(() => transactionSigning(context, { operation: "sign", transaction: tx(13), confirmationNonce: preview.confirmationNonce }), /now needs an email code/);
+  });
+
+  await t.test("a transaction waiting on its signature already counts, so an overlapping one can't slip under the amount", async () => {
+    const { context } = harness(60n * CKB);
+    await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (100n * CKB).toString() });
+    const signDigest = context.signDigest!;
+    let resume!: () => void;
+    let entered!: () => void;
+    const signing = new Promise<void>((resolve) => { entered = resolve; });
+    const held = new Promise<void>((resolve) => { resume = resolve; });
+    context.signDigest = async (digest, wallet) => { entered(); await held; return signDigest(digest, wallet); };
+    const first = await transactionSigning(context, { operation: "preview", transaction: tx(50) }) as { confirmationNonce: string; requiresEmailCode: boolean };
+    assert.equal(first.requiresEmailCode, false);
+    const firstSigned = transactionSigning(context, { operation: "sign", transaction: tx(50), confirmationNonce: first.confirmationNonce });
+    await signing;
+    context.signDigest = signDigest;
+    // The first 60 CKB is still being signed; another 60 CKB reaches the 100 CKB amount.
+    const second = await transactionSigning(context, { operation: "preview", transaction: tx(51) }) as { confirmationNonce: string; requiresEmailCode: boolean };
+    assert.equal(second.requiresEmailCode, true);
+    resume();
+    await firstSigned;
+  });
+
+  await t.test("a failed signature doesn't count, and doesn't remove the count of an earlier signature of the same transaction", async () => {
+    const { context } = harness(60n * CKB);
+    await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (100n * CKB).toString() });
+    const signDigest = context.signDigest!;
+    const failing = async () => { throw new Error("Lit is unavailable"); };
+    const attempt = async (marker: number) => {
+      const preview = await transactionSigning(context, { operation: "preview", transaction: tx(marker) }) as { confirmationNonce: string; requiresEmailCode: boolean };
+      assert.equal(preview.requiresEmailCode, false, `transaction ${marker}`);
+      return transactionSigning(context, { operation: "sign", transaction: tx(marker), confirmationNonce: preview.confirmationNonce });
+    };
+    context.signDigest = failing;
+    await assert.rejects(() => attempt(52), /Lit is unavailable/);
+    context.signDigest = signDigest;
+    await attempt(53);
+    context.signDigest = failing;
+    await assert.rejects(() => attempt(53), /Lit is unavailable/);
+    context.signDigest = signDigest;
+    const after = await transactionSigning(context, { operation: "preview", transaction: tx(54) }) as { requiresEmailCode: boolean };
+    assert.equal(after.requiresEmailCode, true);
+  });
+
+  await t.test("of two overlapping attempts at one outflow, the one that fails leaves the other's count in place", async () => {
+    const { context } = harness(60n * CKB);
+    await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (100n * CKB).toString() });
+    const outflow = { id: `0x${"5a".repeat(32)}`, shannons: 60n * CKB, tokens: [] };
+    const failed = await reserveOutflow(context.user, outflow, false, "transaction");
+    await reserveOutflow(context.user, outflow, false, "transaction");
+    // The first attempt fails after the second counted the same outflow again; the second goes on to sign.
+    await failed();
+    assert.equal(await outflowNeedsEmailCode(context.user, { id: "next", shannons: 60n * CKB, tokens: [] }), true);
+  });
+
+  await t.test("channel funding counts toward the daily amount, and past it needs the emailed code", async () => {
+    const emails: Array<{ subject: string; plaintext: string }> = [];
+    const { context: send } = harness(500n * CKB);
+    const { funding } = fundingHarness(send.user, emails);
+    await signingSettings(send, { operation: "set-daily-amount", asset: "ckb", amount: (1_000n * CKB).toString() });
+
+    // 2,000 CKB is over the amount: the preview asks for the code, and signing without it is refused.
+    const big = await funding(2_000n * CKB, { operation: "preview", transaction: tx(60) });
+    assert.equal(big.requiresEmailCode, true);
+    await assert.rejects(() => funding(2_000n * CKB, { operation: "sign", transaction: tx(60), confirmationNonce: big.confirmationNonce }));
+    const sent = await funding(2_000n * CKB, { operation: "request-email-code", transaction: tx(60), confirmationNonce: big.confirmationNonce });
+    assert.equal(sent.sentTo, "ana@acmepay.example");
+    assert.match(emails.at(-1)!.subject, /Confirm a channel opening in Acme Pay/);
+    assert.match(emails.at(-1)!.plaintext, /1999\.9999 CKB/);
+    const code = /code is (\d{6})/.exec(emails.at(-1)!.plaintext)![1];
+    assert.ok((await funding(2_000n * CKB, { operation: "sign", transaction: tx(60), confirmationNonce: big.confirmationNonce, emailCode: code })).transaction);
+
+    // Under the amount it signs without a code, and counts: a send that then reaches the amount needs the code.
+    const other = harness(500n * CKB);
+    const small = fundingHarness(other.context.user, emails);
+    await signingSettings(other.context, { operation: "set-daily-amount", asset: "ckb", amount: (1_000n * CKB).toString() });
+    const preview = await small.funding(600n * CKB, { operation: "preview", transaction: tx(61) });
+    assert.ok(!preview.requiresEmailCode);
+    await small.funding(600n * CKB, { operation: "sign", transaction: tx(61), confirmationNonce: preview.confirmationNonce });
+    const after = await transactionSigning(other.context, { operation: "preview", transaction: tx(62) }) as { requiresEmailCode: boolean };
+    assert.equal(after.requiresEmailCode, true);
   });
 
   await t.test("stops after five wrong codes", async () => {
