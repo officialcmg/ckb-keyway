@@ -388,7 +388,14 @@ export const migrations: Array<{
     },
   },
   {
-    // 22, not 21: the open session-origins change takes 21.
+    version: 21, name: "session-origins",
+    up: async (sql) => {
+      // The origin each session was issued at, so removing an origin from an app ends its sessions. Sessions from
+      // before this have none and are not tied to an origin.
+      await sql`alter table keyway_auth_sessions add column if not exists "origin" text`;
+    },
+  },
+  {
     version: 22, name: "watchtower-closing-commitment",
     // The commitment number of the peer's commitment that closed a channel, so a revocation that arrives after the
     // close reopens it only when it can punish that commitment.

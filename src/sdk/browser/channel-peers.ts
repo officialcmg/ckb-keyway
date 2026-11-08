@@ -81,10 +81,11 @@ export async function connectCandidates(
   candidates: readonly ChannelPeer[],
   timeoutMs: number,
   intervalMs: number,
+  save = true,
 ): Promise<ChannelPeer[]> {
   if (candidates.length === 0) return [];
   await Promise.allSettled(candidates.flatMap((candidate) =>
-    candidate.addresses.map((address) => client.connectPeer({ address, save: true }))
+    candidate.addresses.map((address) => client.connectPeer({ address, save }))
   ));
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {

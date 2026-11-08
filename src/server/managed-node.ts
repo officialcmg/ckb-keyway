@@ -12,7 +12,7 @@ import { connectCandidates, TESTNET_CHANNEL_PEERS } from "../sdk/browser/channel
 import { normalizeCkbTransactionForCcc } from "@fiber-pay/sdk/browser";
 import { serializeCccTransactionForRpc } from "../sdk/browser/ccc-transaction.ts";
 import { approveFiberParams, FIBER_METHODS, fundingFeeRate, freeFiberParams, paymentFiberParams, type FiberMethod } from "../sdk/browser/fiber-methods.ts";
-import { assertPublicPeerAddress } from "./peer-address.ts";
+import { pinPublicPeerAddress } from "./peer-address.ts";
 import * as ccc from "@ckb-ccc/core";
 import { FEE_RESERVE, needsFeeReserve, sweepSettlement } from "../sdk/browser/settlement-sweep.ts";
 
@@ -65,17 +65,30 @@ export async function managedNodeRequest(
       throw new Error(`${method} isn't available through KeyWay`);
     }
     const params = approveFiberParams(method, body.params);
+    let dial = params;
     if (method === "connectPeer") {
-      if (typeof params.address === "string") await assertPublicPeerAddress(params.address);
-      else await assertKnownPublicPeer(node, String(params.pubkey));
-      if ((await node.listPeers()).peers.length >= MAX_PEERS) throw new Error(`A hosted node can connect to at most ${MAX_PEERS} peers`);
+      // The node dials only what was checked here: a host name becomes its checked IP, and a peer named by key
+      // is dialed at its checked TCP addresses, or by key over TCP only when it is an official peer. Any other
+      // peer that is already connected isn't dialed again: by key, the node would pick from addresses the peer
+      // announced itself, which nothing here checked.
+      if (typeof params.address === "string") dial = { ...params, address: await pinPublicPeerAddress(params.address) };
+      else if (isOfficialPeer(String(params.pubkey))) dial = { ...params, addr_type: "tcp" };
+      else {
+        const peer = `0x${String(params.pubkey).toLowerCase().replace(/^0x/, "")}` as Pubkey;
+        const addresses = await assertKnownPublicPeer(node, peer);
+        if (addresses.length === 0) return { done: true };
+        await assertPeerRoom(node);
+        await connectGraphPeer(node, peer, addresses);
+        return { done: true };
+      }
+      await assertPeerRoom(node);
     }
-    await serializeMutation(userId, () => node.call(FIBER_METHODS[method as FiberMethod].rpc, [params]));
+    await serializeMutation(userId, () => node.call(FIBER_METHODS[method as FiberMethod].rpc, [dial]));
     return { done: true };
   }
   if (body.operation === "status") {
     return {
-      node: await node.nodeInfo(),
+      node: publicNodeInfo(await node.nodeInfo()),
       peers: (await node.listPeers()).peers,
       network: "testnet",
       custody: "keyway-managed",
@@ -293,9 +306,14 @@ const MAX_PEERS = 32;
  * Connecting by pubkey makes the node dial the addresses the peer announced to the network, so those must
  * be public too. A peer that is already connected, or one of the official peers, needs no check.
  */
+function isOfficialPeer(peer: string): boolean {
+  const bare = peer.toLowerCase().replace(/^0x/, "");
+  return TESTNET_CHANNEL_PEERS.some(({ pubkey }) => pubkey.slice(2) === bare);
+}
+
 async function assertKnownPublicPeer(node: ManagedNodeClient, peer: string): Promise<string[]> {
   const bare = peer.toLowerCase().replace(/^0x/, "");
-  if (TESTNET_CHANNEL_PEERS.some(({ pubkey }) => pubkey.slice(2) === bare)) return [];
+  if (isOfficialPeer(peer)) return [];
   if ((await node.listPeers()).peers.some(({ pubkey }) => pubkey.toLowerCase().replace(/^0x/, "") === bare)) return [];
   let after: string | undefined;
   for (let page = 0; page < 8; page++) {
@@ -304,13 +322,30 @@ async function assertKnownPublicPeer(node: ManagedNodeClient, peer: string): Pro
     if (found) {
       const tcp = found.addresses.filter((address) => /\/tcp\/\d+(\/p2p\/|$)/.test(address) && !/\/(ws|wss)(\/|$)/.test(address));
       if (tcp.length === 0) throw new Error("This peer announces no address a hosted node can reach; pass one with connectPeer");
-      for (const address of tcp) await assertPublicPeerAddress(address);
-      return tcp;
+      const pinned: string[] = [];
+      for (const address of tcp) pinned.push(await pinPublicPeerAddress(address));
+      return pinned;
     }
     if (result.nodes.length < 256) break;
     after = result.last_cursor;
   }
   throw new Error("This peer isn't in the Fiber network graph yet; connect to it first with connectPeer and its address");
+}
+
+async function assertPeerRoom(node: ManagedNodeClient): Promise<void> {
+  if ((await node.listPeers()).peers.length >= MAX_PEERS) throw new Error(`A hosted node can connect to at most ${MAX_PEERS} peers`);
+}
+
+/**
+ * Dials a peer at the addresses it announced to the network, which were checked to be public. Fiber accepts
+ * a dial before the handshake, and an address without /p2p/, or a stale one, can reach a different node, so
+ * the peer counts as connected only once its own key is among the node's peers. Like any peer an app asks
+ * for, it isn't saved to the node's permanent peer store.
+ */
+async function connectGraphPeer(node: ManagedNodeClient, peer: Pubkey, addresses: string[]): Promise<void> {
+  if ((await connectCandidates(node, [{ pubkey: peer as `0x${string}`, nodeName: "selected peer", addresses, minimumFunding: 0n }], 10_000, 250, false)).length === 0) {
+    throw new Error("Could not connect to the selected Fiber channel peer");
+  }
 }
 
 async function connectManagedPeer(node: ManagedNodeClient, peer: Pubkey): Promise<void> {
@@ -319,9 +354,7 @@ async function connectManagedPeer(node: ManagedNodeClient, peer: Pubkey): Promis
     // Any public peer: its announced addresses must be public, and the handshake must match its key.
     const addresses = await assertKnownPublicPeer(node, peer);
     if (addresses.length === 0) return;
-    if ((await connectCandidates(node, [{ pubkey: peer as `0x${string}`, nodeName: "selected peer", addresses, minimumFunding: 0n }], 10_000, 250)).length === 0) {
-      throw new Error("Could not connect to the selected Fiber channel peer");
-    }
+    await connectGraphPeer(node, peer, addresses);
     return;
   }
   // Native nodes resolve current TCP addresses from gossip, not browser WSS seeds.
