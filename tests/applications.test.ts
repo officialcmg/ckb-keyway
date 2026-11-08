@@ -49,7 +49,7 @@ test("records OTP usage and enforces each application's request limit", { skip: 
   };
   const context = await prepareOtpSend(request);
   await recordOtpResult(context, "sent");
-  await assert.rejects(prepareOtpSend(request), /too many/i);
+  await assert.rejects(prepareOtpSend({ ...request, email: `${crypto.randomUUID()}@example.com` }), /too many/i);
 
   const [updated] = await listApplications(owner);
   assert.equal(updated.usage.sent24h, 1);

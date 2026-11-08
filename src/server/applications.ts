@@ -34,6 +34,8 @@ type ApplicationRow = {
   updated_at: Date;
 };
 
+const MAX_APPLICATIONS_PER_OWNER = 10;
+
 export async function createApplication(
   user: User,
   input: { name: string; otpLimitPerMinute?: number },
@@ -42,11 +44,17 @@ export async function createApplication(
   const name = applicationName(input.name);
   const otpLimit = otpLimitPerMinute(input.otpLimitPerMinute ?? 30);
   const appId = `keyway_${randomBytes(18).toString("base64url")}`;
-  await sql`
-    insert into keyway_applications (
-      app_id, owner_user_id, name, otp_limit_per_minute
-    ) values (${appId}, ${user.id}, ${name}, ${otpLimit})
-  `;
+  await sql.begin(async (transaction) => {
+    await transaction`select pg_advisory_xact_lock(hashtextextended(${`apps:${user.id}`}, 0))`;
+    // Each app brings its own login-code budget and alerts, so one account can't multiply them without end.
+    const [{ count }] = await transaction<Array<{ count: number }>>`select count(*)::int as count from keyway_applications where owner_user_id = ${user.id}`;
+    if (count >= MAX_APPLICATIONS_PER_OWNER) throw new Error(`A developer account can have at most ${MAX_APPLICATIONS_PER_OWNER} applications`);
+    await transaction`
+      insert into keyway_applications (
+        app_id, owner_user_id, name, otp_limit_per_minute
+      ) values (${appId}, ${user.id}, ${name}, ${otpLimit})
+    `;
+  });
   return (await listApplications(user)).find((app) => app.appId === appId)!;
 }
 
@@ -154,13 +162,18 @@ export async function applicationAllowsOrigin(appId: string, origin: string): Pr
   return rows.length === 1;
 }
 
-// Login-code limits, per 10 minutes unless named otherwise.
-const OTP_EMAIL_APP_LIMIT = 5; // codes to one email for one app
-const OTP_EMAIL_LIMIT = 15; // codes to one email across all apps
-const OTP_SOURCE_LIMIT = 60; // codes asked for from one IP address (an IPv6 /64)
+// Login-code limits, per 10 minutes unless named otherwise. A source is one IP address (an IPv6 /64). Limits on one
+// source are hard; budgets shared with other people refuse only a source that already asked in the last minute.
+const OTP_EMAIL_APP_LIMIT = 5; // codes for one email in one app from one source
+const OTP_SOURCE_LIMIT = 60; // codes asked for from one source
+const OTP_EMAIL_LIMIT = 15; // codes to one email across all apps, shared
+const OTP_EMAIL_HARD_LIMIT = 30; // codes to one email from anyone, so no inbox gets more than 3 a minute
 const DASHBOARD_OTP_LIMIT_PER_MINUTE = 30;
 const OWNER_OTP_LIMIT_PER_MINUTE = 120; // all of one developer's apps together, the most a single app may set
-const OTP_FAILURE_LIMIT = 20; // wrong codes for one email in one app per 24 hours
+const GLOBAL_OTP_LIMIT_PER_MINUTE = 200; // every app together, shared: all login email goes out through one sender
+const OTP_FAILURE_LIMIT = 20; // wrong codes for one email in one app from one source per 24 hours
+const OTP_FAILURE_ALERT = 20; // the same from anyone: one alert
+const OTP_FAILURE_PAUSE = 30; // the same from anyone in the last hour: checks pause until it drops back
 const OTP_FAILURE_MESSAGE = "Too many incorrect codes for this email. Try again tomorrow";
 
 export async function prepareOtpSend(input: {
@@ -183,16 +196,19 @@ export async function prepareOtpSend(input: {
     for (const key of keys.sort()) {
       await transaction`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`;
     }
-    if (await otpFailures(transaction as unknown as DatabaseSql, context) >= OTP_FAILURE_LIMIT) return "failures";
+    if ((await otpFailures(transaction as unknown as DatabaseSql, context)).source >= OTP_FAILURE_LIMIT) return "failures";
     // Bounded by time in the WHERE clause so the index skips older history.
     const [limits] = await transaction<Array<{
-      app_count: number; owner_count: number; email_app_count: number; email_count: number;
-      source_count: number; source_minute_count: number; source_limited: number; app_limited: number;
+      app_count: number; owner_count: number; global_count: number; cooldown: number; email_app_count: number;
+      email_count: number; source_count: number; source_minute_count: number; source_limited: number; app_limited: number;
     }>>`
       select
         count(*) filter (where requested and events.app_id = ${appId} and events.created_at >= now() - interval '1 minute')::int as app_count,
         count(*) filter (where requested and applications.owner_user_id = ${owner} and events.created_at >= now() - interval '1 minute')::int as owner_count,
-        count(*) filter (where requested and email_hash = ${emailHash} and events.app_id = ${appId})::int as email_app_count,
+        count(*) filter (where requested and events.created_at >= now() - interval '1 minute')::int as global_count,
+        count(*) filter (where requested and email_hash = ${emailHash} and events.app_id = ${appId} and ip_hash = ${ipHash}
+          and events.created_at >= now() - interval '60 seconds')::int as cooldown,
+        count(*) filter (where requested and email_hash = ${emailHash} and events.app_id = ${appId} and ip_hash = ${ipHash})::int as email_app_count,
         count(*) filter (where requested and email_hash = ${emailHash})::int as email_count,
         count(*) filter (where requested and ip_hash = ${ipHash})::int as source_count,
         count(*) filter (where requested and ip_hash = ${ipHash} and events.created_at >= now() - interval '1 minute')::int as source_minute_count,
@@ -204,10 +220,15 @@ export async function prepareOtpSend(input: {
       ) events
       left join keyway_applications applications on applications.app_id = events.app_id
     `;
-    // Budgets shared with other people (the app's, the developer's, the inbox's across apps) refuse only a source that
-    // already asked in the last minute, so strangers filling them can't block anyone else's first request.
-    const shared = limits.app_count >= appLimit || limits.owner_count >= OWNER_OTP_LIMIT_PER_MINUTE || limits.email_count >= OTP_EMAIL_LIMIT;
-    if (limits.email_app_count >= OTP_EMAIL_APP_LIMIT || limits.source_count >= OTP_SOURCE_LIMIT || (shared && limits.source_minute_count > 0)) {
+    // One code a minute for one email in one app from one source.
+    if (limits.cooldown > 0) return "cooldown";
+    // Budgets shared with other people (the app's, the developer's, everyone's, the inbox's across apps) refuse only a
+    // source that already asked in the last minute, so strangers filling them can't block anyone else's first request.
+    // The inbox's hard limit is the one exception: past it, more codes would be flooding that inbox.
+    const shared = limits.app_count >= appLimit || limits.owner_count >= OWNER_OTP_LIMIT_PER_MINUTE
+      || limits.global_count >= GLOBAL_OTP_LIMIT_PER_MINUTE || limits.email_count >= OTP_EMAIL_LIMIT;
+    if (limits.email_app_count >= OTP_EMAIL_APP_LIMIT || limits.source_count >= OTP_SOURCE_LIMIT
+      || limits.email_count >= OTP_EMAIL_HARD_LIMIT || (shared && limits.source_minute_count > 0)) {
       // At most one record a minute per source and app, and one alert per app every 10 minutes, however many are refused.
       if (limits.source_limited === 0) await insertOtpEvent(transaction as unknown as DatabaseSql, appId, emailHash, ipHash, "rate_limited");
       return limits.app_limited === 0 ? "limited-first" : "limited";
@@ -217,6 +238,7 @@ export async function prepareOtpSend(input: {
   });
   await pruneOtpEvents(sql);
   if (result === "failures") throw new Error(OTP_FAILURE_MESSAGE);
+  if (result === "cooldown") throw new Error("Too many login codes requested. Wait 60 seconds before resending");
   if (result !== "allowed") {
     // Not awaited: the caller holds a per-email lock and a pool connection.
     if (result === "limited-first") void sendSecurityAlert("otp_rate_limit", { appId });
@@ -253,9 +275,14 @@ export function otpSource(address: string): string {
   return `${words.slice(0, 4).map((word) => word.toString(16)).join(":")}::/64`;
 }
 
-/** Refuses a code check once this email has had too many wrong codes for the app. */
-export async function checkOtpFailures(context: { appId: string; emailHash: string }): Promise<void> {
-  if (await otpFailures(await database(), context) >= OTP_FAILURE_LIMIT) throw new Error(OTP_FAILURE_MESSAGE);
+/**
+ * Refuses a code check once this source has had too many wrong codes for this email in the app, or, for a while,
+ * once anyone has. The second keeps guessing from many addresses slow without letting one stranger lock a user out.
+ */
+export async function checkOtpFailures(context: { appId: string; emailHash: string; ipHash: string }): Promise<void> {
+  const failures = await otpFailures(await database(), context);
+  if (failures.source >= OTP_FAILURE_LIMIT) throw new Error(OTP_FAILURE_MESSAGE);
+  if (failures.hour >= OTP_FAILURE_PAUSE) throw new Error("Too many incorrect codes for this email. Try again later");
 }
 
 export async function recordOtpResult(
@@ -272,19 +299,24 @@ export async function recordOtpVerification(
 ): Promise<void> {
   const sql = await database();
   await insertOtpEvent(sql, context.appId, context.emailHash, context.ipHash, outcome);
-  // Rotated codes each allow 5 tries, so wrong codes add up per email until checks stop. Alert once when they do.
-  if (outcome === "verify_failed" && await otpFailures(sql, context) === OTP_FAILURE_LIMIT) {
+  // Rotated codes each allow 5 tries, so wrong codes add up per email. Alert once when they reach the limit.
+  if (outcome === "verify_failed" && (await otpFailures(sql, context)).day === OTP_FAILURE_ALERT) {
     void sendSecurityAlert("otp_failure_limit", { appId: context.appId });
   }
 }
 
-async function otpFailures(sql: DatabaseSql, context: { appId: string; emailHash: string }): Promise<number> {
-  const [row] = await sql<Array<{ count: number }>>`
-    select count(*)::int as count from keyway_otp_events
+/** Wrong codes for one email in one app: from this source and from anyone in 24 hours, and from anyone in the last hour. */
+async function otpFailures(sql: DatabaseSql, context: { appId: string; emailHash: string; ipHash: string }) {
+  const [row] = await sql<Array<{ source: number; day: number; hour: number }>>`
+    select
+      count(*) filter (where ip_hash = ${context.ipHash})::int as source,
+      count(*)::int as day,
+      count(*) filter (where created_at >= now() - interval '1 hour')::int as hour
+    from keyway_otp_events
     where outcome = 'verify_failed' and created_at >= now() - interval '24 hours'
       and app_id = ${context.appId} and email_hash = ${context.emailHash}
   `;
-  return row.count;
+  return row;
 }
 
 // Limits look back at most 24 hours and the dashboard shows the last day, so older events go as new ones arrive.

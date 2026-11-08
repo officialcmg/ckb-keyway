@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { after, test } from "node:test";
+import { after, beforeEach, test } from "node:test";
 import postgres from "postgres";
 import { Pool } from "pg";
 import { getMigrations } from "better-auth/db/migration";
@@ -79,6 +79,19 @@ function dashboardRequest(ip: string) {
 
 const email = () => `limits-${crypto.randomUUID()}@example.com`;
 
+// As if `seconds` had passed for the send limits and the wait between codes. Wrong codes stay where they are.
+async function later(sql: postgres.Sql, seconds: number) {
+  await sql`update keyway_otp_events set created_at = created_at - ${`${seconds} seconds`}::interval where outcome in ('requested', 'sent', 'rate_limited')`;
+  await sql`update keyway_auth_challenges set created_at = created_at - ${`${seconds} seconds`}::interval`;
+}
+
+// Every test starts with the per-minute and per-10-minute budgets clear of earlier tests' requests.
+beforeEach(async () => {
+  if (ready) await later((await ready).sql, 660);
+});
+
+const wrong = (code: string) => code === "000000" ? "111111" : "000000";
+
 test("concurrent login-code sends never take every pool connection", { skip, timeout: 30_000 }, async () => {
   const { sql } = await setup();
   const { appId } = await application(["https://pool.example"]);
@@ -146,48 +159,100 @@ test("strangers filling an app's per-minute limit don't block another person's f
   await sendEmailCode(dashboardRequest("203.0.113.6"), email());
 });
 
-test("wrong codes add up across rotated codes until sending and checking stop", { skip }, async () => {
+test("a stranger's wrong codes don't lock the user out", { skip }, async () => {
+  const { sql, codes } = await setup();
+  const { appId } = await application(["https://guess.example"]);
+  const victim = email();
+  const stranger = appRequest(appId, "https://guess.example", "198.18.1.1");
+  const { challengeId } = await sendEmailCode(stranger, victim);
+  const code = codes.get(`${appId}:${victim}`)!;
+  for (let i = 0; i < 20; i++) await assert.rejects(verifyEmailCode(stranger, challengeId, wrong(code)), /Incorrect/);
+  await assert.rejects(verifyEmailCode(stranger, challengeId, wrong(code)), /Too many authentication requests/);
+  // Only the 5 codes Better Auth compared count. The rest met a used-up code or its rate limit.
+  const [row] = await sql<Array<{ count: number }>>`select count(*)::int as count from keyway_otp_events where app_id = ${appId} and outcome = 'verify_failed'`;
+  assert.equal(row.count, 5);
+  await later(sql, 61);
+  const user = appRequest(appId, "https://guess.example", "198.18.1.2");
+  const mine = await sendEmailCode(user, victim);
+  assert.ok((await verifyEmailCode(user, mine.challengeId, codes.get(`${appId}:${victim}`)!)).sessionToken);
+});
+
+test("wrong codes from one source add up across rotated codes until that source stops", { skip }, async () => {
   const { sql, codes, alerts } = await setup();
   const { appId } = await application(["https://guess.example"]);
   const victim = email();
-  const request = (round: number) => appRequest(appId, "https://guess.example", `198.18.0.${round}`);
-  const nextRound = async () => {
-    await sql`update keyway_auth_challenges set created_at = created_at - interval '61 seconds' where email = ${victim}`;
-    await sql`update keyway_otp_events set created_at = created_at - interval '11 minutes' where outcome in ('requested', 'sent')`;
-  };
-  const wrong = (code: string) => code === "000000" ? "111111" : "000000";
-  for (let round = 1; round <= 3; round++) {
-    const { challengeId } = await sendEmailCode(request(round), victim);
-    for (let i = 0; i < 5; i++) await assert.rejects(verifyEmailCode(request(round), challengeId, wrong(codes.get(`${appId}:${victim}`)!)), /Incorrect/);
-    await nextRound();
+  const stranger = appRequest(appId, "https://guess.example", "198.18.0.1");
+  const before = alerts.filter((alert) => alert.includes("otp_failure_limit")).length;
+  for (let round = 1; round <= 4; round++) {
+    const { challengeId } = await sendEmailCode(stranger, victim);
+    const code = codes.get(`${appId}:${victim}`)!;
+    for (let i = 0; i < 5; i++) await assert.rejects(verifyEmailCode(stranger, challengeId, wrong(code)), /Incorrect/);
+    await later(sql, 660);
   }
-  const first = await sendEmailCode(request(4), victim);
-  const firstCode = codes.get(`${appId}:${victim}`)!;
-  for (let i = 0; i < 4; i++) await assert.rejects(verifyEmailCode(request(4), first.challengeId, wrong(firstCode)), /Incorrect/);
-  await nextRound();
-  const second = await sendEmailCode(request(5), victim);
-  const secondCode = codes.get(`${appId}:${victim}`)!;
-  assert.equal(alerts.filter((alert) => alert.includes("otp_failure_limit")).length, 0);
-  await assert.rejects(verifyEmailCode(request(5), second.challengeId, wrong(secondCode)), /Incorrect/);
-  assert.equal(alerts.filter((alert) => alert.includes("otp_failure_limit")).length, 1, "An alert fires when the limit is reached");
-  // Even the right code no longer signs in, and no new code goes out.
-  await assert.rejects(verifyEmailCode(request(6), second.challengeId, secondCode), /Too many incorrect codes/);
-  await assert.rejects(verifyEmailCode(request(6), first.challengeId, firstCode), /Too many incorrect codes/);
-  await nextRound();
-  await assert.rejects(sendEmailCode(request(6), victim), /Too many incorrect codes/);
+  assert.equal(alerts.filter((alert) => alert.includes("otp_failure_limit")).length, before + 1, "One alert when the limit is reached");
+  await assert.rejects(sendEmailCode(stranger, victim), /Too many incorrect codes/);
+  const user = appRequest(appId, "https://guess.example", "198.18.0.2");
+  const mine = await sendEmailCode(user, victim);
+  const myCode = codes.get(`${appId}:${victim}`)!;
+  // That source is refused even with the right code, before Better Auth sees it, so the code stays usable.
+  await assert.rejects(verifyEmailCode(stranger, mine.challengeId, myCode), /Too many incorrect codes/);
+  assert.ok((await verifyEmailCode(user, mine.challengeId, myCode)).sessionToken);
 });
 
-test("one email's limit in one app doesn't block it in another", { skip }, async () => {
+test("wrong codes from many sources pause checks for a while", { skip }, async () => {
+  const { sql, codes } = await setup();
+  const { appId } = await application(["https://guess.example"]);
+  const victim = email();
+  for (let source = 1; source <= 6; source++) {
+    const stranger = appRequest(appId, "https://guess.example", `198.18.2.${source}`);
+    const { challengeId } = await sendEmailCode(stranger, victim);
+    const code = codes.get(`${appId}:${victim}`)!;
+    for (let i = 0; i < 5; i++) await assert.rejects(verifyEmailCode(stranger, challengeId, wrong(code)), /Incorrect/);
+    await later(sql, 61);
+  }
+  const user = appRequest(appId, "https://guess.example", "198.18.2.7");
+  const mine = await sendEmailCode(user, victim);
+  const myCode = codes.get(`${appId}:${victim}`)!;
+  await assert.rejects(verifyEmailCode(user, mine.challengeId, myCode), /Try again later/);
+  await sql`update keyway_otp_events set created_at = created_at - interval '61 minutes' where app_id = ${appId} and outcome = 'verify_failed'`;
+  assert.ok((await verifyEmailCode(user, mine.challengeId, myCode)).sessionToken);
+});
+
+test("a stranger's requests don't hold up the user's own code", { skip }, async () => {
+  const { sql, codes } = await setup();
+  const { appId } = await application(["https://wait.example"]);
+  const scopes = [
+    { key: appId, request: (ip: string) => appRequest(appId, "https://wait.example", ip) },
+    { key: "dashboard", request: dashboardRequest },
+  ];
+  for (const scope of scopes) {
+    const victim = email();
+    for (let i = 0; i < 5; i++) {
+      await sendEmailCode(scope.request("198.19.0.1"), victim);
+      await later(sql, 61);
+    }
+    await assert.rejects(sendEmailCode(scope.request("198.19.0.1"), victim), /Too many login codes/);
+    const mine = await sendEmailCode(scope.request("198.19.0.2"), victim);
+    assert.ok((await verifyEmailCode(scope.request("198.19.0.2"), mine.challengeId, codes.get(`${scope.key}:${victim}`)!)).sessionToken);
+    // Right after a stranger's request, the user's own request from elsewhere doesn't have to wait a minute.
+    await later(sql, 61);
+    await sendEmailCode(scope.request("198.19.0.3"), victim);
+    const again = await sendEmailCode(scope.request("198.19.0.2"), victim);
+    assert.ok((await verifyEmailCode(scope.request("198.19.0.2"), again.challengeId, codes.get(`${scope.key}:${victim}`)!)).sessionToken);
+  }
+});
+
+test("one source's limit for an email in one app doesn't block it in another", { skip }, async () => {
   const { sql } = await setup();
   const { appId: appA } = await application(["https://a.example"]);
   const { appId: appB } = await application(["https://b.example"]);
   const victim = email();
   for (let i = 0; i < 5; i++) {
-    await sendEmailCode(appRequest(appA, "https://a.example", `192.0.2.${50 + i}`), victim);
-    await sql`update keyway_auth_challenges set created_at = created_at - interval '61 seconds' where email = ${victim}`;
+    await sendEmailCode(appRequest(appA, "https://a.example", "192.0.2.50"), victim);
+    await later(sql, 61);
   }
-  await assert.rejects(sendEmailCode(appRequest(appA, "https://a.example", "192.0.2.60"), victim), /Too many login codes/);
-  await sendEmailCode(appRequest(appB, "https://b.example", "192.0.2.61"), victim);
+  await assert.rejects(sendEmailCode(appRequest(appA, "https://a.example", "192.0.2.50"), victim), /Too many login codes/);
+  await sendEmailCode(appRequest(appB, "https://b.example", "192.0.2.50"), victim);
 });
 
 test("someone else asking for a code doesn't cancel the code already sent", { skip }, async () => {
@@ -196,7 +261,7 @@ test("someone else asking for a code doesn't cancel the code already sent", { sk
   const user = email();
   const mine = await sendEmailCode(appRequest(appA, "https://a.example", "192.0.2.70"), user);
   const myCode = codes.get(`${appA}:${user}`)!;
-  await sql`update keyway_auth_challenges set created_at = created_at - interval '61 seconds' where email = ${user}`;
+  await later(sql, 61);
   await sendEmailCode(appRequest(appA, "https://a.example", "192.0.2.71"), user);
   const login = await verifyEmailCode(appRequest(appA, "https://a.example", "192.0.2.70"), mine.challengeId, myCode);
   assert.ok(login.sessionToken);
@@ -211,6 +276,61 @@ test("a developer's apps share one per-minute login-code budget", { skip }, asyn
     await prepareOtpSend({ appId: i % 2 ? first : second, email: email(), ipAddress: `100.64.${Math.floor(i / 50)}.1` });
   }
   await assert.rejects(prepareOtpSend({ appId: second, email: email(), ipAddress: "100.64.2.1" }), /Too many login codes/);
+});
+
+test("apps of different developers together stay under one per-minute ceiling", { skip }, async () => {
+  await setup();
+  const { appId: first } = await application([], 120);
+  const { appId: second } = await application([], 120);
+  for (let i = 0; i < 200; i++) {
+    await prepareOtpSend({ appId: i % 2 ? first : second, email: email(), ipAddress: `100.65.${i % 4}.1` });
+  }
+  await assert.rejects(prepareOtpSend({ appId: second, email: email(), ipAddress: "100.65.0.1" }), /Too many login codes/);
+  // Like every shared budget, it doesn't refuse a source's first request in a minute.
+  await prepareOtpSend({ appId: second, email: email(), ipAddress: "100.65.9.1" });
+});
+
+test("a developer account has a limited number of apps", { skip }, async () => {
+  await setup();
+  const owner = { id: crypto.randomUUID() } as User;
+  for (let i = 0; i < 10; i++) await createApplication(owner, { name: `App ${i}` });
+  await assert.rejects(createApplication(owner, { name: "One more" }), /at most 10 applications/);
+});
+
+test("one inbox gets at most 30 codes in 10 minutes, however many sources ask", { skip }, async () => {
+  await setup();
+  const { appId } = await application([], 120);
+  const victim = email();
+  for (let i = 1; i <= 30; i++) await prepareOtpSend({ appId, email: victim, ipAddress: `100.66.0.${i}` });
+  await assert.rejects(prepareOtpSend({ appId, email: victim, ipAddress: "100.66.1.1" }), /Too many login codes/);
+});
+
+test("wallet locks held for a long time don't hold up sign-in", { skip, timeout: 30_000 }, async () => {
+  await setup();
+  const { appId } = await application(["https://wallet.example"]);
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  // Five first-time wallet setups, each holding its lock across slow Lit and CKB calls.
+  const wallets = Array.from({ length: 5 }, () => withUserLock(`wallet-${crypto.randomUUID()}`, () => held));
+  await delay(200);
+  try {
+    assert.ok(await within(sendEmailCode(appRequest(appId, "https://wallet.example", "192.0.2.130"), email()), 3_000), "A login code still goes out");
+  } finally {
+    release();
+    await Promise.all(wallets);
+  }
+});
+
+test("expired codes of challenges nobody used are removed", { skip }, async () => {
+  const { sql, codes } = await setup();
+  const { appId } = await application(["https://expire.example"]);
+  for (let i = 0; i < 3; i++) await sendEmailCode(appRequest(appId, "https://expire.example", `192.0.2.${120 + i}`), email());
+  await sql`update keyway_auth_verifications set "expiresAt" = now() - interval '1 second' where identifier like ${`keyway:${appId}:%`}`;
+  const user = email();
+  const { challengeId } = await sendEmailCode(appRequest(appId, "https://expire.example", "192.0.2.123"), user);
+  await verifyEmailCode(appRequest(appId, "https://expire.example", "192.0.2.123"), challengeId, codes.get(`${appId}:${user}`)!);
+  const [row] = await sql<Array<{ count: number }>>`select count(*)::int as count from keyway_auth_verifications where identifier like ${`keyway:${appId}:%`}`;
+  assert.equal(row.count, 0);
 });
 
 test("the per-address login-code limit counts an IPv6 /64 and IPv4-mapped addresses as one source", { skip }, async () => {
@@ -251,7 +371,7 @@ test("removing an origin ends the sessions signed in there", { skip }, async () 
   const user = email();
   const { challengeId } = await sendEmailCode(appRequest(appId, "https://old.example", "192.0.2.110"), user);
   const { sessionToken } = await verifyEmailCode(appRequest(appId, "https://old.example", "192.0.2.110"), challengeId, codes.get(`${appId}:${user}`)!);
-  await sql`update keyway_auth_challenges set created_at = created_at - interval '61 seconds' where email = ${user}`;
+  await later(sql, 61);
   const kept = await sendEmailCode(appRequest(appId, "https://kept.example", "192.0.2.111"), user);
   const keptLogin = await verifyEmailCode(appRequest(appId, "https://kept.example", "192.0.2.111"), kept.challengeId, codes.get(`${appId}:${user}`)!);
   assert.ok(await sessionForRequest(appRequest(appId, "https://kept.example", "192.0.2.110", sessionToken)));

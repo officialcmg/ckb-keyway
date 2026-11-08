@@ -4,7 +4,7 @@ import { Pool } from "pg";
 import { getMigrations } from "better-auth/db/migration";
 import { authSchemaOptions } from "../src/server/auth-options.ts";
 import { database } from "../src/server/database.ts";
-import { createApplication, addApplicationOrigin } from "../src/server/applications.ts";
+import { createApplication, addApplicationOrigin, otpSubject } from "../src/server/applications.ts";
 import { closeAuthPool, createScopedAuth, resolveAuthScope, setAuthDeliveryForTests, sendEmailCode, verifyEmailCode, sessionForRequest, revokeSession, consumeRateLimit, withOtpChallenge } from "../src/server/auth.ts";
 import { handleKeyWayRequest } from "../src/server/http.ts";
 
@@ -45,7 +45,7 @@ test("real Better Auth endpoints: independent OTPs, application sessions, replay
   await assert.rejects(verifyEmailCode(request(), a.challengeId, codeB), /Incorrect/);
   await assert.rejects(verifyEmailCode(request(appB), b.challengeId, codeA), /Incorrect/);
   await assert.rejects(sendEmailCode(request(appB), email), /60 seconds/);
-  await sql`update keyway_auth_challenges set created_at = now() - interval '61 seconds' where id = ${b.challengeId}`;
+  await sql`update keyway_otp_events set created_at = created_at - interval '61 seconds' where app_id = ${appB.appId} and email_hash = ${otpSubject(appB.appId, email, testIp).emailHash}`;
   const resend = await sendEmailCode(request(appB), email);
   const oldCodeB = codeB;
   codeB = emails.get(`${appB.appId}:${email}`)!;

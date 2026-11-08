@@ -16,37 +16,48 @@ export async function database() {
 }
 
 // Lock holders keep a pool connection each, and work done inside a lock still takes more from the pool, so holders
-// never get more than half of its 10.
-const MAX_RESERVED_LOCKS = 5;
+// never get more than 6 of its 10. Login-code locks and wallet locks each have their own 3: slow first-time wallet
+// setup (Lit and CKB calls) can't hold up anyone's sign-in, and a flood of sign-in requests can't hold up wallets.
+type LockBudget = { held: number; waiting: Array<() => void> };
+const MAX_RESERVED_LOCKS = 3;
+const walletLocks: LockBudget = { held: 0, waiting: [] };
+const loginCodeLocks: LockBudget = { held: 0, waiting: [] };
 // Calls for one key, running or waiting. More get a fast refusal instead of queueing without end.
 const MAX_CALLS_PER_LOCK = 8;
-let reservedLocks = 0;
-const reservationQueue: Array<() => void> = [];
 const lockQueues = new Map<string, { calls: number; tail: Promise<void> }>();
 
-export async function withUserLock<T>(userId: string, task: (sql: DatabaseSql) => Promise<T>): Promise<T> {
+export function withUserLock<T>(userId: string, task: (sql: DatabaseSql) => Promise<T>): Promise<T> {
+  return withLock(userId, walletLocks, task);
+}
+
+/** The lock for sending or checking one email's login code in one scope. */
+export function withLoginCodeLock<T>(key: string, task: (sql: DatabaseSql) => Promise<T>): Promise<T> {
+  return withLock(key, loginCodeLocks, task);
+}
+
+async function withLock<T>(key: string, budget: LockBudget, task: (sql: DatabaseSql) => Promise<T>): Promise<T> {
   const sql = await database();
   // Callers for the same key wait here, in this process, rather than on a pool connection blocked in Postgres.
-  const queue = lockQueues.get(userId) ?? { calls: 0, tail: Promise.resolve() };
+  const queue = lockQueues.get(key) ?? { calls: 0, tail: Promise.resolve() };
   if (queue.calls >= MAX_CALLS_PER_LOCK) throw new Error("Too many requests in progress for this account. Try again in a moment");
   queue.calls += 1;
-  lockQueues.set(userId, queue);
+  lockQueues.set(key, queue);
   const previous = queue.tail;
   let finished!: () => void;
   queue.tail = new Promise<void>((resolve) => { finished = resolve; });
   try {
     await previous;
-    if (reservedLocks < MAX_RESERVED_LOCKS) reservedLocks += 1;
-    else await new Promise<void>((resolve) => reservationQueue.push(resolve));
+    if (budget.held < MAX_RESERVED_LOCKS) budget.held += 1;
+    else await new Promise<void>((resolve) => budget.waiting.push(resolve));
     try {
-      return await withReservedLock(sql, userId, task);
+      return await withReservedLock(sql, key, task);
     } finally {
-      const next = reservationQueue.shift();
-      if (next) next(); else reservedLocks -= 1;
+      const next = budget.waiting.shift();
+      if (next) next(); else budget.held -= 1;
     }
   } finally {
     queue.calls -= 1;
-    if (queue.calls === 0) lockQueues.delete(userId);
+    if (queue.calls === 0) lockQueues.delete(key);
     finished();
   }
 }

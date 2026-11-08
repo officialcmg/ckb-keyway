@@ -6,7 +6,7 @@ import { getAdapter } from "better-auth/db/adapter";
 import { bearer, emailOTP } from "better-auth/plugins";
 import { Pool } from "pg";
 import { Resend } from "resend";
-import { database, withUserLock } from "./database.ts";
+import { database, withLoginCodeLock } from "./database.ts";
 import { applicationAllowsOrigin, checkOtpFailures, otpSubject, prepareOtpSend, recordOtpResult, recordOtpVerification } from "./applications.ts";
 import { authSchemaOptions } from "./auth-options.ts";
 import { scopedAuthAdapter } from "./scoped-auth-adapter.ts";
@@ -135,9 +135,8 @@ export function withOtpChallenge<T>(challengeId: string, task: () => T): T {
 export async function sendEmailCode(request: Request, emailInput: string): Promise<{ challengeId: string }> {
   const scope = await resolveAuthScope(request);
   const email = emailInput.trim().toLowerCase();
-  return withUserLock(`otp:${scope.id}:${email}`, async (sql) => {
-    const [last] = await sql<Array<{ created_at: Date }>>`select created_at from keyway_auth_challenges where scope_id = ${scope.id} and email = ${email} order by created_at desc limit 1`;
-    if (last && Date.now() - last.created_at.getTime() < 60_000) throw new Error("Too many login codes requested. Wait 60 seconds before resending");
+  return withLoginCodeLock(`otp:${scope.id}:${email}`, async (sql) => {
+    // Also applies the 60-second wait between codes, counted per requester so a stranger's request doesn't delay yours.
     const context = await prepareOtpSend({ appId: scope.id === "dashboard" ? undefined : scope.id, email, ipAddress: requestIp(request) });
     const challengeId = randomUUID();
     // Earlier challenges for this email stay open: each has its own code, and anyone may ask for one.
@@ -165,14 +164,18 @@ export async function verifyEmailCode(request: Request, challengeId: string, cod
   const sql = await database();
   const [challenge] = await sql<Array<{ email: string }>>`select email from keyway_auth_challenges where id::text = ${challengeId} and scope_id = ${scope.id}`;
   if (!challenge) throw new Error("Incorrect or expired code");
-  return withUserLock(`otp:${scope.id}:${challenge.email}`, async (connection) => {
+  return withLoginCodeLock(`otp:${scope.id}:${challenge.email}`, async (connection) => {
     const [current] = await connection`select 1 from keyway_auth_challenges where id::text = ${challengeId} and scope_id = ${scope.id} and status = 'sent' and expires_at > now()`;
     if (!current) throw new Error("Incorrect or expired code");
     const context = otpSubject(scope.id, challenge.email, requestIp(request));
     await checkOtpFailures(context);
     const response = await withOtpChallenge(challengeId, () => callAuthEndpoint(request, scope, "/sign-in/email-otp", { email: challenge.email, otp: code }));
     if (!response.ok) {
-      await recordOtpVerification(context, "verify_failed");
+      // Count a wrong code only when Better Auth compared it. After a wrong code it keeps the record (one more attempt
+      // used); a rate-limit refusal, a server error, or a code already used up or expired leaves nothing to guess at.
+      const identifier = `keyway:${scope.id}:${challengeId}:sign-in-otp-${challenge.email}`;
+      const [open] = response.status === 400 ? await connection`select 1 from keyway_auth_verifications where identifier = ${identifier}` : [];
+      if (open) await recordOtpVerification(context, "verify_failed");
       throw new Error(response.status === 429 ? "Too many authentication requests" : "Incorrect or expired code");
     }
     const result = await response.json();
