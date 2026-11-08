@@ -5,81 +5,53 @@ import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { secp256k1Lock } from "../src/sdk/browser/account-lock.ts";
-import { encodeSendLimitSettings, setSendLimitRecord } from "../src/sdk/browser/send-limits.ts";
-import { sendLimitHead } from "../src/server/send-limits.ts";
+import { encodeSendLimitSettings, recordEntriesBytes, setSendLimitRecord } from "../src/sdk/browser/send-limits.ts";
+import { sendLimitHead, sendLimitRpc } from "../src/server/send-limits.ts";
+import { fakeLit } from "./lit-action-fixture.ts";
 
 const CKB = 100_000_000n;
-const publicKey = ccc.hexFrom(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true));
+const privateKey = secp256k1.utils.randomSecretKey();
+const publicKey = ccc.hexFrom(secp256k1.getPublicKey(privateKey, true));
 const stranger = ccc.Script.from({ codeHash: `0x${"99".repeat(32)}`, hashType: "type", args: "0x" });
 const typeId = (args: ccc.HexLike) => ccc.Script.from({ codeHash: "0x00000000000000000000000000000000000000000000000000545950455f4944", hashType: "type", args });
 const settings = encodeSendLimitSettings({ fingerprint: `0x${"11".repeat(32)}`, tokensUnlimited: false, ckb: 100n * CKB, tokens: new Map() });
+const RECORD = "0x4b575352010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 let nonce = 1;
 const outside = () => ({ previousOutput: { txHash: `0x${(nonce++).toString(16).padStart(64, "0")}`, index: 0 } });
 
-/** Committed transactions, oldest first, one a block, behind a CCC client that counts what it asks the node for. */
+/**
+ * Committed transactions, oldest first, one a block, behind a fake CKB node (the indexer included). The search and
+ * the CCC client both reach that node, and every request to it is counted.
+ */
 function chain() {
   const txs: ccc.Transaction[] = [];
   const byHash = new Map<string, ccc.Transaction>();
-  const counts = { lookups: 0, cellsRead: 0 };
   const add = (tx: ccc.Transaction) => { txs.push(tx); byHash.set(tx.hash(), tx); return tx; };
+  const node = fakeLit({ privateKey, pkpId: "0x01", lookup: (hash) => { const tx = byHash.get(hash); return tx ? { tx, status: "committed" } : undefined; }, transactions: () => txs });
+  sendLimitRpc.fetch = node.fetch;
   const client = new ccc.ClientPublicTestnet({ url: "https://testnet.ckb.dev/" });
-  Object.assign(client, {
-    getTransaction: async (hash: ccc.HexLike) => {
-      counts.lookups++;
-      const tx = byHash.get(ccc.hexFrom(hash));
-      return tx ? { transaction: tx, status: "committed", blockNumber: BigInt(txs.indexOf(tx)) } : undefined;
-    },
-    // As ckb-indexer: the lock's history in a block range, an entry per input spent from it and output made at it.
-    findTransactionsPaged: async (key: ccc.ClientIndexerSearchKeyTransactionLike, _order: "asc" | "desc", limit: number) => {
-      counts.lookups++;
-      const search = ccc.ClientIndexerSearchKey.from(key);
-      const [from, to] = search.filter?.blockRange ?? [0n, BigInt(txs.length)];
-      const transactions = txs.slice(Number(from), Number(to)).flatMap((tx) => {
-        const blockNumber = BigInt(txs.indexOf(tx));
-        const spends = tx.inputs.flatMap((input, cellIndex) => {
-          const spentCell = byHash.get(input.previousOutput.txHash)?.outputs[Number(input.previousOutput.index)];
-          return spentCell?.lock.eq(search.script) ? [{ txHash: tx.hash(), blockNumber, txIndex: 0n, isInput: true, cellIndex: BigInt(cellIndex) }] : [];
-        });
-        const makes = tx.outputs.flatMap((output, cellIndex) => output.lock.eq(search.script) ? [{ txHash: tx.hash(), blockNumber, txIndex: 0n, isInput: false, cellIndex: BigInt(cellIndex) }] : []);
-        return [...spends, ...makes];
-      });
-      return { lastCursor: "0x", transactions: transactions.slice(0, limit) };
-    },
-    // As ckb-indexer: live cells under the lock, matching the type script by prefix and the data by its filter.
-    findCellsOnChain: async function* (key: ccc.ClientIndexerSearchKeyLike, order: "asc" | "desc" = "asc") {
-      const search = ccc.ClientIndexerSearchKey.from(key);
-      const spent = new Set(txs.flatMap((tx) => tx.inputs.map((input) => `${input.previousOutput.txHash}:${input.previousOutput.index}`)));
-      const live: ccc.Cell[] = [];
-      for (const tx of txs) {
-        const hash = tx.hash();
-        tx.outputs.forEach((output, index) => {
-          const data = ccc.hexFrom(tx.outputsData[index]);
-          if (spent.has(`${hash}:${index}`) || !output.lock.eq(search.script)) return;
-          const type = search.filter?.script;
-          if (type && !(output.type && output.type.codeHash === type.codeHash && output.type.hashType === type.hashType && output.type.args.startsWith(type.args))) return;
-          const wanted = search.filter?.outputData;
-          if (wanted && (search.filter?.outputDataSearchMode === "exact" ? data !== wanted : !data.startsWith(wanted))) return;
-          live.push(ccc.Cell.from({ outPoint: { txHash: hash, index }, cellOutput: output, outputData: data }));
-        });
-      }
-      for (const cell of order === "desc" ? live.reverse() : live) {
-        counts.cellsRead++;
-        yield cell;
-      }
-    },
-  });
-  return { add, client, counts };
+  // As CCC's own requestor, over the same node; the node answers get_transaction in batches only.
+  type Transform = ((value: unknown) => unknown) | undefined;
+  const request = async (method: string, params: unknown[], into: Transform[] = [], out?: Transform) => {
+    const sent = await Promise.all([...params, ...Array(Math.max(into.length - params.length, 0)).fill(undefined)].map((value, i) => into[i] ? into[i]!(value) : value));
+    const call = { id: 0, jsonrpc: "2.0", method, params: sent };
+    const batched = method === "get_transaction";
+    const reply = await (await node.fetch("https://testnet.ckb.dev/", { body: JSON.stringify(batched ? [call] : call), headers: {} })).json();
+    const result = (batched ? reply[0] : reply).result;
+    return out ? out(result) : result;
+  };
+  Object.assign(client, { requestor: { request } });
+  return { add, client, requests: node.requests };
 }
 
 /** A look-alike: a send-limit-shaped cell at the address, made by a transaction that spends only outsiders' cells. */
-function lookalike(secp: ccc.Script, inputs = 1) {
+function lookalike(secp: ccc.Script, count = 1) {
   const tx = ccc.Transaction.from({
-    inputs: Array.from({ length: inputs }, outside),
-    outputs: [{ lock: secp, type: typeId(ccc.hexFrom(crypto.getRandomValues(new Uint8Array(32)))), capacity: 174n * CKB }],
-    outputsData: [settings],
+    inputs: [outside()],
+    outputs: Array.from({ length: count }, () => ({ lock: secp, type: typeId(ccc.hexFrom(crypto.getRandomValues(new Uint8Array(32)))), capacity: 174n * CKB })),
+    outputsData: Array.from({ length: count }, () => settings),
   });
-  // Record-shaped witnesses on every input, so each one would be worth looking up.
-  for (let i = 0; i < inputs; i++) setSendLimitRecord(tx, i, "0x4b57535201");
+  setSendLimitRecord(tx, 0, RECORD);
   return tx;
 }
 
@@ -102,6 +74,7 @@ test("look-alike send-limit cells anyone plants, older or newer, don't hide the 
   const made = world.add(genesis(secp, ccc.OutPoint.from({ txHash: funding.hash(), index: 0 })));
   const head = await sendLimitHead(world.client, { litPublicKey: publicKey }, []);
   assert.equal(head?.outPoint.txHash, made.hash(), "the genesis behind four older look-alikes");
+  assert.equal(head?.recordEntriesBytes, 0);
 
   // A change the key signed: someone else's cell is input 0, the send-limit input carries the record.
   const theirs = world.add(ccc.Transaction.from({ inputs: [outside()], outputs: [{ lock: stranger, capacity: 100n * CKB }], outputsData: ["0x"] }));
@@ -110,12 +83,13 @@ test("look-alike send-limit cells anyone plants, older or newer, don't hide the 
     outputs: [{ lock: stranger, capacity: 100n * CKB }, { ...made.outputs[0], capacity: 174n * CKB - 1_000n }],
     outputsData: ["0x", settings],
   });
-  setSendLimitRecord(change, 1, "0x4b57535201");
+  setSendLimitRecord(change, 1, RECORD);
   world.add(change);
   for (let i = 0; i < 4; i++) world.add(lookalike(secp));
   const next = await sendLimitHead(world.client, { litPublicKey: publicKey }, []);
   assert.equal(next?.outPoint.txHash, change.hash(), "the chained cell behind four newer look-alikes");
   assert.equal(next?.outPoint.index, 1);
+  assert.equal(next?.recordEntriesBytes, recordEntriesBytes(RECORD), "the record its transaction carries");
 });
 
 test("look-alikes alone aren't send limits", async () => {
@@ -125,30 +99,32 @@ test("look-alikes alone aren't send limits", async () => {
   assert.equal(await sendLimitHead(world.client, { litPublicKey: publicKey }, []), undefined);
 });
 
-test("planted cells can't make the search page through everything or look up without bound", async () => {
+test("64 or about 1000 newer look-alikes, each in its own block, can't hide the account's own, and cost a few requests", async () => {
+  for (const planted of [64, 1000]) {
+    const world = chain();
+    const { secp, funding } = await account(world);
+    const made = world.add(genesis(secp, ccc.OutPoint.from({ txHash: funding.hash(), index: 0 })));
+    for (let i = 0; i < planted; i++) world.add(lookalike(secp));
+    const head = await sendLimitHead(world.client, { litPublicKey: publicKey }, []);
+    assert.equal(head?.outPoint.txHash, made.hash(), `behind ${planted} look-alikes`);
+    // Pages of cells, batches of history (256 blocks each) and the one creating transaction.
+    assert.ok(world.requests.length <= 9, `${planted} look-alikes took ${world.requests.length} requests`);
+  }
+});
+
+test("past the Action's 1024 look-alikes the search says so, never 'no send limits', in a bounded number of requests", async () => {
   const world = chain();
   const { secp, funding } = await account(world);
   world.add(genesis(secp, ccc.OutPoint.from({ txHash: funding.hash(), index: 0 })));
-  // Thousands of plain Type ID cells, then newer look-alikes whose making transactions have 64 inputs each.
+  // Thousands of plain Type ID cells the data filter passes over, then more look-alikes than the Action reads.
   world.add(ccc.Transaction.from({
     inputs: [outside()],
     outputs: Array.from({ length: 3200 }, (_, i) => ({ lock: secp, type: typeId(ccc.hexFrom(ccc.numLeToBytes(i + 1, 32))), capacity: 125n * CKB })),
     outputsData: Array.from({ length: 3200 }, () => "0x"),
   }));
-  for (let i = 0; i < 200; i++) world.add(lookalike(secp, 64));
-  // Too many to look through says so; it never reads as "no send limits", which would offer them again.
+  world.add(lookalike(secp, 1100));
   await assert.rejects(sendLimitHead(world.client, { litPublicKey: publicKey }, []), /too many look-alike send-limit cells/);
-  assert.ok(world.counts.cellsRead <= 65, `read ${world.counts.cellsRead} cells`);
-  assert.ok(world.counts.lookups <= 128, `made ${world.counts.lookups} lookups`);
-});
-
-test("a look-alike costs the search the same two lookups however many inputs its transaction has", async () => {
-  const world = chain();
-  const { secp, funding } = await account(world);
-  const made = world.add(genesis(secp, ccc.OutPoint.from({ txHash: funding.hash(), index: 0 })));
-  // Newer look-alikes, each made by a transaction with a record-shaped witness on all 64 of its inputs.
-  for (let i = 0; i < 40; i++) world.add(lookalike(secp, 64));
-  const head = await sendLimitHead(world.client, { litPublicKey: publicKey }, []);
-  assert.equal(head?.outPoint.txHash, made.hash());
-  assert.ok(world.counts.lookups <= 2 * 41, `made ${world.counts.lookups} lookups`);
+  // Five pages on each of the two nodes.
+  assert.ok(world.requests.length <= 10, `made ${world.requests.length} requests`);
+  assert.ok(world.requests.every(({ methods }) => methods.every((method) => method === "get_cells")));
 });

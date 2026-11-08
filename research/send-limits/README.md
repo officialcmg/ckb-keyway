@@ -196,7 +196,9 @@ counted send, and fund channels only from there.
 - **Pending sends (Goal 2).** Every transaction the server gets signed for an account is stored in
   `keyway_v2_pending_transactions` (migration 20). `POST /api/keyway/pending-transactions` returns the account's
   pending ones, after dropping those the node reports committed or rejected, or no longer knows after a grace period.
-  It also returns the newest send-limit cell and the record size to reserve. The node's status is read raw
+  It also returns the newest send-limit cell and the record size to reserve. The server finds that cell the way the
+  Action does, from one node: the send-limit-shaped cells at the address (up to 1024, so look-alikes anyone plants
+  can't hide it), each checked against the key's own history in its block, in batched requests. The node's status is read raw
   (`get_transaction` with verbosity 1), because CCC returns nothing for "unknown" and "rejected". The SDK loads this when its signer
   starts and before every `findCells` (the step CCC uses to pick inputs), then marks the transactions in CCC's cache
   in the order they were signed, so their spent cells are skipped and their change can be used.

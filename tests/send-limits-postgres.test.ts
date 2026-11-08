@@ -12,7 +12,7 @@ import { fundingCode, fundingNeedsLitCode, issueFundingCodeRequest, sendFundingC
 import { litSignerOverride } from "../src/server/lit-config.ts";
 import { litPolicyRunner } from "../src/server/lit-policy.ts";
 import { listPendingTransactions } from "../src/server/pending-transactions.ts";
-import { sendLimitHead, sendLimitPlanner } from "../src/server/send-limits.ts";
+import { sendLimitHead, sendLimitPlanner, sendLimitRpc } from "../src/server/send-limits.ts";
 import { previewGeneralTransaction } from "../src/server/transaction-policy.ts";
 import type { ReadyWallet } from "../src/server/user-wallet.ts";
 import { fakeLit, litCodeIn } from "./lit-action-fixture.ts";
@@ -34,7 +34,6 @@ function chain() {
   const known = new Map<string, { tx: ccc.Transaction; status: string }>();
   const add = (tx: ccc.Transaction, status = "committed") => { known.set(tx.hash(), { tx, status }); return tx; };
   const committed = () => [...known.values()].filter(({ status }) => status === "committed").map(({ tx }) => tx);
-  const blockOf = (tx: ccc.Transaction) => BigInt([...known.keys()].indexOf(tx.hash()));
   const outputOf = (outPoint: ccc.OutPoint) => {
     const tx = known.get(outPoint.txHash)?.tx;
     const index = Number(outPoint.index);
@@ -45,18 +44,9 @@ function chain() {
     Object.assign(fresh, {
       findSingletonCellByType: async () => undefined,
       getCell: async (outPoint: ccc.OutPointLike) => outputOf(ccc.OutPoint.from(outPoint)),
-      // Each transaction is its own block, numbered in the order it was added.
       getTransaction: async (hash: ccc.HexLike) => {
         const found = known.get(ccc.hexFrom(hash));
-        return found ? { transaction: found.tx, status: found.status, ...(found.status === "committed" ? { blockNumber: blockOf(found.tx) } : {}) } : undefined;
-      },
-      // The indexer's history of a lock in a block range: an entry per committed input spent from it.
-      findTransactionsPaged: async (key: ccc.ClientIndexerSearchKeyTransactionLike) => {
-        const search = ccc.ClientIndexerSearchKey.from(key);
-        const [from, to] = search.filter?.blockRange ?? [0n, BigInt(known.size)];
-        const transactions = committed().filter((tx) => blockOf(tx) >= from && blockOf(tx) < to).flatMap((tx) => tx.inputs.flatMap((input, cellIndex) => (
-          outputOf(input.previousOutput)?.cellOutput.lock.eq(search.script) ? [{ txHash: tx.hash(), blockNumber: blockOf(tx), txIndex: 0n, isInput: true, cellIndex: BigInt(cellIndex) }] : [])));
-        return { lastCursor: "0x", transactions };
+        return found ? { transaction: found.tx, status: found.status } : undefined;
       },
       getFeeRate: async () => 1_000n,
       requestor: { request: async (_method: string, [hash]: [string]) => ({ tx_status: { status: known.get(hash)?.status ?? "unknown" } }) },
@@ -99,6 +89,7 @@ async function setUp() {
   litSignerOverride.mode = "policy";
   litPolicyRunner.run = async (_config, params) => action.main(params);
   sendLimitPlanner.run = async (params) => action.main(params);
+  sendLimitRpc.fetch = world.lit.fetch;
   const user = { id: crypto.randomUUID() };
   const wallet = { version: 1, status: "ready", litPkpId: pkpId, litPublicKey: publicKey, ckbAddress: "ckt1test", encryptedFiberKey: "x", primaryDeviceIdHash: "a".repeat(64), hasOpenedChannel: false, createdAt: "", updatedAt: "" } as unknown as ReadyWallet;
   const sent: ccc.Transaction[] = [];
