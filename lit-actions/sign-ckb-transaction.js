@@ -374,16 +374,18 @@ function lockSearchKey(lock, filter) {
 }
 
 /**
- * Live cells under a lock, from the indexer, a page of 256 at a time, only those matching `filter`; refuses more
- * than `maxCells`. Large pages keep a run within Lit's limit on outbound requests.
+ * Live cells under a lock, from the indexer, a page of 256 at a time, only those matching `filter` (and `keep`, when
+ * given); refuses more than `maxCells` kept or more than `maxPages` pages. Large pages keep a run within Lit's limit
+ * on outbound requests.
  */
-async function indexerCells(lock, maxCells, filter, urls = RPC_URLS) {
+async function indexerCells(lock, maxCells, filter, urls = RPC_URLS, { keep, maxPages = Infinity } = {}) {
   const searchKey = lockSearchKey(lock, filter);
   const method = "get_cells";
   const pageSize = 0x100;
   const cells = [];
   let cursor = null;
-  for (;;) {
+  for (let pages = 1; ; pages++) {
+    if (pages > maxPages) throw new Error("This account has too many cells to check");
     const body = JSON.stringify({ id: 0, jsonrpc: "2.0", method, params: [searchKey, "asc", `0x${pageSize.toString(16)}`, ...(cursor ? [cursor] : [])] });
     let result;
     let lastError;
@@ -400,7 +402,7 @@ async function indexerCells(lock, maxCells, filter, urls = RPC_URLS) {
       }
     }
     if (!result) throw lastError ?? new Error("CKB RPC is unavailable");
-    cells.push(...result.objects);
+    cells.push(...(keep ? result.objects.filter(keep) : result.objects));
     if (cells.length > maxCells) throw new Error("This account has too many cells to check");
     if (result.objects.length < pageSize || !result.last_cursor) return cells;
     cursor = result.last_cursor;
@@ -935,6 +937,8 @@ const XUDT_CODE_HASHES = [
   "0x1142755a044bf2ee358cba9f2da187ce928c91cd4dc8692ded0337efa677d21a", // Stable++'s xUDT copy (RUSD)
   "0xc5e5dcf215925f7ef4dfaf5f4b4f105bc321c02776d6e7d52a1db3fcd9d011a4", // testnet sUDT
 ];
+// The xUDT binary itself, referenced by its data hash (hash_type "data1"), as RGB++ and mainnet tokens do.
+const XUDT_DATA1_HASH = "0x50bd8d6680b8b9cf98b73f3c08faf8b2a21914311954118ad6609be6e78a1b95";
 const DAO_CODE_HASH = "0x82d76d1b75fe2fd9a27dfbaa65a039221a380d76c926f378d3f81cf3e7e13f2e";
 
 function readU64(bytes, at) {
@@ -992,30 +996,59 @@ function weakens(before, after) {
   return false;
 }
 
-const isUdt = (type) => type.hashType === "type" && XUDT_CODE_HASHES.includes(bytesToHex(type.codeHash));
+const isUdt = (type) => (type.hashType === "type" && XUDT_CODE_HASHES.includes(bytesToHex(type.codeHash)))
+  || (type.hashType === "data1" && bytesToHex(type.codeHash) === XUDT_DATA1_HASH);
 const isDao = (type) => type.hashType === "type" && bytesToHex(type.codeHash) === DAO_CODE_HASH;
+/**
+ * Type scripts that never stop the account spending a cell of its own: Nervos DAO, Type ID, and a UDT without
+ * extension scripts (args of just the owner's lock hash), which can always be burned.
+ */
+const keepsCkbFree = (type) => !type || isDao(type) || isTypeId(type) || (isUdt(type) && type.args.length === 32);
 
 /**
  * What leaves the account: CKB over all of its locks (the fee included, change back excluded) and, per type script
  * hash, tokens (a UDT's 16-byte amount, any other type by cell). The send-limit cell, the recovery list and Nervos
  * DAO cells aren't tokens; their CKB counts like any other.
+ *
+ * Any other type script runs whenever its cell is spent, so whoever wrote it could keep the CKB put under it: CKB
+ * the account gets back under such a script stays only as far as it already held that much under the same script.
+ * A type whose amounts aren't read counts as leaving whenever one of the account's cells of it doesn't come back
+ * unchanged, so a balance can't leave while an empty cell of it stays.
  */
 function outflowOf(account, tx, inputs) {
   let ckb = 0n;
   const tokens = new Map();
+  const heldUnder = new Map();
+  const unread = new Map();
   const count = (output, data, sign) => {
     const kind = lockKind(account, output.lock);
     if (!kind) return;
-    ckb += sign * output.capacity;
     const type = output.type;
+    if (keepsCkbFree(type)) ckb += sign * output.capacity;
+    else {
+      // Inputs are counted first, so the outputs see everything the account held under the script.
+      const hash = bytesToHex(scriptHash(type));
+      const held = heldUnder.get(hash) ?? 0n;
+      const amount = sign > 0n || output.capacity < held ? output.capacity : held;
+      heldUnder.set(hash, held + sign * amount);
+      ckb += sign * amount;
+    }
     if (!type || isDao(type)) return;
     if (isTypeId(type) && (kind === "list" || isSettingsShaped(account, output, data))) return;
     const asset = bytesToHex(scriptHash(type));
     const amount = isUdt(type) && data.length >= 16 ? readU128(data, 0) : 1n;
     tokens.set(asset, (tokens.get(asset) ?? 0n) + sign * amount);
+    if (!isUdt(type)) {
+      const cells = unread.get(asset) ?? new Map();
+      cells.set(bytesToHex(data), (cells.get(bytesToHex(data)) ?? 0n) + sign);
+      unread.set(asset, cells);
+    }
   };
   inputs.forEach((cell) => count(cell.output, cell.data, 1n));
   tx.outputs.forEach((output, index) => count(output, tx.outputsData[index], -1n));
+  for (const [asset, cells] of unread) {
+    if ((tokens.get(asset) ?? 0n) <= 0n && [...cells.values()].some((left) => left > 0n)) tokens.set(asset, 1n);
+  }
   const leaving = [...tokens].filter(([, amount]) => amount > 0n).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([asset, amount]) => ({ asset, amount }));
   return { ckb: ckb > 0n ? ckb : 0n, tokens: leaving };
 }
@@ -1185,7 +1218,12 @@ function plannedRecord(previous, times, self, now) {
 
 /** The live send-limit cells this key made at its secp256k1 address, as the indexer shows them. */
 async function liveSettingsAt(account, urls) {
-  const candidates = (await indexerCells(account.secp, 1024, TYPE_ID_FILTER, urls)).map((object) => {
+  // Anyone can plant Type ID cells here. Only send-limit-shaped ones are asked for, and only those count toward the
+  // limit; any others a node returns anyway are passed over, up to a number of pages that keeps the run within
+  // Lit's limit on outbound requests.
+  const filter = { ...TYPE_ID_FILTER, output_data: `0x${SETTINGS_MAGIC}`, output_data_filter_mode: "prefix" };
+  const keep = (object) => typeof object?.output_data === "string" && object.output_data.toLowerCase().startsWith(`0x${SETTINGS_MAGIC}`);
+  const candidates = (await indexerCells(account.secp, 1024, filter, urls, { keep, maxPages: 16 })).map((object) => {
     const lock = parseScript(object?.output?.lock, "cell lock");
     const type = object?.output?.type ? parseScript(object.output.type, "cell type") : undefined;
     const data = hexToBytes(object?.output_data ?? "0x", "cell data");
@@ -1327,7 +1365,66 @@ function describeAllowance(settings, asset) {
   return asset === "ckb" ? `${formatCkb(limit)} CKB a day` : `${limit} a day`;
 }
 
-function limitLines(limits) {
+const BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+const BECH32_GENERATOR = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+
+/** The script's full CKB testnet address: bech32m of 0x00 ‖ code hash ‖ hash type ‖ args (CKB RFC 0021). */
+function testnetAddress(script) {
+  const words = [];
+  let acc = 0;
+  let bits = 0;
+  for (const byte of concat([0x00], script.codeHash, [HASH_TYPES[script.hashType]], script.args)) {
+    acc = ((acc << 8) | byte) & 0x1fff;
+    bits += 8;
+    while (bits >= 5) { bits -= 5; words.push((acc >>> bits) & 31); }
+  }
+  if (bits > 0) words.push((acc << (5 - bits)) & 31);
+  const hrp = "ckt";
+  let check = 1;
+  for (const value of [...[...hrp].map((c) => c.charCodeAt(0) >>> 5), 0, ...[...hrp].map((c) => c.charCodeAt(0) & 31), ...words, 0, 0, 0, 0, 0, 0]) {
+    const top = check >>> 25;
+    check = ((check & 0x1ffffff) << 5) ^ value;
+    for (let i = 0; i < 5; i++) if ((top >>> i) & 1) check ^= BECH32_GENERATOR[i];
+  }
+  check ^= 0x2bc830a3; // bech32m
+  for (let i = 0; i < 6; i++) words.push((check >>> (5 * (5 - i))) & 31);
+  return `${hrp}1${words.map((word) => BECH32_CHARSET[word]).join("")}`;
+}
+
+const FIBER_FUNDING_CODE_HASH = "0x6c67887fe201ee0c7853f1682c0b77c0e6214044c156c7558269390a8afa6d7c";
+const MAX_RECIPIENT_LINES = 8;
+
+/**
+ * Where the outputs that leave the account go, one line per lock with its full address, the largest first, so a
+ * page that swaps the recipient can't send an email that reads like the one the user expects.
+ */
+function recipientLines(account, tx) {
+  const byLock = new Map();
+  tx.outputs.forEach((output, index) => {
+    if (lockKind(account, output.lock)) return;
+    const key = bytesToHex(scriptHash(output.lock));
+    const entry = byLock.get(key) ?? { lock: output.lock, ckb: 0n, tokens: new Map() };
+    entry.ckb += output.capacity;
+    if (output.type) {
+      const asset = bytesToHex(scriptHash(output.type));
+      const data = tx.outputsData[index];
+      entry.tokens.set(asset, (entry.tokens.get(asset) ?? 0n) + (isUdt(output.type) && data.length >= 16 ? readU128(data, 0) : 1n));
+    }
+    byLock.set(key, entry);
+  });
+  const entries = [...byLock.values()].sort((a, b) => (a.ckb > b.ckb ? -1 : a.ckb < b.ckb ? 1 : 0));
+  const lines = entries.slice(0, MAX_RECIPIENT_LINES).map(({ lock, ckb, tokens }) => {
+    const address = testnetAddress(lock);
+    const fiber = lock.hashType === "type" && bytesToHex(lock.codeHash) === FIBER_FUNDING_CODE_HASH;
+    const amounts = [`${formatCkb(ckb)} CKB`, ...[...tokens].map(([asset, amount]) => `${amount} of token ${shortAsset(asset)}`)];
+    return `To ${fiber ? `a Fiber channel (${address})` : address}: ${amounts.join(", ")}`;
+  });
+  const rest = entries.slice(MAX_RECIPIENT_LINES);
+  if (rest.length > 0) lines.push(`And ${rest.length} more recipients: ${formatCkb(rest.reduce((sum, { ckb }) => sum + ckb, 0n))} CKB in all`);
+  return lines;
+}
+
+function limitLines(limits, analysis) {
   const { flow, settings, next, totals } = limits;
   if (limits.kind === "genesis") {
     return ["Turn on daily send limits", `CKB: ${describeAllowance(next, "ckb")}`, ...[...next.tokens.keys()].map((asset) => `Token ${shortAsset(asset)}: ${describeAllowance(next, asset)}`), `Other tokens: ${next.tokensUnlimited ? "no limit" : "a code for every transfer"}`];
@@ -1335,6 +1432,7 @@ function limitLines(limits) {
   const lines = [limits.weakening && flow.ckb <= EXEMPT_OUTFLOW && flow.tokens.length === 0 ? "Change your daily send limits" : "Confirm a send"];
   if (flow.ckb > 0n) lines.push(`Sending ${formatCkb(flow.ckb)} CKB, network fee included`);
   for (const token of flow.tokens) lines.push(`Sending ${token.amount} of token ${shortAsset(token.asset)}`);
+  lines.push(...recipientLines(analysis.account, analysis.tx));
   if (limits.kind === "unchained") lines.push("This transaction (such as opening a Fiber channel) can't count toward your daily amount, so it always needs a code");
   if (totals) lines.push(`Already sent in the last 24 hours: ${formatCkb(totals.get("ckb") ?? 0n)} CKB`);
   lines.push(`Your daily amount: ${describeAllowance(settings, "ckb")}`);
@@ -1491,7 +1589,7 @@ async function main(params) {
     const limits = await limitAnalysis(analysis, params);
     let target;
     if (recoveryEmail) target = { email: recoveryEmail, lines: emailLines(analysis.op), codeHash: analysis.txHash };
-    else if (LIMITED.includes(limits.kind)) target = { email: await limitEmail(pkpId, limits, params), lines: limitLines(limits), codeHash: limits.codeHash ?? analysis.txHash };
+    else if (LIMITED.includes(limits.kind)) target = { email: await limitEmail(pkpId, limits, params), lines: limitLines(limits, analysis), codeHash: limits.codeHash ?? analysis.txHash };
     else throw new Error("This transaction doesn't need an email code");
     const ticket = await sendCode(pkpId, target.codeHash, target.email, target.lines, params);
     const result = { ticket, sentTo: target.email, transactionHash: bytesToHex(analysis.txHash) };

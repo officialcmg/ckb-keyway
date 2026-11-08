@@ -445,3 +445,110 @@ test("lowering the amount applies at once even when today's total is past the ne
   assert.equal((await planned(env, lower, cell)).needsCode, false);
   await env.run("transaction", lower);
 });
+
+test("CKB moved under a type script the account doesn't control counts as leaving, so it needs the code", async () => {
+  const env = await account();
+  await turnOn(env, { ckb: 100n * CKB });
+  // Whoever wrote this type script decides when a cell under it can be spent again.
+  const hostile = ccc.Script.from({ codeHash: `0x${"66".repeat(32)}`, hashType: "type", args: "0x" });
+  const locked = ccc.Transaction.from({ inputs: [{ previousOutput: cellOf(env.funding, 2).outPoint }], outputs: [{ lock: env.secp, type: hostile, capacity: 500n * CKB - FEE }], outputsData: ["0x"] });
+  prepare(env, locked, [env.secp]);
+  const plan = await planned(env, locked, null);
+  assert.equal(plan.limits, "unchained");
+  assert.equal(plan.needsCode, true);
+  await assert.rejects(env.run("transaction", locked), /eight-digit code/);
+
+  // A small cell of the type planted at the address vouches for no more CKB than it holds.
+  const planted = env.add(ccc.Transaction.from({ inputs: [outside()], outputs: [{ lock: env.secp, type: hostile, capacity: 100n * CKB }], outputsData: ["0x"] }));
+  const topped = ccc.Transaction.from({
+    inputs: [{ previousOutput: cellOf(planted, 0).outPoint }, { previousOutput: cellOf(env.funding, 3).outPoint }],
+    outputs: [{ lock: env.secp, type: hostile, capacity: 500n * CKB - FEE }],
+    outputsData: ["0x"],
+  });
+  prepare(env, topped, [env.secp]);
+  assert.equal((await planned(env, topped, null)).needsCode, true);
+  await assert.rejects(env.run("transaction", topped), /eight-digit code/);
+
+  // Moving a cell under its own type, unchanged, and a plain self-transfer stay exempt.
+  const moved = ccc.Transaction.from({ inputs: [{ previousOutput: cellOf(planted, 0).outPoint }], outputs: [{ lock: env.secp, type: hostile, capacity: 100n * CKB - FEE }], outputsData: ["0x"] });
+  prepare(env, moved, [env.secp]);
+  assert.equal((await env.run("transaction", moved) as { limits: string }).limits, "exempt");
+  const self = ccc.Transaction.from({ inputs: [{ previousOutput: cellOf(env.funding, 3).outPoint }], outputs: [{ lock: env.secp, capacity: 400n * CKB - FEE }], outputsData: ["0x"] });
+  prepare(env, self, [env.secp]);
+  assert.equal((await env.run("transaction", self) as { limits: string }).limits, "exempt");
+});
+
+test("a token balance of an unlisted type (or xUDT referenced by data hash) can't leave in an 'exempt' transaction", async () => {
+  const xudtByData = ccc.Script.from({ codeHash: "0x50bd8d6680b8b9cf98b73f3c08faf8b2a21914311954118ad6609be6e78a1b95", hashType: "data1", args: `0x${"cd".repeat(32)}` });
+  const otherUdt = ccc.Script.from({ codeHash: `0x${"5a".repeat(32)}`, hashType: "type", args: `0x${"01".repeat(32)}` });
+  for (const token of [xudtByData, otherUdt]) {
+    const env = await account();
+    const held = env.add(ccc.Transaction.from({ inputs: [outside()], outputs: [{ lock: env.secp, type: token, capacity: 200n * CKB }], outputsData: [ccc.hexFrom(ccc.numLeToBytes(1_000n, 16))] }));
+    await turnOn(env, { ckb: 100n * CKB });
+    // Someone else pays for the recipient's cell; an empty cell of the token comes back to the account.
+    const payer = env.add(ccc.Transaction.from({ inputs: [outside()], outputs: [{ lock: stranger, capacity: 300n * CKB }], outputsData: ["0x"] }));
+    const drain = ccc.Transaction.from({
+      inputs: [{ previousOutput: cellOf(held, 0).outPoint }, { previousOutput: cellOf(payer, 0).outPoint }],
+      outputs: [{ lock: env.secp, type: token, capacity: 200n * CKB }, { lock: stranger, type: token, capacity: 300n * CKB - FEE }],
+      outputsData: [ccc.hexFrom(ccc.numLeToBytes(0n, 16)), ccc.hexFrom(ccc.numLeToBytes(1_000n, 16))],
+    });
+    prepare(env, drain, [env.secp, stranger]);
+    const plan = await planned(env, drain, null);
+    assert.notEqual(plan.limits, "exempt", token.codeHash);
+    assert.equal(plan.needsCode, true, token.codeHash);
+    await assert.rejects(env.run("transaction", drain), /eight-digit code/);
+  }
+});
+
+test("Type ID cells anyone plants at the address don't block the send-limit lookup", async () => {
+  const env = await account();
+  // More than the 1024 the lookup reads; each locks its CKB at the account's address.
+  const planted = env.add(ccc.Transaction.from({
+    inputs: [outside()],
+    outputs: Array.from({ length: 1100 }, (_, i) => ({ lock: env.secp, type: typeIdScript(ccc.hexFrom(ccc.numLeToBytes(i + 1, 32))), capacity: 125n * CKB })),
+    outputsData: Array.from({ length: 1100 }, () => "0x"),
+  }));
+  const transfer = sendTx(env, null, [cellOf(env.funding, 1)], 90n * CKB);
+  assert.equal((await planned(env, transfer, null)).limits, "legacy");
+  // Clearing some of them out isn't exempt (they count as tokens), but it plans.
+  const cleanup = ccc.Transaction.from({
+    inputs: [0, 1, 2].map((i) => ({ previousOutput: cellOf(planted, i).outPoint })),
+    outputs: [{ lock: env.secp, capacity: 375n * CKB - FEE }],
+    outputsData: ["0x"],
+  });
+  prepare(env, cleanup, [env.secp]);
+  assert.equal((await planned(env, cleanup, null)).limits, "legacy");
+  await turnOn(env, { ckb: 100n * CKB });
+  assert.equal((await planned(env, transfer, null)).limits, "unchained");
+});
+
+test("the code email names where the funds go, so a swapped recipient shows", async () => {
+  const env = await account();
+  const { head, change } = await turnOn(env, { ckb: 100n * CKB });
+  const address = (lock: ccc.Script) => ccc.Address.fromScript(lock, new ccc.ClientPublicTestnet({ url: "https://testnet.ckb.dev/" })).toString();
+  const x = ccc.Script.from({ codeHash: "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8", hashType: "type", args: `0x${"aa".repeat(20)}` });
+  const y = ccc.Script.from({ codeHash: "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8", hashType: "type", args: `0x${"bb".repeat(20)}` });
+  const emailFor = async (to: ccc.Script) => {
+    const tx = sendTx(env, head, [change], 150n * CKB, to);
+    await planned(env, tx, head);
+    await codeFor(env, tx);
+    return env.emails[env.emails.length - 1].text;
+  };
+  const toX = await emailFor(x);
+  const toY = await emailFor(y);
+  assert.ok(toX.includes(`To ${address(x)}: 150 CKB`), toX);
+  assert.ok(toY.includes(`To ${address(y)}: 150 CKB`), toY);
+  assert.ok(!toY.includes(address(x)));
+  const body = (text: string) => text.replace(/Transaction 0x[0-9a-f]+…/, "").replace(/code is \d{8}/, "");
+  assert.notEqual(body(toX), body(toY), "the same amount to another address reads differently");
+
+  // A channel funding says so; an unchained send to an ordinary address doesn't read like one.
+  const funding = sendTx(env, null, [cellOf(env.funding, 1)], 100n * CKB, fiberFunding);
+  await codeFor(env, funding);
+  assert.ok(env.emails[env.emails.length - 1].text.includes(`To a Fiber channel (${address(fiberFunding)}): 100 CKB`));
+  const unchained = sendTx(env, null, [cellOf(env.funding, 2)], 100n * CKB, x);
+  await codeFor(env, unchained);
+  const text = env.emails[env.emails.length - 1].text;
+  assert.ok(text.includes(`To ${address(x)}: 100 CKB`), text);
+  assert.ok(!text.includes("To a Fiber channel"));
+});
