@@ -201,8 +201,6 @@ function refusePending(wallet: ReadyWallet): void {
 
 /** How long a sent change the node no longer knows is still treated as in flight. */
 const PENDING_GRACE_MS = 10 * 60_000;
-/** How long a change the node keeps refusing to take again (for reasons that can pass) stays pending. */
-const PENDING_REFUSED_MS = 24 * 60 * 60_000;
 
 export type RecoveryStatus = { pending: boolean; transactionHash?: string; recovery?: KeyWayRecovery; ckbAddress: string };
 
@@ -212,9 +210,9 @@ function recoveryStatus(wallet: ReadyWallet): RecoveryStatus {
 
 /**
  * Settles a pending recovery change from the chain: once its transaction is committed the account takes the new
- * settings (and, when turning recovery on, the new address) and the notice email goes out; once it is rejected,
- * or unknown to the node well after it was sent and no longer able to commit, the change is dropped. Called on
- * every sign-in and status check.
+ * settings (and, when turning recovery on, the new address) and the notice email goes out. One the node reports
+ * rejected, or hasn't known for the grace period, is dropped only once it can no longer commit. Called on every
+ * sign-in and status check.
  */
 export async function settleRecoveryChange(context: Pick<RecoveryContext, "user" | "client" | "broadcast" | "appName" | "email" | "sendEmail">, now = new Date()): Promise<ReadyWallet> {
   const client = context.client ?? new ccc.ClientPublicTestnet();
@@ -225,7 +223,9 @@ export async function settleRecoveryChange(context: Pick<RecoveryContext, "user"
     if (!pending) return { wallet };
     const found = await client.getTransaction(pending.transactionHash);
     const unknown = !found || found.status === "unknown";
-    const stale = unknown && now.getTime() - Date.parse(pending.sentAt) > PENDING_GRACE_MS ? await resendStale(context, client, pending, now) : undefined;
+    // A node also reports "rejected" for removals that aren't final (expiry, a full pool), so that is checked the same way.
+    const gone = found?.status === "rejected" || (unknown && now.getTime() - Date.parse(pending.sentAt) > PENDING_GRACE_MS);
+    const stale = gone ? await resendStale(context, client, pending) : undefined;
     if (stale === "kept") return { wallet };
     const { recoveryPending: _done, ...rest } = wallet;
     if (found?.status === "committed" || stale === "committed") {
@@ -233,7 +233,7 @@ export async function settleRecoveryChange(context: Pick<RecoveryContext, "user"
       await saveWallet(context.user, updated, sql);
       return { wallet: updated, notice: pending };
     }
-    if (found?.status === "rejected" || stale === "dropped") {
+    if (stale === "dropped") {
       const updated: ReadyWallet = { ...rest, updatedAt: now.toISOString() };
       await saveWallet(context.user, updated, sql);
       return { wallet: updated };
@@ -249,13 +249,13 @@ export async function settleRecoveryChange(context: Pick<RecoveryContext, "user"
 }
 
 /**
- * A change the node hasn't known for the grace period. While all its inputs are unspent the signed transaction can
- * still commit, so it is sent again (no node may have got it, or one dropped it) and stays pending, unless the
- * resend is refused outright, or the node still refuses it a day after it was sent. Once an input is spent the
- * change is dropped, unless this transaction spent it. A change recorded without its transaction is dropped, as
- * before.
+ * A change the node rejected or hasn't known for the grace period. While all its inputs are unspent the signed
+ * transaction can still commit, so it is sent again (no node may have got it, or one dropped it) and stays pending,
+ * unless the resend is refused in a way that holds for good. Any other refusal can pass, however long it lasts. Once
+ * an input is spent the change is dropped, unless this transaction spent it. A change recorded without its
+ * transaction is dropped, as before.
  */
-async function resendStale(context: Pick<RecoveryContext, "broadcast">, client: ccc.Client, pending: PendingRecoveryChange, now: Date): Promise<"kept" | "committed" | "dropped"> {
+async function resendStale(context: Pick<RecoveryContext, "broadcast">, client: ccc.Client, pending: PendingRecoveryChange): Promise<"kept" | "committed" | "dropped"> {
   if (!pending.transaction) return "dropped";
   const transaction = ccc.Transaction.fromBytes(pending.transaction);
   for (const input of transaction.inputs) {
@@ -266,9 +266,6 @@ async function resendStale(context: Pick<RecoveryContext, "broadcast">, client: 
     await send(context, client, transaction);
   } catch (error) {
     if (neverCommits(error)) return "dropped";
-    // The node answered and still won't take it (its pool's own reasons, say the fee rate) a day on: give up, so the
-    // account isn't left "still confirming" for good. A lost answer never drops it.
-    if (error instanceof ccc.ErrorClientBase && now.getTime() - Date.parse(pending.sentAt) > PENDING_REFUSED_MS) return "dropped";
   }
   return "kept";
 }

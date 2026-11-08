@@ -146,6 +146,11 @@ const EXPIRED = /^Error: This request expired\. Start again\.$/;
 
 type Preview = { preview: { newAddress: string; adminListCkb: string; transactionHash: string }; confirmationNonce: string; requiresEmailCode: boolean };
 
+/** A node's answers when a send fails: lost on the way back, a resend's Duplicated, a script refusal. */
+const TIMEOUT = () => new Error("The operation was aborted due to timeout");
+const duplicated = (transaction: ccc.Transaction) => new ccc.ErrorClientDuplicatedTransaction({ code: -1107, message: "PoolRejectedDuplicatedTransaction: Transaction is already in the pool", data: `Duplicated(Byte32(${transaction.hash()}))` }, transaction.hash());
+const refused = () => new ccc.ErrorClientBase({ code: -302, message: "TransactionFailedToVerify: Verification failed Script(TransactionScriptError)", data: "Verification(Error { kind: Script })" });
+
 test("turning recovery on: preview, emailed code, enable", { skip: !enabled }, async (t) => {
   process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
 
@@ -205,11 +210,13 @@ test("turning recovery on: preview, emailed code, enable", { skip: !enabled }, a
     await assert.rejects(recoverySetup(h.context(stored), { operation: "preview", backups: [h.proof] }), /already on/);
   });
 
-  await t.test("a change the network rejects is dropped, and recovery can be turned on again", async () => {
+  await t.test("a change the network rejects for good is dropped, and recovery can be turned on again", async () => {
     const h = await harness();
     const preview = await recoverySetup(h.context(h.wallet), { operation: "preview", backups: [h.proof] }) as Preview;
     await recoverySetup(h.context(h.wallet), { operation: "request-email-code", backups: [h.proof], confirmationNonce: preview.confirmationNonce });
     await recoverySetup(h.context(h.wallet), { operation: "enable", backups: [h.proof], confirmationNonce: preview.confirmationNonce, emailCode: h.codeFrom() });
+    // Rejected, and its resend refused by the scripts: it can never commit.
+    h.sendFaults.push({ before: refused() });
     const dropped = await h.settle("rejected");
     assert.equal(dropped.recovery, undefined);
     assert.equal(dropped.recoveryPending, undefined);
@@ -285,11 +292,6 @@ test("turning recovery on: preview, emailed code, enable", { skip: !enabled }, a
   });
 });
 
-/** A node's answers when a send fails: lost on the way back, a resend's Duplicated, a script refusal. */
-const TIMEOUT = () => new Error("The operation was aborted due to timeout");
-const duplicated = (transaction: ccc.Transaction) => new ccc.ErrorClientDuplicatedTransaction({ code: -1107, message: "PoolRejectedDuplicatedTransaction: Transaction is already in the pool", data: `Duplicated(Byte32(${transaction.hash()}))` }, transaction.hash());
-const refused = () => new ccc.ErrorClientBase({ code: -302, message: "TransactionFailedToVerify: Verification failed Script(TransactionScriptError)", data: "Verification(Error { kind: Script })" });
-
 test("a recovery change whose send fails stays pending until the chain settles it", { skip: !enabled }, async (t) => {
   process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
   const later = (minutes: number) => new Date(Date.now() + minutes * 60_000);
@@ -358,20 +360,40 @@ test("a recovery change whose send fails stays pending until the chain settles i
     assert.equal(refusedAgain.ckbAddress, other.legacyAddress);
   });
 
-  await t.test("a resend the node refuses for its pool's own reasons is kept, until a day after the change was sent", async () => {
+  await t.test("a resend the node refuses for its pool's own reasons is kept, however long after it was sent", async () => {
     const h = await harness();
-    await enable(h, { before: TIMEOUT() });
-    const poolRefused = () => new ccc.ErrorClientBase({ code: -1104, message: "PoolRejectedTransactionByMinFeeRate: The min fee rate is 1000 shannons/KW, so the transaction fee should be 1000 shannons at least, but only 0", data: "" });
+    const result = await enable(h, { before: TIMEOUT() });
+    const poolRefused = () => new ccc.ErrorClientBase({ code: -1108, message: "PoolIsFull: Transaction are replaced because the pool is full", data: "" });
     h.sendFaults.push({ before: poolRefused() });
     assert.ok((await settleRecoveryChange(await current(h), later(11))).recoveryPending, "kept: it can still commit");
     h.sendFaults.push({ before: TIMEOUT() });
     assert.ok((await settleRecoveryChange(await current(h), later(25 * 60))).recoveryPending, "a lost answer never drops it");
-    // Still refused a day on: dropped, so the account isn't left "still confirming" for good.
+    // Still refused a day on, while every input is unspent: kept, since it can still commit.
     h.sendFaults.push({ before: poolRefused() });
-    const dropped = await settleRecoveryChange(await current(h), later(25 * 60));
+    const kept = await settleRecoveryChange(await current(h), later(25 * 60));
+    assert.equal(kept.recoveryPending?.transactionHash, result.transactionHash);
+    // Once an input is spent elsewhere it can't commit any more: dropped.
+    const spend = ccc.Transaction.from({ inputs: [{ previousOutput: ccc.Transaction.from(result.transaction).inputs[0].previousOutput }], outputs: [], outputsData: [] });
+    h.chain.set(spend.hash(), { transaction: spend, status: "committed" });
+    const dropped = await settleRecoveryChange(await current(h), later(26 * 60));
     assert.equal(dropped.recoveryPending, undefined);
     assert.equal(dropped.ckbAddress, h.legacyAddress);
     await recoverySetup(h.context(dropped), { operation: "preview", backups: [h.sign(evmWallet())] });
+  });
+
+  await t.test("one the node reports rejected while its inputs are unspent stays pending, is sent again, and is applied once committed", async () => {
+    const h = await harness();
+    const result = await enable(h, {});
+    assert.equal(h.broadcasts.length, 1);
+    // Rejected as a pool removal (expiry, a full pool) that isn't final: the inputs are still live.
+    const kept = await h.settle("rejected");
+    assert.equal(kept.recoveryPending?.transactionHash, result.transactionHash);
+    assert.equal(kept.ckbAddress, h.legacyAddress);
+    assert.deepEqual(h.broadcasts.map((transaction) => transaction.hash()), [result.transactionHash, result.transactionHash], "sent again");
+    const settled = await h.settle();
+    assert.equal(settled.ckbAddress, result.ckbAddress);
+    assert.equal(settled.recovery?.enableTransactionHash, result.transactionHash);
+    assert.equal(settled.recoveryPending, undefined);
   });
 });
 
