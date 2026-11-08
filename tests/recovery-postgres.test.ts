@@ -357,6 +357,22 @@ test("a recovery change whose send fails stays pending until the chain settles i
     assert.equal(refusedAgain.recoveryPending, undefined);
     assert.equal(refusedAgain.ckbAddress, other.legacyAddress);
   });
+
+  await t.test("a resend the node refuses for its pool's own reasons is kept, until a day after the change was sent", async () => {
+    const h = await harness();
+    await enable(h, { before: TIMEOUT() });
+    const poolRefused = () => new ccc.ErrorClientBase({ code: -1104, message: "PoolRejectedTransactionByMinFeeRate: The min fee rate is 1000 shannons/KW, so the transaction fee should be 1000 shannons at least, but only 0", data: "" });
+    h.sendFaults.push({ before: poolRefused() });
+    assert.ok((await settleRecoveryChange(await current(h), later(11))).recoveryPending, "kept: it can still commit");
+    h.sendFaults.push({ before: TIMEOUT() });
+    assert.ok((await settleRecoveryChange(await current(h), later(25 * 60))).recoveryPending, "a lost answer never drops it");
+    // Still refused a day on: dropped, so the account isn't left "still confirming" for good.
+    h.sendFaults.push({ before: poolRefused() });
+    const dropped = await settleRecoveryChange(await current(h), later(25 * 60));
+    assert.equal(dropped.recoveryPending, undefined);
+    assert.equal(dropped.ckbAddress, h.legacyAddress);
+    await recoverySetup(h.context(dropped), { operation: "preview", backups: [h.sign(evmWallet())] });
+  });
 });
 
 test("adding and removing backups: preview, emailed code, apply", { skip: !enabled }, async (t) => {
