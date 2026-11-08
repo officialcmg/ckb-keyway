@@ -19,6 +19,16 @@ export function isXudtCompatible(script: { codeHash: string; hashType: string })
 }
 
 /**
+ * The xUDT binary itself, referenced by its data hash (hash_type "data1"), as RGB++ and mainnet tokens do. It is
+ * read as a token, but kept out of XUDT_COMPATIBLE, whose entries also pick the RUSD contract as the cell dep.
+ */
+export const XUDT_DATA1_HASH = "0x50bd8d6680b8b9cf98b73f3c08faf8b2a21914311954118ad6609be6e78a1b95";
+
+export function isXudtByDataHash(script: { codeHash: string; hashType: string }): boolean {
+  return script.hashType === "data1" && script.codeHash.toLowerCase() === XUDT_DATA1_HASH;
+}
+
+/**
  * Whether a token cell's xUDT args are just the owner's lock hash (optionally with zero flags). Args that carry
  * flags name extension scripts or need witness data to move, which KeyWay's sweeps and the rescue page can't
  * supply, so those cells are left where they are rather than block everything else.
