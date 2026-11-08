@@ -34,6 +34,7 @@ function chain() {
   const known = new Map<string, { tx: ccc.Transaction; status: string }>();
   const add = (tx: ccc.Transaction, status = "committed") => { known.set(tx.hash(), { tx, status }); return tx; };
   const committed = () => [...known.values()].filter(({ status }) => status === "committed").map(({ tx }) => tx);
+  const blockOf = (tx: ccc.Transaction) => BigInt([...known.keys()].indexOf(tx.hash()));
   const outputOf = (outPoint: ccc.OutPoint) => {
     const tx = known.get(outPoint.txHash)?.tx;
     const index = Number(outPoint.index);
@@ -44,9 +45,18 @@ function chain() {
     Object.assign(fresh, {
       findSingletonCellByType: async () => undefined,
       getCell: async (outPoint: ccc.OutPointLike) => outputOf(ccc.OutPoint.from(outPoint)),
+      // Each transaction is its own block, numbered in the order it was added.
       getTransaction: async (hash: ccc.HexLike) => {
         const found = known.get(ccc.hexFrom(hash));
-        return found ? { transaction: found.tx, status: found.status } : undefined;
+        return found ? { transaction: found.tx, status: found.status, ...(found.status === "committed" ? { blockNumber: blockOf(found.tx) } : {}) } : undefined;
+      },
+      // The indexer's history of a lock in a block range: an entry per committed input spent from it.
+      findTransactionsPaged: async (key: ccc.ClientIndexerSearchKeyTransactionLike) => {
+        const search = ccc.ClientIndexerSearchKey.from(key);
+        const [from, to] = search.filter?.blockRange ?? [0n, BigInt(known.size)];
+        const transactions = committed().filter((tx) => blockOf(tx) >= from && blockOf(tx) < to).flatMap((tx) => tx.inputs.flatMap((input, cellIndex) => (
+          outputOf(input.previousOutput)?.cellOutput.lock.eq(search.script) ? [{ txHash: tx.hash(), blockNumber: blockOf(tx), txIndex: 0n, isInput: true, cellIndex: BigInt(cellIndex) }] : [])));
+        return { lastCursor: "0x", transactions };
       },
       getFeeRate: async () => 1_000n,
       requestor: { request: async (_method: string, [hash]: [string]) => ({ tx_status: { status: known.get(hash)?.status ?? "unknown" } }) },

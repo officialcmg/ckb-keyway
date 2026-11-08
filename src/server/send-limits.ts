@@ -6,6 +6,7 @@ import {
   encodeSendLimitSettings,
   isSendLimitCell,
   recordEntriesBytes,
+  SEND_LIMIT_MAGIC,
   SEND_LIMIT_RECORD_MAGIC,
   SEND_LIMIT_SPARE,
   sendLimitInputIndex,
@@ -130,30 +131,50 @@ export async function sendLimitHead(
     const index = limitOutput(transaction);
     if (index !== -1 && !spent.has(`${transaction.hash()}:${index}`)) return head(transaction, index);
   }
-  const found: ccc.Cell[] = [];
-  for await (const cell of client.findCellsOnChain({ script: secp, scriptType: "lock", scriptSearchMode: "exact", filter: { script: { codeHash: TYPE_ID_CODE_HASH, hashType: "type", args: "0x" } } }, "asc", 32)) {
-    if (isSendLimitCell(cell.cellOutput, cell.outputData, secp) && !spent.has(`${cell.outPoint.txHash}:${Number(cell.outPoint.index)}`)) found.push(cell);
+  // Anyone can plant a look-alike at the address; the real one was made by a transaction that spent one of the key's
+  // own cells (any input), which needs its signature. As in the Action, that is read from the key's own lock history
+  // in the block that holds the cell, so every candidate costs the same two lookups however its transaction was
+  // made. The newest comes first (every chained send makes the real one the newest), and planted cells can't stretch
+  // the search past a fixed number of candidates: running out of them is an error, never "no send limits".
+  const history = new Map<bigint, Promise<Set<string>>>();
+  const spentByKeyIn = (block: bigint) => {
+    let inputs = history.get(block);
+    if (!inputs) {
+      const key = { script: secp, scriptType: "lock" as const, scriptSearchMode: "exact" as const, filter: { blockRange: [block, block + 1n] as [bigint, bigint] } };
+      inputs = client.findTransactionsPaged(key, "asc", MAX_BLOCK_HISTORY).then(({ transactions }) => {
+        // A full page can't be read past here; outsiders can only fill it by giving this key that many cells in one block.
+        if (transactions.length >= MAX_BLOCK_HISTORY) throw new Error("A block holds too much of this account's history to check");
+        return new Set(transactions.filter(({ isInput }) => isInput).map(({ txHash }) => txHash));
+      });
+      history.set(block, inputs);
+    }
+    return inputs;
+  };
+  let scanned = 0;
+  let candidates = 0;
+  const filter = { script: { codeHash: TYPE_ID_CODE_HASH, hashType: "type" as const, args: "0x" }, outputData: SEND_LIMIT_MAGIC, outputDataSearchMode: "prefix" as const };
+  for await (const cell of client.findCellsOnChain({ script: secp, scriptType: "lock", scriptSearchMode: "exact", filter }, "desc", 32)) {
+    if (++scanned > MAX_SCANNED) throw new Error("This account has too many look-alike send-limit cells to check");
+    if (!isSendLimitCell(cell.cellOutput, cell.outputData, secp) || spent.has(`${cell.outPoint.txHash}:${Number(cell.outPoint.index)}`)) continue;
+    if (++candidates > MAX_CANDIDATES) throw new Error("This account has too many look-alike send-limit cells to check");
+    const created = await client.getTransaction(cell.outPoint.txHash);
+    if (!created || created.blockNumber === undefined) continue;
+    if ((await spentByKeyIn(created.blockNumber)).has(cell.outPoint.txHash)) {
+      return { outPoint: { txHash: cell.outPoint.txHash, index: Number(cell.outPoint.index) }, cellOutput: cell.cellOutput, outputData: cell.outputData, recordEntriesBytes: recordEntriesBytes(recordOf(created.transaction) ?? "0x") };
+    }
   }
-  // Anyone can plant a look-alike; the real one was made by a transaction that spent one of the key's own cells.
-  const real: ccc.Cell[] = [];
-  // Bounded, so cells anyone can plant can't make this expensive: a few candidates, a few inputs each (KeyWay's own
-  // send-limit transactions spend the previous cell among their first inputs).
-  for (const cell of found.slice(0, MAX_CANDIDATES)) {
-    const creator = (await client.getTransaction(cell.outPoint.txHash))?.transaction;
-    if (!creator) continue;
-    const inputs = await Promise.all(creator.inputs.slice(0, MAX_CREATOR_INPUTS).map((input) => input.getCell(client).catch(() => undefined)));
-    if (inputs.some((input) => input?.cellOutput.lock.eq(secp))) real.push(cell);
-  }
-  if (real.length !== 1) return undefined;
-  const creator = (await client.getTransaction(real[0].outPoint.txHash))!.transaction;
-  return { outPoint: { txHash: real[0].outPoint.txHash, index: Number(real[0].outPoint.index) }, cellOutput: real[0].cellOutput, outputData: real[0].outputData, recordEntriesBytes: recordEntriesBytes(recordOf(creator) ?? "0x") };
+  return undefined;
 }
 
 const TYPE_ID_CODE_HASH = "0x00000000000000000000000000000000000000000000000000545950455f4944";
 /** How long after signing a transaction the node doesn't know yet is waited for: its client is sending it. */
 const JUST_SIGNED_MS = 10_000;
-const MAX_CANDIDATES = 4;
-const MAX_CREATOR_INPUTS = 64;
+/** Send-limit-shaped cells the search checks, newest first, two lookups each. Planting more costs about 11k CKB. */
+const MAX_CANDIDATES = 64;
+/** Cells the search may read, should a node return more than the send-limit-shaped ones it was asked for. */
+const MAX_SCANNED = 512;
+/** Entries of the key's history read from one block, as in the Action. */
+const MAX_BLOCK_HISTORY = 1024;
 const FEE_RATE = 1_500n;
 
 /** The capacity a send-limit cell with this data occupies, in shannons. */
