@@ -44,6 +44,7 @@ import { serializeCccTransactionForRpc } from "./ccc-transaction";
 import { fundingLockCellDeps, FUNDING_LOCK_KNOWN_SCRIPTS, type KeyWayRecovery } from "./account-lock";
 import { getLockBalance } from "./ckb-balance";
 import { toKeyWayError } from "./keyway-error";
+import { refuseFundingBeyondRequest, type FundingRequest } from "./funding-limit";
 import { createFeeReserve, FEE_RESERVE } from "./fee-reserve";
 
 type ManagedStatus = {
@@ -69,15 +70,20 @@ export function createManagedKeyWay(options: {
 }) {
   let openingPeer: string | undefined;
   let openingWithReserve = false;
+  let openingRequest: FundingRequest | undefined;
   const api = options.apiClient ?? new KeyWayApiClient();
   const fundingSigner = new RemoteCkbSigner(
     options.authToken,
     options.ckbPublicKey,
-    (preview) => options.approveFiberChannelOpen({
+    (preview) => {
+      // The account's share may not exceed what the app asked Fiber for, whatever the peer did to the transaction.
+      refuseFundingBeyondRequest(preview, openingRequest);
+      return options.approveFiberChannelOpen({
       ...preview,
       ...(openingPeer ? { peer: openingPeer } : {}),
       ...(openingWithReserve ? { feeReserveCkb: ccc.fixedPointToString(FEE_RESERVE) } : {}),
-    }),
+      });
+    },
     undefined,
     api,
     options.recovery,
@@ -156,6 +162,7 @@ export function createManagedKeyWay(options: {
     openingPeer = params.pubkey;
     openingWithReserve = await feeReserve.needed();
     const funding = await resolveExternalFunding(undefined);
+    openingRequest = { fundingAmount: BigInt(params.funding_amount), udtTypeScript: params.funding_udt_type_script, shutdownScript: funding.shutdownScript };
     const result = await openChannelWithExternalFundingFlow({
       node: { openChannelWithExternalFunding, submitSignedFundingTx },
       params: {

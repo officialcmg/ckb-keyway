@@ -30,7 +30,7 @@ export type ValidatedFunding = {
   transaction: ccc.Transaction;
   signer: ccc.SignerCkbPublicKey;
   script: ccc.Script;
-  /** Every lock group of the account in the transaction, the current lock first. */
+  /** The account's lock group in the transaction: a funding spends only its current lock. */
   groups: SigningGroup[];
   preview: FundingPreview;
   /** All CKB leaving the account, the fee included; it counts toward the daily email-confirmation amount. */
@@ -54,10 +54,16 @@ export async function previewFundingTransaction(
   // The account's address comes from its recovery record, so the record must be one the chain backs.
   if (wallet.recovery) await verifyRecoveryAnchor(client, wallet.litPublicKey, wallet.recovery);
   const locks = await accountLocks(client, wallet.litPublicKey, wallet.recovery);
-  const own = locks.map(({ script }) => script);
-  const isOwn = (lock: ccc.Script) => own.some((script) => script.eq(lock));
+  // Fiber knows only the account's current lock (its recommended address: the Omnilock once recovery is set up) and
+  // treats every other input as the peer's. So a funding may spend only that lock: a cell at the account's older
+  // address would otherwise be signed for as if it were the peer's contribution.
+  const current = locks[0];
+  const isOwn = (lock: ccc.Script) => current.script.eq(lock);
   const inputCells = await Promise.all(transaction.inputs.map((input) => input.getCell(client)));
   refuseAdminListSpend(transaction, inputCells, wallet.recovery);
+  if (locks.slice(1).some(({ script }) => inputCells.some(({ cellOutput }) => cellOutput.lock.eq(script)))) {
+    throw new Error("A channel funding can only spend from the account's current address");
+  }
   const ownedInputs = inputCells.filter(({ cellOutput }) => isOwn(cellOutput.lock));
   if (ownedInputs.length === 0) {
     throw new Error("Funding transaction has no input controlled by this KeyWay wallet");
@@ -69,7 +75,8 @@ export async function previewFundingTransaction(
   ));
   if (fundingOutputs.length !== 1) throw new Error("Funding transaction must contain exactly one channel output");
   const fundingOutput = fundingOutputs[0];
-  const token = await checkTokenFunding(client, transaction, inputCells, own, fundingOutput);
+  const token = await checkTokenFunding(client, transaction, inputCells, current.script, fundingOutput);
+  refuseUncoveredForeignOutputs(transaction, inputCells, isOwn, fundingOutput);
   const spend = calculateFundingSpend({
     ownedInputCapacity: sumCapacities(ownedInputs.map(({ cellOutput }) => cellOutput.capacity)),
     ownedChangeCapacity: sumCapacities(transaction.outputs.filter(({ lock }) => isOwn(lock)).map(({ capacity }) => capacity)),
@@ -77,7 +84,7 @@ export async function previewFundingTransaction(
     totalOutputCapacity: transaction.getOutputsCapacity(),
   });
 
-  const groups = signingGroups(locks, inputCells);
+  const groups = signingGroups([current], inputCells);
   const related = await signer.getRelatedScripts(transaction);
   // CCC's own groups for this key are its secp256k1 lock and anyone-can-pay locks; only the first is signed.
   const secp = locks.find(({ kind }) => kind === "secp256k1")!.script;
@@ -99,6 +106,25 @@ export async function previewFundingTransaction(
     },
     outflowShannons: spend.fundingAmount + spend.fee,
   };
+}
+
+/**
+ * The other parties' inputs must pay for their own outputs (everything but the account's change and the channel
+ * output), so the account's CKB can only go into the channel or the fee. Tokens are checked by `checkTokenFunding`.
+ */
+export function refuseUncoveredForeignOutputs(
+  transaction: ccc.Transaction,
+  inputCells: Array<{ cellOutput: ccc.CellOutput }>,
+  isOwn: (lock: ccc.Script) => boolean,
+  fundingOutput: ccc.CellOutput,
+): void {
+  const foreignInputs = sumCapacities(inputCells.filter(({ cellOutput }) => !isOwn(cellOutput.lock)).map(({ cellOutput }) => cellOutput.capacity));
+  const foreignOutputs = sumCapacities(transaction.outputs
+    .filter((output) => output !== fundingOutput && !isOwn(output.lock))
+    .map(({ capacity }) => capacity));
+  if (foreignInputs < foreignOutputs) {
+    throw new Error("Funding transaction pays other outputs from the KeyWay wallet");
+  }
 }
 
 /**
