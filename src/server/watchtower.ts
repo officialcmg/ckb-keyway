@@ -279,8 +279,10 @@ export async function watchtowerRequest(user: User, request: WatchtowerRequest, 
         }
         return { channel: publicStatus(existing) };
       }
+      // A close or penalty is checked every pass until it is confirmed, so it counts until then too.
       const [{ count }] = await tx<Array<{ count: string }>>`
-        select count(*) from keyway_v2_watchtower_channels where user_id = ${user.id} and state in ('watching', 'penalty-sent')
+        select count(*) from keyway_v2_watchtower_channels
+        where user_id = ${user.id} and (state in ('watching', 'penalty-sent') or (state in ('closed', 'penalized') and not resolution_confirmed))
       `;
       if (Number(count) >= MAX_WATCHED_CHANNELS) throw new Error(`The watchtower already watches ${MAX_WATCHED_CHANNELS} open channels for this account`);
       const [row] = await tx<Row[]>`
@@ -317,6 +319,10 @@ export async function watchtowerRequest(user: User, request: WatchtowerRequest, 
           aggregated_signature = ${revocation.aggregatedSignature},
           revocation_output = ${revocation.output},
           revocation_output_data = ${revocation.outputData},
+          -- A close taken for the current state may be a commitment this revocation covers (it arrived late): the
+          -- next pass looks at the close again and punishes it if so.
+          state = case when state = 'closed' then 'watching' else state end,
+          resolution_confirmed = case when state = 'closed' then false else resolution_confirmed end,
           updated_at = now()
         where user_id = ${user.id} and channel_id = ${request.channelId}
         returning *
@@ -686,7 +692,10 @@ export type PassDependencies = {
  * its backlog, and a penalty if it needs one), several at a time; then the channels still catching up on a backlog
  * share the rest of the pass's catch-up budget. A channel's backlog never delays another channel's check.
  */
-export async function runWatchtowerPass(deps: PassDependencies): Promise<void> {
+export async function runWatchtowerPass(passDeps: PassDependencies): Promise<void> {
+  // Channels that share a funding lock (from the same scan position) or a transaction share its read in a pass, so
+  // registering many channels on one lock, or closing many with one transaction, adds no reads.
+  const deps = { ...passDeps, chain: readOncePerPass(passDeps.chain) };
   const { sql } = deps;
   const log = deps.log ?? ((message: string) => console.info(`[watchtower] ${message}`));
   await sql`
@@ -744,13 +753,17 @@ export async function runWatchtowerPass(deps: PassDependencies): Promise<void> {
   await Promise.all(Array.from({ length: Math.min(deps.concurrency ?? CHECK_CONCURRENCY, queue.length) }, async () => {
     for (let row = queue.shift(); row; row = queue.shift()) if (await check(row, 0)) behind.push(row);
   }));
-  for (const row of recent) {
-    try {
-      await confirmResolution(deps, row, log);
-    } catch (error) {
-      log(`${row.channel_id}: could not confirm the ${row.state} state: ${error instanceof Error ? error.message : String(error)}`);
+  // Several at a time too, so a long list of closes doesn't hold up the next pass.
+  const confirming = [...recent];
+  await Promise.all(Array.from({ length: Math.min(deps.concurrency ?? CHECK_CONCURRENCY, confirming.length) }, async () => {
+    for (let row = confirming.shift(); row; row = confirming.shift()) {
+      try {
+        await confirmResolution(deps, row, log);
+      } catch (error) {
+        log(`${row.channel_id}: could not confirm the ${row.state} state: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
-  }
+  }));
 
   // Catching up: each channel gets an equal share of what is left of the budget, so one long backlog can't take it.
   const deadline = Date.now() + (deps.catchUpBudgetMs ?? CATCH_UP_BUDGET_MS);
@@ -763,6 +776,23 @@ export async function runWatchtowerPass(deps: PassDependencies): Promise<void> {
     `;
     if (row) await check(row, share);
   }
+}
+
+function readOncePerPass(chain: ChainView): ChainView {
+  const histories = new Map<string, Promise<HistoryProgress>>();
+  const transactions = new Map<string, ReturnType<ChainView["transaction"]>>();
+  return {
+    ...chain,
+    fundingHistory(lock, scan, options) {
+      const key = JSON.stringify([lock.codeHash, lock.hashType, lock.args, scan.cursor ?? null, scan.recent ?? null, options ?? null]);
+      if (!histories.has(key)) histories.set(key, chain.fundingHistory(lock, scan, options));
+      return histories.get(key)!;
+    },
+    transaction(hash) {
+      if (!transactions.has(hash)) transactions.set(hash, chain.transaction(hash));
+      return transactions.get(hash)!;
+    },
+  };
 }
 
 /** Checks one channel and acts on what it finds; says whether its backlog scan has more to read. */
@@ -799,7 +829,7 @@ async function confirmResolution(deps: PassDependencies, row: Row, log: (message
 
 async function checkChannel(deps: PassDependencies, row: Row, log: (message: string) => void, backlogBudgetMs: number): Promise<boolean> {
   const { sql, chain } = deps;
-  const save = (fields: Partial<Pick<Row, "state" | "detail" | "funding_out_point" | "closing_tx" | "penalty_tx">>) => sql`
+  const save = (fields: Partial<Pick<Row, "state" | "detail" | "funding_out_point" | "closing_tx" | "penalty_tx">>, { unlessRevoked = false } = {}) => sql`
     update keyway_v2_watchtower_channels set
       state = ${fields.state ?? row.state},
       detail = ${fields.detail ?? row.detail},
@@ -809,6 +839,7 @@ async function checkChannel(deps: PassDependencies, row: Row, log: (message: str
       checked_at = now(),
       updated_at = case when ${fields.state ?? row.state} <> state or ${fields.detail ?? row.detail}::text is distinct from detail then now() else updated_at end
     where user_id = ${row.user_id} and channel_id = ${row.channel_id}
+      ${unlessRevoked ? sql`and commitment_number is not distinct from ${row.commitment_number}` : sql``}
   `;
   // The scan's progress is saved as soon as it is known, so a check that fails afterwards (or partway through
   // the history) resumes where it got to instead of starting over.
@@ -834,7 +865,8 @@ async function checkChannel(deps: PassDependencies, row: Row, log: (message: str
   }
   if (assessment.state === "closed") {
     log(`${row.channel_id}: ${assessment.detail} (${assessment.closingTx})`);
-    await save({ state: "closed", detail: assessment.detail, closing_tx: assessment.closingTx, funding_out_point: assessment.fundingOutPoint });
+    // Not if a revocation arrived during the check: it may cover this commitment, and the next pass decides with it.
+    await save({ state: "closed", detail: assessment.detail, closing_tx: assessment.closingTx, funding_out_point: assessment.fundingOutPoint }, { unlessRevoked: true });
     return false;
   }
   // The peer published a revoked commitment.
