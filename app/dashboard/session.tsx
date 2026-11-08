@@ -148,3 +148,29 @@ export function useDashboard(): DashboardSession {
   if (!value) throw new Error("useDashboard must be used inside DashboardProvider");
   return value;
 }
+
+/**
+ * The sign-out button. A second click while the first sign-out is still waiting does nothing.
+ * A failure shows only while that session lasts, so the next sign-in doesn't inherit it.
+ */
+export function useSignOut() {
+  const session = useDashboard();
+  const [error, setError] = useState<string>();
+  const pending = useRef(false);
+  useEffect(() => {
+    if (session.status !== "signedIn") setError(undefined);
+  }, [session.status]);
+  const run = async () => {
+    if (pending.current) return;
+    pending.current = true;
+    setError(undefined);
+    try {
+      await session.signOut();
+    } catch {
+      setError("Sign-out didn't go through, so you're still signed in. Try again in a moment.");
+    } finally {
+      pending.current = false;
+    }
+  };
+  return { error, run };
+}

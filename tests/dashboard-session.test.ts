@@ -41,8 +41,9 @@ const browser = {
 };
 for (const [name, value] of Object.entries(browser)) Object.defineProperty(globalThis, name, { value, writable: true, configurable: true });
 
-const { DashboardProvider, useDashboard } = await import("../app/dashboard/session.tsx");
+const { DashboardProvider, useDashboard, useSignOut } = await import("../app/dashboard/session.tsx");
 type Session = ReturnType<typeof useDashboard>;
+type SignOutButton = ReturnType<typeof useSignOut>;
 
 // Every request waits until the test answers it; nothing leaves the process.
 type Call = { path: string; auth?: string; body: Record<string, unknown>; resolve: (response: Response) => void; reject: (error: Error) => void; done: boolean };
@@ -71,12 +72,12 @@ const APP_B = app("app_b", "Account B's app");
 /** Mounts a dashboard "tab". Tabs share localStorage and window events, as tabs of one origin do. */
 const open: Root[] = [];
 async function openTab() {
-  const tab: { session?: Session; root?: Root } = {};
-  const Probe = () => { tab.session = useDashboard(); return null; };
+  const tab: { session?: Session; signOutButton?: SignOutButton; root?: Root } = {};
+  const Probe = () => { tab.session = useDashboard(); tab.signOutButton = useSignOut(); return null; };
   tab.root = createRoot(new FakeNode() as unknown as Element);
   open.push(tab.root);
   await act(async () => { tab.root!.render(createElement(DashboardProvider, null, createElement(Probe))); });
-  return tab as { session: Session; root: Root };
+  return tab as { session: Session; signOutButton: SignOutButton; root: Root };
 }
 async function fresh(token?: string) {
   calls = [];
@@ -241,4 +242,25 @@ test("A's late sign-out in one tab doesn't sign B out in another", async () => {
   assertOnlyB(second.session);
   await close(first);
   await close(second);
+});
+
+test("a failed sign-out's message doesn't carry over to the next sign-in", async () => {
+  const tab = await signInAsA();
+  let clicked!: Promise<void>;
+  await act(async () => { clicked = tab.signOutButton.run(); });
+  await settle(() => take("/api/keyway/auth/logout", TOKEN_A).resolve(json(503, { error: "Service unavailable" })));
+  await act(async () => { await clicked; });
+  assert.match(tab.signOutButton.error ?? "", /still signed in/);
+  // The session then ends some other way: here the server stops accepting it.
+  await act(async () => { window.dispatchEvent(new Event("focus")); });
+  await settle(() => take("/api/keyway/auth/session", TOKEN_A).resolve(json(401, { error: "Session revoked" })));
+  assert.equal(tab.session.status, "signedOut");
+  let verified!: Promise<void>;
+  await act(async () => { verified = tab.session.verifyCode("b@example.test", "challenge-b", "000000"); });
+  await settle(() => take("/api/keyway/auth/verify-code").resolve(json(200, { sessionToken: TOKEN_B })));
+  await settle(() => take("/api/keyway/developer/apps", TOKEN_B, "list").resolve(json(200, { applications: [APP_B] })));
+  await act(async () => { await verified; });
+  assertOnlyB(tab.session);
+  assert.equal(tab.signOutButton.error, undefined);
+  await close(tab);
 });
