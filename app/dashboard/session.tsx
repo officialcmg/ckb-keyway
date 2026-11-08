@@ -114,11 +114,14 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     },
     signOut: async () => {
       // Only look signed out once the server has ended the session (a 401 means it already had).
-      // Otherwise keep it, so the caller can say sign-out failed.
+      // Otherwise keep it, so the caller can say sign-out failed. If the session changed while
+      // waiting, this sign-out is already done and its reply must not touch the next account.
+      const started = generation.current;
       if (token) await apiRequest("/api/keyway/auth/logout", {}, token).catch((cause) => {
+        if (started !== generation.current) return;
         if (!(cause instanceof DashboardApiError && cause.status === 401)) throw cause;
       });
-      clear();
+      if (started === generation.current) clear();
     },
     request: async <T,>(body: Record<string, unknown>) => {
       if (!token) throw new Error("Sign in again to continue");

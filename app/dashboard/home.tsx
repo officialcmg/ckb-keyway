@@ -2,7 +2,7 @@
 
 import dynamic from "next/dynamic";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { type DeveloperApplication } from "./api";
 import { useDashboard } from "./session";
 import { ApplicationRows, ApplicationsHeader, CreateDialog, ListEmpty, ListError, ListLoading, SignInCard } from "./views";
@@ -22,6 +22,7 @@ function LiveHome() {
   const router = useRouter();
   const [creating, setCreating] = useState(false);
   const [signOutError, setSignOutError] = useState<string>();
+  const signingOut = useRef(false);
   if (session.status === "checking") return null;
   if (session.status === "signedOut") return <SignInCard onSendCode={session.sendCode} onVerify={session.verifyCode} />;
 
@@ -32,11 +33,16 @@ function LiveHome() {
   }
 
   async function signOut() {
+    // A second click while the first sign-out is still waiting does nothing.
+    if (signingOut.current) return;
+    signingOut.current = true;
     setSignOutError(undefined);
     try {
       await session.signOut();
     } catch {
       setSignOutError("Sign-out didn't go through, so you're still signed in. Try again in a moment.");
+    } finally {
+      signingOut.current = false;
     }
   }
 

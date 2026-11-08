@@ -203,3 +203,42 @@ test("A's late change, or its 401, doesn't reach B's dashboard", async () => {
     await close(tab);
   }
 });
+
+test("A's late reply to a second sign-out doesn't sign B out", async () => {
+  for (const late of [json(401, { error: "Session expired" }), json(503, { error: "Service unavailable" })]) {
+    const tab = await signInAsA();
+    // Sign out clicked twice: both requests carry A's token.
+    let first!: Promise<void>;
+    let second!: Promise<void>;
+    await act(async () => { first = tab.session.signOut(); second = tab.session.signOut(); second.catch(() => undefined); });
+    await settle(() => take("/api/keyway/auth/logout", TOKEN_A).resolve(json(204)));
+    await act(async () => { await first; });
+    let verified!: Promise<void>;
+    await act(async () => { verified = tab.session.verifyCode("b@example.test", "challenge-b", "000000"); });
+    await settle(() => take("/api/keyway/auth/verify-code").resolve(json(200, { sessionToken: TOKEN_B })));
+    await settle(() => take("/api/keyway/developer/apps", TOKEN_B, "list").resolve(json(200, { applications: [APP_B] })));
+    await act(async () => { await verified; });
+    await settle(() => take("/api/keyway/auth/logout", TOKEN_A).resolve(late));
+    // A's session had already ended, so the late reply is neither a sign-out of B nor a failure.
+    await act(async () => { await second; });
+    assertOnlyB(tab.session);
+    await close(tab);
+  }
+});
+
+test("A's late sign-out in one tab doesn't sign B out in another", async () => {
+  const first = await signInAsA();
+  const second = await openTab();
+  await settle(() => take("/api/keyway/developer/apps", TOKEN_A, "list").resolve(json(200, { applications: [APP_A] })));
+  let slow!: Promise<void>;
+  await act(async () => { slow = first.session.signOut(); slow.catch(() => undefined); });
+  const slowLogout = take("/api/keyway/auth/logout", TOKEN_A);
+  await switchToB(second);
+  // The browser tells the first tab that the stored session changed.
+  await act(async () => { window.dispatchEvent(new StorageEvent("storage", { key: SESSION_KEY })); });
+  await settle(() => slowLogout.resolve(json(401, { error: "Session expired" })));
+  await act(async () => { await slow; });
+  assertOnlyB(second.session);
+  await close(first);
+  await close(second);
+});
