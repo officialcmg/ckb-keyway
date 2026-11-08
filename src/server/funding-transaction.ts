@@ -37,6 +37,11 @@ export type ValidatedFunding = {
   outflowShannons: bigint;
 };
 
+/**
+ * Checks a Fiber channel funding before KeyWay signs it: only the account's current lock is spent, other parties
+ * pay for their own outputs, tokens go only into the channel, and the fee stays under the limit. Returns what to
+ * show the user and the account's lock group to sign.
+ */
 export async function previewFundingTransaction(
   wallet: ReadyWallet,
   input: unknown,

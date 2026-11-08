@@ -158,6 +158,7 @@ export function createManagedKeyWay(options: {
     );
   }
 
+  /** Opens a channel funded from the account, recording the request so its funding preview can be checked against it. */
   async function openFundedChannel(params: KeyWayFundingParams) {
     openingPeer = params.pubkey;
     openingWithReserve = await feeReserve.needed();

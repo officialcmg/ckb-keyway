@@ -441,6 +441,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     restoreRequired = false;
   }
 
+  /** Opens a channel funded from the account, recording the request so its funding preview can be checked against it. */
   async function openFundedChannel(params: KeyWayFundingParams) {
     if (!node.isRunning) throw new Error("Start the Fiber node before opening a channel");
     openingPeer = params.pubkey;
