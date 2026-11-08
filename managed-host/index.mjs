@@ -10,6 +10,10 @@ import { pathToFileURL } from "node:url";
 
 const USER_ID = /^[0-9a-f]{64}$/;
 const SNAPSHOT = /^snap-\d+$/;
+const CHANNELS_MARKER = "keyway-channels";
+// A node used this recently is never stopped to make room, so a user's steps that span several requests,
+// such as connecting to a peer and then opening a channel with it, can't lose the node in between.
+const RECENT_USE_MS = 5 * 60_000;
 const nodes = new Map();
 const starting = new Map();
 const operations = new Map();
@@ -85,22 +89,57 @@ async function handleRequest(request, response) {
     }
     const match = request.method === "POST" && /^\/users\/([0-9a-f]{64})$/.exec(request.url ?? "");
     if (!match) return send(response, 404, { error: "Not found" });
-    const body = await readBody(request, 1_048_576);
-    await withUserOperation(match[1], async () => {
-      const node = await ensureNode(match[1]);
-      const upstream = await fetch(`http://127.0.0.1:${node.port}`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body,
-        signal: AbortSignal.timeout(120_000),
-      });
-      response.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json" });
-      response.end(Buffer.from(await upstream.arrayBuffer()));
-    });
+    const upstream = await proxyUserRequest(match[1], await readBody(request, 1_048_576));
+    response.writeHead(upstream.status, { "content-type": upstream.contentType });
+    response.end(upstream.body);
   } catch (error) {
     logError(error);
     send(response, 502, { error: error instanceof Error ? error.message : "Managed node failed" });
   }
+}
+
+/** Passes one JSON-RPC request to the user's node, starting it if needed. */
+export function proxyUserRequest(userId, body) {
+  return withUserOperation(userId, async () => {
+    const node = await ensureNode(userId);
+    const upstream = await fetch(`http://127.0.0.1:${node.port}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+      signal: AbortSignal.timeout(120_000),
+    });
+    const result = {
+      status: upstream.status,
+      contentType: upstream.headers.get("content-type") ?? "application/json",
+      body: Buffer.from(await upstream.arrayBuffer()),
+    };
+    if (upstream.ok && opensChannel(body, result.body)) await markChannels(userId, true);
+    return result;
+  });
+}
+
+function opensChannel(request, response) {
+  try {
+    const { method } = JSON.parse(request.toString("utf8"));
+    return (method === "open_channel" || method === "open_channel_with_external_funding") && !JSON.parse(response.toString("utf8")).error;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A node that may hold channels keeps a marker in its data directory, so that after a restart the host starts
+ * those nodes, and only those: any other node starts when its user next needs it.
+ */
+async function markChannels(userId, hasChannels) {
+  const marker = join(managedDataDir(userId), CHANNELS_MARKER);
+  if (hasChannels) await writeFile(marker, "", { mode: 0o600 });
+  else await rm(marker, { force: true });
+}
+
+async function hasChannelsMarker(userId) {
+  try { await stat(join(managedDataDir(userId), CHANNELS_MARKER)); return true; }
+  catch (error) { if (error?.code === "ENOENT") return false; throw error; }
 }
 
 export async function withUserOperation(userId, operation) {
@@ -122,6 +161,7 @@ async function ensureNode(userId) {
   if (running?.stopping) throw new Error("Fiber process is still stopping");
   if (running) {
     running.lastUsed = ++uses;
+    running.lastUsedAt = Date.now();
     return running;
   }
   const pending = starting.get(userId);
@@ -135,17 +175,21 @@ async function ensureNode(userId) {
 /**
  * When the host is full, a new node takes the place of the least recently used one that has no channels,
  * so accounts that never opened a channel can't hold the host's capacity. A node with channels is never
- * stopped this way, nor is one serving a request.
+ * stopped this way, nor is one serving a request or used in the last few minutes.
  */
 async function makeRoom(userId) {
+  const reusable = (id, node) => id !== userId && !node.stopping && !operations.has(id) && Date.now() - node.lastUsedAt >= RECENT_USE_MS;
   const candidates = [...nodes.entries()]
-    .filter(([id, node]) => id !== userId && !node.stopping && !operations.has(id))
+    .filter(([id, node]) => reusable(id, node))
     .sort(([, left], [, right]) => left.lastUsed - right.lastUsed);
   for (const [id, node] of candidates) {
-    let idle = false;
-    try { requireClosedChannels(await nodeChannels(node)); idle = true; } catch {}
+    let channels;
+    try { channels = await nodeChannels(node); } catch { continue; }
+    let idle = true;
+    try { requireClosedChannels(channels); } catch { idle = false; await markChannels(id, true).catch(logError); }
     // Checked again after the wait, in case the node was stopped or picked up a request meanwhile.
-    if (!idle || nodes.get(id) !== node || node.stopping || operations.has(id)) continue;
+    if (!idle || nodes.get(id) !== node || !reusable(id, node)) continue;
+    await markChannels(id, false);
     await stopNode(id);
     return;
   }
@@ -153,13 +197,16 @@ async function makeRoom(userId) {
 }
 
 /**
- * Starts the nodes on the volume after a restart: as many as fit together, then the rest one at a time,
- * so that each node with channels can take the place of an idle one that happened to be listed first.
+ * Starts the nodes that may hold channels after a restart: as many as fit together, then the rest one at a
+ * time, in case one has closed its channels since and can make room. Every other node starts on its user's
+ * next request, so leftover nodes can't hold up the ones with channels.
  */
 export async function startKnownNodes(users) {
+  const marked = await Promise.all(users.map((userId) => hasChannelsMarker(userId).catch(() => true)));
+  const withChannels = users.filter((_, index) => marked[index]);
   const start = (userId) => withUserOperation(userId, () => ensureNode(userId)).catch(logError);
-  await Promise.all(users.slice(0, maxNodes()).map(start));
-  for (const userId of users.slice(maxNodes())) await start(userId);
+  await Promise.all(withChannels.slice(0, maxNodes()).map(start));
+  for (const userId of withChannels.slice(maxNodes())) await start(userId);
 }
 
 export function runningUsers() {
@@ -188,7 +235,7 @@ async function startNode(userId) {
   ], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
   child.stdout.on("data", (chunk) => process.stdout.write(`[fnn:${userId.slice(0, 8)}] ${chunk}`));
   child.stderr.on("data", (chunk) => process.stderr.write(`[fnn:${userId.slice(0, 8)}] ${chunk}`));
-  const node = { child, port, lastUsed: 0 };
+  const node = { child, port, lastUsed: 0, lastUsedAt: 0 };
   child.once("exit", (code, signal) => {
     const wasRunning = nodes.get(userId)?.child === child;
     if (wasRunning) nodes.delete(userId);
@@ -197,6 +244,7 @@ async function startNode(userId) {
   });
   await waitForRpc(port, child);
   node.lastUsed = ++uses;
+  node.lastUsedAt = Date.now();
   nodes.set(userId, node);
   return node;
 }

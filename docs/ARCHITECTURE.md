@@ -91,7 +91,7 @@ Managed channel connections use the approved public peer's key with `addr_type: 
 
 Funding transactions use CCC's native JSON-RPC transformer before submission, excluding cached input metadata while preserving the transaction hash and witnesses. The gateway applies the same transformation for older SDK versions, which native Fiber otherwise rejects as invalid parameters.
 
-The managed host caps load with `KEYWAY_MANAGED_MAX_NODES` (default 16 concurrent nodes). When it is full, a new node takes the place of the least recently used running node that has no channels (none, or all cooperatively closed); a node with channels is never stopped this way. After a restart it starts as many known nodes as fit together, then the rest one at a time, so nodes with channels displace idle ones. State is protected by an operator-driven snapshot API on the same bearer-token boundary:
+The managed host caps load with `KEYWAY_MANAGED_MAX_NODES` (default 16 concurrent nodes). When it is full, a new node takes the place of the least recently used running node that has no channels (none, or all cooperatively closed); a node with channels is never stopped this way, nor is one used in the last five minutes. A node that opens a channel, or is found with one, gets a `keyway-channels` marker in its data directory; after a restart the host starts only marked nodes, and every other node starts on its user's next request. State is protected by an operator-driven snapshot API on the same bearer-token boundary:
 
 | Request | Effect |
 | --- | --- |
