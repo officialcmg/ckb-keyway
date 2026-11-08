@@ -127,11 +127,14 @@ test("general signing binds approvals, email codes and threshold changes", { ski
     assert.ok(signed);
   });
 
-  await t.test("a token with no daily amount of its own needs the code once confirmation is on", async () => {
+  await t.test("a token with no daily amount of its own has no limit, even with a CKB amount set", async () => {
     const { context } = harness(1n * CKB, [{ asset: RUSD, amount: 5n }]);
     await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (1_000n * CKB).toString() });
-    const preview = await transactionSigning(context, { operation: "preview", transaction: tx(5) }) as { requiresEmailCode: boolean };
-    assert.equal(preview.requiresEmailCode, true);
+    for (const marker of [5, 7, 8]) {
+      const preview = await transactionSigning(context, { operation: "preview", transaction: tx(marker) }) as { requiresEmailCode: boolean; confirmationNonce: string };
+      assert.equal(preview.requiresEmailCode, false, `transfer ${marker}`);
+      await transactionSigning(context, { operation: "sign", transaction: tx(marker), confirmationNonce: preview.confirmationNonce });
+    }
     const off = harness(1n * CKB, [{ asset: RUSD, amount: 5n }]);
     const free = await transactionSigning(off.context, { operation: "preview", transaction: tx(6) }) as { requiresEmailCode: boolean };
     assert.equal(free.requiresEmailCode, false);
@@ -140,21 +143,21 @@ test("general signing binds approvals, email codes and threshold changes", { ski
   await t.test("tokens with their own daily amount count toward it, separately from CKB", async () => {
     const { context, emails, codeFrom } = harness(1n * CKB, [{ asset: RUSD, amount: 40n }]);
     await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (1_000n * CKB).toString() });
-    // Giving a token its own amount lets more of it through without a code, so it needs the emailed code.
-    const pending = await signingSettings(context, { operation: "set-daily-amount", asset: RUSD, amount: "100" }) as { requiresEmailCode: boolean; confirmationNonce: string };
-    assert.equal(pending.requiresEmailCode, true);
-    assert.match(emails.at(-1)!.plaintext, /token 0x/);
-    await signingSettings(context, { operation: "set-daily-amount", asset: RUSD, amount: "100", confirmationNonce: pending.confirmationNonce, emailCode: codeFrom() });
-    assert.deepEqual(await signingSettings(context, { operation: "get" }), {
+    // Giving a token its own amount limits a token that had none, so it applies at once.
+    assert.deepEqual(await signingSettings(context, { operation: "set-daily-amount", asset: RUSD, amount: "100" }), {
       dailyAmounts: { ckb: (1_000n * CKB).toString(), [RUSD]: "100" },
     });
+    assert.equal(emails.length, 0);
     for (const [marker, needsCode] of [[20, false], [21, false], [22, true]] as const) {
       const preview = await transactionSigning(context, { operation: "preview", transaction: tx(marker) }) as { confirmationNonce: string; requiresEmailCode: boolean };
       assert.equal(preview.requiresEmailCode, needsCode, `transfer ${marker}`);
       if (!needsCode) await transactionSigning(context, { operation: "sign", transaction: tx(marker), confirmationNonce: preview.confirmationNonce });
     }
-    // Removing the token's amount makes it need the code every time again: that's stronger, so no code.
-    assert.deepEqual(await signingSettings(context, { operation: "set-daily-amount", asset: RUSD, amount: null }), {
+    // Removing the token's amount leaves it with no limit: that loosens, so it needs the emailed code.
+    const pending = await signingSettings(context, { operation: "set-daily-amount", asset: RUSD, amount: null }) as { requiresEmailCode: boolean; confirmationNonce: string };
+    assert.equal(pending.requiresEmailCode, true);
+    assert.match(emails.at(-1)!.plaintext, /token 0x/);
+    assert.deepEqual(await signingSettings(context, { operation: "set-daily-amount", asset: RUSD, amount: null, confirmationNonce: pending.confirmationNonce, emailCode: codeFrom() }), {
       dailyAmounts: { ckb: (1_000n * CKB).toString() },
     });
   });

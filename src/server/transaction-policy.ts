@@ -329,9 +329,9 @@ export function describeTransaction(
   return {
     outflowShannons: leaving,
     tokensLeaving: [...tokenTotals.values()].some(({ delta }) => delta < 0n) || cellsLeaving(ownInputs, ownOutputs, countsPerCell).length > 0,
-    // Other typed cells (NFTs, Type ID and Unique cells, scripts KeyWay can't read) leave as "tokens" with no daily
-    // amount, counted per cell (and whenever one doesn't come back unchanged), so they always need the email code
-    // once confirmation is on.
+    // Other typed cells (NFTs, Type ID and Unique cells, scripts KeyWay can't read) leave as "tokens" counted per
+    // cell (and whenever one doesn't come back unchanged). Like a token, they have no limit unless the user sets an
+    // amount for their type script hash, as the Lit Action reads the send-limit cell KeyWay writes.
     tokenOutflows: [
       ...[...tokenTotals].filter(([, { delta }]) => delta < 0n).map(([asset, { delta }]) => ({ asset, amount: -delta })),
       ...cellsLeaving(ownInputs, ownOutputs, countsPerCell),

@@ -36,7 +36,7 @@ function harness(amount: bigint, options: { failSend?: boolean } = {}) {
     },
   };
   // The amounts as the server keeps them (a test signer, so no send-limit cell is built on chain).
-  const settings = (threshold: bigint | null) => signingSettings({ ...context, wallet: {}, signDigest: async () => "0x" } as unknown as SigningContext, { operation: "set-daily-amount", asset: "ckb", amount: threshold?.toString() ?? null });
+  const settings = (threshold: bigint | null, asset = "ckb") => signingSettings({ ...context, wallet: {}, signDigest: async () => "0x" } as unknown as SigningContext, { operation: "set-daily-amount", asset, amount: threshold?.toString() ?? null });
   return { context, node, emails, sent, settings, codeFrom: () => /code is (\d{6})/.exec(emails.at(-1)!.plaintext)![1] };
 }
 
@@ -150,7 +150,7 @@ test("hosted Fiber payments: daily amount, email codes and overlapping approvals
     assert.equal(second.requiresEmailCode, true);
   });
 
-  await t.test("token payments count toward the token's own amount; with none, they need the code", async () => {
+  await t.test("token payments count toward the token's own amount; with none, they have no limit", async () => {
     const h = harness(5n);
     const rusd = { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" };
     const token = { method: "sendPayment", params: { invoice: "fibt1test", udt_type_script: rusd } };
@@ -159,7 +159,10 @@ test("hosted Fiber payments: daily amount, email codes and overlapping approvals
     assert.match(off.preview.asset, /^0x[0-9a-f]{64}$/);
     await h.settings(100n * CKB);
     const on = await fiberPayment(h.context, h.node, { ...token, stage: "preview" }) as { requiresEmailCode: boolean };
-    assert.equal(on.requiresEmailCode, true);
+    assert.equal(on.requiresEmailCode, false, "a CKB amount doesn't limit a token without its own");
+    await h.settings(5n, off.preview.asset);
+    const limited = await fiberPayment(h.context, h.node, { ...token, stage: "preview" }) as { requiresEmailCode: boolean };
+    assert.equal(limited.requiresEmailCode, true, "the payment reaches the token's own amount");
   });
 
   await t.test("a repeated send with the same idempotency key returns the first result and pays once", async () => {

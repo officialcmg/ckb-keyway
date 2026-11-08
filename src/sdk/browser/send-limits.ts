@@ -35,7 +35,10 @@ export type SendLimitOffer = { ckb: bigint };
 export type SendLimitSettings = {
   /** The keyed fingerprint of the bound email (32 bytes); never the address. */
   fingerprint: ccc.Hex;
-  /** Tokens without an amount of their own: unlimited (limits off) or a code for every transfer. */
+  /**
+   * Tokens (and any other cell type) without an amount of their own: unlimited, or a code for every transfer.
+   * KeyWay writes true: only assets with their own amount are limited. Older cells may say false.
+   */
   tokensUnlimited: boolean;
   /** CKB a day in shannons; undefined for no limit. */
   ckb?: bigint;
@@ -71,12 +74,12 @@ export function decodeSendLimitSettings(data: ccc.HexLike): SendLimitSettings {
 }
 
 /**
- * Settings for the server's daily amounts ("ckb" or a token's type script hash, to its amount). No amounts at all
- * means limits off: every asset unlimited, as the server's own rule has it.
+ * Settings for the server's daily amounts ("ckb" or a token's type script hash, to its amount). As the server's own
+ * rule has it, an asset without an amount of its own has no limit: tokens are unlimited unless listed.
  */
 export function settingsFromDailyAmounts(amounts: Map<string, bigint>, fingerprint: ccc.HexLike): SendLimitSettings {
   const tokens = new Map([...amounts].filter(([asset]) => asset !== "ckb"));
-  return { fingerprint: ccc.hexFrom(fingerprint), tokensUnlimited: amounts.size === 0, ...(amounts.has("ckb") ? { ckb: amounts.get("ckb") } : {}), tokens };
+  return { fingerprint: ccc.hexFrom(fingerprint), tokensUnlimited: true, ...(amounts.has("ckb") ? { ckb: amounts.get("ckb") } : {}), tokens };
 }
 
 export function isSendLimitCell(cellOutput: ccc.CellOutputLike, outputData: ccc.HexLike, secp: ccc.ScriptLike): boolean {

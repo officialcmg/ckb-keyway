@@ -186,18 +186,18 @@ export type Outflow = { id: string; shannons: bigint; tokens: Array<{ asset: str
 export type DailyAmounts = Map<string, bigint>;
 
 /**
- * Email confirmation is off until the user sets a daily amount. Once any is set, the emailed code is needed
- * when an asset's 24-hour total (signed transactions and Fiber payments together) reaches its amount, so
- * splitting a transfer doesn't avoid it. A token with no amount of its own always needs the code.
+ * Email confirmation is off until the user sets a daily amount. Once one is set, the emailed code is needed
+ * when that asset's 24-hour total (signed transactions and Fiber payments together) reaches its amount, so
+ * splitting a transfer doesn't avoid it. An asset without an amount of its own (a token, an NFT, any cell
+ * KeyWay can't read) has no limit, as in the send-limit cell KeyWay writes (tokens unlimited).
  */
 export async function outflowNeedsEmailCode(user: User, outflow: Outflow, connection?: Query): Promise<boolean> {
   const amounts = await readDailyAmounts(user, connection);
-  if (amounts.size === 0) return false;
-  const ckb = amounts.get("ckb");
-  if (ckb !== undefined && outflow.shannons > 0n && await recentOutflow(user, outflow.id, connection) + outflow.shannons >= ckb) return true;
+  const ckb = dailyAllowance(amounts, "ckb");
+  if (ckb !== "unlimited" && outflow.shannons > 0n && await recentOutflow(user, outflow.id, connection) + outflow.shannons >= ckb) return true;
   for (const token of outflow.tokens) {
-    const limit = amounts.get(token.asset);
-    if (limit === undefined || await recentTokenOutflow(user, outflow.id, token.asset, connection) + token.amount >= limit) return true;
+    const limit = dailyAllowance(amounts, token.asset);
+    if (limit !== "unlimited" && await recentTokenOutflow(user, outflow.id, token.asset, connection) + token.amount >= limit) return true;
   }
   return false;
 }
@@ -413,20 +413,19 @@ async function signAndSendSettings(context: SigningContext, client: ccc.Client, 
 }
 
 /**
- * How much of an asset can leave in 24 hours without the emailed code: unlimited when email confirmation is
- * off; CKB without an amount is unlimited; a token without an amount always needs the code.
+ * How much of an asset can leave in 24 hours without the emailed code: its own amount, or unlimited without one
+ * (CKB, a token, an NFT or any cell KeyWay can't read). The Lit Action reads a cell with tokens unlimited the same way.
  */
-function allowance(amounts: DailyAmounts, asset: string): bigint | "unlimited" {
-  if (amounts.size === 0) return "unlimited";
-  return amounts.get(asset) ?? (asset === "ckb" ? "unlimited" : 0n);
+export function dailyAllowance(amounts: DailyAmounts, asset: string): bigint | "unlimited" {
+  return amounts.get(asset) ?? "unlimited";
 }
 
-/** A change weakens protection if any asset, including tokens with no amount of their own, can then send more. */
+/** A change weakens protection if any asset can then send more: an amount raised or removed. */
 export function weakens(before: DailyAmounts, after: DailyAmounts): boolean {
-  const assets = new Set(["ckb", "0x" + "0".repeat(64), ...before.keys(), ...after.keys()]);
+  const assets = new Set(["ckb", ...before.keys(), ...after.keys()]);
   return [...assets].some((asset) => {
-    const was = allowance(before, asset);
-    const now = allowance(after, asset);
+    const was = dailyAllowance(before, asset);
+    const now = dailyAllowance(after, asset);
     return now === "unlimited" ? was !== "unlimited" : was !== "unlimited" && now > was;
   });
 }
@@ -436,7 +435,7 @@ function assetName(asset: string): string {
 }
 
 function describeAmount(amounts: DailyAmounts, asset: string): string {
-  const value = allowance(amounts, asset);
+  const value = dailyAllowance(amounts, asset);
   if (value === "unlimited") return "off";
   if (value === 0n) return "every transfer";
   return `once ${asset === "ckb" ? `${formatCkb(value)} CKB` : value.toString()} is sent in 24 hours`;

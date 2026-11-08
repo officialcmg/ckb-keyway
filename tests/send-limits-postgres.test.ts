@@ -141,6 +141,7 @@ test("send limits through the server: turning them on, sending under and over th
     assert.ok(genesis.inputs[0].previousOutput.eq(ccc.OutPoint.from({ txHash: funding.hash(), index: 0 })), "from the oldest plain cell");
     const settings = decodeSendLimitSettings(genesis.outputsData[0]);
     assert.equal(settings.ckb, 150n * CKB);
+    assert.equal(settings.tokensUnlimited, true, "tokens without an amount of their own have no limit");
     assert.notEqual(settings.fingerprint, `0x${"00".repeat(32)}`);
     world.add(genesis, "committed");
   });
@@ -226,4 +227,40 @@ test("send limits are offered by default to an account that could have them", { 
 
   litSignerOverride.mode = "digest";
   assert.equal(await sendLimitOffer(user, wallet, undefined, withCapacity(2_500n * CKB)), undefined, "not without the policy signer, which enforces them");
+});
+
+test("a token without an amount of its own sends without a code through the server and the Action", { skip: !enabled }, async (t) => {
+  const { world, secp, user, wallet, context, sent } = await setUp();
+  t.after(() => { litSignerOverride.mode = undefined; });
+  const xudt = ccc.Script.from({ codeHash: "0x25c29dc317811a6f6f3985a7a9ebc4838bd388d19d0feeecf0bcd60f6c0975bb", hashType: "type", args: `0x${"ab".repeat(32)}` });
+  const asked = await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (1_000n * CKB).toString() }) as { confirmationNonce: string };
+  await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (1_000n * CKB).toString(), confirmationNonce: asked.confirmationNonce, emailCode: codeFrom(world) });
+  const genesis = world.add(sent.at(-1)!, "committed");
+  const tokens = world.add(ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: `0x${"0e".repeat(32)}`, index: 0 } }],
+    outputs: [{ lock: secp, type: xudt, capacity: 200n * CKB }],
+    outputsData: [ccc.hexFrom(ccc.numLeToBytes(1_000_000n, 16))],
+  }));
+  const head = (await sendLimitHead(context.client!, wallet, await listPendingTransactions(user.id, async () => "committed")))!;
+  const token = ccc.Cell.from({ outPoint: { txHash: tokens.hash(), index: 0 }, cellOutput: tokens.outputs[0], outputData: tokens.outputsData[0] });
+  const change = ccc.Cell.from({ outPoint: { txHash: genesis.hash(), index: 1 }, cellOutput: genesis.outputs[1], outputData: "0x" });
+  const tx = ccc.Transaction.from({
+    inputs: [token, change].map((cell) => ({ previousOutput: cell.outPoint, cellOutput: cell.cellOutput, outputData: cell.outputData })),
+    outputs: [{ lock: stranger, type: xudt, capacity: 200n * CKB }, { lock: secp, capacity: change.cellOutput.capacity - 100_000n }],
+    outputsData: [token.outputData, "0x"],
+  });
+  chainOnSendLimit(tx, head);
+  const witness = tx.getWitnessArgsAt(0) ?? ccc.WitnessArgs.from({});
+  witness.lock = ccc.hexFrom(new Uint8Array(65));
+  tx.setWitnessArgsAt(0, witness);
+  const transaction = JSON.parse(ccc.stringify(tx));
+  // The whole balance of a token the user set no amount for, with the CKB amount set: no code, from either side.
+  const preview = await transactionSigning(context, { operation: "preview", transaction }) as { requiresEmailCode: boolean; confirmationNonce: string };
+  assert.equal(preview.requiresEmailCode, false);
+  const signed = await transactionSigning(context, { operation: "sign", transaction, confirmationNonce: preview.confirmationNonce }) as { transaction: unknown };
+  assert.ok(signed.transaction);
+  t.after(async () => {
+    const sql = await database();
+    await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
+  });
 });

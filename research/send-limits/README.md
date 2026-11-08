@@ -75,8 +75,10 @@ One cell per account, created when the account turns limits on:
 - **Data:** `"KWSL" ‖ 0x01 ‖ email fingerprint (32) ‖ flags (1) ‖ CKB amount (u64 LE) ‖ n (1) ‖ n × (token type hash
   (32) ‖ amount (u128 LE))`, 47 + 48n bytes. The fingerprint is the same keyed HMAC as the recovery binding
   (`emailFingerprint`): never the address, never encrypted. A CKB amount of `2^64-1` means no limit. Flag bit 0 means
-  tokens without an amount of their own are unlimited (limits off); without it they always need the code, as the
-  server's rule does today. At most 8 tokens.
+  tokens (and NFTs, and any other type the Action counts by cell) without an amount of their own are unlimited;
+  without it they always need the code. KeyWay sets it on every cell it writes, as the server's rule has it: only
+  assets with an amount of their own are limited. Cells written before that have it off until their next settings
+  change, which sets it (a weakening, so it needs the code). At most 8 tokens.
 - **Size:** 173 bytes with no tokens, so 173 CKB, plus 1 CKB the server leaves in it to pay the fee of later
   settings changes. Ordinary sends pay their fee from their own change. That CKB stays the user's.
 
