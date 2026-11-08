@@ -21,6 +21,7 @@ function LiveHome() {
   const session = useDashboard();
   const router = useRouter();
   const [creating, setCreating] = useState(false);
+  const [signOutError, setSignOutError] = useState<string>();
   if (session.status === "checking") return null;
   if (session.status === "signedOut") return <SignInCard onSendCode={session.sendCode} onVerify={session.verifyCode} />;
 
@@ -30,10 +31,19 @@ function LiveHome() {
     router.push(`/dashboard/${app.appId}`);
   }
 
+  async function signOut() {
+    setSignOutError(undefined);
+    try {
+      await session.signOut();
+    } catch {
+      setSignOutError("Sign-out didn't go through, so you're still signed in. Try again in a moment.");
+    }
+  }
+
   const loading = session.listState === "loading" || session.listState === "idle";
   return (
     <>
-      <ApplicationsHeader email={session.email} onSignOut={() => void session.signOut()} onCreate={() => setCreating(true)} />
+      <ApplicationsHeader email={session.email} signOutError={signOutError} onSignOut={() => void signOut()} onCreate={() => setCreating(true)} />
       {loading ? <ListLoading />
         : session.listState === "error" ? <ListError onRetry={() => void session.reload()} />
         : session.applications.length ? <ApplicationRows applications={session.applications} />

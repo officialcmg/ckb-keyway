@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { apiRequest, DashboardApiError, developerRequest, type DeveloperApplication } from "./api";
 
 const SESSION_KEY = "ckb-keyway.developer-session.v2";
@@ -31,10 +31,13 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   const [email, setEmail] = useState<string>();
   const [applications, setApplications] = useState<DeveloperApplication[]>([]);
   const [listState, setListState] = useState<ListState>("idle");
+  // Bumped whenever the session changes. A reply to a request from an older session is dropped,
+  // so a slow answer for the previous account can't fill in or sign out the next one.
+  const generation = useRef(0);
 
-  const clear = useCallback(() => {
-    localStorage.removeItem(SESSION_KEY);
-    localStorage.removeItem(EMAIL_KEY);
+  // Signs this tab out without touching storage, which another tab may already have changed.
+  const reset = useCallback(() => {
+    generation.current += 1;
     setToken(undefined);
     setEmail(undefined);
     setApplications([]);
@@ -42,13 +45,22 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     setStatus("signedOut");
   }, []);
 
+  const clear = useCallback(() => {
+    localStorage.removeItem(SESSION_KEY);
+    localStorage.removeItem(EMAIL_KEY);
+    reset();
+  }, [reset]);
+
   const load = useCallback(async (authToken: string) => {
+    const started = generation.current;
     setListState("loading");
     try {
       const result = await developerRequest<{ applications: DeveloperApplication[] }>(authToken, { operation: "list" });
+      if (started !== generation.current) return;
       setApplications(result.applications);
       setListState("ready");
     } catch (cause) {
+      if (started !== generation.current) return;
       if (cause instanceof DashboardApiError && cause.status === 401) return clear();
       setListState("error");
     }
@@ -66,13 +78,21 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   // Drop the session as soon as the API stops accepting it.
   useEffect(() => {
     if (!token) return;
-    const check = () => void apiRequest("/api/keyway/auth/session", {}, token).catch((cause) => {
-      if (cause instanceof DashboardApiError && cause.status === 401) clear();
-    });
+    const check = () => {
+      const started = generation.current;
+      void apiRequest("/api/keyway/auth/session", {}, token).catch((cause) => {
+        if (started === generation.current && cause instanceof DashboardApiError && cause.status === 401) clear();
+      });
+    };
+    // Another tab signed out or in: drop this tab's session rather than keep using one that ended.
+    const sync = (event: StorageEvent) => {
+      if ((event.key === SESSION_KEY || event.key === null) && localStorage.getItem(SESSION_KEY) !== token) reset();
+    };
     const interval = window.setInterval(check, 15 * 60_000);
     window.addEventListener("focus", check);
-    return () => { window.clearInterval(interval); window.removeEventListener("focus", check); };
-  }, [token, clear]);
+    window.addEventListener("storage", sync);
+    return () => { window.clearInterval(interval); window.removeEventListener("focus", check); window.removeEventListener("storage", sync); };
+  }, [token, clear, reset]);
 
   const value = useMemo<DashboardSession>(() => ({
     status,
@@ -86,21 +106,29 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
       const { sessionToken } = await apiRequest<{ sessionToken: string }>("/api/keyway/auth/verify-code", { challengeId, code });
       localStorage.setItem(SESSION_KEY, sessionToken);
       localStorage.setItem(EMAIL_KEY, address);
+      generation.current += 1;
       setToken(sessionToken);
       setEmail(address);
       setStatus("signedIn");
       await load(sessionToken);
     },
     signOut: async () => {
-      if (token) await apiRequest("/api/keyway/auth/logout", {}, token).catch(() => undefined);
+      // Only look signed out once the server has ended the session (a 401 means it already had).
+      // Otherwise keep it, so the caller can say sign-out failed.
+      if (token) await apiRequest("/api/keyway/auth/logout", {}, token).catch((cause) => {
+        if (!(cause instanceof DashboardApiError && cause.status === 401)) throw cause;
+      });
       clear();
     },
     request: async <T,>(body: Record<string, unknown>) => {
       if (!token) throw new Error("Sign in again to continue");
+      const started = generation.current;
       try {
-        return await developerRequest<T>(token, body);
+        const result = await developerRequest<T>(token, body);
+        if (started !== generation.current) throw new Error("You signed out before this finished");
+        return result;
       } catch (cause) {
-        if (cause instanceof DashboardApiError && cause.status === 401) clear();
+        if (started === generation.current && cause instanceof DashboardApiError && cause.status === 401) clear();
         throw cause;
       }
     },
