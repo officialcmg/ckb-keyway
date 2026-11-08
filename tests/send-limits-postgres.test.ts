@@ -12,7 +12,7 @@ import { fundingCode, fundingNeedsLitCode, issueFundingCodeRequest, sendFundingC
 import { litSignerOverride } from "../src/server/lit-config.ts";
 import { litPolicyRunner } from "../src/server/lit-policy.ts";
 import { listPendingTransactions } from "../src/server/pending-transactions.ts";
-import { sendLimitHead, sendLimitPlanner } from "../src/server/send-limits.ts";
+import { sendLimitHead, sendLimitPlanner, sendLimitRpc } from "../src/server/send-limits.ts";
 import { previewGeneralTransaction } from "../src/server/transaction-policy.ts";
 import type { ReadyWallet } from "../src/server/user-wallet.ts";
 import { fakeLit, litCodeIn } from "./lit-action-fixture.ts";
@@ -89,6 +89,7 @@ async function setUp() {
   litSignerOverride.mode = "policy";
   litPolicyRunner.run = async (_config, params) => action.main(params);
   sendLimitPlanner.run = async (params) => action.main(params);
+  sendLimitRpc.fetch = world.lit.fetch;
   const user = { id: crypto.randomUUID() };
   const wallet = { version: 1, status: "ready", litPkpId: pkpId, litPublicKey: publicKey, ckbAddress: "ckt1test", encryptedFiberKey: "x", primaryDeviceIdHash: "a".repeat(64), hasOpenedChannel: false, createdAt: "", updatedAt: "" } as unknown as ReadyWallet;
   const sent: ccc.Transaction[] = [];

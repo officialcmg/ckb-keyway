@@ -120,10 +120,13 @@ hashes:
 
 - **CKB:** capacity of the account's inputs minus capacity of its outputs, over all of the account's locks
   (secp256k1, its administrator-mode Omnilock, its owner-only list lock). Change back to the account doesn't
-  count; the fee does.
-- **Tokens:** per type script hash, the account's input amount minus its output amount. xUDT (CCC's deployment and
-  the RUSD-compatible one) and sUDT count their 16-byte amount; any other type counts cells. The send-limit cell,
-  the recovery list and Nervos DAO cells aren't tokens (their CKB still counts).
+  count; the fee does. CKB the account gets back under a type script other than Nervos DAO, Type ID or a UDT without
+  extension scripts counts as staying only as far as the account already held that much under the same script:
+  that script runs when the cell is spent, so whoever wrote it could keep the CKB.
+- **Tokens:** per type script hash, the account's input amount minus its output amount. xUDT (CCC's deployment, the
+  RUSD-compatible one and the xUDT binary referenced by data hash) and sUDT count their 16-byte amount; any other
+  type counts cells, and counts as leaving whenever one of the account's cells of it doesn't come back unchanged. The
+  send-limit cell, the recovery list and Nervos DAO cells aren't tokens (their CKB still counts).
 
 Then:
 
@@ -183,15 +186,19 @@ counted send, and fund channels only from there.
   hand must leave room for about 300 more bytes), and the transaction hash the user approves doesn't change when
   the server fills in the record (witnesses aren't in the hash).
 - **Codes.** When the plan says a code is needed, `request-email-code` has the Action email it (`send-code`), the
-  server stores only the ticket, and the SDK's prompt takes 8 digits. When only the server's own rule (Fiber
-  payments in the total) asks for a code, the Action emails it too, so the user always gets one code.
+  server stores only the ticket, and the SDK's prompt takes 8 digits. The email names the full address of each
+  recipient and what it gets, so a page that swapped the recipient can't send one that reads as expected. When
+  only the server's own rule (Fiber payments in the total) asks for a code, the Action emails it too, so the user
+  always gets one code.
 - **Turning limits on or changing them** (`signing-settings`): the server builds the genesis or the change
   transaction itself, has the Action sign it (with the code when needed), broadcasts it and records it as pending.
   An account with fewer than ~175 free CKB keeps its amounts on the server only until it can afford the cell.
 - **Pending sends (Goal 2).** Every transaction the server gets signed for an account is stored in
   `keyway_v2_pending_transactions` (migration 20). `POST /api/keyway/pending-transactions` returns the account's
   pending ones, after dropping those the node reports committed or rejected, or no longer knows after a grace period.
-  It also returns the newest send-limit cell and the record size to reserve. The node's status is read raw
+  It also returns the newest send-limit cell and the record size to reserve. The server finds that cell the way the
+  Action does, from one node: the send-limit-shaped cells at the address (up to 1024, so look-alikes anyone plants
+  can't hide it), each checked against the key's own history in its block, in batched requests. The node's status is read raw
   (`get_transaction` with verbosity 1), because CCC returns nothing for "unknown" and "rejected". The SDK loads this when its signer
   starts and before every `findCells` (the step CCC uses to pick inputs), then marks the transactions in CCC's cache
   in the order they were signed, so their spent cells are skipped and their change can be used.
@@ -277,14 +284,14 @@ server: roughly +0.4 s per send with limits on. Today's policy signer takes 0.65
 
 1. Run the migration (`npm run migrate:production`): it adds `keyway_v2_pending_transactions`.
 2. In the Chipotle dashboard, paste `lit-actions/sign-ckb-transaction.js` into **Action Runner**, click **Get Lit
-   Action IPFS CID**, and check it is `QmUs7kRWcAV1ARk3t4nmvgPFfYqJRfvJa8RUx5T1B1715C`, the same as `LIT_ACTION_CIDS["sign-ckb-transaction"]` in
+   Action IPFS CID**, and check it is `QmaZABPThjFpeBWpRSw3TXosHG4yVsfbHwsF9RGruGuS9b`, the same as `LIT_ACTION_CIDS["sign-ckb-transaction"]` in
    `src/server/lit-config.ts`.
 3. Register it under **IPFS Actions** (for example as `keyway-ckb-policy-signer-v2`) and add it to group 1,
    `CKB Keyway`.
 4. Run `npm run verify:lit -- --policy` locally. It should print "policy Action".
 5. Deploy the server and publish the SDK (version of your choosing).
-6. Remove the previous policy CID (`QmXEKyvWa2MwCSY9qMBGUp3aawRrWeSW6xqP4SS2w8x2gd`) from group 1. Until then the
-   server can sign sends through the old Action, which has no limits.
+6. Remove the previous policy CID (`QmUs7kRWcAV1ARk3t4nmvgPFfYqJRfvJa8RUx5T1B1715C`) from group 1. Until then the
+   server can still sign sends through the old Action and its weaker checks.
 7. Live check: sign in, set a daily amount (a code arrives; the cell appears at the secp256k1 address), send under
    the amount twice from two tabs without waiting, then send over it (8-digit code).
 

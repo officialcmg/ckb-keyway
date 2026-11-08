@@ -177,6 +177,49 @@ test("with recovery on, the Omnilock and the old secp256k1 lock are both the use
   assert.equal(preview.recipients.length, 1);
 });
 
+test("CKB moved under a type script the account doesn't control counts as leaving", () => {
+  // Whoever wrote this type script decides when a cell under it can be spent again.
+  const hostile = ccc.Script.from({ codeHash: `0x${"66".repeat(32)}`, hashType: "type", args: "0x" });
+  const fee = 1_000n;
+  const locked = build([{ lock: own, capacity: 500n * CKB }], [{ lock: own, capacity: 500n * CKB - fee, type: hostile }]);
+  assert.equal(locked.outflowShannons, 500n * CKB);
+
+  // A small cell of the type the account already holds vouches for no more CKB than it holds.
+  const topped = build(
+    [{ lock: own, capacity: 100n * CKB, type: hostile }, { lock: own, capacity: 400n * CKB }],
+    [{ lock: own, capacity: 500n * CKB - fee, type: hostile }],
+  );
+  assert.equal(topped.outflowShannons, 400n * CKB);
+
+  // Moving a cell under its own type, a plain self-transfer and a token change stay at the fee.
+  assert.equal(build([{ lock: own, capacity: 100n * CKB, type: hostile }], [{ lock: own, capacity: 100n * CKB - fee, type: hostile }]).outflowShannons, fee);
+  assert.equal(build([{ lock: own, capacity: 400n * CKB }], [{ lock: own, capacity: 400n * CKB - fee }]).outflowShannons, fee);
+  assert.equal(build(
+    [{ lock: own, capacity: 200n * CKB, type: xudt, data: u128(10n) }, { lock: own, capacity: 300n * CKB }],
+    [{ lock: own, capacity: 300n * CKB, type: xudt, data: u128(10n) }, { lock: own, capacity: 200n * CKB - fee }],
+  ).outflowShannons, fee);
+});
+
+test("a token balance of an unlisted type (or xUDT referenced by data hash) can't leave while an empty cell comes back", () => {
+  const xudtByData = ccc.Script.from({ codeHash: "0x50bd8d6680b8b9cf98b73f3c08faf8b2a21914311954118ad6609be6e78a1b95", hashType: "data1", args: `0x${"cd".repeat(32)}` });
+  const otherUdt = ccc.Script.from({ codeHash: `0x${"5a".repeat(32)}`, hashType: "type", args: `0x${"01".repeat(32)}` });
+  for (const [token, amount] of [[xudtByData, 1_000n], [otherUdt, 1n]] as const) {
+    // Someone else pays for the recipient's cell; an empty cell of the token comes back to the account.
+    const { tokensLeaving, tokenOutflows } = build(
+      [{ lock: own, capacity: 200n * CKB, type: token, data: u128(1_000n) }, { lock: alice, capacity: 300n * CKB }],
+      [{ lock: own, capacity: 200n * CKB, type: token, data: u128(0n) }, { lock: alice, capacity: 300n * CKB - 2_000n, type: token, data: u128(1_000n) }],
+    );
+    assert.equal(tokensLeaving, true, token.codeHash);
+    assert.deepEqual(tokenOutflows, [{ asset: token.hash(), amount }], token.codeHash);
+  }
+  // The same cell coming back unchanged isn't a transfer.
+  const moved = build(
+    [{ lock: own, capacity: 200n * CKB, type: otherUdt, data: u128(1_000n) }, { lock: own, capacity: 300n * CKB }],
+    [{ lock: own, capacity: 200n * CKB, type: otherUdt, data: u128(1_000n) }, { lock: own, capacity: 300n * CKB - 2_000n }],
+  );
+  assert.deepEqual(moved.tokenOutflows, []);
+});
+
 test("Spore, Cluster, Type ID and Unique cells leaving the account count as assets, per cell, like the Lit Action", () => {
   const cluster = ccc.Script.from({ codeHash: "0x0bbe768b519d8ea7b96d58f1182eb7e6ef96c541fbd9526975077ee09f049058", hashType: "data1", args: `0x${"c1".repeat(32)}` });
   const typeId = ccc.Script.from({ codeHash: TYPE_ID, hashType: "type", args: `0x${"71".repeat(32)}` });

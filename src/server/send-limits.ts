@@ -1,4 +1,5 @@
 import * as ccc from "@ckb-ccc/core";
+import { JsonRpcTransformers, type JsonRpcCellOutput, type JsonRpcOutPoint, type JsonRpcTransaction } from "@ckb-ccc/core/advanced";
 import { currentLock, KeyWayAccountSigner, secp256k1Lock } from "../sdk/browser/account-lock.ts";
 import {
   chainOnSendLimit,
@@ -6,6 +7,7 @@ import {
   encodeSendLimitSettings,
   isSendLimitCell,
   recordEntriesBytes,
+  SEND_LIMIT_MAGIC,
   SEND_LIMIT_RECORD_MAGIC,
   SEND_LIMIT_SPARE,
   sendLimitInputIndex,
@@ -130,30 +132,114 @@ export async function sendLimitHead(
     const index = limitOutput(transaction);
     if (index !== -1 && !spent.has(`${transaction.hash()}:${index}`)) return head(transaction, index);
   }
-  const found: ccc.Cell[] = [];
-  for await (const cell of client.findCellsOnChain({ script: secp, scriptType: "lock", scriptSearchMode: "exact", filter: { script: { codeHash: TYPE_ID_CODE_HASH, hashType: "type", args: "0x" } } }, "asc", 32)) {
-    if (isSendLimitCell(cell.cellOutput, cell.outputData, secp) && !spent.has(`${cell.outPoint.txHash}:${Number(cell.outPoint.index)}`)) found.push(cell);
+  // The cells and the history must come from the same node, as in the Action: a node that fails retries the whole
+  // search on the next.
+  let lastError: unknown;
+  for (const url of RPC_URLS) {
+    try {
+      return await liveSendLimitCellAt(url, secp, spent);
+    } catch (error) {
+      lastError = error;
+    }
   }
-  // Anyone can plant a look-alike; the real one was made by a transaction that spent one of the key's own cells.
-  const real: ccc.Cell[] = [];
-  // Bounded, so cells anyone can plant can't make this expensive: a few candidates, a few inputs each (KeyWay's own
-  // send-limit transactions spend the previous cell among their first inputs).
-  for (const cell of found.slice(0, MAX_CANDIDATES)) {
-    const creator = (await client.getTransaction(cell.outPoint.txHash))?.transaction;
-    if (!creator) continue;
-    const inputs = await Promise.all(creator.inputs.slice(0, MAX_CREATOR_INPUTS).map((input) => input.getCell(client).catch(() => undefined)));
-    if (inputs.some((input) => input?.cellOutput.lock.eq(secp))) real.push(cell);
+  throw lastError ?? new Error("CKB RPC is unavailable");
+}
+
+/**
+ * The newest live send-limit cell this key made at its secp256k1 address, read the way the Action reads it.
+ * Anyone can plant a look-alike there; the real one was made by a transaction that spent one of the key's own cells
+ * (any input), which needs its signature. That is read from the key's own lock history in just the blocks that hold
+ * the candidates, in batches, so the whole search is a few requests however many look-alikes there are, up to the
+ * Action's own bound of 1024. Past that it's an error, never "no send limits".
+ */
+async function liveSendLimitCellAt(url: string, secp: ccc.Script, spent: Set<string>): Promise<SendLimitHead | undefined> {
+  const lockKey = (filter: Record<string, unknown>) => ({ script: JsonRpcTransformers.scriptFrom(secp), script_type: "lock", script_search_mode: "exact", filter });
+  const filter = { script: { code_hash: TYPE_ID_CODE_HASH, hash_type: "type", args: "0x" }, output_data: SEND_LIMIT_MAGIC, output_data_filter_mode: "prefix" };
+  const candidates: Array<{ outPoint: ccc.OutPoint; cellOutput: ccc.CellOutput; outputData: ccc.Hex; block: bigint }> = [];
+  let cursor: string | undefined;
+  for (let pages = 1; ; pages++) {
+    // Nodes that ignore the data filter return other Type ID cells too; those are passed over, up to a page bound.
+    if (pages > MAX_PAGES) throw new Error("This account has too many look-alike send-limit cells to check");
+    const page = await rpc(url, "get_cells", [lockKey(filter), "asc", ccc.numToHex(PAGE_SIZE), ...(cursor ? [cursor] : [])]) as { objects?: unknown; last_cursor?: string };
+    if (!Array.isArray(page.objects)) throw new Error("CKB RPC returned an invalid get_cells page");
+    for (const object of page.objects as Array<{ out_point: JsonRpcOutPoint; output: JsonRpcCellOutput; output_data?: string; block_number: string }>) {
+      const outputData = ccc.hexFrom(object.output_data ?? "0x");
+      const cellOutput = JsonRpcTransformers.cellOutputTo(object.output);
+      if (!isSendLimitCell(cellOutput, outputData, secp)) continue;
+      candidates.push({ outPoint: JsonRpcTransformers.outPointTo(object.out_point), cellOutput, outputData, block: BigInt(object.block_number) });
+      if (candidates.length > MAX_CANDIDATES) throw new Error("This account has too many look-alike send-limit cells to check");
+    }
+    if (page.objects.length < PAGE_SIZE || !page.last_cursor) break;
+    cursor = page.last_cursor;
   }
-  if (real.length !== 1) return undefined;
-  const creator = (await client.getTransaction(real[0].outPoint.txHash))!.transaction;
-  return { outPoint: { txHash: real[0].outPoint.txHash, index: Number(real[0].outPoint.index) }, cellOutput: real[0].cellOutput, outputData: real[0].outputData, recordEntriesBytes: recordEntriesBytes(recordOf(creator) ?? "0x") };
+  const live = candidates.filter(({ outPoint }) => !spent.has(`${outPoint.txHash}:${Number(outPoint.index)}`));
+  if (live.length === 0) return undefined;
+
+  const blocks = [...new Set(live.map(({ block }) => block))];
+  const madeByKey = new Set<string>();
+  for (let at = 0; at < blocks.length; at += BATCH_SIZE) {
+    const calls = blocks.slice(at, at + BATCH_SIZE).map((block) => ({
+      method: "get_transactions",
+      params: [lockKey({ block_range: [ccc.numToHex(block), ccc.numToHex(block + 1n)] }), "asc", ccc.numToHex(MAX_BLOCK_HISTORY)],
+    }));
+    for (const result of await rpcBatch(url, calls) as Array<{ objects?: Array<{ tx_hash?: string; io_type?: string }> }>) {
+      if (!Array.isArray(result.objects)) throw new Error("CKB RPC returned an invalid get_transactions page");
+      // A full page can't be read past here; outsiders can only fill it by giving this key that many cells in one block.
+      if (result.objects.length >= MAX_BLOCK_HISTORY) throw new Error("A block holds too much of this account's history to check");
+      for (const entry of result.objects) if (entry.io_type === "input" && typeof entry.tx_hash === "string") madeByKey.add(entry.tx_hash.toLowerCase());
+    }
+  }
+  // The indexer lists cells oldest first; every chained send makes the real one the newest.
+  const real = live.filter(({ outPoint }) => madeByKey.has(outPoint.txHash)).at(-1);
+  if (!real) return undefined;
+  const [found] = await rpcBatch(url, [{ method: "get_transaction", params: [real.outPoint.txHash] }]) as Array<{ transaction?: JsonRpcTransaction }>;
+  const creator = found.transaction ? JsonRpcTransformers.transactionTo(found.transaction) : undefined;
+  if (!creator || creator.hash() !== real.outPoint.txHash) throw new Error("CKB RPC returned the wrong transaction");
+  return { outPoint: { txHash: real.outPoint.txHash, index: Number(real.outPoint.index) }, cellOutput: real.cellOutput, outputData: real.outputData, recordEntriesBytes: recordEntriesBytes(recordOf(creator) ?? "0x") };
+}
+
+/** How the search reaches CKB nodes; tests replace `fetch` with a fake chain. */
+export const sendLimitRpc: { fetch: (url: string, init: { method: string; headers: Record<string, string>; body: string; redirect: "error" }) => Promise<Response> } = {
+  fetch: (url, init) => globalThis.fetch(url, init),
+};
+
+async function post(url: string, payload: unknown): Promise<unknown> {
+  const response = await sendLimitRpc.fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload), redirect: "error" });
+  if (!response.ok) throw new Error(`CKB RPC returned HTTP ${response.status}`);
+  return response.json();
+}
+
+/** One JSON-RPC call's result; an error or a missing result fails it. */
+async function rpc(url: string, method: string, params: unknown[]): Promise<unknown> {
+  const reply = await post(url, { id: 0, jsonrpc: "2.0", method, params }) as { result?: unknown } | null;
+  if (!reply?.result) throw new Error(`CKB RPC didn't answer ${method}`);
+  return reply.result;
+}
+
+/** One JSON-RPC batch, each call's result in order; any error or missing result fails the batch. */
+async function rpcBatch(url: string, calls: Array<{ method: string; params: unknown[] }>): Promise<unknown[]> {
+  const replies = await post(url, calls.map((call, id) => ({ id, jsonrpc: "2.0", ...call }))) as Array<{ id?: unknown; result?: unknown }>;
+  if (!Array.isArray(replies)) throw new Error("CKB RPC returned an invalid batch");
+  const results = new Array<unknown>(calls.length);
+  for (const reply of replies) if (Number.isInteger(reply?.id) && (reply.id as number) >= 0 && (reply.id as number) < calls.length && reply.result) results[reply.id as number] = reply.result;
+  for (let i = 0; i < calls.length; i++) if (results[i] === undefined) throw new Error("CKB RPC left a call in the batch unanswered");
+  return results;
 }
 
 const TYPE_ID_CODE_HASH = "0x00000000000000000000000000000000000000000000000000545950455f4944";
+/** The nodes the Action reads (its RPC_URLS), over HTTP so history lookups can go in batches. */
+const RPC_URLS = ["https://testnet.ckb.dev/", "https://testnet.ckbapp.dev/"];
 /** How long after signing a transaction the node doesn't know yet is waited for: its client is sending it. */
 const JUST_SIGNED_MS = 10_000;
-const MAX_CANDIDATES = 4;
-const MAX_CREATOR_INPUTS = 64;
+/** Send-limit-shaped cells the search reads, as the Action does. Planting more costs about 175k CKB. */
+const MAX_CANDIDATES = 1024;
+/** Indexer pages of cells, as in the Action. */
+const PAGE_SIZE = 256;
+const MAX_PAGES = 16;
+/** History lookups in one request: 1024 candidates take at most four. */
+const BATCH_SIZE = 256;
+/** Entries of the key's history read from one block, as in the Action. */
+const MAX_BLOCK_HISTORY = 1024;
 const FEE_RATE = 1_500n;
 
 /** The capacity a send-limit cell with this data occupies, in shannons. */

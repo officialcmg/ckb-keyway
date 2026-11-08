@@ -1,5 +1,5 @@
 import * as ccc from "@ckb-ccc/core";
-import { formatAsset, isXudtCompatible } from "../sdk/browser/tokens.ts";
+import { formatAsset, isXudtByDataHash, isXudtCompatible } from "../sdk/browser/tokens.ts";
 import { accountLocks, refuseAdminListSpend, refuseForeignOmnilockOutputs, verifyRecoveryAnchor, type KeyWayRecovery } from "../sdk/browser/account-lock.ts";
 import { signingGroups, withChainInputs, type SigningGroup } from "./funding-transaction.ts";
 import type { ReadyWallet } from "./user-wallet.ts";
@@ -171,7 +171,7 @@ export function describeTransaction(
   const matches = (script: ccc.Script | undefined, info: ccc.ScriptInfo) => Boolean(script && script.codeHash === info.codeHash && script.hashType === info.hashType);
   const typeKind = (type: ccc.Script | undefined): "none" | "xUDT" | "sUDT" | "dao" | "Spore" | "Cluster" | "quiet" | "unknown" => {
     if (!type) return "none";
-    if (matches(type, known.xudt) || isXudtCompatible(type)) return "xUDT";
+    if (matches(type, known.xudt) || isXudtCompatible(type) || isXudtByDataHash(type)) return "xUDT";
     if (matches(type, known.sudt)) return "sUDT";
     if (matches(type, known.dao)) return "dao";
     if (SPORE_CODE_HASHES.has(type.codeHash)) return "Spore";
@@ -197,6 +197,31 @@ export function describeTransaction(
   const ownOut = sum(ownOutputs.map(({ cellOutput }) => cellOutput.capacity));
   const userPaysFee = otherSigners === 0;
   const outflow = ownIn > ownOut ? ownIn - ownOut : 0n;
+  // What the daily amount counts, as the policy Action does: a type script runs whenever its cell is spent, so
+  // whoever wrote it could keep the CKB put under it. CKB the account gets back under one that can't stop it
+  // (none, Nervos DAO, Type ID, a UDT without extension scripts) is kept; under any other, only as far as the
+  // account already held that much under the same script.
+  const keepsCkbFree = (type: ccc.Script | undefined) => {
+    const kind = typeKind(type);
+    return kind === "none" || kind === "dao" || (type!.codeHash === TYPE_ID_CODE_HASH && type!.hashType === "type")
+      || ((kind === "xUDT" || kind === "sUDT") && ccc.bytesFrom(type!.args).length === 32);
+  };
+  const heldUnder = new Map<string, bigint>();
+  for (const { cellOutput } of ownInputs) {
+    if (!keepsCkbFree(cellOutput.type)) heldUnder.set(cellOutput.type!.hash(), (heldUnder.get(cellOutput.type!.hash()) ?? 0n) + cellOutput.capacity);
+  }
+  let kept = 0n;
+  for (const { cellOutput } of ownOutputs) {
+    if (keepsCkbFree(cellOutput.type)) {
+      kept += cellOutput.capacity;
+      continue;
+    }
+    const held = heldUnder.get(cellOutput.type!.hash()) ?? 0n;
+    const amount = cellOutput.capacity < held ? cellOutput.capacity : held;
+    heldUnder.set(cellOutput.type!.hash(), held - amount);
+    kept += amount;
+  }
+  const leaving = ownIn > kept ? ownIn - kept : 0n;
   const sending = userPaysFee ? maxBig(0n, outflow - fee) : outflow;
   const receiving = ownOut > ownIn ? ownOut - ownIn : 0n;
 
@@ -302,10 +327,11 @@ export function describeTransaction(
   };
 
   return {
-    outflowShannons: outflow,
+    outflowShannons: leaving,
     tokensLeaving: [...tokenTotals.values()].some(({ delta }) => delta < 0n) || cellsLeaving(ownInputs, ownOutputs, countsPerCell).length > 0,
     // Other typed cells (NFTs, Type ID and Unique cells, scripts KeyWay can't read) leave as "tokens" with no daily
-    // amount, counted per cell, so they always need the email code once confirmation is on.
+    // amount, counted per cell (and whenever one doesn't come back unchanged), so they always need the email code
+    // once confirmation is on.
     tokenOutflows: [
       ...[...tokenTotals].filter(([, { delta }]) => delta < 0n).map(([asset, { delta }]) => ({ asset, amount: -delta })),
       ...cellsLeaving(ownInputs, ownOutputs, countsPerCell),
@@ -378,17 +404,32 @@ function maxBig(a: bigint, b: bigint): bigint {
   return a > b ? a : b;
 }
 
+/**
+ * Typed cells that count as assets one per cell (see countsPerCell) and leave the account. As in the policy Action,
+ * a type counts as leaving whenever one of the account's cells of it doesn't come back with the same data, so a
+ * balance can't leave while an empty cell of it stays.
+ */
 function cellsLeaving(
   ownInputs: Array<{ cellOutput: ccc.CellOutput; outputData: ccc.Hex }>,
   ownOutputs: Array<{ cellOutput: ccc.CellOutput; outputData: ccc.Hex }>,
   countsPerCell: (cell: { cellOutput: ccc.CellOutput; outputData: ccc.Hex }) => boolean,
 ): TokenOutflow[] {
   const counts = new Map<string, bigint>();
-  for (const cell of ownInputs) {
-    if (countsPerCell(cell)) counts.set(cell.cellOutput.type!.hash(), (counts.get(cell.cellOutput.type!.hash()) ?? 0n) + 1n);
-  }
-  for (const cell of ownOutputs) {
-    if (countsPerCell(cell) && counts.has(cell.cellOutput.type!.hash())) counts.set(cell.cellOutput.type!.hash(), counts.get(cell.cellOutput.type!.hash())! - 1n);
-  }
-  return [...counts].filter(([, left]) => left > 0n).map(([asset, amount]) => ({ asset, amount }));
+  const byData = new Map<string, Map<string, bigint>>();
+  const count = (cell: { cellOutput: ccc.CellOutput; outputData: ccc.Hex }, sign: 1n | -1n) => {
+    if (!countsPerCell(cell)) return;
+    const asset = cell.cellOutput.type!.hash();
+    if (sign < 0n && !counts.has(asset)) return;
+    counts.set(asset, (counts.get(asset) ?? 0n) + sign);
+    const cells = byData.get(asset) ?? new Map<string, bigint>();
+    const data = cell.outputData.toLowerCase();
+    cells.set(data, (cells.get(data) ?? 0n) + sign);
+    byData.set(asset, cells);
+  };
+  ownInputs.forEach((cell) => count(cell, 1n));
+  ownOutputs.forEach((cell) => count(cell, -1n));
+  return [...counts].flatMap(([asset, left]) => {
+    if (left > 0n) return [{ asset, amount: left }];
+    return [...byData.get(asset)!.values()].some((cells) => cells > 0n) ? [{ asset, amount: 1n }] : [];
+  });
 }

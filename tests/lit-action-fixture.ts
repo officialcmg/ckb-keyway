@@ -123,7 +123,9 @@ export function fakeLit(options: {
       return new Response(JSON.stringify({ id: parsed.id, jsonrpc: "2.0", result: page(history(parsed.params[0]), parsed.params[2], parsed.params[3]) }), { status: 200 });
     }
     if (!Array.isArray(parsed) && parsed.method === "get_cells") {
-      const [{ script: wanted, filter, script_search_mode: mode }] = parsed.params as [{ script: { code_hash: string; hash_type: string; args: string }; script_search_mode?: string; filter?: { script?: { code_hash: string; hash_type: string; args: string }; script_len_range?: [string, string]; output_data_len_range?: [string, string] } }];
+      const [{ script: wanted, filter, script_search_mode: mode }] = parsed.params as [{ script: { code_hash: string; hash_type: string; args: string }; script_search_mode?: string; filter?: { script?: { code_hash: string; hash_type: string; args: string }; script_len_range?: [string, string]; output_data_len_range?: [string, string]; output_data?: string; output_data_filter_mode?: string } }];
+      // As ckb-indexer: output_data matches by prefix unless the request asks for "exact".
+      const dataMatches = (data: string) => !filter?.output_data || (filter.output_data_filter_mode === "exact" ? data.toLowerCase() === filter.output_data.toLowerCase() : data.toLowerCase().startsWith(filter.output_data.toLowerCase()));
       // As ckb-indexer: with a lock search, script_len_range is the type script's length, 0 with no type.
       const inRange = (range: [string, string] | undefined, length: number) => !range || (length >= Number(range[0]) && length < Number(range[1]));
       const typeLength = (output: ccc.CellOutput) => output.type ? output.type.toBytes().length : 0;
@@ -135,7 +137,7 @@ export function fakeLit(options: {
       const objects = all.flatMap((tx, block) => tx.outputs.map((output, index) => ({ tx, output, index, block })))
         .filter(({ tx, output, index }) => !spent.has(`${hashOf(tx)}:${index}`) && output.lock.codeHash === wanted.code_hash && output.lock.hashType === wanted.hash_type && argsMatch(output.lock.args)
           && (!typeFilter || (output.type?.codeHash === typeFilter.code_hash && output.type.hashType === typeFilter.hash_type && output.type.args.startsWith(typeFilter.args)))
-          && inRange(filter?.script_len_range, typeLength(output)) && inRange(filter?.output_data_len_range, ccc.bytesFrom(tx.outputsData[index]).length))
+          && inRange(filter?.script_len_range, typeLength(output)) && inRange(filter?.output_data_len_range, ccc.bytesFrom(tx.outputsData[index]).length) && dataMatches(tx.outputsData[index]))
         .map(({ tx, output, index, block }) => ({ block_number: ccc.numToHex(block), out_point: { tx_hash: hashOf(tx), index: ccc.numToHex(index) }, output: { capacity: ccc.numToHex(output.capacity), lock: script(output.lock), type: output.type ? script(output.type) : null }, output_data: tx.outputsData[index] }));
       return new Response(JSON.stringify({ id: parsed.id, jsonrpc: "2.0", result: page(objects, parsed.params[2], parsed.params[3]) }), { status: 200 });
     }
