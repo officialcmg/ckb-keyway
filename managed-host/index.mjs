@@ -14,6 +14,7 @@ const nodes = new Map();
 const starting = new Map();
 const operations = new Map();
 let shuttingDown = false;
+let uses = 0;
 
 export function managedUserId(userId) {
   return createHash("sha256").update(userId).digest("hex");
@@ -34,11 +35,10 @@ async function main() {
   server.listen(Number(process.env.PORT ?? 8080), "0.0.0.0", () => {
     console.log(`[managed-host] listening on ${process.env.PORT ?? 8080}`);
   });
-  for (const userId of await existingUsers()) void withUserOperation(userId, () => ensureNode(userId)).catch(logError);
+  void startKnownNodes(await existingUsers()).catch(logError);
   const stop = () => {
-    shuttingDown = true;
     server.close();
-    for (const node of nodes.values()) node.child.kill("SIGTERM");
+    void shutdown();
   };
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);
@@ -53,7 +53,7 @@ async function handleRequest(request, response) {
       return send(response, 200, { status: "ready", nodes: nodes.size, maxNodes: maxNodes() });
     }
     if (request.method === "GET" && request.url === "/inventory") {
-      return send(response, 200, { users: await existingUsers(), running: [...nodes.keys()] });
+      return send(response, 200, { users: await existingUsers(), running: runningUsers() });
     }
     const retirement = request.method === "POST" && /^\/users\/([0-9a-f]{64})\/retire$/.exec(request.url ?? "");
     if (retirement) {
@@ -120,15 +120,55 @@ async function ensureNode(userId) {
   if (await isRetired(userId)) throw new Error("Legacy Fiber node has been retired");
   const running = nodes.get(userId);
   if (running?.stopping) throw new Error("Fiber process is still stopping");
-  if (running) return running;
+  if (running) {
+    running.lastUsed = ++uses;
+    return running;
+  }
   const pending = starting.get(userId);
   if (pending) return pending;
-  if (new Set([...nodes.keys(), ...starting.keys()]).size >= maxNodes()) {
-    throw new Error("Managed node capacity is full");
-  }
-  const promise = startNode(userId).finally(() => starting.delete(userId));
+  const full = new Set([...nodes.keys(), ...starting.keys()]).size >= maxNodes();
+  const promise = (full ? makeRoom(userId) : Promise.resolve()).then(() => startNode(userId)).finally(() => starting.delete(userId));
   starting.set(userId, promise);
   return promise;
+}
+
+/**
+ * When the host is full, a new node takes the place of the least recently used one that has no channels,
+ * so accounts that never opened a channel can't hold the host's capacity. A node with channels is never
+ * stopped this way, nor is one serving a request.
+ */
+async function makeRoom(userId) {
+  const candidates = [...nodes.entries()]
+    .filter(([id, node]) => id !== userId && !node.stopping && !operations.has(id))
+    .sort(([, left], [, right]) => left.lastUsed - right.lastUsed);
+  for (const [id, node] of candidates) {
+    let idle = false;
+    try { requireClosedChannels(await nodeChannels(node)); idle = true; } catch {}
+    // Checked again after the wait, in case the node was stopped or picked up a request meanwhile.
+    if (!idle || nodes.get(id) !== node || node.stopping || operations.has(id)) continue;
+    await stopNode(id);
+    return;
+  }
+  throw new Error("Managed node capacity is full");
+}
+
+/**
+ * Starts the nodes on the volume after a restart: as many as fit together, then the rest one at a time,
+ * so that each node with channels can take the place of an idle one that happened to be listed first.
+ */
+export async function startKnownNodes(users) {
+  const start = (userId) => withUserOperation(userId, () => ensureNode(userId)).catch(logError);
+  await Promise.all(users.slice(0, maxNodes()).map(start));
+  for (const userId of users.slice(maxNodes())) await start(userId);
+}
+
+export function runningUsers() {
+  return [...nodes.keys()];
+}
+
+export async function shutdown() {
+  shuttingDown = true;
+  await Promise.all([...nodes.values()].map((node) => waitForExit(node.child).catch(logError)));
 }
 
 async function startNode(userId) {
@@ -148,7 +188,7 @@ async function startNode(userId) {
   ], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
   child.stdout.on("data", (chunk) => process.stdout.write(`[fnn:${userId.slice(0, 8)}] ${chunk}`));
   child.stderr.on("data", (chunk) => process.stderr.write(`[fnn:${userId.slice(0, 8)}] ${chunk}`));
-  const node = { child, port };
+  const node = { child, port, lastUsed: 0 };
   child.once("exit", (code, signal) => {
     const wasRunning = nodes.get(userId)?.child === child;
     if (wasRunning) nodes.delete(userId);
@@ -156,6 +196,7 @@ async function startNode(userId) {
     if (wasRunning && !node.stopping && !shuttingDown) setTimeout(() => void withUserOperation(userId, () => ensureNode(userId)).catch(logError), 1_000);
   });
   await waitForRpc(port, child);
+  node.lastUsed = ++uses;
   nodes.set(userId, node);
   return node;
 }
@@ -276,6 +317,17 @@ async function isRetired(userId) {
   catch (error) { if (error?.code === "ENOENT") return false; throw error; }
 }
 
+async function nodeChannels(node) {
+  const response = await fetch(`http://127.0.0.1:${node.port}`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "list_channels", params: [{ include_closed: true }] }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  const result = await response.json();
+  if (!response.ok || result.error) throw new Error("Could not verify channel closure");
+  return result.result?.channels;
+}
+
 export function requireClosedChannels(channels) {
   if (!Array.isArray(channels) || channels.some((channel) => String(channel?.state?.state_name).replaceAll("_", "").toLowerCase() !== "closed" || channel?.state?.state_flags !== "COOPERATIVE")) {
     throw new Error("Channel closure is incomplete; preserve the node database");
@@ -285,15 +337,7 @@ export function requireClosedChannels(channels) {
 async function retireUser(userId) {
   if (await isRetired(userId)) return { retired: true, databasePreserved: true };
   await stat(managedDataDir(userId)); // Never provision a new identity for cleanup.
-  const node = await ensureNode(userId);
-  const response = await fetch(`http://127.0.0.1:${node.port}`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "list_channels", params: [{ include_closed: true }] }),
-    signal: AbortSignal.timeout(15_000),
-  });
-  const result = await response.json();
-  if (!response.ok || result.error) throw new Error("Could not verify channel closure");
-  requireClosedChannels(result.result?.channels);
+  requireClosedChannels(await nodeChannels(await ensureNode(userId)));
   await mkdir(required("KEYWAY_MANAGED_RETIRED_DIR", "/fiber/retired"), { recursive: true });
   await writeFile(retiredPath(userId), JSON.stringify({ retiredAt: new Date().toISOString() }), { flag: "wx", mode: 0o600 });
   await stopNode(userId);

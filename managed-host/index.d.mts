@@ -30,3 +30,6 @@ export function restoreSnapshot(input: {
   name: string;
   encryptionKey?: Buffer;
 }): Promise<{ restored: boolean; name: string; digest: string }>;
+export function startKnownNodes(users: string[]): Promise<void>;
+export function runningUsers(): string[];
+export function shutdown(): Promise<void>;
