@@ -4,17 +4,19 @@ type Adapter = Awaited<ReturnType<typeof getAdapter>>;
 
 // Only verification records are namespaced. Authentication users stay private;
 // public wallet accounts and sessions are separately bound to the application.
-export function scopedAuthAdapter(adapter: Adapter, scopeId: string): Adapter {
+// `challenge` names the login challenge being sent or checked, so each one keeps its own code record.
+export function scopedAuthAdapter(adapter: Adapter, scopeId: string, challenge: () => string | undefined = () => undefined): Adapter {
   if (!scopeId) throw new Error("Authentication scope is required");
-  const prefix = `keyway:${scopeId}:`;
   return new Proxy(adapter, {
     get(target, property, receiver) {
       const operation = Reflect.get(target, property, receiver);
       if (typeof operation !== "function") return operation;
       if (property === "transaction") return (callback: (transaction: Adapter) => unknown) =>
-        operation.call(target, (transaction: Adapter) => callback(scopedAuthAdapter(transaction, scopeId)));
+        operation.call(target, (transaction: Adapter) => callback(scopedAuthAdapter(transaction, scopeId, challenge)));
       return async (input: Record<string, unknown>) => {
         if (input.model !== "verification") return operation.call(target, input);
+        const challengeId = challenge();
+        const prefix = `keyway:${scopeId}:${challengeId ? `${challengeId}:` : ""}`;
         const scoped = { ...input };
         for (const field of ["data", "update", "set"]) {
           const data = input[field] as Record<string, unknown> | undefined;

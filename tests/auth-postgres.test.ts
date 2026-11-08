@@ -5,7 +5,7 @@ import { getMigrations } from "better-auth/db/migration";
 import { authSchemaOptions } from "../src/server/auth-options.ts";
 import { database } from "../src/server/database.ts";
 import { createApplication, addApplicationOrigin } from "../src/server/applications.ts";
-import { closeAuthPool, createScopedAuth, resolveAuthScope, setAuthDeliveryForTests, sendEmailCode, verifyEmailCode, sessionForRequest, revokeSession, consumeRateLimit } from "../src/server/auth.ts";
+import { closeAuthPool, createScopedAuth, resolveAuthScope, setAuthDeliveryForTests, sendEmailCode, verifyEmailCode, sessionForRequest, revokeSession, consumeRateLimit, withOtpChallenge } from "../src/server/auth.ts";
 import { handleKeyWayRequest } from "../src/server/http.ts";
 
 if (process.env.npm_lifecycle_event === "test:auth:postgres" && !process.env.KEYWAY_AUTH_TEST_DATABASE_URL) {
@@ -49,7 +49,8 @@ test("real Better Auth endpoints: independent OTPs, application sessions, replay
   const resend = await sendEmailCode(request(appB), email);
   const oldCodeB = codeB;
   codeB = emails.get(`${appB.appId}:${email}`)!;
-  await assert.rejects(verifyEmailCode(request(appB), b.challengeId, oldCodeB), /Incorrect/);
+  // Each challenge keeps its own code: the earlier one's code doesn't open the resend.
+  await assert.rejects(verifyEmailCode(request(appB), resend.challengeId, oldCodeB), /Incorrect/);
   const loginA = await verifyEmailCode(request(), a.challengeId, codeA);
   const loginB = await verifyEmailCode(request(appB), resend.challengeId, codeB);
   assert.notEqual(loginA.user.id, loginB.user.id);
@@ -63,7 +64,7 @@ test("real Better Auth endpoints: independent OTPs, application sessions, replay
   const challenge = await sendEmailCode(request(), concurrentEmail);
   const concurrentCode = emails.get(`${appA.appId}:${concurrentEmail}`)!;
   const nativeRequest = () => new Request("http://localhost:3001/internal-auth/sign-in/email-otp", { method: "POST", headers: { Origin: "https://a.example", "Content-Type": "application/json", "x-keyway-client-ip": testIp }, body: JSON.stringify({ email: concurrentEmail, otp: concurrentCode }) });
-  const submissions = await Promise.all([instance1.handler(nativeRequest()), instance2.handler(nativeRequest())]);
+  const submissions = await withOtpChallenge(challenge.challengeId, () => Promise.all([instance1.handler(nativeRequest()), instance2.handler(nativeRequest())]));
   assert.equal(submissions.filter((response) => response.ok).length, 1, "Only one actual Better Auth endpoint may consume an OTP");
   assert.ok(challenge.challengeId);
   const [session] = await sql`select id, "expiresAt" from keyway_auth_sessions where "scopeId" = ${scope.id} and "userId" = (select auth_user_id from keyway_users where id = ${loginA.user.id})`;
@@ -95,7 +96,7 @@ test("real Better Auth endpoints: independent OTPs, application sessions, replay
   await assert.rejects(sessionForRequest(request(appA, loginA.sessionToken)), /Session/);
   const expiredEmail = `expired-${crypto.randomUUID()}@example.com`;
   const expired = await sendEmailCode(request(appB), expiredEmail);
-  await sql`update keyway_auth_verifications set "expiresAt" = now() - interval '1 second' where identifier = ${`keyway:${appB.appId}:sign-in-otp-${expiredEmail}`}`;
+  await sql`update keyway_auth_verifications set "expiresAt" = now() - interval '1 second' where identifier = ${`keyway:${appB.appId}:${expired.challengeId}:sign-in-otp-${expiredEmail}`}`;
   await assert.rejects(verifyEmailCode(request(appB), expired.challengeId, emails.get(`${appB.appId}:${expiredEmail}`)!), /Incorrect/);
   const badEmail = `attempts-${crypto.randomUUID()}@example.com`;
   const bad = await sendEmailCode(request(appB), badEmail);

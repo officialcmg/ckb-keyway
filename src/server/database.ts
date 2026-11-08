@@ -15,8 +15,44 @@ export async function database() {
   return client;
 }
 
+// Lock holders keep a pool connection each, and work done inside a lock still takes more from the pool, so holders
+// never get more than half of its 10.
+const MAX_RESERVED_LOCKS = 5;
+// Calls for one key, running or waiting. More get a fast refusal instead of queueing without end.
+const MAX_CALLS_PER_LOCK = 8;
+let reservedLocks = 0;
+const reservationQueue: Array<() => void> = [];
+const lockQueues = new Map<string, { calls: number; tail: Promise<void> }>();
+
 export async function withUserLock<T>(userId: string, task: (sql: DatabaseSql) => Promise<T>): Promise<T> {
   const sql = await database();
+  // Callers for the same key wait here, in this process, rather than on a pool connection blocked in Postgres.
+  const queue = lockQueues.get(userId) ?? { calls: 0, tail: Promise.resolve() };
+  if (queue.calls >= MAX_CALLS_PER_LOCK) throw new Error("Too many requests in progress for this account. Try again in a moment");
+  queue.calls += 1;
+  lockQueues.set(userId, queue);
+  const previous = queue.tail;
+  let finished!: () => void;
+  queue.tail = new Promise<void>((resolve) => { finished = resolve; });
+  try {
+    await previous;
+    if (reservedLocks < MAX_RESERVED_LOCKS) reservedLocks += 1;
+    else await new Promise<void>((resolve) => reservationQueue.push(resolve));
+    try {
+      return await withReservedLock(sql, userId, task);
+    } finally {
+      const next = reservationQueue.shift();
+      if (next) next(); else reservedLocks -= 1;
+    }
+  } finally {
+    queue.calls -= 1;
+    if (queue.calls === 0) lockQueues.delete(userId);
+    finished();
+  }
+}
+
+async function withReservedLock<T>(sql: DatabaseSql, userId: string, task: (sql: DatabaseSql) => Promise<T>): Promise<T> {
+  // The advisory lock still serializes the key across API processes.
   const connection = await sql.reserve();
   await connection`select pg_advisory_lock(hashtextextended(${userId}, 0))`;
   try {
