@@ -111,6 +111,11 @@ test("reads a wallet with recovery on, and refuses recovery settings that don't 
   // A change waiting for its transaction is kept beside the settings, and checked the same way.
   const pending = { kind: "add", transactionHash: `0x${"be".repeat(32)}`, recovery: wallet.recovery, ckbAddress: "ckt1omnilock", sentAt: "2026-10-30T00:00:00.000Z" } as const;
   assert.deepEqual(parseWallet({ ...wallet, recoveryPending: pending }), { ...wallet, recoveryPending: pending });
+  // Its signed transaction, kept so it can be sent again, is hex bytes when present.
+  const withTransaction = { ...pending, transaction: "0x0a0b" };
+  assert.deepEqual(parseWallet({ ...wallet, recoveryPending: withTransaction }), { ...wallet, recoveryPending: withTransaction });
+  assert.throws(() => parseWallet({ ...wallet, recoveryPending: { ...pending, transaction: { inputs: [] } } }), /recovery settings are invalid/);
+  assert.throws(() => parseWallet({ ...wallet, recoveryPending: { ...pending, transaction: "0xsigned" } }), /recovery settings are invalid/);
   assert.throws(() => parseWallet({ ...wallet, recoveryPending: { ...pending, kind: "swap" } }), /recovery settings are invalid/);
   assert.throws(() => parseWallet({ ...wallet, recoveryPending: { ...pending, recovery: { ...wallet.recovery, omnilockArgs: "0x00" } } }), /recovery settings are invalid/);
 });

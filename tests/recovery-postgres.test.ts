@@ -73,6 +73,14 @@ async function harness() {
     findCells: async function* () {},
     findCellsByLock: async function* () { yield* cells; },
     getTransaction: async (hash: ccc.HexLike) => chain.get(ccc.hexFrom(hash)),
+    // Live: made by a committed transaction and not spent by one.
+    getCellLive: async (outPointLike: ccc.OutPointLike) => {
+      const outPoint = ccc.OutPoint.from(outPointLike);
+      const made = chain.get(outPoint.txHash);
+      const spent = [...chain.values()].some(({ transaction, status }) => status === "committed" && transaction.inputs.some((input) => input.previousOutput.eq(outPoint)));
+      if (made?.status !== "committed" || spent) return undefined;
+      return ccc.Cell.from({ outPoint, cellOutput: made.transaction.outputs[Number(outPoint.index)], outputData: made.transaction.outputsData[Number(outPoint.index)] ?? "0x" });
+    },
   });
   await addCell(1_000n * CKB);
 
@@ -86,6 +94,8 @@ async function harness() {
   await saveWallet(user, wallet);
   const emails: Array<{ subject: string; plaintext: string }> = [];
   const broadcasts: ccc.Transaction[] = [];
+  /** How the next sends fail: before reaching a node, or after the node took the transaction. */
+  const sendFaults: Array<{ before?: Error; after?: (transaction: ccc.Transaction) => Error }> = [];
   const context = (current: ReadyWallet): RecoveryContext => ({
     user, wallet: current, appName: "Acme Pay", client,
     email: async () => "ana@acmepay.example",
@@ -97,8 +107,11 @@ async function harness() {
       return formatCkbSignature({ recoveryParam: raw[0] as 0 | 1, r: ccc.hexFrom(raw.slice(1, 33)), s: ccc.hexFrom(raw.slice(33, 65)) });
     },
     broadcast: async (transaction) => {
+      const fault = sendFaults.shift();
+      if (fault?.before) throw fault.before;
       broadcasts.push(transaction);
       chain.set(transaction.hash(), { transaction, status: "pending" });
+      if (fault?.after) throw fault.after(transaction);
       return transaction.hash();
     },
   });
@@ -115,7 +128,7 @@ async function harness() {
     for (const entry of chain.values()) if (entry.status === "pending") entry.status = status;
     return settleRecoveryChange(context(await readWallet(user) as ReadyWallet));
   };
-  return { privateKey, user, wallet, legacyAddress, publicKey, client, context, emails, broadcasts, proof, sign, settle, chain, addCell, codeFrom: () => /code is (\d{6})/.exec(emails.findLast(({ plaintext }) => /code is \d{6}/.test(plaintext))!.plaintext)![1] };
+  return { privateKey, user, wallet, legacyAddress, publicKey, client, context, emails, broadcasts, sendFaults, proof, sign, settle, chain, addCell, codeFrom: () => /code is (\d{6})/.exec(emails.findLast(({ plaintext }) => /code is \d{6}/.test(plaintext))!.plaintext)![1] };
 }
 
 /** Moves a pending request, and its code, this many minutes into the past, as if that time had gone by. */
@@ -272,6 +285,80 @@ test("turning recovery on: preview, emailed code, enable", { skip: !enabled }, a
   });
 });
 
+/** A node's answers when a send fails: lost on the way back, a resend's Duplicated, a script refusal. */
+const TIMEOUT = () => new Error("The operation was aborted due to timeout");
+const duplicated = (transaction: ccc.Transaction) => new ccc.ErrorClientDuplicatedTransaction({ code: -1107, message: "PoolRejectedDuplicatedTransaction: Transaction is already in the pool", data: `Duplicated(Byte32(${transaction.hash()}))` }, transaction.hash());
+const refused = () => new ccc.ErrorClientBase({ code: -302, message: "TransactionFailedToVerify: Verification failed Script(TransactionScriptError)", data: "Verification(Error { kind: Script })" });
+
+test("a recovery change whose send fails stays pending until the chain settles it", { skip: !enabled }, async (t) => {
+  process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
+  const later = (minutes: number) => new Date(Date.now() + minutes * 60_000);
+  type Enabled = { transactionHash: string; pending: boolean; ckbAddress: string; transaction: ccc.TransactionLike };
+  /** Turns recovery on through the real flow, with its send failing as given. */
+  async function enable(h: Awaited<ReturnType<typeof harness>>, fault: (typeof h.sendFaults)[number]) {
+    const preview = await recoverySetup(h.context(h.wallet), { operation: "preview", backups: [h.proof] }) as Preview;
+    await recoverySetup(h.context(h.wallet), { operation: "request-email-code", backups: [h.proof], confirmationNonce: preview.confirmationNonce });
+    h.sendFaults.push(fault);
+    return await recoverySetup(h.context(h.wallet), { operation: "enable", backups: [h.proof], confirmationNonce: preview.confirmationNonce, emailCode: h.codeFrom() }) as Enabled;
+  }
+  const current = async (h: Awaited<ReturnType<typeof harness>>) => h.context(await readWallet(h.user) as ReadyWallet);
+
+  for (const [name, after] of [["its answer was lost", TIMEOUT], ["a resend was answered Duplicated", duplicated]] as const) {
+    await t.test(`a node took the enable but ${name}: it stays pending and is applied once committed`, async () => {
+      const h = await harness();
+      const result = await enable(h, { after });
+      assert.equal(result.pending, true);
+      assert.equal((await readWallet(h.user) as ReadyWallet).recoveryPending?.transactionHash, result.transactionHash);
+      const settled = await h.settle();
+      assert.equal(settled.ckbAddress, result.ckbAddress);
+      assert.equal(settled.recovery?.enableTransactionHash, result.transactionHash);
+      assert.equal(settled.recoveryPending, undefined);
+      assert.equal(h.emails.filter(({ subject }) => /Account recovery is on/.test(subject)).length, 1);
+    });
+  }
+
+  await t.test("a refusal that means it can never commit drops the change at once", async () => {
+    const h = await harness();
+    await assert.rejects(enable(h, { before: refused() }), /TransactionFailedToVerify/);
+    const wallet = await readWallet(h.user) as ReadyWallet;
+    assert.equal(wallet.recoveryPending, undefined);
+    assert.equal(wallet.ckbAddress, h.legacyAddress);
+    await recoverySetup(h.context(wallet), { operation: "preview", backups: [h.sign(evmWallet())] });
+  });
+
+  await t.test("one no node got is sent again after the grace period, not dropped, and applied once committed", async () => {
+    const h = await harness();
+    const result = await enable(h, { before: TIMEOUT() });
+    assert.equal(h.broadcasts.length, 0);
+    assert.ok((await settleRecoveryChange(await current(h))).recoveryPending, "kept within the grace period");
+    assert.equal(h.broadcasts.length, 0);
+    const kept = await settleRecoveryChange(await current(h), later(11));
+    assert.equal(kept.recoveryPending?.transactionHash, result.transactionHash);
+    assert.deepEqual(h.broadcasts.map((transaction) => transaction.hash()), [result.transactionHash]);
+    const settled = await h.settle();
+    assert.equal(settled.ckbAddress, result.ckbAddress);
+    assert.equal(settled.recovery?.enableTransactionHash, result.transactionHash);
+  });
+
+  await t.test("past the grace period it is dropped once an input is spent elsewhere, or a resend is refused", async () => {
+    const h = await harness();
+    const result = await enable(h, { before: TIMEOUT() });
+    const spend = ccc.Transaction.from({ inputs: [{ previousOutput: ccc.Transaction.from(result.transaction).inputs[0].previousOutput }], outputs: [], outputsData: [] });
+    h.chain.set(spend.hash(), { transaction: spend, status: "committed" });
+    const dropped = await settleRecoveryChange(await current(h), later(11));
+    assert.equal(dropped.recoveryPending, undefined);
+    assert.equal(dropped.ckbAddress, h.legacyAddress);
+    assert.equal(h.broadcasts.length, 0, "not sent again");
+
+    const other = await harness();
+    await enable(other, { before: TIMEOUT() });
+    other.sendFaults.push({ before: refused() });
+    const refusedAgain = await settleRecoveryChange(await current(other), later(11));
+    assert.equal(refusedAgain.recoveryPending, undefined);
+    assert.equal(refusedAgain.ckbAddress, other.legacyAddress);
+  });
+});
+
 test("adding and removing backups: preview, emailed code, apply", { skip: !enabled }, async (t) => {
   process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
 
@@ -341,6 +428,18 @@ test("adding and removing backups: preview, emailed code, apply", { skip: !enabl
     // signed by the account key.
     assert.equal(ccc.bytesFrom(h.broadcasts.at(-1)!.getWitnessArgsAt(0)!.lock!).length, 85);
     assert.equal(ccc.bytesFrom(h.broadcasts.at(-1)!.getWitnessArgsAt(1)!.lock!).length, 85);
+  });
+
+  await t.test("a backup added while the send's answer was lost is applied once committed, and later changes still work", async () => {
+    const h = await enabledHarness();
+    const second = evmWallet();
+    h.sendFaults.push({ after: TIMEOUT });
+    const { result } = await h.apply({ change: "add", backup: h.sign(second) });
+    const stored = await readWallet(h.user) as ReadyWallet;
+    assert.deepEqual(stored.recovery?.backups, [{ kind: "evm", address: h.proof.address }, { kind: "evm", address: second.address }]);
+    assert.deepEqual(stored.recovery?.adminListOutPoint, { txHash: result.transactionHash, index: 0 });
+    await h.apply({ change: "remove", backup: { kind: "evm", address: h.proof.address } });
+    assert.deepEqual((await readWallet(h.user) as ReadyWallet).recovery?.backups, [{ kind: "evm", address: second.address }]);
   });
 
   await t.test("removes a backup with the emailed code and refuses removing the last one", async () => {
