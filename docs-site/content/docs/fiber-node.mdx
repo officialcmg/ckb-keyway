@@ -68,7 +68,7 @@ Each prop goes on `KeyWayProvider` and returns `true` or `false`, or a promise o
 </KeyWayProvider>
 ```
 
-`openChannelWithExternalFunding` builds, signs and submits the funding transaction from the user's CKB account in one call. Channel funding doesn't count toward the email-confirmation total, because the funds stay the user's and a channel can only close back to their own address.
+`openChannelWithExternalFunding` builds, signs and submits the funding transaction from the user's CKB account in one call. Channel funding counts toward the email-confirmation total like any other transfer, and past the daily amount it needs the emailed code: a browser node's payments never pass through KeyWay's server, so the funding is the last point where KeyWay sees the money leave.
 
 ## Parameters
 

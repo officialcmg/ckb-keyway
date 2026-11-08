@@ -30,7 +30,7 @@ const { channelId } = await fiber.openChannel(
 
 `fundingAmount` defaults to 1,000 CKB. Pass `peer` with a Fiber node ID to choose the channel peer; otherwise KeyWay picks an available public testnet peer. The progress callback receives `connecting`, `negotiating`, `confirming`, `signing`, `broadcasting` and `waiting`.
 
-The channel is funded from the user's CKB account, and KeyWay sets its close address to that same account. Channel funding doesn't count toward the user's email-confirmation total.
+The channel is funded from the user's CKB account, and KeyWay sets its close address to that same account. Channel funding counts toward the user's email-confirmation total, and past their daily amount it needs the emailed code.
 
 ### Open a token channel
 

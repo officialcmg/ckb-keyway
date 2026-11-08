@@ -42,8 +42,9 @@ export class RemoteCkbSigner extends KeyWayAccountSigner {
     /** Told once an approved funding transaction is signed, or signing failed. */
     private readonly settled?: (error?: unknown) => void,
     /**
-     * Asks for the code KeyWay's Lit Action emails. Once the account has daily send limits, a channel funding always
-     * needs it: Fiber chooses the funding's inputs, so it can't count toward the daily amount.
+     * Asks for the emailed code. Once the account has daily send limits, a channel funding always needs the Lit
+     * Action's: Fiber chooses the funding's inputs, so it can't count toward the limits on chain. Before that, KeyWay
+     * emails its own code once the funding reaches the daily amount.
      */
     private readonly requestEmailCode?: RequestEmailCode,
   ) {

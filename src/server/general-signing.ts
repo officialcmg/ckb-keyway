@@ -95,19 +95,22 @@ export async function transactionSigning(context: SigningContext, body: Record<s
   } else {
     await consumeRequest(context.user, "transaction", nonce);
   }
-  await context.recordSigning(context.user.id);
-  if (limits) applySendLimitRecord(validated.transaction, limits);
+  // Counted before it is signed, under the per-user lock, so an overlapping send or payment sees it; without a code,
+  // checked once more under that lock.
+  const release = await reserveOutflow(context.user, transactionOutflow(validated), request.requires_email_code, "transaction");
   let signed: ccc.Transaction;
   try {
+    await context.recordSigning(context.user.id);
+    if (limits) applySendLimitRecord(validated.transaction, limits);
     signed = await signGroups(context, validated.transaction, validated.groups, validated.signer.client, emailCode ? { email: await context.email(), emailCode } : {});
   } catch (error) {
+    await release();
     // Lit counted something the preview didn't see yet (another send landed in between).
     if (!emailCode && error instanceof Error && /eight-digit code/.test(error.message)) throw new Error("This transaction now needs an email code. Review it again");
     throw error;
   }
   // A mistyped Lit code fails above and leaves the request for another try; a signature uses it up.
   if (emailCode) await consumeRequest(context.user, "transaction", nonce);
-  await recordOutflow(context.user, transactionOutflow(validated));
   await recordPendingTransaction(context.user.id, signed);
   return { transaction: serializeTransaction(signed) };
 }
@@ -239,22 +242,31 @@ export async function recordOutflow(user: User, outflow: Outflow, connection?: Q
 }
 
 /**
- * Counts an outflow before the money moves, under a per-user lock, so overlapping payments can't each
- * slip under the amount. Unless the user already confirmed by email, it refuses once an amount is
- * reached. Returns a function that removes the entry if the payment then fails.
+ * Counts an outflow before the money moves, under a per-user lock, so overlapping payments and transactions can't
+ * each slip under the amount. Unless the user already confirmed by email, it refuses once an amount is reached.
+ * Returns a function that removes the entry if the payment or signature then fails. An outflow that was already
+ * counted (the same transaction signed before), or that another attempt counted again since, stays counted.
  */
-export async function reserveOutflow(user: User, outflow: Outflow, emailConfirmed: boolean): Promise<() => Promise<void>> {
+export async function reserveOutflow(user: User, outflow: Outflow, emailConfirmed: boolean, what: "payment" | "transaction" = "payment"): Promise<() => Promise<void>> {
   const sql = await database();
-  await sql.begin(async (tx) => {
+  const reservedAt = await sql.begin(async (tx) => {
     await tx`select pg_advisory_xact_lock(hashtextextended(${`keyway-outflow:${user.id}`}, 0))`;
     if (!emailConfirmed && await outflowNeedsEmailCode(user, outflow, tx)) {
-      throw new Error("This payment now needs an email code. Review it again");
+      throw new Error(`This ${what} now needs an email code. Review it again`);
     }
+    const [{ at, counted }] = await tx<Array<{ at: string; counted: boolean }>>`
+      select now()::text as at,
+        exists(select 1 from keyway_v2_signed_outflows where user_id = ${user.id} and transaction_hash = ${outflow.id} and signed_at > now() - ${OUTFLOW_WINDOW}::interval)
+        or exists(select 1 from keyway_v2_token_outflows where user_id = ${user.id} and outflow_id = ${outflow.id} and signed_at > now() - ${OUTFLOW_WINDOW}::interval) as counted
+    `;
     await recordOutflow(user, outflow, tx);
+    return counted ? undefined : at;
   });
   return async () => {
-    await sql`delete from keyway_v2_signed_outflows where user_id = ${user.id} and transaction_hash = ${outflow.id}`;
-    await sql`delete from keyway_v2_token_outflows where user_id = ${user.id} and outflow_id = ${outflow.id}`;
+    if (reservedAt === undefined) return;
+    // Rows written by this reservation only: a later attempt that counted the same outflow rewrote signed_at.
+    await sql`delete from keyway_v2_signed_outflows where user_id = ${user.id} and transaction_hash = ${outflow.id} and signed_at = ${reservedAt}::text::timestamptz`;
+    await sql`delete from keyway_v2_token_outflows where user_id = ${user.id} and outflow_id = ${outflow.id} and signed_at = ${reservedAt}::text::timestamptz`;
   };
 }
 
