@@ -23,7 +23,7 @@ import { ANY_FUNDING, connectChannelPeers, type ChannelPeer } from "./channel-pe
 import { normalizeFiberPubkey } from "./fiber-pubkey";
 import { KeyWayApiClient } from "./api-client";
 import { createEncryptedNodeBackup, restoreEncryptedNodeBackup } from "./node-backup";
-import { backUpBeforeLogout, restoreBeforeStart } from "./node-migration";
+import { backUpBeforeLogout, restoreBeforeStart, stopBeforeLogout } from "./node-migration";
 import { toKeyWayError, type KeyWayError } from "./keyway-error";
 import { freeFiberParams, fundingFeeRate, paymentFiberParams } from "./fiber-methods";
 import { describePayment, type ApproveFiberPayment } from "./fiber-payment";
@@ -245,7 +245,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     async release() {
       // The bridge has drained. Give KeyWay's watchtower whatever is still queued before the page lets go of the node.
       await Promise.race([remoteWatchtower.flush(), new Promise((resolve) => setTimeout(resolve, 10_000))]);
-      if (typeof window !== "undefined") window.removeEventListener("beforeunload", warnBeforeUnload);
+      // Anything still queued keeps being retried after the stop, so closing the tab still needs the warning.
+      if (typeof window !== "undefined" && remoteWatchtower.pending() === 0) window.removeEventListener("beforeunload", warnBeforeUnload);
       watchtower.close();
       const lease = deviceLease;
       const lock = deviceLock;
@@ -382,12 +383,18 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     // A start in progress settles first: one that already holds the lease is backed up below.
     return lifecycle.logout(async (steps) => {
       if (!deviceLease) {
-        try {
-          await steps.stop();
-        } finally {
-          preparedPeers = undefined;
-          preparedFundingAmount = undefined;
-        }
+        await stopBeforeLogout({
+          async stop() {
+            try {
+              await steps.stop();
+            } finally {
+              preparedPeers = undefined;
+              preparedFundingAmount = undefined;
+            }
+          },
+          // An earlier stop() may have left revocations queued; they still have to reach KeyWay's watchtower.
+          flushWatchtower: () => remoteWatchtower.deliver(10_000),
+        });
         remoteWatchtower.stop();
         return;
       }

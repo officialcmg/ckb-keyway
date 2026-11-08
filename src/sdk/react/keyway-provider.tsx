@@ -27,6 +27,7 @@ import {
   type ConnectedManagedKeyWay,
 } from "../browser/connect-managed-keyway";
 import { bootstrapKeyWay, type PublicWallet } from "../browser/bootstrap";
+import { createStoppedNodes } from "../browser/node-migration";
 import type { ApproveFiberChannelOpen, FiberChannelOpenPreview } from "../browser/remote-ckb-signer";
 import type { ApproveFiberPayment } from "../browser/fiber-payment";
 import type { EmailCodeReason, RequestEmailCode } from "../browser/email-code";
@@ -269,6 +270,8 @@ export function KeyWayProvider({
   const resolvedAppName = appName.trim().slice(0, 64) || "CKB KeyWay";
   const api = new KeyWayApiClient({ appId });
   const connectionRef = useRef<KeyWayConnection | undefined>(undefined);
+  // Stopped nodes may still be sending channel updates to KeyWay's watchtower: a logout delivers them first.
+  const [stoppedNodes] = useState(() => createStoppedNodes<KeyWayConnection["keyway"]>());
   const operationRef = useRef<Promise<void>>(Promise.resolve());
   const runRef = useRef(0);
   const callbacksRef = useRef({ approveFiberChannelOpen, approveFiberPayment, approveFiberChannelClose, approveFiberPeerConnect, approveFiberChannelSettings, approveCkbTransaction, approveCkbMessage, approveDailyLimit, approveRecovery, approveBackupChange, onError, onFiberStartup });
@@ -353,7 +356,10 @@ export function KeyWayProvider({
       const previous = connectionRef.current;
       connectionRef.current = undefined;
       setConnection(undefined);
-      if (previous) await previous.keyway.stop();
+      if (previous) {
+        stoppedNodes.add(previous.keyway);
+        await previous.keyway.stop();
+      }
 
       try {
         const connectNode = fiberNode === "hosted" ? connectManagedKeyWay : connectKeyWay;
@@ -376,6 +382,7 @@ export function KeyWayProvider({
           }),
           ...(fiberNode === "browser" ? { onLeaseLost: (leaseError: Error) => {
             if (run !== runRef.current) return;
+            if (connectionRef.current) stoppedNodes.add(connectionRef.current.keyway);
             connectionRef.current = undefined;
             setConnection(undefined);
             setError(leaseError);
@@ -428,6 +435,7 @@ export function KeyWayProvider({
       return;
     }
     setStatus("disconnecting");
+    stoppedNodes.add(current.keyway);
     try {
       await current.keyway.stop();
     } finally {
@@ -451,6 +459,7 @@ export function KeyWayProvider({
     const current = connectionRef.current;
     try {
       if (current) await current.keyway.stopForLogout();
+      await stoppedNodes.logout();
       if (token) await api.logout(token);
       ++runRef.current;
       connectionRef.current = undefined;

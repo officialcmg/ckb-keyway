@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { backUpBeforeLogout, restoreBeforeStart } from "../src/sdk/browser/node-migration.ts";
+import { backUpBeforeLogout, createStoppedNodes, restoreBeforeStart, stopBeforeLogout } from "../src/sdk/browser/node-migration.ts";
 import { createRemoteWatchtower } from "../src/sdk/browser/watchtower-remote.ts";
 
 const payload = {
@@ -81,6 +81,41 @@ for (const failure of ["fails", "hangs"] as const) {
     }
   });
 }
+
+// Stop Fiber (or an SDK app's stop()) and then a logout: the node no longer holds the device, so there is no backup,
+// but the peer's last revocation, queued by the stop, failed to send and is still being retried.
+test("a logout after a stop fails until the revocation the stop left queued reaches KeyWay's watchtower", async () => {
+  let reachable = false;
+  const remote = createRemoteWatchtower({
+    send: async () => {
+      if (!reachable) throw Object.assign(new Error("KeyWay request failed"), { status: 502 });
+    },
+    retryMs: 60_000,
+    log: { info: () => undefined, warn: () => undefined },
+  });
+  const stops: string[] = [];
+  // The stopped node's own logout: stopForLogout without a device lease.
+  const keyway = {
+    stopForLogout: () => stopBeforeLogout({ stop: async () => { stops.push("stop"); }, flushWatchtower: () => remote.deliver(500) }),
+  };
+  const stopped = createStoppedNodes<typeof keyway>();
+  try {
+    remote.enqueue({ operation: "revoke", channelId: `0x${"ab".repeat(32)}`, revocation: { commitment_number: "0x5", aggregated_signature: "0x", output: "0x", output_data: "0x" } });
+    stopped.add(keyway);
+    await assert.rejects(keyway.stopForLogout(), /watchtower/, "an SDK app's stop() then stopForLogout()");
+    await assert.rejects(stopped.logout(), /watchtower/, "the provider's Stop Fiber then logout");
+    assert.equal(remote.pending(), 1);
+    reachable = true;
+    await stopped.logout();
+    assert.equal(remote.pending(), 0);
+    // Delivered: a later logout has nothing more to do with that node.
+    stops.length = 0;
+    await stopped.logout();
+    assert.deepEqual(stops, []);
+  } finally {
+    remote.stop();
+  }
+});
 
 test("confirms a restore only after import succeeds", async () => {
   const order: string[] = [];

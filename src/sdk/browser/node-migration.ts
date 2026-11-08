@@ -22,6 +22,39 @@ export async function backUpBeforeLogout(options: {
   }
 }
 
+/**
+ * A logout with nothing to back up: no node holds the device here. A stop before it may have left channel updates
+ * queued for KeyWay's watchtower, still being retried from this page; they must reach it before the session ends,
+ * so until they do the logout fails.
+ */
+export async function stopBeforeLogout(options: {
+  stop: () => Promise<void>;
+  flushWatchtower: () => Promise<void>;
+}): Promise<void> {
+  await options.stop();
+  await options.flushWatchtower();
+}
+
+/**
+ * The nodes stopped during a session (Stop Fiber, a lost device lease, a restart). Each one's page keeps retrying
+ * the channel updates KeyWay's watchtower is missing; a logout delivers them through it first and fails while any
+ * is still missing, as it does for a running node.
+ */
+export function createStoppedNodes<T extends { stopForLogout(): Promise<void> }>() {
+  const nodes = new Set<T>();
+  return {
+    add(node: T) {
+      nodes.add(node);
+    },
+    async logout() {
+      for (const node of [...nodes]) {
+        await node.stopForLogout();
+        nodes.delete(node);
+      }
+    },
+  };
+}
+
 export async function restoreBeforeStart(options: {
   loadFiberKey: () => Promise<Uint8Array>;
   loadBackup: () => Promise<ClaimedNodeBackup>;
