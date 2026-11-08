@@ -65,23 +65,25 @@ export async function managedNodeRequest(
       throw new Error(`${method} isn't available through KeyWay`);
     }
     const params = approveFiberParams(method, body.params);
-    let dial = [params];
+    let dial = params;
     if (method === "connectPeer") {
       // The node dials only what was checked here: a host name becomes its checked IP, and a peer named by key
       // is dialed at its checked TCP addresses, or by key over TCP only when it is an official peer. Any other
       // peer that is already connected isn't dialed again: by key, the node would pick from addresses the peer
       // announced itself, which nothing here checked.
-      if (typeof params.address === "string") dial = [{ ...params, address: await pinPublicPeerAddress(params.address) }];
-      else if (isOfficialPeer(String(params.pubkey))) dial = [{ ...params, addr_type: "tcp" }];
-      else dial = (await assertKnownPublicPeer(node, String(params.pubkey))).map((address) => ({ address, save: false }));
-      if (dial.length === 0) return { done: true };
-      if ((await node.listPeers()).peers.length >= MAX_PEERS) throw new Error(`A hosted node can connect to at most ${MAX_PEERS} peers`);
+      if (typeof params.address === "string") dial = { ...params, address: await pinPublicPeerAddress(params.address) };
+      else if (isOfficialPeer(String(params.pubkey))) dial = { ...params, addr_type: "tcp" };
+      else {
+        const peer = `0x${String(params.pubkey).toLowerCase().replace(/^0x/, "")}` as Pubkey;
+        const addresses = await assertKnownPublicPeer(node, peer);
+        if (addresses.length === 0) return { done: true };
+        await assertPeerRoom(node);
+        await connectGraphPeer(node, peer, addresses);
+        return { done: true };
+      }
+      await assertPeerRoom(node);
     }
-    // A peer named by key may have several checked addresses; one that works is enough.
-    await serializeMutation(userId, async () => {
-      const results = await Promise.allSettled(dial.map((each) => node.call(FIBER_METHODS[method as FiberMethod].rpc, [each])));
-      if (results.every((result) => result.status === "rejected")) throw (results[0] as PromiseRejectedResult).reason;
-    });
+    await serializeMutation(userId, () => node.call(FIBER_METHODS[method as FiberMethod].rpc, [dial]));
     return { done: true };
   }
   if (body.operation === "status") {
@@ -330,16 +332,29 @@ async function assertKnownPublicPeer(node: ManagedNodeClient, peer: string): Pro
   throw new Error("This peer isn't in the Fiber network graph yet; connect to it first with connectPeer and its address");
 }
 
+async function assertPeerRoom(node: ManagedNodeClient): Promise<void> {
+  if ((await node.listPeers()).peers.length >= MAX_PEERS) throw new Error(`A hosted node can connect to at most ${MAX_PEERS} peers`);
+}
+
+/**
+ * Dials a peer at the addresses it announced to the network, which were checked to be public. Fiber accepts
+ * a dial before the handshake, and an address without /p2p/, or a stale one, can reach a different node, so
+ * the peer counts as connected only once its own key is among the node's peers. Like any peer an app asks
+ * for, it isn't saved to the node's permanent peer store.
+ */
+async function connectGraphPeer(node: ManagedNodeClient, peer: Pubkey, addresses: string[]): Promise<void> {
+  if ((await connectCandidates(node, [{ pubkey: peer as `0x${string}`, nodeName: "selected peer", addresses, minimumFunding: 0n }], 10_000, 250, false)).length === 0) {
+    throw new Error("Could not connect to the selected Fiber channel peer");
+  }
+}
+
 async function connectManagedPeer(node: ManagedNodeClient, peer: Pubkey): Promise<void> {
   const candidate = TESTNET_CHANNEL_PEERS.find(({ pubkey }) => pubkey === peer.toLowerCase());
   if (!candidate) {
-    // Any public peer: its announced addresses must be public, and the handshake must match its key. Like any
-    // peer an app asks for, it isn't saved to the node's permanent peer store.
+    // Any public peer: its announced addresses must be public, and the handshake must match its key.
     const addresses = await assertKnownPublicPeer(node, peer);
     if (addresses.length === 0) return;
-    if ((await connectCandidates(node, [{ pubkey: peer as `0x${string}`, nodeName: "selected peer", addresses, minimumFunding: 0n }], 10_000, 250, false)).length === 0) {
-      throw new Error("Could not connect to the selected Fiber channel peer");
-    }
+    await connectGraphPeer(node, peer, addresses);
     return;
   }
   // Native nodes resolve current TCP addresses from gossip, not browser WSS seeds.

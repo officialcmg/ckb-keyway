@@ -75,6 +75,29 @@ test("connecting by pubkey to a peer that is already connected never dials it by
   assert.deepEqual(dialed, []);
 });
 
+test("connecting by pubkey succeeds only once that peer itself is connected, not another node at its address", async (t) => {
+  // A graph address without /p2p/ (or a stale one) reaches whatever node now listens there, and Fiber accepts
+  // the dial before the handshake.
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const { node, dialed } = hostedNode(["/ip4/203.0.113.5/tcp/8228"]);
+  let dialedOnce = false;
+  node.connectPeer = async (params) => { dialed.push(params); dialedOnce = true; };
+  node.call = async (method: string, [params]: [Record<string, unknown>]) => {
+    if (method === "graph_nodes") return { nodes: [{ pubkey: PEER.slice(2), addresses: ["/ip4/203.0.113.5/tcp/8228"] }], last_cursor: "0x" };
+    if (method === "connect_peer") { dialed.push(params); dialedOnce = true; }
+    return {};
+  };
+  node.listPeers = async () => {
+    t.mock.timers.tick(5_000);
+    return { peers: dialedOnce ? [{ pubkey: `0x02${"cd".repeat(32)}` }] : [] };
+  };
+  await assert.rejects(
+    managedNodeRequest("stale-user", { operation: "act", method: "connectPeer", params: { pubkey: PEER } }, node as never),
+    /Could not connect/,
+  );
+  assert.deepEqual(dialed, [{ address: "/ip4/203.0.113.5/tcp/8228", save: false }]);
+});
+
 test("a hosted node dials the checked IP, not a host name it would resolve again", async (t) => {
   fakeDns(t, ["203.0.113.9"]);
   const { node, dialed } = hostedNode([]);

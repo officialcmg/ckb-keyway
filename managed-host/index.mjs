@@ -189,8 +189,10 @@ async function makeRoom(userId) {
     try { requireClosedChannels(channels); } catch { idle = false; await markChannels(id, true).catch(logError); }
     // Checked again after the wait, in case the node was stopped or picked up a request meanwhile.
     if (!idle || nodes.get(id) !== node || !reusable(id, node)) continue;
-    await markChannels(id, false);
+    // Stopping marks the node at once, so no request can pick it up in between; its marker goes only once
+    // it has stopped.
     await stopNode(id);
+    await markChannels(id, false);
     return;
   }
   throw new Error("Managed node capacity is full");
@@ -215,7 +217,11 @@ export function runningUsers() {
 
 export async function shutdown() {
   shuttingDown = true;
-  await Promise.all([...nodes.values()].map((node) => waitForExit(node.child).catch(logError)));
+  // A node still starting either stops before it spawns or stops itself once it is up (see startNode).
+  await Promise.all([
+    ...[...nodes.values()].map((node) => waitForExit(node.child).catch(logError)),
+    ...[...starting.values()].map((pending) => pending.catch(() => {})),
+  ]);
 }
 
 async function startNode(userId) {
@@ -225,6 +231,8 @@ async function startNode(userId) {
   const ckbDir = join(baseDir, "ckb");
   await mkdir(ckbDir, { recursive: true });
   await createCkbKey(join(ckbDir, "key"));
+  // The host may have begun shutting down while this admission waited, for room or for the steps above.
+  if (shuttingDown) throw new Error("Managed host is shutting down");
   const child = spawn(required("FNN_PATH", "/usr/local/bin/fnn"), [
     "-d", baseDir,
     "-c", required("FIBER_CONFIG_TEMPLATE", "/usr/local/share/fiber/config/testnet/config.yml"),
@@ -243,6 +251,10 @@ async function startNode(userId) {
     if (wasRunning && !node.stopping && !shuttingDown) setTimeout(() => void withUserOperation(userId, () => ensureNode(userId)).catch(logError), 1_000);
   });
   await waitForRpc(port, child);
+  if (shuttingDown) {
+    await waitForExit(child);
+    throw new Error("Managed host is shutting down");
+  }
   node.lastUsed = ++uses;
   node.lastUsedAt = Date.now();
   nodes.set(userId, node);
