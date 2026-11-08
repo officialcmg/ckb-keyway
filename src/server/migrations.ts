@@ -387,4 +387,12 @@ export const migrations: Array<{
       await sql`create index keyway_v2_pending_transactions_user on keyway_v2_pending_transactions (user_id, seq)`;
     },
   },
+  {
+    version: 21, name: "session-origins",
+    up: async (sql) => {
+      // The origin each session was issued at, so removing an origin from an app ends its sessions. Sessions from
+      // before this have none and are not tied to an origin.
+      await sql`alter table keyway_auth_sessions add column if not exists "origin" text`;
+    },
+  },
 ];

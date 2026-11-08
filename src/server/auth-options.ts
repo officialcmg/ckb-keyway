@@ -16,7 +16,10 @@ export function authSchemaOptions(pool: Pool): BetterAuthOptions {
       expiresIn: 7 * 24 * 60 * 60,
       updateAge: 24 * 60 * 60,
       cookieCache: { enabled: false },
-      additionalFields: { scopeId: { type: "string", required: true, input: false } },
+      additionalFields: {
+        scopeId: { type: "string", required: true, input: false },
+        origin: { type: "string", required: false, input: false },
+      },
     },
     plugins: [
       bearer({ requireSignature: true }),
