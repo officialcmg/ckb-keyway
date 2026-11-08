@@ -18,6 +18,7 @@
 .dash-list-head__copy { display: flex; flex-direction: column; gap: 6px; }
 .dash-list-head__copy p { margin: 0; font-size: 14px; color: var(--ink-muted); overflow-wrap: anywhere; }
 .dash-list-head__copy a { color: var(--ink-muted); }
+.dash-list-head__copy .field-error { color: var(--danger); }
 .dash-list-head h1, .dash-detail-head h1 { margin: 0; font-size: clamp(30px, 3vw, 40px); line-height: 1.1; font-weight: 800; letter-spacing: -0.04em; }
 .dash-new { padding: 0 16px; }
 .dash-loading { padding: 40px 24px; display: flex; align-items: center; justify-content: center; gap: 12px; font-size: 15px; color: var(--ink-muted); }

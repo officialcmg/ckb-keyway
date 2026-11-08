@@ -4,7 +4,7 @@ import dynamic from "next/dynamic";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { type DeveloperApplication } from "./api";
-import { useDashboard } from "./session";
+import { useDashboard, useSignOut } from "./session";
 import { ApplicationRows, ApplicationsHeader, CreateDialog, ListEmpty, ListError, ListLoading, SignInCard } from "./views";
 
 /** Development-only state previews (`/dashboard?screen=…`); never bundled in production. */
@@ -21,6 +21,7 @@ function LiveHome() {
   const session = useDashboard();
   const router = useRouter();
   const [creating, setCreating] = useState(false);
+  const signOut = useSignOut();
   if (session.status === "checking") return null;
   if (session.status === "signedOut") return <SignInCard onSendCode={session.sendCode} onVerify={session.verifyCode} />;
 
@@ -33,7 +34,7 @@ function LiveHome() {
   const loading = session.listState === "loading" || session.listState === "idle";
   return (
     <>
-      <ApplicationsHeader email={session.email} onSignOut={() => void session.signOut()} onCreate={() => setCreating(true)} />
+      <ApplicationsHeader email={session.email} signOutError={signOut.error} onSignOut={() => void signOut.run()} onCreate={() => setCreating(true)} />
       {loading ? <ListLoading />
         : session.listState === "error" ? <ListError onRetry={() => void session.reload()} />
         : session.applications.length ? <ApplicationRows applications={session.applications} />
