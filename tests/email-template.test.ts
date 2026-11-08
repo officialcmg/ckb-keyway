@@ -71,3 +71,20 @@ test("the confirmation email shows each recipient's whole address", () => {
     assert.ok(email.plaintext.includes(full) && email.html.includes(full), full);
   }
 });
+
+test("a recipient line too long for the email keeps its amount and is marked as cut", () => {
+  const long = ccc.Address.fromScript(ccc.Script.from({
+    codeHash: "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8", hashType: "type", args: `0x${"cd".repeat(200)}`,
+  }), client).toString();
+  const base = preview(1);
+  const lines = previewSummaryLines({ ...base, recipients: [{ ...base.recipients[0], address: long, ckb: "4321" }] });
+  const email = createConfirmationEmailTemplate("Acme Pay", "123456", "Confirm a transaction", lines);
+  const shown = email.plaintext.split("\n").find((line) => line.includes(long.slice(0, 40)));
+  assert.ok(shown, "the recipient line is in the email");
+  assert.match(shown, /4321 CKB/);
+  assert.ok(shown.endsWith("…") && shown.length === 240, shown);
+  assert.ok(email.html.includes(shown));
+  // A line that fits is left as it is.
+  const short = createConfirmationEmailTemplate("Acme Pay", "123456", "Confirm a transaction", previewSummaryLines(preview(1)));
+  assert.doesNotMatch(short.plaintext, /…$/m);
+});

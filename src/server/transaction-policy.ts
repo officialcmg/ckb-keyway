@@ -339,7 +339,8 @@ export function previewSummaryLines(preview: TransactionPreview): string[] {
   for (const action of preview.dao) lines.push(`Nervos DAO ${action.action}: ${action.amountCkb} CKB`);
   for (const script of preview.unrecognized) lines.push(`Unrecognized script ${script.codeHash} (${script.cells} cells)`);
   if (preview.details.outputs.some(({ type }) => type === RECOVERY_LIST)) lines.push("Writes the account's recovery list");
-  for (const recipient of preview.recipients) lines.push(`To ${recipient.address} (${recipient.kind}): ${recipient.ckb} CKB`);
+  // The amount comes before the address, so an address too long for the email's line can't push it out.
+  for (const recipient of preview.recipients) lines.push(`${recipient.ckb} CKB to ${recipient.address} (${recipient.kind})`);
   return lines;
 }
 

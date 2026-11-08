@@ -41,8 +41,9 @@ export function createConfirmationEmailTemplate(appName: string, code: string, h
   const safeHeading = escapeHtml(heading);
   // Up to 12 lines; past that the last one says how many more there are, so nothing is left out unannounced.
   const shown = summary.length > 12 ? [...summary.slice(0, 11), `…and ${summary.length - 11} more not shown here. If you didn't start this, don't enter the code.`] : summary;
-  // Long enough for a whole address, which the email shows rather than its start and checksum.
-  const lines = shown.map((line) => line.slice(0, 240));
+  // Long enough for a whole address, which the email shows rather than its start and checksum. A longer line
+  // (an address with unusually long lock args) ends in "…" so the reader knows it was cut.
+  const lines = shown.map((line) => (line.length > 240 ? `${line.slice(0, 239)}…` : line));
   const rows = lines.map((line) => `<tr><td style="padding:6px 0;border-top:1px solid #e5e7eb;font-size:14px;line-height:20px;text-align:left;overflow-wrap:anywhere;word-break:break-all">${escapeHtml(line)}</td></tr>`).join("");
   return {
     subject: `${heading} in ${name}`,
