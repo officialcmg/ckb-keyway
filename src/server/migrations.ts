@@ -395,4 +395,10 @@ export const migrations: Array<{
       await sql`alter table keyway_auth_sessions add column if not exists "origin" text`;
     },
   },
+  {
+    version: 22, name: "watchtower-closing-commitment",
+    // The commitment number of the peer's commitment that closed a channel, so a revocation that arrives after the
+    // close reopens it only when it can punish that commitment.
+    up: (sql) => sql`alter table keyway_v2_watchtower_channels add column closing_commitment_number numeric(20, 0)`,
+  },
 ];

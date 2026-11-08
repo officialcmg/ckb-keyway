@@ -187,3 +187,51 @@ test("a start retried as soon as the last one failed starts again", async () => 
   assert.equal(await retried, "info");
   assert.equal(h.log.filter((entry) => entry === "claim").length, 2);
 });
+
+test("after a logout that failed before letting go of the device, a start comes back on the same claim, and a failed one keeps it", async () => {
+  const h = harness();
+  const started = h.lifecycle.start();
+  await until(h.startPending);
+  h.finishStart();
+  await started;
+  // KeyWay's watchtower can't be reached: the backup never happens and the device is kept.
+  await assert.rejects(h.lifecycle.logout(async (steps) => {
+    await steps.stopNodeAndDrain();
+    throw new Error("Fiber channel updates have not reached KeyWay's watchtower yet");
+  }), /watchtower/);
+  assert.equal(h.lifecycle.holdsDevice(), true);
+  h.log.length = 0;
+
+  h.failStart(new Error("wasm failed"));
+  await assert.rejects(h.lifecycle.start(), /wasm failed/);
+  assert.deepEqual(h.log, ["bridge.open", "node.start"], "no second claim, and the device is not let go");
+  assert.equal(h.lifecycle.holdsDevice(), true);
+
+  h.failStart(undefined as unknown as Error);
+  h.log.length = 0;
+  const resumed = h.lifecycle.start();
+  await until(() => h.log.includes("node.start"));
+  h.finishStart();
+  assert.equal(await resumed, "info");
+  assert.deepEqual(h.log, ["bridge.open", "node.start", "node.up", "timers.start"]);
+
+  h.log.length = 0;
+  await h.lifecycle.logout(async (steps) => {
+    await steps.stopNodeAndDrain();
+    h.log.push("backup");
+    await steps.releaseGuards();
+  });
+  assert.deepEqual(h.log, ["timers.stop", "node.stop", "bridge.drained", "backup", "release"]);
+  assert.equal(h.lifecycle.holdsDevice(), false);
+});
+
+test("a logout that fails with the node still up starts its timers again", async () => {
+  const h = harness();
+  const started = h.lifecycle.start();
+  await until(h.startPending);
+  h.finishStart();
+  await started;
+  h.log.length = 0;
+  await assert.rejects(h.lifecycle.logout(async () => { throw new Error("could not load the Fiber key"); }), /Fiber key/);
+  assert.deepEqual(h.log, ["timers.stop", "timers.start"]);
+});

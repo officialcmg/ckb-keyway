@@ -23,7 +23,7 @@ import { ANY_FUNDING, connectChannelPeers, type ChannelPeer } from "./channel-pe
 import { normalizeFiberPubkey } from "./fiber-pubkey";
 import { KeyWayApiClient } from "./api-client";
 import { createEncryptedNodeBackup, restoreEncryptedNodeBackup } from "./node-backup";
-import { backUpBeforeLogout, restoreBeforeStart } from "./node-migration";
+import { backUpBeforeLogout, restoreBeforeStart, stopBeforeLogout } from "./node-migration";
 import { toKeyWayError, type KeyWayError } from "./keyway-error";
 import { freeFiberParams, fundingFeeRate, paymentFiberParams } from "./fiber-methods";
 import { describePayment, type ApproveFiberPayment } from "./fiber-payment";
@@ -245,7 +245,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     async release() {
       // The bridge has drained. Give KeyWay's watchtower whatever is still queued before the page lets go of the node.
       await Promise.race([remoteWatchtower.flush(), new Promise((resolve) => setTimeout(resolve, 10_000))]);
-      if (typeof window !== "undefined") window.removeEventListener("beforeunload", warnBeforeUnload);
+      // Anything still queued keeps being retried after the stop, so closing the tab still needs the warning.
+      if (typeof window !== "undefined" && remoteWatchtower.pending() === 0) window.removeEventListener("beforeunload", warnBeforeUnload);
       watchtower.close();
       const lease = deviceLease;
       const lock = deviceLock;
@@ -382,12 +383,18 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     // A start in progress settles first: one that already holds the lease is backed up below.
     return lifecycle.logout(async (steps) => {
       if (!deviceLease) {
-        try {
-          await steps.stop();
-        } finally {
-          preparedPeers = undefined;
-          preparedFundingAmount = undefined;
-        }
+        await stopBeforeLogout({
+          async stop() {
+            try {
+              await steps.stop();
+            } finally {
+              preparedPeers = undefined;
+              preparedFundingAmount = undefined;
+            }
+          },
+          // An earlier stop() may have left revocations queued; they still have to reach KeyWay's watchtower.
+          flushWatchtower: () => remoteWatchtower.deliver(10_000),
+        });
         remoteWatchtower.stop();
         return;
       }
@@ -397,6 +404,9 @@ export function createKeyWay(options: CreateKeyWayOptions) {
         loadFiberKey: () => options.loadFiberKey(lease.leaseId),
         // The backup is taken only after the bridge has drained, so it holds every watchtower call.
         stopNode: steps.stopNodeAndDrain,
+        // Once the session ends nothing more reaches KeyWay's watchtower from this page, so it must have every
+        // revocation first; until then the logout fails and the user stays signed in.
+        flushWatchtower: () => remoteWatchtower.deliver(10_000),
         createBackup: (fiberKey) => createEncryptedNodeBackup(databasePrefix, fiberKey),
         saveBackup: (backup) => api.saveNodeBackup(options.authToken, {
           deviceIdHash,
@@ -580,6 +590,12 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     start,
     stop,
     stopForLogout,
+    /**
+     * Whether this page still holds the device. After a failed `stopForLogout()` it does when the logout stopped
+     * before letting go (e.g. KeyWay's watchtower or the backup upload was unreachable): `start()` then brings the
+     * node back on the same device lease, and the next `stopForLogout()` retries the delivery and the backup.
+     */
+    holdsDevice: lifecycle.holdsDevice,
     nodeInfo: () => node.nodeInfo(),
     connectPeer: node.connectPeer.bind(node),
     listPeers: node.listPeers.bind(node),
