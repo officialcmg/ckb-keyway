@@ -590,6 +590,12 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     start,
     stop,
     stopForLogout,
+    /**
+     * Whether this page still holds the device. After a failed `stopForLogout()` it does when the logout stopped
+     * before letting go (e.g. KeyWay's watchtower or the backup upload was unreachable): `start()` then brings the
+     * node back on the same device lease, and the next `stopForLogout()` retries the delivery and the backup.
+     */
+    holdsDevice: lifecycle.holdsDevice,
     nodeInfo: () => node.nodeInfo(),
     connectPeer: node.connectPeer.bind(node),
     listPeers: node.listPeers.bind(node),

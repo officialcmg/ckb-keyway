@@ -161,6 +161,76 @@ test("one channel's failing update doesn't hold up another's, and a refused one 
   }
 });
 
+test("a CKB channel refused at the watched-channel limit holds up delivery until KeyWay takes it or it closes; a token channel is still dropped", async () => {
+  const TOKEN = `0x${"cd".repeat(32)}`;
+  const CLOSED = `0x${"ef".repeat(32)}`;
+  const attempts: string[] = [];
+  let atLimit = true;
+  const remote = createRemoteWatchtower({
+    send: async (update) => {
+      const name = `${update.operation === "revoke" ? `revoke ${update.revocation.commitment_number}` : update.operation} ${update.channelId.slice(0, 4)}`;
+      attempts.push(name);
+      if (update.channelId === TOKEN && update.operation === "watch") throw Object.assign(new Error("Token channels are not watched yet"), { status: 400 });
+      if (update.operation === "watch" && atLimit) throw Object.assign(new Error("The watchtower already watches 64 open channels for this account"), { status: 400 });
+    },
+    retryMs: 5,
+    log: { info: () => undefined, warn: () => undefined },
+  });
+  const watch = (channelId: string) => ({ operation: "watch", channelId, localFundingPubkey: `0x${K1}`, remoteFundingPubkey: `0x${K2}`, fundingUdtTypeScript: null }) as const;
+  try {
+    remote.enqueue(watch(CHANNEL));
+    remote.enqueue({ operation: "revoke", channelId: CHANNEL, revocation: revocationJson(1n) });
+    remote.enqueue(watch(TOKEN));
+    await assert.rejects(remote.deliver(500), /already watching as many channels as it can/);
+    assert.equal(remote.pending(), 1, "the unwatched CKB channel still counts; the token channel doesn't");
+    // Newer revocations are kept for it, without a send each.
+    const sends = attempts.length;
+    remote.enqueue({ operation: "revoke", channelId: CHANNEL, revocation: revocationJson(2n) });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(attempts.length, sends, "not retried until the next flush");
+    await assert.rejects(remote.deliver(500), /already watching/);
+    // A slot frees up: the next delivery registers it and sends its newest revocation.
+    atLimit = false;
+    attempts.length = 0;
+    await remote.deliver(500);
+    assert.deepEqual(attempts, ["watch 0xab", "revoke 0x2 0xab"]);
+    assert.equal(remote.pending(), 0);
+
+    // One that closes while at the limit has nothing left to register.
+    atLimit = true;
+    remote.enqueue(watch(CLOSED));
+    await assert.rejects(remote.deliver(500), /already watching/);
+    remote.enqueue({ operation: "unwatch", channelId: CLOSED });
+    await remote.deliver(500);
+    assert.equal(remote.pending(), 0);
+    assert.ok(!attempts.includes("unwatch 0xef"));
+  } finally {
+    remote.stop();
+  }
+});
+
+// A stop with nothing queued flushes an empty queue; the logout after it (or a later update) must still go through.
+test("a flush with nothing queued doesn't hold up later updates or the next delivery", async () => {
+  const sent: string[] = [];
+  const remote = createRemoteWatchtower({
+    send: async (update) => { sent.push(update.operation); },
+    retryMs: 5,
+    log: { info: () => undefined, warn: () => undefined },
+  });
+  try {
+    await remote.flush();
+    remote.enqueue({ operation: "revoke", channelId: CHANNEL, revocation: revocationJson(1n) });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(sent, ["revoke"]);
+    remote.enqueue({ operation: "unwatch", channelId: CHANNEL });
+    await remote.deliver(500);
+    assert.deepEqual(sent, ["revoke", "unwatch"]);
+    assert.equal(remote.pending(), 0);
+  } finally {
+    remote.stop();
+  }
+});
+
 test("only the API's own refusals are final; other failures are retried", async () => {
   const attempts: string[] = [];
   let failures = 2;

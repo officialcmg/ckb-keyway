@@ -27,7 +27,7 @@ import {
   type ConnectedManagedKeyWay,
 } from "../browser/connect-managed-keyway";
 import { bootstrapKeyWay, type PublicWallet } from "../browser/bootstrap";
-import { createStoppedNodes } from "../browser/node-migration";
+import { createStoppedNodes, recoverFailedLogout } from "../browser/node-migration";
 import type { ApproveFiberChannelOpen, FiberChannelOpenPreview } from "../browser/remote-ckb-signer";
 import type { ApproveFiberPayment } from "../browser/fiber-payment";
 import type { EmailCodeReason, RequestEmailCode } from "../browser/email-code";
@@ -270,6 +270,8 @@ export function KeyWayProvider({
   const resolvedAppName = appName.trim().slice(0, 64) || "CKB KeyWay";
   const api = new KeyWayApiClient({ appId });
   const connectionRef = useRef<KeyWayConnection | undefined>(undefined);
+  /** The connect() run the current connection belongs to: its callbacks answer only while that run is current. */
+  const connectionRunRef = useRef(0);
   // Stopped nodes may still be sending channel updates to KeyWay's watchtower: a logout delivers them first.
   const [stoppedNodes] = useState(() => createStoppedNodes<KeyWayConnection["keyway"]>());
   const operationRef = useRef<Promise<void>>(Promise.resolve());
@@ -405,6 +407,7 @@ export function KeyWayProvider({
           throw new Error("KeyWay connection was superseded");
         }
         connectionRef.current = next;
+        connectionRunRef.current = run;
         setConnection(next);
         setStatus("connected");
         return next;
@@ -451,12 +454,13 @@ export function KeyWayProvider({
 
   async function logout() {
     const token = authToken;
-    ++runRef.current;
+    const logoutRun = ++runRef.current;
     funding.dismiss();
     setStatus("disconnecting");
     setError(undefined);
     await operationRef.current;
     const current = connectionRef.current;
+    const currentRun = connectionRunRef.current;
     try {
       if (current) await current.keyway.stopForLogout();
       await stoppedNodes.logout();
@@ -474,7 +478,14 @@ export function KeyWayProvider({
       setFiberStartupStage(undefined);
     } catch (cause) {
       const logoutError = cause instanceof Error ? cause : new Error("Could not safely back up and log out");
-      if (current) await connect().catch(() => undefined);
+      // A node whose logout failed before letting go of the device stays the connection (started again on the same
+      // device lease if it can be), so the next logout retries the delivery and the backup before releasing anything.
+      if (current) {
+        await recoverFailedLogout(current.keyway, connect, () => {
+          // The same connection carries on, so its callbacks answer again, unless a connect started meanwhile.
+          if (runRef.current === logoutRun) runRef.current = currentRun;
+        });
+      }
       setError(logoutError);
       setStatus("error");
       callbacksRef.current.onError?.(logoutError);

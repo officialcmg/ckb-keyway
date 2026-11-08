@@ -14,7 +14,8 @@ import type { WatchedChannel } from "./watchtower-store";
  *
  * Updates are coalesced per channel (only the newest revocation matters: it covers every older commitment) and
  * retried until KeyWay has them. `pending()` says whether something is still unsent, so the page can warn before
- * the tab closes.
+ * the tab closes. A channel KeyWay won't register because the account is at its watched-channel limit keeps its
+ * updates; they are tried again on each `flush()`, and `deliver()` fails while the channel is unwatched.
  */
 
 export type RemoteWatchUpdate =
@@ -99,9 +100,12 @@ export type RemoteWatchtower = {
   enqueue(update: RemoteWatchUpdate | undefined): void;
   /** Sends everything queued; resolves when the queue is empty or a send failed (it is then retried later). */
   flush(): Promise<void>;
-  /** Sends everything queued, and fails unless KeyWay has all of it within `timeoutMs` (e.g. before a logout). */
+  /**
+   * Sends everything queued, and fails unless KeyWay has all of it within `timeoutMs` (e.g. before a logout), or while
+   * KeyWay refuses to watch a channel because the account is at its limit.
+   */
   deliver(timeoutMs: number): Promise<void>;
-  /** Channels with an update KeyWay doesn't have yet. */
+  /** Channels with an update KeyWay doesn't have yet, including one it won't watch while the account is at its limit. */
   pending(): number;
   stop(): void;
 };
@@ -126,6 +130,12 @@ export function createRemoteWatchtower(options: {
 
   function enqueue(update: RemoteWatchUpdate | undefined) {
     if (!update || !/^0x[0-9a-f]{64}$/.test(update.channelId) || rejectedChannels.has(update.channelId)) return;
+    if (update.operation === "unwatch" && atLimit.has(update.channelId)) {
+      // Closed before KeyWay could watch it: there is nothing left to register.
+      atLimit.delete(update.channelId);
+      queues.delete(update.channelId);
+      return;
+    }
     const queue = queues.get(update.channelId) ?? {};
     if (update.operation === "revoke") {
       // Only the newest revocation is worth sending.
@@ -142,15 +152,23 @@ export function createRemoteWatchtower(options: {
    * failure (network, 5xx, 429, a database error the API reports as 400) is retried, so a revocation is never dropped
    * because of a passing fault.
    */
-  const PERMANENT = /Token channels are not watched|Invalid watchtower|Unsupported watchtower operation|already watched with other funding keys|already watches \d+ open channels|does not match the channel's asset/i;
+  const PERMANENT = /Token channels are not watched|Invalid watchtower|Unsupported watchtower operation|already watched with other funding keys|does not match the channel's asset/i;
+  /** KeyWay won't register another channel until one of the account's watched channels is closed. */
+  const LIMIT = /already watches \d+ open channels/i;
   const refused = (error: unknown, message: string) => {
     const status = (error as { status?: unknown })?.status;
     return status === 400 && PERMANENT.test(message);
   };
   /** Channels KeyWay won't watch (e.g. token channels): their later updates are dropped too. */
   const rejectedChannels = new Set<string>();
+  /**
+   * CKB channels KeyWay refused to register at the account's watched-channel limit. Nothing watches them while the
+   * tab is closed, so their updates are kept (the newest revocation still replaces older ones) and tried again on a
+   * `flush()` rather than on every retry, and `deliver()` reports them until KeyWay takes them or they close.
+   */
+  const atLimit = new Set<string>();
 
-  async function flushOnce() {
+  async function flushOnce(retryAtLimit: boolean) {
     let failed = false;
     for (const [channelId, queue] of [...queues]) {
       if (stopped) return;
@@ -158,6 +176,7 @@ export function createRemoteWatchtower(options: {
         queues.delete(channelId);
         continue;
       }
+      if (atLimit.has(channelId) && !retryAtLimit) continue;
       // In order: the watchtower needs the channel before its revocations, and the close comes last. A channel
       // whose update fails waits for the retry; the other channels still go now.
       for (const kind of ["watch", "revoke", "unwatch"] as const) {
@@ -178,6 +197,16 @@ export function createRemoteWatchtower(options: {
             } catch {
               // Retried with the update.
             }
+          } else if (kind === "watch" && (error as { status?: unknown })?.status === 400 && LIMIT.test(message)) {
+            if (queue.unwatch) {
+              // Already closed: there is nothing left to register.
+              queues.delete(channelId);
+              atLimit.delete(channelId);
+            } else {
+              if (!atLimit.has(channelId)) log.warn(`[keyway] watchtower: KeyWay is at this account's channel limit and won't watch channel ${channelId} yet`, message);
+              atLimit.add(channelId);
+            }
+            break;
           } else if (refused(error, message) || (notWatched && queue.reregistered && !queue.watch)) {
             log.warn(`[keyway] watchtower: KeyWay refused ${kind} for channel ${channelId}`, message);
             if (kind === "watch") rejectedChannels.add(channelId);
@@ -194,10 +223,14 @@ export function createRemoteWatchtower(options: {
         // A send got through, so a failure after it starts the backoff over: a peer that keeps the updates coming
         // can't push the wait to its longest.
         attempt = 0;
+        if (kind === "watch") atLimit.delete(channelId);
         // A newer update may have replaced this one while it was being sent.
         if (queue[kind] === update) delete queue[kind];
       }
-      if (rejectedChannels.has(channelId) || (!queue.watch && !queue.revoke && !queue.unwatch && queues.get(channelId) === queue)) queues.delete(channelId);
+      if (rejectedChannels.has(channelId) || (!queue.watch && !queue.revoke && !queue.unwatch && queues.get(channelId) === queue)) {
+        queues.delete(channelId);
+        atLimit.delete(channelId);
+      }
     }
     if (failed) scheduleRetry();
   }
@@ -226,26 +259,39 @@ export function createRemoteWatchtower(options: {
       clearTimeout(retry);
       retry = undefined;
     }
-    flushing = (async () => {
-      try {
-        // Each pass sends something, drops a refused update or schedules a retry, so this ends.
-        while (!retry && !stopped && pending() > 0) await flushOnce();
-        if (!retry) attempt = 0;
-      } finally {
-        flushing = undefined;
+    const pass = (async () => {
+      // Each pass sends something, drops a refused update, sets a channel aside at the limit or schedules a retry,
+      // so this ends. A flush starts with one pass that also tries the channels set aside.
+      let retryAtLimit = force;
+      while (!retry && !stopped && (retryAtLimit ? pending() : sendable()) > 0) {
+        await flushOnce(retryAtLimit);
+        retryAtLimit = false;
       }
+      if (!retry) attempt = 0;
     })();
-    return flushing;
+    // Cleared once the pass settles, never before it is set: a pass with nothing to send finishes at once.
+    flushing = pass;
+    const clear = () => { if (flushing === pass) flushing = undefined; };
+    void pass.then(clear, clear);
+    return pass;
   }
   const flush = () => run(true);
 
   async function deliver(timeoutMs: number) {
     await withTimeout(flush(), timeoutMs, "").catch(() => undefined);
-    if (pending() > 0) throw new Error("Fiber channel updates have not reached KeyWay's watchtower yet. Try again in a moment.");
+    if (sendable() > 0) throw new Error("Fiber channel updates have not reached KeyWay's watchtower yet. Try again in a moment.");
+    if (atLimit.size > 0) {
+      throw new Error(`KeyWay's watchtower is already watching as many channels as it can for this account, so ${atLimit.size === 1 ? "a channel on this device isn't" : `${atLimit.size} channels on this device aren't`} watched. Close a channel, then try again.`);
+    }
   }
 
+  const waiting = (queue: ChannelQueue) => Boolean(queue.watch || queue.revoke || queue.unwatch);
+  /** Channels with an update to send now: not those set aside at the limit. */
+  function sendable() {
+    return [...queues].filter(([channelId, queue]) => !atLimit.has(channelId) && waiting(queue)).length;
+  }
   function pending() {
-    return [...queues.values()].filter((queue) => queue.watch || queue.revoke || queue.unwatch).length;
+    return [...queues.values()].filter(waiting).length;
   }
 
   return {

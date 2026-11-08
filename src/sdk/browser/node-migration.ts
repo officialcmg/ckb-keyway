@@ -55,6 +55,27 @@ export function createStoppedNodes<T extends { stopForLogout(): Promise<void> }>
   };
 }
 
+/**
+ * Brings Fiber back after a failed logout; the user is still signed in. A node whose logout failed before it let go
+ * of the device starts again on the same claim, and stays the connection even when it can't start, so the next
+ * logout retries its delivery to KeyWay's watchtower and its backup before anything is released. A node that had
+ * already let go (or a hosted one) is replaced by a fresh connection, as before.
+ */
+export async function recoverFailedLogout(
+  node: { start(): Promise<unknown>; holdsDevice?: () => boolean },
+  reconnect: () => Promise<unknown>,
+  /** Runs before a node that held on to the device starts again (the provider lets its callbacks answer again). */
+  onResume?: () => void,
+): Promise<"resumed" | "reconnected"> {
+  if (node.holdsDevice?.()) {
+    onResume?.();
+    await node.start().catch(() => undefined);
+    return "resumed";
+  }
+  await reconnect().catch(() => undefined);
+  return "reconnected";
+}
+
 export async function restoreBeforeStart(options: {
   loadFiberKey: () => Promise<Uint8Array>;
   loadBackup: () => Promise<ClaimedNodeBackup>;

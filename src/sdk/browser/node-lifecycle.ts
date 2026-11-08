@@ -43,13 +43,22 @@ export function createNodeLifecycle<Info>(parts: NodeLifecycleParts<Info>) {
   let starting: { generation: number; result: Promise<Info>; settled: Promise<void> } | undefined;
   /** The stop (or logout) in progress. A start waits for it, so the two never claim and release at once. */
   let stopping: Promise<void> | undefined;
+  /** Holds the device (claimed, not yet released): true from a claim until the release after the bridge drains. */
+  let claimed = false;
 
   async function run(startedAt: number): Promise<Info> {
     const overtaken = () => startedAt !== generation;
+    // A logout that failed before letting go of the device (KeyWay unreachable) left it claimed: a start then brings
+    // the node back on the same claim, and a failed one keeps it, so the next logout can still back up before it
+    // lets go.
+    const resumed = claimed;
     try {
       // Stopped while waiting, or while claiming: don't bring the node up at all.
       if (overtaken()) throw parts.overtaken();
-      await parts.claim();
+      if (!resumed) {
+        claimed = true;
+        await parts.claim();
+      }
       if (overtaken()) throw parts.overtaken();
       parts.openBridge();
       const info = await parts.node.start();
@@ -63,7 +72,7 @@ export function createNodeLifecycle<Info>(parts: NodeLifecycleParts<Info>) {
       return info;
     } catch (error) {
       // The stop that overtook this start lets go of the device itself, once this start has settled.
-      if (!overtaken()) await releaseGuards();
+      if (!overtaken() && !resumed) await releaseGuards();
       throw error;
     }
   }
@@ -86,6 +95,7 @@ export function createNodeLifecycle<Info>(parts: NodeLifecycleParts<Info>) {
   /** Drains the bridge, then lets go of the device. */
   async function releaseGuards() {
     await parts.closeBridge();
+    claimed = false;
     await parts.release();
   }
 
@@ -122,22 +132,34 @@ export function createNodeLifecycle<Info>(parts: NodeLifecycleParts<Info>) {
 
   /**
    * A logout: stops the timers, waits for an overtaken start to stop its node, then hands `backUp` the steps that
-   * stop the node, drain the bridge and let go of the device, in that order.
+   * stop the node, drain the bridge and let go of the device, in that order. One that fails with the node still up
+   * starts its timers again.
    */
   function logout<T>(backUp: (steps: LogoutSteps) => Promise<T>): Promise<T> {
     return stopping_(async (overtakenStart) => {
       await parts.stopTimers();
       await overtakenStart;
-      return backUp({
-        stopNodeAndDrain: async () => {
-          await parts.node.stop();
-          await parts.closeBridge();
-        },
-        releaseGuards,
-        stop: () => stopNow(Promise.resolve()),
-      });
+      try {
+        return await backUp({
+          stopNodeAndDrain: async () => {
+            await parts.node.stop();
+            await parts.closeBridge();
+          },
+          releaseGuards,
+          stop: () => stopNow(Promise.resolve()),
+        });
+      } catch (error) {
+        if (parts.node.isRunning) parts.afterStart();
+        throw error;
+      }
     });
   }
 
-  return { start, stop, logout };
+  return {
+    start,
+    stop,
+    logout,
+    /** Whether this node still holds the device: after a logout, only when the logout failed before letting go. */
+    holdsDevice: () => claimed,
+  };
 }
