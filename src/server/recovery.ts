@@ -147,23 +147,44 @@ export async function recoverySetup(context: RecoveryContext, body: Record<strin
       ...(policy ? { litEmailBound: true } : {}),
     };
     // Recorded before sending, so a crash in between leaves a pending change the chain settles, not a lost one.
-    const pending: PendingRecoveryChange = { kind: "enable", transactionHash, recovery, ckbAddress: planned.preview.newAddress, sentAt: new Date().toISOString() };
+    const pending: PendingRecoveryChange = { kind: "enable", transactionHash, recovery, ckbAddress: planned.preview.newAddress, sentAt: new Date().toISOString(), transaction: ccc.hexFrom(signed.toBytes()) };
     await saveWallet(context.user, { ...wallet, recoveryPending: pending, updatedAt: new Date().toISOString() }, sql);
     await broadcast(context, client, signed, async () => saveWallet(context.user, { ...wallet, updatedAt: new Date().toISOString() }, sql));
     return { transactionHash, pending: true, recovery, ckbAddress: planned.preview.newAddress, transaction: serializeTransaction(signed) };
   });
 }
 
-/** Sends the transaction; a refused send clears the pending change. */
+/**
+ * Sends the transaction. Only a refusal that means it can never commit clears the pending change. Any other
+ * failure (a timeout, a lost answer) may come after a node took it, so the change stays pending and
+ * `settleRecoveryChange` settles it from the chain.
+ */
 async function broadcast(context: RecoveryContext, client: ccc.Client, signed: ccc.Transaction, clear: () => Promise<void>): Promise<void> {
   // Listed for the account's other clients until the node reports it committed or gone (pending-transactions.ts).
   await recordPendingTransaction(context.user.id, signed);
   try {
-    await (context.broadcast ?? ((transaction) => client.sendTransaction(transaction, "passthrough")))(signed);
+    await send(context, client, signed);
   } catch (error) {
+    if (!neverCommits(error)) return;
     await clear();
     throw error;
   }
+}
+
+async function send(context: Pick<RecoveryContext, "broadcast">, client: ccc.Client, signed: ccc.Transaction): Promise<void> {
+  try {
+    await (context.broadcast ?? ((transaction) => client.sendTransaction(transaction, "passthrough")))(signed);
+  } catch (error) {
+    // Already in a node's pool, as after a resend once the first answer was lost: it was sent.
+    if (error instanceof ccc.ErrorClientDuplicatedTransaction || (error instanceof Error && /PoolRejectedDuplicatedTransaction/.test(error.message))) return;
+    throw error;
+  }
+}
+
+/** A send refusal that holds for any node at any time: the scripts reject it, it is malformed, or its fee is off. */
+function neverCommits(error: unknown): boolean {
+  if (error instanceof ccc.ErrorClientVerification || error instanceof ccc.ErrorClientMaxFeeRateExceeded) return true;
+  return error instanceof ccc.ErrorClientBase && /TransactionFailedToVerify|PoolRejectedMalformedTransaction/.test(`${error.message} ${error.data}`);
 }
 
 /** Which signer a recovery request was issued under. A request finishes under the same one, or not at all. */
@@ -189,10 +210,11 @@ function recoveryStatus(wallet: ReadyWallet): RecoveryStatus {
 
 /**
  * Settles a pending recovery change from the chain: once its transaction is committed the account takes the new
- * settings (and, when turning recovery on, the new address) and the notice email goes out; once it is rejected,
- * or unknown to the node well after it was sent, the change is dropped. Called on every sign-in and status check.
+ * settings (and, when turning recovery on, the new address) and the notice email goes out. One the node reports
+ * rejected, or hasn't known for the grace period, is dropped only once it can no longer commit. Called on every
+ * sign-in and status check.
  */
-export async function settleRecoveryChange(context: Pick<RecoveryContext, "user" | "client" | "appName" | "email" | "sendEmail">, now = new Date()): Promise<ReadyWallet> {
+export async function settleRecoveryChange(context: Pick<RecoveryContext, "user" | "client" | "broadcast" | "appName" | "email" | "sendEmail">, now = new Date()): Promise<ReadyWallet> {
   const client = context.client ?? new ccc.ClientPublicTestnet();
   const settled = await withUserLock(context.user.id, async (sql) => {
     const wallet = await readWallet(context.user, sql);
@@ -200,14 +222,18 @@ export async function settleRecoveryChange(context: Pick<RecoveryContext, "user"
     const pending = wallet.recoveryPending;
     if (!pending) return { wallet };
     const found = await client.getTransaction(pending.transactionHash);
+    const unknown = !found || found.status === "unknown";
+    // A node also reports "rejected" for removals that aren't final (expiry, a full pool), so that is checked the same way.
+    const gone = found?.status === "rejected" || (unknown && now.getTime() - Date.parse(pending.sentAt) > PENDING_GRACE_MS);
+    const stale = gone ? await resendStale(context, client, pending) : undefined;
+    if (stale === "kept") return { wallet };
     const { recoveryPending: _done, ...rest } = wallet;
-    if (found?.status === "committed") {
+    if (found?.status === "committed" || stale === "committed") {
       const updated: ReadyWallet = { ...rest, recovery: pending.recovery, ckbAddress: pending.ckbAddress, updatedAt: now.toISOString() };
       await saveWallet(context.user, updated, sql);
       return { wallet: updated, notice: pending };
     }
-    const unknown = !found || found.status === "unknown";
-    if (found?.status === "rejected" || (unknown && now.getTime() - Date.parse(pending.sentAt) > PENDING_GRACE_MS)) {
+    if (stale === "dropped") {
       const updated: ReadyWallet = { ...rest, updatedAt: now.toISOString() };
       await saveWallet(context.user, updated, sql);
       return { wallet: updated };
@@ -220,6 +246,28 @@ export async function settleRecoveryChange(context: Pick<RecoveryContext, "user"
     await sendRecoveryNotice(context, heading, ckbAddress, recovery.backups ?? [], transactionHash);
   }
   return settled.wallet;
+}
+
+/**
+ * A change the node rejected or hasn't known for the grace period. While all its inputs are unspent the signed
+ * transaction can still commit, so it is sent again (no node may have got it, or one dropped it) and stays pending,
+ * unless the resend is refused in a way that holds for good. Any other refusal can pass, however long it lasts. Once
+ * an input is spent the change is dropped, unless this transaction spent it. A change recorded without its
+ * transaction is dropped, as before.
+ */
+async function resendStale(context: Pick<RecoveryContext, "broadcast">, client: ccc.Client, pending: PendingRecoveryChange): Promise<"kept" | "committed" | "dropped"> {
+  if (!pending.transaction) return "dropped";
+  const transaction = ccc.Transaction.fromBytes(pending.transaction);
+  for (const input of transaction.inputs) {
+    if (await client.getCellLive(input.previousOutput, false)) continue;
+    return (await client.getTransaction(pending.transactionHash))?.status === "committed" ? "committed" : "dropped";
+  }
+  try {
+    await send(context, client, transaction);
+  } catch (error) {
+    if (neverCommits(error)) return "dropped";
+  }
+  return "kept";
 }
 
 /**
@@ -544,7 +592,7 @@ export async function recoveryBackupChange(context: RecoveryContext, body: Recor
     }
     const transactionHash = signed.hash();
     const recovery: KeyWayRecovery = { ...wallet.recovery, adminListOutPoint: { txHash: transactionHash, index: 0 }, backups: plan.backups };
-    const pending: PendingRecoveryChange = { kind: change.change, transactionHash, recovery, ckbAddress: wallet.ckbAddress, sentAt: new Date().toISOString() };
+    const pending: PendingRecoveryChange = { kind: change.change, transactionHash, recovery, ckbAddress: wallet.ckbAddress, sentAt: new Date().toISOString(), transaction: ccc.hexFrom(signed.toBytes()) };
     await saveWallet(context.user, { ...wallet, recoveryPending: pending, updatedAt: new Date().toISOString() }, sql);
     await broadcast(context, client, signed, async () => saveWallet(context.user, { ...wallet, updatedAt: new Date().toISOString() }, sql));
     return { transactionHash, pending: true, recovery, transaction: serializeTransaction(signed) };
