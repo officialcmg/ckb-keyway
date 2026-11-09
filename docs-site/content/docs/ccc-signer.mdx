@@ -58,7 +58,7 @@ Users can require a code from their inbox once what leaves their account within 
 
 It's on by default. Before an account's first send, the signer shows a "Protect your account" dialog with a daily CKB limit of 100,000 CKB, which the user can change before continuing. Continuing emails a code that turns the limit on, then the send goes ahead as usual. Cancelling cancels that send, and the dialog comes back on the next one. The dialog is skipped, and the send goes out as before, for an account with less than about 236 CKB of plain CKB (the cell below needs 174) and for an account with recovery on, which can't hold the cell yet. Pass `approveDailyLimit` to `KeyWayProvider` to replace the dialog: it receives `{ ckb }` (the amount offered, in shannons) and returns the amount to use, or `null` to cancel the send.
 
-Once any amount is set, a token with no amount of its own always needs the code, and so does any cell KeyWay can't read that leaves the account.
+Only assets with an amount of their own are limited. A token without one has no limit and never needs the code, unless the user sets an amount for that token; the same goes for NFTs and any other cell KeyWay can't read an amount from (each cell counts as one, so an amount for its type script hash limits how many cells of it can leave in 24 hours). CKB keeps its daily amount as set.
 
 The amounts are enforced by KeyWay's Lit Action, not only by KeyWay's server. Setting the first amount writes a small send-limit cell to the user's account (about 174 CKB that stays theirs) holding the amounts and a keyed fingerprint of their email, never the address; that first change asks for a code, which binds the address. From then on, every send spends that cell and creates its successor, which the signer does for you in `prepareTransaction` (CCC calls it before computing the fee). The Lit Action counts the last 24 hours from that chain and emails its own 8-digit code once the amount is reached. Opening a Fiber channel always needs the code while an amount is set: Fiber chooses the funding transaction's inputs, so it can't join the chain.
 
@@ -79,7 +79,7 @@ await signer.getDailyConfirmationAmounts(); // { ckb: 50000000000n, "0x45b3…df
 await signer.setDailyConfirmationAmount("ckb", null); // remove the CKB amount
 ```
 
-Changes that make confirmation stricter, such as lowering an amount, apply at once. Changes that loosen it, and turning it on the first time, email the user a code first: raising or removing an amount, or giving a token its own amount while it still needs the code for every transfer. The code prompt is always the SDK's own, even when you replace the approval dialogs. `TransactionPreview.requiresEmailCode` tells your own dialog whether a code will follow.
+Changes that make confirmation stricter, such as lowering an amount, apply at once. Changes that loosen it, and turning it on the first time, email the user a code first: raising or removing an amount. Giving a token its own amount makes it stricter, so it applies at once. An account whose send-limit cell was written before tokens became unlimited by default keeps needing the code for tokens without an amount until its next settings change, which asks for the code once to update the cell. The code prompt is always the SDK's own, even when you replace the approval dialogs. `TransactionPreview.requiresEmailCode` tells your own dialog whether a code will follow.
 
 ## Silent signing
 

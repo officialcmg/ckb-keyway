@@ -6,7 +6,8 @@ import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
-import { chainOnSendLimit, decodeSendLimitSettings, encodeSendLimitSettings, sendLimitInputIndex, setSendLimitRecord, type SendLimitHead, type SendLimitSettings } from "../src/sdk/browser/send-limits.ts";
+import { chainOnSendLimit, decodeSendLimitSettings, encodeSendLimitSettings, sendLimitInputIndex, setSendLimitRecord, settingsFromDailyAmounts, type SendLimitHead, type SendLimitSettings } from "../src/sdk/browser/send-limits.ts";
+import { dailyAllowance } from "../src/server/general-signing.ts";
 import { fakeLit, litCodeIn, type ActionModule } from "./lit-action-fixture.ts";
 
 const CKB = 100_000_000n;
@@ -347,7 +348,7 @@ test("sends older than 24 hours leave the window, judged by their block's time, 
   await assert.rejects(env.run("transaction", again.tx), /changes an earlier send/);
 });
 
-test("tokens count by amount against their own limit, and a token without one always needs the code", async () => {
+test("on a cell with tokens not unlimited (written before they became the default), a token without its own limit always needs the code", async () => {
   const env = await account();
   const asset = xudt.hash();
   const tokens = env.add(ccc.Transaction.from({
@@ -391,6 +392,62 @@ test("tokens count by amount against their own limit, and a token without one al
   chainOnSendLimit(nftSend, { ...headAfter(first), recordEntriesBytes: 0 } as SendLimitHead);
   prepare(env, nftSend, [env.secp]);
   assert.equal((await planned(env, nftSend, headAfter(first))).needsCode, true);
+});
+
+test("with the settings KeyWay writes, a token or NFT without its own amount has no limit, in the Action and on the server alike", async () => {
+  const env = await account();
+  const limited = ccc.Script.from({ ...xudt, args: `0x${"cd".repeat(32)}` });
+  const tokens = env.add(ccc.Transaction.from({
+    inputs: [outside()],
+    outputs: [{ lock: env.secp, type: xudt, capacity: 200n * CKB }, { lock: env.secp, type: nft, capacity: 200n * CKB }, { lock: env.secp, type: limited, capacity: 200n * CKB }],
+    outputsData: [ccc.hexFrom(ccc.numLeToBytes(1_000n, 16)), "0x01", ccc.hexFrom(ccc.numLeToBytes(1_000n, 16))],
+  }));
+  // The daily amounts the server keeps, and the cell it writes for them.
+  const amounts = new Map([["ckb", 1_000n * CKB], [limited.hash(), 500n]]);
+  const settings = settingsFromDailyAmounts(amounts, new Uint8Array(32));
+  assert.equal(settings.tokensUnlimited, true);
+  const { head, change } = await turnOn(env, settings);
+  assert.equal(decodeSendLimitSettings(head.outputData).tokensUnlimited, true);
+  // Each send moves one cell (all of a token's balance, or the NFT) to a stranger, chained on the cell.
+  const send = (cell: Cell, type: ccc.Script) => {
+    const tx = ccc.Transaction.from({
+      inputs: [{ previousOutput: cell.outPoint }, { previousOutput: change.outPoint }],
+      outputs: [{ lock: stranger, type, capacity: cell.cellOutput.capacity }, { lock: env.secp, capacity: change.cellOutput.capacity - FEE }],
+      outputsData: [cell.outputData, "0x"],
+    });
+    chainOnSendLimit(tx, { ...head, recordEntriesBytes: 0 } as SendLimitHead);
+    prepare(env, tx, [env.secp]);
+    return tx;
+  };
+  for (const [name, index, type, needsCode] of [["a token without its own amount", 0, xudt, false], ["an NFT", 1, nft, false], ["a token past its own amount", 2, limited, true]] as const) {
+    const tx = send(cellOf(tokens, index), type);
+    const plan = await planned(env, tx, head);
+    assert.equal(plan.needsCode, needsCode, `Action: ${name}`);
+    // The server's rule for the same asset: no amount of its own means no limit.
+    assert.equal(dailyAllowance(amounts, type.hash()) !== "unlimited", needsCode, `server: ${name}`);
+    if (!needsCode) await env.run("transaction", tx);
+    else await assert.rejects(env.run("transaction", tx), /eight-digit code/);
+  }
+});
+
+test("a cell written before tokens became unlimited picks it up at its next settings change, which needs the code", async () => {
+  const env = await account();
+  const { head } = await turnOn(env, { ckb: 100n * CKB, tokensUnlimited: false });
+  const before = decodeSendLimitSettings(head.outputData);
+  // Lowering the CKB amount, written as the server now writes it: tokens turn unlimited too, which loosens the cell.
+  const next = settingsFromDailyAmounts(new Map([["ckb", 10n * CKB]]), before.fingerprint);
+  const tx = ccc.Transaction.from({
+    inputs: [ccc.CellInput.from({ previousOutput: head.outPoint })],
+    outputs: [{ ...head.cellOutput, capacity: head.cellOutput.capacity - FEE }],
+    outputsData: [encodeSendLimitSettings(next)],
+  });
+  setSendLimitRecord(tx, 0, new Uint8Array(0));
+  prepare(env, tx, [env.secp]);
+  assert.equal((await planned(env, tx, head)).needsCode, true);
+  await assert.rejects(env.run("transaction", tx), /eight-digit code/);
+  const { emailCode } = await codeFor(env, tx);
+  assert.match(env.emails[env.emails.length - 1].text, /Other tokens: no limit/);
+  await env.run("transaction", tx, { email: EMAIL, emailCode });
 });
 
 test("an account without a send-limit cell signs as before, and accounts without limits never pay for the check twice", async () => {

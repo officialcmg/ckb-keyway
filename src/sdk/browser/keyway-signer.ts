@@ -183,8 +183,8 @@ export class KeyWaySigner extends KeyWayAccountSigner {
 
   /**
    * Requires an emailed code once this much of an asset leaves the account within 24 hours (CKB sends, token
-   * transfers and Fiber payments together); null removes the amount. Once any amount is set, a token with no
-   * amount of its own always needs the code. Strengthening applies at once; weakening asks for an emailed code.
+   * transfers and Fiber payments together); null removes the amount. An asset without an amount of its own has no
+   * limit. Strengthening (lowering or adding an amount) applies at once; weakening asks for an emailed code.
    */
   async setDailyConfirmationAmount(asset: "ckb" | `0x${string}`, amount: bigint | null): Promise<void> {
     const value = amount === null ? null : ccc.numFrom(amount).toString();
