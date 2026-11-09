@@ -1,6 +1,6 @@
 {
   "name": "ckb-keyway",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "description": "Email-authenticated CKB wallet and Fiber payment infrastructure",
   "private": true,
   "license": "MIT",
