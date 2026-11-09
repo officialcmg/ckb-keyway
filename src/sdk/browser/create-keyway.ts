@@ -38,6 +38,7 @@ import { openWatchtowerStore } from "./watchtower-store";
 import { settleChannel } from "./watchtower-settle";
 import { createRemoteWatchtower, remoteWatchUpdate, updatesForStoredChannel } from "./watchtower-remote";
 import { createNodeLifecycle } from "./node-lifecycle";
+import { refuseFundingBeyondRequest, type FundingRequest } from "./funding-limit";
 import { createFeeReserve, FEE_RESERVE, needsFeeReserve } from "./fee-reserve";
 import type { RequestEmailCode } from "./email-code";
 
@@ -148,9 +149,12 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   let activationProgress: ChannelOpenProgress | undefined;
   let openingPeer: string | undefined;
   let openingWithReserve = false;
+  let openingRequest: FundingRequest | undefined;
   let preparedPeers: Promise<ChannelPeer[]> | undefined;
   let preparedFundingAmount: bigint | undefined;
   const fundingSigner = new RemoteCkbSigner(options.authToken, options.ckbPublicKey, async (preview) => {
+    // The account's share may not exceed what the app asked Fiber for, whatever the peer did to the transaction.
+    refuseFundingBeyondRequest(preview, openingRequest);
     activationProgress?.("confirming");
     const approved = await options.approveFiberChannelOpen({
       ...preview,
@@ -437,11 +441,13 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     restoreRequired = false;
   }
 
+  /** Opens a channel funded from the account, recording the request so its funding preview can be checked against it. */
   async function openFundedChannel(params: KeyWayFundingParams) {
     if (!node.isRunning) throw new Error("Start the Fiber node before opening a channel");
     openingPeer = params.pubkey;
     openingWithReserve = await feeReserve.needed();
     const funding = await resolveExternalFunding(undefined);
+    openingRequest = { fundingAmount: BigInt(params.funding_amount), udtTypeScript: params.funding_udt_type_script, shutdownScript: funding.shutdownScript };
     const result = await openChannelWithExternalFundingFlow({
       node,
       params: {
