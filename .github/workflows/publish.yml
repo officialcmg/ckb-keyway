@@ -1,5 +1,10 @@
 name: Publish SDK
 
+# The workflow file name (publish.yml) is what npm trusted publishing is bound to; keep it.
+# verify runs the dependencies' code (npm ci, tests, builds) without any npm identity.
+# publish gets the npm OIDC token only after the founder approves the npm-publish environment,
+# and it runs no install or package scripts before publishing the package verify built.
+
 on:
   push:
     tags:
@@ -7,11 +12,12 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
-  publish:
+  verify:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     services:
       postgres:
         image: postgres:14
@@ -29,17 +35,45 @@ jobs:
       KEYWAY_AUTH_TEST_DATABASE_URL: postgres://postgres:keyway-ci@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
-          registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
+      - name: Verify tag matches package version
+        run: test "$GITHUB_REF_NAME" = "v$(node -p "require('./package.json').version")"
       - run: npm ci
       - run: npm test
       - run: npm run build:package
       - name: Typecheck demo against the SDK being released
         run: npm install ./dist/package --no-save --package-lock=false --ignore-scripts
       - run: npm run typecheck
-      - name: Verify tag matches package version
-        run: test "$GITHUB_REF_NAME" = "v$(node -p "require('./package.json').version")"
-      - run: npm publish ./dist/package
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sdk-package
+          path: dist/package
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: sdk-package
+          path: package
+      - name: Verify tag matches the built package's version
+        run: test "$GITHUB_REF_NAME" = "v$(node -p "require('./package/package.json').version")"
+      - name: Publish
+        run: npm publish ./package --ignore-scripts
