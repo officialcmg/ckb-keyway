@@ -35,7 +35,6 @@ import { runIdempotentMutation } from "./idempotency.ts";
 import { recordSigningEvent } from "./security-alerts.ts";
 import { fundingSigning, type FundingContext } from "./funding-signing.ts";
 import { messageSigning, sendLimitOffer, signingSettings, transactionSigning, type SigningContext } from "./general-signing.ts";
-import { litPolicyEnabled } from "./lit-policy.ts";
 import { listPendingTransactions, nodeStatus } from "./pending-transactions.ts";
 import { sendLimitHead } from "./send-limits.ts";
 import { recoveryBackupChange, recoverySetup, settleRecoveryChange } from "./recovery.ts";
@@ -352,7 +351,7 @@ async function pendingTransactionsRequest(request: Request): Promise<Response> {
   if (!limit.allowed) throw new Error(`Too many requests. Try again in ${limit.retryAfter ?? 60} seconds`);
   const client = new ccc.ClientPublicTestnet();
   const pending = await listPendingTransactions(user.id, nodeStatus(client));
-  const sendLimit = litPolicyEnabled() ? await sendLimitHead(client, wallet, pending) : undefined;
+  const sendLimit = await sendLimitHead(client, wallet, pending);
   // Send limits are on by default: an account that could have them is offered them on its next send.
   const offer = await sendLimitOffer(user, wallet, sendLimit, client).catch(() => undefined);
   return Response.json({

@@ -3,22 +3,16 @@ import { omnilockOwnerWitnessLock, witnessLockLength } from "../sdk/browser/acco
 import { joyIdLock, joyIdPubkeyHash, normalizeEvmAddress, type RecoveryBackup } from "../sdk/browser/recovery-backups.ts";
 import type { SigningGroup } from "./funding-transaction.ts";
 import { loadLitAction } from "./lit-actions.ts";
-import { LIT_ACTION_CIDS, litSignerMode } from "./lit-config.ts";
+import { LIT_ACTION_CIDS } from "./lit-config.ts";
 import { runLitAction, type LitRuntimeConfig, type LitSignature } from "./lit.ts";
 import { recoverPkpPublicKey } from "./pkp-identity.ts";
 
 /**
- * KeyWay's policy signer (`lit-actions/sign-ckb-transaction.js`). Unlike `sign-ckb-digest`, it never signs a
- * digest it is handed: it fetches the transaction's inputs from the chain, computes each sighash itself, enforces
+ * KeyWay's signer (`lit-actions/sign-ckb-transaction.js`). It never signs a digest it is handed: it fetches the transaction's inputs from the chain, computes each sighash itself, enforces
  * the recovery list's rules and checks the code it emailed for every list change. The pinned CID below is the
  * hash of that source (tests/lit-action-packaging.test.ts); the founder registers it in the Lit group.
  */
 export const POLICY_ACTION_CID = LIT_ACTION_CIDS["sign-ckb-transaction"];
-
-/** Whether the policy Action signs (`LIT_SIGNER` in lit-config.ts); otherwise the digest signer does. */
-export function litPolicyEnabled(): boolean {
-  return litSignerMode() === "policy";
-}
 
 /**
  * The size of the email binding a transaction turning recovery on carries in witness 0's input_type: "KWEB", a

@@ -6,16 +6,12 @@ import type { User } from "./auth-user.ts";
 import type { TransactionSql } from "postgres";
 import { database, type DatabaseSql } from "./database.ts";
 import { createConfirmationEmailTemplate } from "./email-template.ts";
-import { formatCkbSignature, serializeTransaction, signAccountGroups, signingGroups, type SigningGroup } from "./funding-transaction.ts";
+import { serializeTransaction, signAccountGroups, signingGroups, type SigningGroup } from "./funding-transaction.ts";
 import { accountLocks, secp256k1Lock } from "../sdk/browser/account-lock.ts";
 import { DEFAULT_DAILY_LIMIT_SHANNONS, SEND_LIMIT_OFFER_MINIMUM, settingsFromDailyAmounts, type SendLimitHead } from "../sdk/browser/send-limits.ts";
-import { loadLitAction } from "./lit-actions.ts";
-import { LIT_ACTION_CIDS } from "./lit-config.ts";
-import { signCkbDigest } from "./lit.ts";
-import { litPolicyEnabled, parseLitEmailCode, policySendCode, policySignMessage, policySignTransaction, type LitEmailCode } from "./lit-policy.ts";
+import { parseLitEmailCode, policySendCode, policySignMessage, policySignTransaction, type LitEmailCode } from "./lit-policy.ts";
 import { listPendingTransactions, nodeStatus, recordPendingTransaction } from "./pending-transactions.ts";
 import { applySendLimitRecord, buildSendLimitChange, buildSendLimitGenesis, LIT_CODE_KINDS, planSendLimits, sendLimitHead, withFingerprint } from "./send-limits.ts";
-import { recoverPkpPublicKey } from "./pkp-identity.ts";
 import { formatCkb, previewGeneralTransaction, previewSummaryLines, type ValidatedTransaction } from "./transaction-policy.ts";
 import type { ReadyWallet } from "./user-wallet.ts";
 
@@ -50,7 +46,7 @@ export async function transactionSigning(context: SigningContext, body: Record<s
   const validated = await preview(context.wallet, body.transaction);
   const digest = hashText(JSON.stringify(serializeTransaction(validated.transaction)));
   // With the policy Action signing, Lit enforces the send limits itself; the server plans with the same rules.
-  const policy = !context.signDigest && litPolicyEnabled();
+  const policy = !context.signDigest;
 
   if (body.operation === "preview") {
     await limit(context, "sign", { max: 10, window: 60 });
@@ -117,7 +113,6 @@ export async function transactionSigning(context: SigningContext, body: Record<s
 
 /** Whether Lit will ask for its code before signing this channel funding (the account has send limits on). */
 export async function fundingNeedsLitCode(wallet: ReadyWallet, transaction: ccc.Transaction): Promise<boolean> {
-  if (!litPolicyEnabled()) return false;
   const plan = await planSendLimits(wallet, transaction);
   return plan.needsCode && LIT_CODE_KINDS.includes(plan.limits);
 }
@@ -286,7 +281,7 @@ export async function messageSigning(context: SigningContext, body: Record<strin
   await loadRequest(context.user, "message", nonce, digest);
   await consumeRequest(context.user, "message", nonce);
   await context.recordSigning(context.user.id);
-  const signature = !context.signDigest && litPolicyEnabled()
+  const signature = !context.signDigest
     ? await policySignMessage(context.wallet, message)
     : await sign(context, ccc.messageHashCkbSecp256k1(message));
   return { signature, identity: context.wallet.litPublicKey };
@@ -307,12 +302,12 @@ export async function signingSettings(context: SigningContext, body: Record<stri
   const change = { asset: parseAsset(body.asset), amount: parseThreshold(body.amount) };
   const next = new Map(current);
   if (change.amount === null) next.delete(change.asset); else next.set(change.asset, change.amount);
-  if (!context.signDigest && litPolicyEnabled()) {
+  if (!context.signDigest) {
     const onChain = await sendLimitSettings(context, body, current, next, change);
     if (onChain) return { ...view(onChain.amounts), enforcedByLit: true, ...onChain.response };
   }
-  // Below: the amounts live on the server only (no policy signer, or the account can't make the cell yet).
-  const serverOnly = !context.signDigest && litPolicyEnabled() ? { enforcedByLit: false } : {};
+  // Below: the amounts live on the server only (the account can't make the cell yet, or a test signs locally).
+  const serverOnly = !context.signDigest ? { enforcedByLit: false } : {};
   if (!weakens(current, next)) {
     await writeDailyAmount(context.user, change.asset, change.amount);
     return { ...view(next), ...serverOnly };
@@ -452,8 +447,8 @@ async function signTransaction(context: SigningContext, validated: ValidatedTran
 }
 
 /**
- * Signs the account's lock groups in a transaction: with the policy Action (the whole transaction, which it
- * checks itself) once LIT_SIGNER is "policy", otherwise digest by digest. A test's `signDigest` always wins.
+ * Signs the account's lock groups in a transaction with the policy Action (the whole transaction, which it checks
+ * itself). Only a test passes `signDigest`, which signs locally digest by digest instead.
  */
 export async function signGroups(
   context: Pick<SigningContext, "wallet" | "signDigest">,
@@ -462,24 +457,17 @@ export async function signGroups(
   client: ccc.Client,
   options: { enableTransactionHash?: string; email?: string; emailCode?: LitEmailCode; previousListRecord?: ccc.Hex; backups?: RecoveryBackup[]; missingGroup?: string } = {},
 ): Promise<ccc.Transaction> {
-  if (!context.signDigest && litPolicyEnabled()) {
+  if (!context.signDigest) {
     if (groups.length === 0) throw new Error(options.missingGroup ?? "Transaction has no KeyWay signing group");
     return policySignTransaction(transaction, groups, client, context.wallet, options);
   }
   return signAccountGroups(transaction, groups, client, (digest) => sign(context, digest), options.missingGroup);
 }
 
-/** Signs a digest the backend computed itself, then checks the recovered key before releasing it. */
+/** Signs a digest with a test's local signer. Production never signs a digest: only the policy Action signs. */
 export async function sign(context: Pick<SigningContext, "wallet" | "signDigest">, digest: ccc.Hex): Promise<ccc.Hex> {
-  if (context.signDigest) return context.signDigest(digest, context.wallet);
-  const signature = await signCkbDigest(digest, context.wallet.litPkpId, {
-    apiKey: requiredEnv("LIT_USAGE_API_KEY"),
-    actionCid: LIT_ACTION_CIDS["sign-ckb-digest"],
-    actionCode: await loadLitAction("sign-ckb-digest"),
-  });
-  const recovered = ccc.hexFrom(recoverPkpPublicKey(ccc.bytesFrom(digest), signature));
-  if (recovered.toLowerCase() !== context.wallet.litPublicKey.toLowerCase()) throw new Error("Lit signature does not match the KeyWay wallet");
-  return formatCkbSignature(signature);
+  if (!context.signDigest) throw new Error("KeyWay signs only through the policy Action");
+  return context.signDigest(digest, context.wallet);
 }
 
 export async function limit(context: Pick<SigningContext, "user" | "rateLimit">, name: string, rule: { max: number; window: number }) {
@@ -621,7 +609,7 @@ export async function sendLimitOffer(
   head: SendLimitHead | undefined,
   client: ccc.Client,
 ): Promise<{ ckb: bigint } | undefined> {
-  if (!litPolicyEnabled() || head || wallet.recovery) return undefined;
+  if (head || wallet.recovery) return undefined;
   const secp = await secp256k1Lock(client, wallet.litPublicKey);
   const plain = await client.getCellsCapacity({ script: secp, scriptType: "lock", scriptSearchMode: "exact", filter: { scriptLenRange: [0, 1], outputDataLenRange: [0, 1] } });
   if (plain < SEND_LIMIT_OFFER_MINIMUM) return undefined;
@@ -669,10 +657,4 @@ function codeHash(nonce: string, code: string): string {
 
 export function hashText(value: string): string {
   return Buffer.from(sha256(new TextEncoder().encode(value))).toString("hex");
-}
-
-function requiredEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) throw new Error(`Missing server configuration: ${name}`);
-  return value;
 }

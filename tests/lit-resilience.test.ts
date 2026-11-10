@@ -2,10 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { publicErrorMessage } from "../src/server/http.ts";
 import { litActionCid } from "../src/server/lit-cid.ts";
-import { LitTransientError, signCkbDigest, withLitRetry } from "../src/server/lit.ts";
+import { LitTransientError, runLitAction, withLitRetry } from "../src/server/lit.ts";
 
 const pkpId = `0x${"11".repeat(20)}`;
-const digest = `0x${"ab".repeat(32)}`;
 const code = "(async () => { Lit.Actions.setResponse({ response: '{}' }); })();";
 const config = { apiKey: "test", actionCid: litActionCid(code), actionCode: code };
 const signature = { r: `0x${"11".repeat(32)}`, s: `0x${"22".repeat(32)}`, recoveryParam: 1 };
@@ -24,7 +23,7 @@ test("computes the IPFS CIDv0 Lit uses for Action source", () => {
 test("refuses to send Action code that does not match its pinned CID", async () => {
   let called = false;
   await withFetch(async () => { called = true; return Response.json({}); }, async () => {
-    await assert.rejects(() => signCkbDigest(digest, pkpId, { ...config, actionCid: "QmNotThisCode" }), /pinned CID/);
+    await assert.rejects(() => runLitAction({ ...config, actionCid: "QmNotThisCode" }, { pkpId }), /pinned CID/);
   });
   assert.equal(called, false);
 });
@@ -33,7 +32,7 @@ test("sends Lit's privacy-mode header with every Action call", async () => {
   await withFetch(async (_input, init) => {
     assert.equal(new Headers(init?.headers).get("X-Privacy-Mode"), "true");
     return Response.json({ has_error: false, logs: "", response: signature });
-  }, () => signCkbDigest(digest, pkpId, config));
+  }, () => runLitAction(config, { pkpId }));
 });
 
 test("waits for a new wallet's group grant to propagate, then signs", async () => {
@@ -42,7 +41,7 @@ test("waits for a new wallet's group grant to propagate, then signs", async () =
     calls += 1;
     if (calls < 3) return new Response(JSON.stringify({ message: notGranted }), { status: 500 });
     return Response.json({ has_error: false, logs: "", response: signature });
-  }, () => signCkbDigest(digest, pkpId, config));
+  }, () => runLitAction(config, { pkpId }) as Promise<typeof signature>);
   assert.equal(calls, 3);
   assert.equal(result.recoveryParam, 1);
 });
@@ -50,7 +49,7 @@ test("waits for a new wallet's group grant to propagate, then signs", async () =
 test("does not retry a request Lit rejects outright", async () => {
   let calls = 0;
   await withFetch(async () => { calls += 1; return new Response(JSON.stringify({ message: "Invalid js_params" }), { status: 400 }); }, async () => {
-    await assert.rejects(() => signCkbDigest(digest, pkpId, config), /Invalid js_params/);
+    await assert.rejects(() => runLitAction(config, { pkpId }), /Invalid js_params/);
   });
   assert.equal(calls, 1);
 });
