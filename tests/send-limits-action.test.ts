@@ -8,7 +8,11 @@ import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { chainOnSendLimit, decodeSendLimitSettings, encodeSendLimitSettings, sendLimitInputIndex, setSendLimitRecord, settingsFromDailyAmounts, type SendLimitHead, type SendLimitSettings } from "../src/sdk/browser/send-limits.ts";
 import { dailyAllowance } from "../src/server/general-signing.ts";
-import { fakeLit, litCodeIn, type ActionModule } from "./lit-action-fixture.ts";
+import { loadLitAction } from "../src/server/lit-actions.ts";
+import { litBackupIds, setEmailBinding } from "../src/server/lit-policy.ts";
+import { planRecovery } from "../src/server/recovery.ts";
+import type { ReadyWallet } from "../src/server/user-wallet.ts";
+import { fakeEthers, fakeLit, litCodeIn, type ActionModule } from "./lit-action-fixture.ts";
 
 const CKB = 100_000_000n;
 const HOUR = 60 * 60_000;
@@ -608,4 +612,83 @@ test("the code email names where the funds go, so a swapped recipient shows", as
   const text = env.emails[env.emails.length - 1].text;
   assert.ok(text.includes(`To ${address(x)}: 100 CKB`), text);
   assert.ok(!text.includes("To a Fiber channel"));
+});
+
+/** A testnet client that answers from the account's committed transactions and never reaches the network. */
+async function offlineClient(env: Account): Promise<ccc.Client> {
+  const transactions = [...env.known.values()].filter(({ status }) => status === "committed").map(({ tx }) => tx);
+  const spent = new Set(transactions.flatMap((tx) => tx.inputs.map((input) => `${input.previousOutput.txHash}:${Number(input.previousOutput.index)}`)));
+  const client = new ccc.ClientPublicTestnet({ url: "https://testnet.ckb.dev/" });
+  const cells = transactions.flatMap((tx) => tx.outputs.map((cellOutput, index) => ccc.Cell.from({ outPoint: { txHash: tx.hash(), index }, cellOutput, outputData: tx.outputsData[index] })));
+  await client.cache.recordCells(cells);
+  const live = cells.filter((cell) => !spent.has(`${cell.outPoint.txHash}:${Number(cell.outPoint.index)}`));
+  Object.assign(client, {
+    findCells: async function* () {},
+    findCellsByLock: async function* (lock: ccc.ScriptLike) { for (const cell of live) if (cell.cellOutput.lock.eq(ccc.Script.from(lock))) yield cell; },
+  });
+  return client;
+}
+
+/**
+ * An account with limits on (100 CKB a day, bound to EMAIL) and recovery off, and the transaction turning recovery
+ * on that a compromised server would plan: every plain cell to an address its own backup can spend.
+ */
+async function limitedEnable(before: (env: Account) => void = () => {}) {
+  const env = await account();
+  await turnOn(env, { ckb: 100n * CKB });
+  before(env);
+  const client = await offlineClient(env);
+  const wallet = { version: 1, status: "ready", litPkpId: env.pkpId, litPublicKey: env.publicKey, ckbAddress: "ckt1test", encryptedFiberKey: "x", primaryDeviceIdHash: "a".repeat(64), hasOpenedChannel: false, createdAt: "2026-11-10T00:00:00.000Z", updatedAt: "2026-11-10T00:00:00.000Z" } as ReadyWallet;
+  const backup = { kind: "evm" as const, address: ccc.hexFrom(keccak_256(Uint8Array.of(0xbb)).slice(12)) };
+  const plan = await planRecovery(client, wallet, [backup], { emailBinding: true });
+  const backups = await litBackupIds(client, [backup]);
+  const binding = async (email: string) => ccc.hexFrom(ccc.bytesConcat("0x4b57454202", await env.action.emailFingerprint(env.pkpId, email)));
+  return { env, tx: plan.transaction, backups, binding, moved: plan.transaction.outputs.reduce((sum, output) => sum + output.capacity, 0n) };
+}
+
+test("with send limits on, turning recovery on needs the code at the limits' bound address, not one the server names", async () => {
+  const attacker = "attacker@example.com";
+  const { env, tx, backups, binding, moved } = await limitedEnable();
+  assert.ok(moved > 1_000n * CKB, "the enable moves far more than the daily amount");
+
+  // send-code to the server's own address: refused, nothing emailed, no binding handed back.
+  const sentBefore = env.emails.length;
+  await assert.rejects(env.run("send-code", tx, { email: attacker, emailApiKey: "re_test_sending_key", appName: "Demo", backups }), /bound to this account's send limits/);
+  assert.equal(env.emails.length, sentBefore);
+
+  // Transaction mode bound to the server's address, holding a valid code for it: refused for the address.
+  const action = new Function("Lit", "ethers", "fetch", `${await loadLitAction("sign-ckb-transaction")}\nreturn { codeFor };`)(env.Lit, fakeEthers, env.fetch) as { codeFor: (pkpId: string, txHash: Uint8Array, email: string, ticket: string) => Promise<string> };
+  const forged = tx.clone();
+  setEmailBinding(forged, await binding(attacker));
+  const { transactionHash } = await env.run("plan", forged, { backups }) as { transactionHash: ccc.Hex };
+  const ticket = `v1.${Date.now() + 5 * 60_000}.${"ab".repeat(16)}`;
+  const code = await action.codeFor(env.pkpId, ccc.bytesFrom(transactionHash), attacker, ticket);
+  await assert.rejects(env.run("transaction", forged, { email: attacker, backups, emailCode: { code, ticket } }), /bound to this account's send limits/);
+  // Nor can the bound address sign a binding to another one.
+  await assert.rejects(env.run("transaction", forged, { email: EMAIL, backups, emailCode: { code, ticket } }), /bound to this account's recovery/);
+
+  // The bound address works in both modes, and the code goes only there.
+  const sent = await env.run("send-code", tx, { email: EMAIL, emailApiKey: "re_test_sending_key", appName: "Demo", backups }) as { ticket: string; binding: ccc.Hex; sentTo: string };
+  assert.equal(sent.sentTo, EMAIL);
+  assert.deepEqual(env.emails.slice(sentBefore).map((email) => email.to), [[EMAIL]]);
+  setEmailBinding(tx, sent.binding);
+  const signed = await env.run("transaction", tx, { email: EMAIL, backups, emailCode: { code: litCodeIn(env.emails[env.emails.length - 1]), ticket: sent.ticket } }) as { operation: string; signatures: unknown[] };
+  assert.equal(signed.operation, "enable");
+  assert.ok(signed.signatures.length > 0);
+});
+
+test("turning recovery on is refused while the account shows two send-limit cells", async () => {
+  const { env, tx, backups } = await limitedEnable((env) => {
+    // A second send-limit cell this key made (spending its own cell), as a conflicting genesis would leave.
+    const input = ccc.CellInput.from({ previousOutput: cellOf(env.funding, 3).outPoint });
+    const settings: SendLimitSettings = { fingerprint: `0x${"11".repeat(32)}`, tokensUnlimited: false, tokens: new Map(), ckb: 100n * CKB };
+    env.add(ccc.Transaction.from({
+      inputs: [input],
+      outputs: [{ lock: env.secp, type: typeIdScript(ccc.hashTypeId(input, 0)), capacity: 174n * CKB }, { lock: env.secp, capacity: 226n * CKB - FEE }],
+      outputsData: [encodeSendLimitSettings(settings), "0x"],
+    }));
+  });
+  const sentBefore = env.emails.length;
+  await assert.rejects(env.run("send-code", tx, { email: EMAIL, emailApiKey: "re_test_sending_key", appName: "Demo", backups }), /more than one send-limit cell/);
+  assert.equal(env.emails.length, sentBefore);
 });

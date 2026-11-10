@@ -762,14 +762,18 @@ async function emailFingerprint(pkpId, email) {
   return new Uint8Array(await crypto.subtle.sign("HMAC", key, utf8(`keyway-email-binding/v2|${pkpId.toLowerCase()}|${email.toLowerCase()}`)));
 }
 
+/** The address the server passed, if its fingerprint is `bound` (compared in constant time). */
+async function emailMatching(pkpId, bound, email, refusal) {
+  const given = await emailFingerprint(pkpId, checkEmail(email));
+  let diff = bound.length ^ given.length;
+  for (let i = 0; i < given.length; i++) diff |= bound[i] ^ given[i];
+  if (diff !== 0) throw new Error(refusal);
+  return email;
+}
+
 /** The address the server passed, if its fingerprint is the one bound on chain. */
 async function emailMatchingBinding(pkpId, binding, email) {
-  const bound = decodeBinding(binding);
-  const given = await emailFingerprint(pkpId, checkEmail(email));
-  let diff = 0;
-  for (let i = 0; i < 32; i++) diff |= bound[i] ^ given[i];
-  if (diff !== 0) throw new Error("This isn't the email address bound to this account's recovery");
-  return email;
+  return emailMatching(pkpId, decodeBinding(binding), email, "This isn't the email address bound to this account's recovery");
 }
 
 /**
@@ -899,8 +903,15 @@ async function codeTarget(pkpId, analysis, params) {
   const { op } = analysis;
   if (op.kind === "plain") return undefined;
   if (op.kind === "enable") {
+    // Turning recovery on moves everything to an address the backups can spend. On an account with send limits on,
+    // that is a send past them, so its code may go only to the address the limits are bound to; otherwise whoever
+    // runs this could name their own backup and their own inbox. Accounts without limits bind their address here.
+    const live = await liveSettings(analysis.account);
+    if (live.length > 1) throw new Error("This account has more than one send-limit cell");
+    if (live.length === 1) await emailMatching(pkpId, parseSettings(live[0].data).fingerprint, params.email, "This isn't the email address bound to this account's send limits");
     if (params.mode === "send-code") return checkEmail(params.email);
     if (!op.binding) throw new Error("Turning recovery on must bind the account's email");
+    // With limits on, the binding then matches them too, as params.email matches both.
     return emailMatchingBinding(pkpId, op.binding, params.email);
   }
   // A list made before this Action existed has no binding; it keeps the server's checks and the shape rules above.
@@ -1446,14 +1457,9 @@ function limitLines(limits, analysis) {
 
 /** The email a send-limit code goes to: one whose fingerprint is bound in the send-limit cell (or, at genesis, the one being bound). */
 async function limitEmail(pkpId, limits, params) {
-  const email = checkEmail(params.email);
-  const given = await emailFingerprint(pkpId, email);
+  if (limits.kind === "genesis" && params.mode === "send-code") return checkEmail(params.email);
   const bound = limits.kind === "genesis" ? limits.next.fingerprint : limits.settings.fingerprint;
-  if (limits.kind === "genesis" && params.mode === "send-code") return email;
-  let diff = 0;
-  for (let i = 0; i < 32; i++) diff |= bound[i] ^ given[i];
-  if (diff !== 0) throw new Error("This isn't the email address bound to this account's send limits");
-  return email;
+  return emailMatching(pkpId, bound, params.email, "This isn't the email address bound to this account's send limits");
 }
 
 // ---------- codes ----------

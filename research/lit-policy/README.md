@@ -266,8 +266,10 @@ Plainly, after the switch:
 - **Recovery accounts from before the switch.** No binding, so a compromised server can still add one backup per
   transaction to them, without a code. The shape and first-wins rules still apply. To get the binding, these
   users have to turn recovery off and on again; there is no in-place migration yet.
-- **Accounts with recovery off.** A compromised server can turn recovery on for them with its own backup and its
-  own email. That is no worse than what it can already do with a plain send, but it is not prevented.
+- **Accounts with recovery off and no send limits.** A compromised server can turn recovery on for them with its
+  own backup and its own email. That is no worse than what it can already do with a plain send, but it is not
+  prevented. On an account with send limits on, the code for turning recovery on goes only to the address the
+  limits are bound to (`research/send-limits/README.md`), so the server can't pick the email there.
 - **Lit itself.** The TEE network, Chipotle's group check, and the founder's Lit account key, which can register
   any CID.
 - **`LIT_PROVISIONING_API_KEY` on the server.** If it can add Actions to group 1, the server can register an

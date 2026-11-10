@@ -7,7 +7,7 @@
  */
 export const LIT_ACTION_CIDS = {
   "sign-ckb-digest": "QmXJAW3CKLUuKa9RjEZKCMzEmLYcT7z4tmrzxZvGGfm6Q3",
-  "sign-ckb-transaction": "QmaZABPThjFpeBWpRSw3TXosHG4yVsfbHwsF9RGruGuS9b",
+  "sign-ckb-transaction": "QmZ2sYky6JNvaPjREfhZza4zQYfKVSCQqbVsL4ej2CpRzj",
   "generate-fiber-key": "QmNZDRCHGW1Y8hAy9zVnWay1ob1ybsR62AjNBPr1ecLFQL",
   "wrap-fiber-key": "QmP52L3EYKPAagzsjDQJEXZSMH3X9rZ9NsGdMR4fxNXQ1B",
 } as const;

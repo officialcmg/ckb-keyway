@@ -211,6 +211,9 @@ counted send, and fund channels only from there.
   requests, balance splitting, delayed broadcast, hiding an ancestor, leaving the send-limit cell out, using a
   forged send-limit cell, and channel funding all fail (tests in `tests/send-limits-action.test.ts`).
 - The server choosing the email the code goes to, or raising the amount, on an account with a send-limit cell.
+- Turning recovery on, which moves everything to an address the new backups can spend, with a backup and an email
+  the server picks: on an account with a send-limit cell, the code for it goes only to the cell's bound address,
+  and the enable is refused while more than one send-limit cell shows.
 
 ## 5. What stays trusted
 
@@ -246,7 +249,9 @@ counted send, and fund channels only from there.
 - **CKB RPC:** transaction status, block timestamps and which cells are live, as before. A lying node, not the
   server, could make an old ancestor look older than it is.
 - **Recovery backups** can create a send-limit cell's genesis only by signing for the key's secp256k1 address,
-  which they can't. They can still move everything at the Omnilock address, by design.
+  which they can't. They can still move everything at the Omnilock address, by design. Which backups those are is
+  approved with the code to the bound address on accounts with limits on, and trusted on first use on accounts
+  without them.
 - **The Lit clock**, the TEE network, the founder's Lit account, and everything else listed in the lit-policy
   README. The `sign-ckb-digest` CID must still be removed from the group, or none of this holds.
 
@@ -286,7 +291,7 @@ server: roughly +0.4 s per send with limits on. Today's policy signer takes 0.65
 
 1. Run the migration (`npm run migrate:production`): it adds `keyway_v2_pending_transactions`.
 2. In the Chipotle dashboard, paste `lit-actions/sign-ckb-transaction.js` into **Action Runner**, click **Get Lit
-   Action IPFS CID**, and check it is `QmaZABPThjFpeBWpRSw3TXosHG4yVsfbHwsF9RGruGuS9b`, the same as `LIT_ACTION_CIDS["sign-ckb-transaction"]` in
+   Action IPFS CID**, and check it is `QmZ2sYky6JNvaPjREfhZza4zQYfKVSCQqbVsL4ej2CpRzj`, the same as `LIT_ACTION_CIDS["sign-ckb-transaction"]` in
    `src/server/lit-config.ts`.
 3. Register it under **IPFS Actions** (for example as `keyway-ckb-policy-signer-v2`) and add it to group 1,
    `CKB Keyway`.
