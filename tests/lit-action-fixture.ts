@@ -58,6 +58,8 @@ export function fakeLit(options: {
   failing?: (method: string) => boolean;
   /** Requests to fail with HTTP 500, by node and methods. */
   failingAt?: (url: string, methods: string[]) => boolean;
+  /** How many blocks a node's indexer is behind its chain tip (0 by default). */
+  indexerLag?: (url: string) => number;
 }) {
   /** Every transaction hash the Action fetched with get_transaction. */
   const fetched: string[] = [];
@@ -141,8 +143,13 @@ export function fakeLit(options: {
         .map(({ tx, output, index, block }) => ({ block_number: ccc.numToHex(block), out_point: { tx_hash: hashOf(tx), index: ccc.numToHex(index) }, output: { capacity: ccc.numToHex(output.capacity), lock: script(output.lock), type: output.type ? script(output.type) : null }, output_data: tx.outputsData[index] }));
       return new Response(JSON.stringify({ id: parsed.id, jsonrpc: "2.0", result: page(objects, parsed.params[2], parsed.params[3]) }), { status: 200 });
     }
-    const calls = parsed as Array<{ id: number; method: string; params: [string, string?] }>;
+    const calls = (Array.isArray(parsed) ? parsed : [parsed]) as Array<{ id: number; method: string; params: [string, string?] }>;
+    // Each transaction is its own block, so the tip is at least the last one (offset so a lag is always exact); an
+    // indexer may be behind it.
+    const tip = options.transactions().length + 100;
     return new Response(JSON.stringify(calls.map(({ id, method, params: [hash, verbosity] }) => {
+      if (method === "get_tip_header") return { id, jsonrpc: "2.0", result: { number: ccc.numToHex(tip), hash: ccc.hexFrom(ccc.numLeToBytes(tip, 32)), timestamp: "0x0" } };
+      if (method === "get_indexer_tip") return { id, jsonrpc: "2.0", result: { block_number: ccc.numToHex(tip - (options.indexerLag?.(url) ?? 0)), block_hash: ccc.hexFrom(new Uint8Array(32)) } };
       if (method === "get_header") {
         const timestamp = options.header?.(hash);
         return { id, jsonrpc: "2.0", result: timestamp === undefined ? null : { hash, timestamp: ccc.numToHex(timestamp) } };

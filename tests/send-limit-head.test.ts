@@ -23,11 +23,11 @@ const outside = () => ({ previousOutput: { txHash: `0x${(nonce++).toString(16).p
  * Committed transactions, oldest first, one a block, behind a fake CKB node (the indexer included). The search and
  * the CCC client both reach that node, and every request to it is counted.
  */
-function chain() {
+function chain(options: { indexerLag?: (url: string) => number } = {}) {
   const txs: ccc.Transaction[] = [];
   const byHash = new Map<string, ccc.Transaction>();
   const add = (tx: ccc.Transaction) => { txs.push(tx); byHash.set(tx.hash(), tx); return tx; };
-  const node = fakeLit({ privateKey, pkpId: "0x01", lookup: (hash) => { const tx = byHash.get(hash); return tx ? { tx, status: "committed" } : undefined; }, transactions: () => txs });
+  const node = fakeLit({ privateKey, pkpId: "0x01", lookup: (hash) => { const tx = byHash.get(hash); return tx ? { tx, status: "committed" } : undefined; }, transactions: () => txs, indexerLag: options.indexerLag });
   sendLimitRpc.fetch = node.fetch;
   const client = new ccc.ClientPublicTestnet({ url: "https://testnet.ckb.dev/" });
   // As CCC's own requestor, over the same node; the node answers get_transaction in batches only.
@@ -107,24 +107,42 @@ test("64 or about 1000 newer look-alikes, each in its own block, can't hide the 
     for (let i = 0; i < planted; i++) world.add(lookalike(secp));
     const head = await sendLimitHead(world.client, { litPublicKey: publicKey }, []);
     assert.equal(head?.outPoint.txHash, made.hash(), `behind ${planted} look-alikes`);
-    // Pages of cells, batches of history (256 blocks each) and the one creating transaction.
-    assert.ok(world.requests.length <= 9, `${planted} look-alikes took ${world.requests.length} requests`);
+    // The indexer's tip, pages of cells, batches of history (256 blocks each) and the one creating transaction.
+    assert.ok(world.requests.length <= 10, `${planted} look-alikes took ${world.requests.length} requests`);
   }
 });
 
-test("past the Action's 1024 look-alikes the search says so, never 'no send limits', in a bounded number of requests", async () => {
+test("look-alikes count toward no cap, and a block full of them doesn't hide the account's own; past 16 pages the search says so, never 'no send limits'", async () => {
   const world = chain();
   const { secp, funding } = await account(world);
-  world.add(genesis(secp, ccc.OutPoint.from({ txHash: funding.hash(), index: 0 })));
-  // Thousands of plain Type ID cells the data filter passes over, then more look-alikes than the Action reads.
+  const made = world.add(genesis(secp, ccc.OutPoint.from({ txHash: funding.hash(), index: 0 })));
+  // Thousands of plain Type ID cells the data filter passes over, then 1100 look-alikes in one block: more than the
+  // old cap of 1024, and more entries than one page of that block's history.
   world.add(ccc.Transaction.from({
     inputs: [outside()],
     outputs: Array.from({ length: 3200 }, (_, i) => ({ lock: secp, type: typeId(ccc.hexFrom(ccc.numLeToBytes(i + 1, 32))), capacity: 125n * CKB })),
     outputsData: Array.from({ length: 3200 }, () => "0x"),
   }));
   world.add(lookalike(secp, 1100));
+  assert.equal((await sendLimitHead(world.client, { litPublicKey: publicKey }, []))?.outPoint.txHash, made.hash());
+  // Past the 16 pages of 256 the Action reads too (about 530k CKB of look-alikes), it's an error.
+  world.add(lookalike(secp, 3000));
+  const before = world.requests.length;
   await assert.rejects(sendLimitHead(world.client, { litPublicKey: publicKey }, []), /too many look-alike send-limit cells/);
-  // Five pages on each of the two nodes.
-  assert.ok(world.requests.length <= 10, `made ${world.requests.length} requests`);
-  assert.ok(world.requests.every(({ methods }) => methods.every((method) => method === "get_cells")));
+  // The indexer's tip and 16 pages, on each of the two nodes.
+  const made2 = world.requests.slice(before);
+  assert.ok(made2.length <= 34, `made ${made2.length} requests`);
+  assert.ok(made2.every(({ methods }) => methods.every((method) => ["get_cells", "get_indexer_tip", "get_tip_header"].includes(method))));
+});
+
+test("an indexer behind its chain isn't believed: the search moves to the next node, and fails if every one lags", async () => {
+  const first = chain({ indexerLag: (url) => (url === "https://testnet.ckb.dev/" ? 10 : 0) });
+  const { secp, funding } = await account(first);
+  const made = first.add(genesis(secp, ccc.OutPoint.from({ txHash: funding.hash(), index: 0 })));
+  assert.equal((await sendLimitHead(first.client, { litPublicKey: publicKey }, []))?.outPoint.txHash, made.hash());
+  assert.ok(first.requests.some(({ url }) => url === "https://testnet.ckbapp.dev/"));
+  const both = chain({ indexerLag: () => 10 });
+  const other = await account(both);
+  both.add(genesis(other.secp, ccc.OutPoint.from({ txHash: other.funding.hash(), index: 0 })));
+  await assert.rejects(sendLimitHead(both.client, { litPublicKey: publicKey }, []), /indexer is behind/);
 });

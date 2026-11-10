@@ -89,6 +89,24 @@ test("reports token amounts leaving the account and who receives them", () => {
   assert.equal(tokensLeaving, true);
 });
 
+test("minting a token the account issued to someone else counts as that token leaving, as in the policy Action", () => {
+  const issued = ccc.Script.from({ codeHash: known.xudt.codeHash, hashType: "type", args: own.hash() });
+  const mint = (to: ccc.Script) => build(
+    [{ lock: own, capacity: 500n * CKB }, { lock: alice, capacity: 200n * CKB }],
+    [{ lock: to, capacity: 200n * CKB, type: issued, data: u128(10n ** 30n) }, { lock: own, capacity: 500n * CKB - 2_000n }],
+  );
+  const away = mint(alice);
+  assert.equal(away.tokensLeaving, true);
+  assert.deepEqual(away.tokenOutflows, [{ asset: issued.hash(), amount: 10n ** 30n }]);
+  // Minted to the account itself, nothing leaves; another issuer's token isn't counted.
+  assert.equal(mint(own).tokensLeaving, false);
+  const foreign = build(
+    [{ lock: own, capacity: 500n * CKB }, { lock: alice, capacity: 200n * CKB }],
+    [{ lock: alice, capacity: 200n * CKB, type: xudt, data: u128(10n ** 30n) }, { lock: own, capacity: 500n * CKB - 2_000n }],
+  );
+  assert.equal(foreign.tokensLeaving, false);
+});
+
 test("recognizes a Nervos DAO deposit", () => {
   const { preview } = build(
     [{ lock: own, capacity: 2_000n * CKB }],

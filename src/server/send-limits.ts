@@ -149,10 +149,13 @@ export async function sendLimitHead(
  * The newest live send-limit cell this key made at its secp256k1 address, read the way the Action reads it.
  * Anyone can plant a look-alike there; the real one was made by a transaction that spent one of the key's own cells
  * (any input), which needs its signature. That is read from the key's own lock history in just the blocks that hold
- * the candidates, in batches, so the whole search is a few requests however many look-alikes there are, up to the
- * Action's own bound of 1024. Past that it's an error, never "no send limits".
+ * the candidates, in batches, so the whole search is a few requests however many look-alikes there are, within the
+ * Action's own bound of 16 pages. Past that it's an error, never "no send limits"; so is an indexer that is behind
+ * its chain, whose empty answer could hide the real cell.
  */
 async function liveSendLimitCellAt(url: string, secp: ccc.Script, spent: Set<string>): Promise<SendLimitHead | undefined> {
+  const [indexer, tip] = await rpcBatch(url, [{ method: "get_indexer_tip", params: [] }, { method: "get_tip_header", params: [] }]) as Array<{ block_number?: string; number?: string }>;
+  if (BigInt(tip.number ?? "0x0") - BigInt(indexer.block_number ?? "0x0") > MAX_INDEXER_LAG) throw new Error("CKB RPC's indexer is behind the chain");
   const lockKey = (filter: Record<string, unknown>) => ({ script: JsonRpcTransformers.scriptFrom(secp), script_type: "lock", script_search_mode: "exact", filter });
   const filter = { script: { code_hash: TYPE_ID_CODE_HASH, hash_type: "type", args: "0x" }, output_data: SEND_LIMIT_MAGIC, output_data_filter_mode: "prefix" };
   const candidates: Array<{ outPoint: ccc.OutPoint; cellOutput: ccc.CellOutput; outputData: ccc.Hex; block: bigint }> = [];
@@ -166,8 +169,8 @@ async function liveSendLimitCellAt(url: string, secp: ccc.Script, spent: Set<str
       const outputData = ccc.hexFrom(object.output_data ?? "0x");
       const cellOutput = JsonRpcTransformers.cellOutputTo(object.output);
       if (!isSendLimitCell(cellOutput, outputData, secp)) continue;
+      // Look-alikes anyone plants count toward no cap: only the page bound limits how many are read.
       candidates.push({ outPoint: JsonRpcTransformers.outPointTo(object.out_point), cellOutput, outputData, block: BigInt(object.block_number) });
-      if (candidates.length > MAX_CANDIDATES) throw new Error("This account has too many look-alike send-limit cells to check");
     }
     if (page.objects.length < PAGE_SIZE || !page.last_cursor) break;
     cursor = page.last_cursor;
@@ -175,19 +178,29 @@ async function liveSendLimitCellAt(url: string, secp: ccc.Script, spent: Set<str
   const live = candidates.filter(({ outPoint }) => !spent.has(`${outPoint.txHash}:${Number(outPoint.index)}`));
   if (live.length === 0) return undefined;
 
-  const blocks = [...new Set(live.map(({ block }) => block))];
+  // A full page of a block's history is read on from its cursor, so cells outsiders give the key in the same block
+  // can't hide its own entry; only past MAX_HISTORY_PAGES full pages (CKB the outsider gave away) is it an error.
+  let pending: Array<{ block: bigint; cursor?: string }> = [...new Set(live.map(({ block }) => block))].map((block) => ({ block }));
   const madeByKey = new Set<string>();
-  for (let at = 0; at < blocks.length; at += BATCH_SIZE) {
-    const calls = blocks.slice(at, at + BATCH_SIZE).map((block) => ({
-      method: "get_transactions",
-      params: [lockKey({ block_range: [ccc.numToHex(block), ccc.numToHex(block + 1n)] }), "asc", ccc.numToHex(MAX_BLOCK_HISTORY)],
-    }));
-    for (const result of await rpcBatch(url, calls) as Array<{ objects?: Array<{ tx_hash?: string; io_type?: string }> }>) {
-      if (!Array.isArray(result.objects)) throw new Error("CKB RPC returned an invalid get_transactions page");
-      // A full page can't be read past here; outsiders can only fill it by giving this key that many cells in one block.
-      if (result.objects.length >= MAX_BLOCK_HISTORY) throw new Error("A block holds too much of this account's history to check");
-      for (const entry of result.objects) if (entry.io_type === "input" && typeof entry.tx_hash === "string") madeByKey.add(entry.tx_hash.toLowerCase());
+  for (let round = 0; pending.length > 0; round++) {
+    if (round >= MAX_HISTORY_PAGES) throw new Error("A block holds too much of this account's history to check");
+    const next: typeof pending = [];
+    for (let at = 0; at < pending.length; at += BATCH_SIZE) {
+      const slice = pending.slice(at, at + BATCH_SIZE);
+      const calls = slice.map(({ block, cursor }) => ({
+        method: "get_transactions",
+        params: [lockKey({ block_range: [ccc.numToHex(block), ccc.numToHex(block + 1n)] }), "asc", ccc.numToHex(MAX_BLOCK_HISTORY), ...(cursor ? [cursor] : [])],
+      }));
+      (await rpcBatch(url, calls) as Array<{ objects?: Array<{ tx_hash?: string; io_type?: string }>; last_cursor?: string }>).forEach((result, i) => {
+        if (!Array.isArray(result.objects)) throw new Error("CKB RPC returned an invalid get_transactions page");
+        for (const entry of result.objects) if (entry.io_type === "input" && typeof entry.tx_hash === "string") madeByKey.add(entry.tx_hash.toLowerCase());
+        if (result.objects.length >= MAX_BLOCK_HISTORY) {
+          if (typeof result.last_cursor !== "string") throw new Error("CKB RPC returned an invalid get_transactions page");
+          next.push({ ...slice[i], cursor: result.last_cursor });
+        }
+      });
     }
+    pending = next;
   }
   // The indexer lists cells oldest first; every chained send makes the real one the newest.
   const real = live.filter(({ outPoint }) => madeByKey.has(outPoint.txHash)).at(-1);
@@ -231,15 +244,16 @@ const TYPE_ID_CODE_HASH = "0x000000000000000000000000000000000000000000000000005
 const RPC_URLS = ["https://testnet.ckb.dev/", "https://testnet.ckbapp.dev/"];
 /** How long after signing a transaction the node doesn't know yet is waited for: its client is sending it. */
 const JUST_SIGNED_MS = 10_000;
-/** Send-limit-shaped cells the search reads, as the Action does. Planting more costs about 175k CKB. */
-const MAX_CANDIDATES = 1024;
-/** Indexer pages of cells, as in the Action. */
+/** Indexer pages of send-limit-shaped cells, as in the Action: past 4096 look-alikes (about 530k CKB) it's an error. */
 const PAGE_SIZE = 256;
 const MAX_PAGES = 16;
-/** History lookups in one request: 1024 candidates take at most four. */
+/** History lookups in one request. */
 const BATCH_SIZE = 256;
-/** Entries of the key's history read from one block, as in the Action. */
+/** Entries of the key's history in one page, and full pages read from one block, as in the Action. */
 const MAX_BLOCK_HISTORY = 1024;
+const MAX_HISTORY_PAGES = 4;
+/** Blocks an indexer may be behind its chain tip before its answer isn't believed, as in the Action. */
+const MAX_INDEXER_LAG = 3n;
 const FEE_RATE = 1_500n;
 
 /** The capacity a send-limit cell with this data occupies, in shannons. */

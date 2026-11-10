@@ -188,7 +188,9 @@ counted send, and fund channels only from there.
   hand must leave room for about 300 more bytes), and the transaction hash the user approves doesn't change when
   the server fills in the record (witnesses aren't in the hash).
 - **Codes.** When the plan says a code is needed, `request-email-code` has the Action email it (`send-code`), the
-  server stores only the ticket, and the SDK's prompt takes 8 digits. The email names the full address of each
+  server stores only the ticket, and the SDK's prompt takes 8 digits. The ticket carries a tag only the Action can
+  make, bound to the PKP, the address and what the code is for, so every window for guessing a code is an email the
+  user sees, closed when the ticket expires (10 minutes). The email names the full address of each
   recipient and what it gets, so a page that swapped the recipient can't send one that reads as expected. When
   only the server's own rule (Fiber payments in the total) asks for a code, the Action emails it too, so the user
   always gets one code.
@@ -199,8 +201,9 @@ counted send, and fund channels only from there.
   `keyway_v2_pending_transactions` (migration 20). `POST /api/keyway/pending-transactions` returns the account's
   pending ones, after dropping those the node reports committed or rejected, or no longer knows after a grace period.
   It also returns the newest send-limit cell and the record size to reserve. The server finds that cell the way the
-  Action does, from one node: the send-limit-shaped cells at the address (up to 1024, so look-alikes anyone plants
-  can't hide it), each checked against the key's own history in its block, in batched requests. The node's status is read raw
+  Action does, from one node whose indexer is within 3 blocks of its tip: the send-limit-shaped cells at the address
+  (up to 16 pages of 256; look-alikes anyone plants count toward nothing until proven), each checked against the
+  key's own history in its block, read past a full page when outsiders filled the block, in batched requests. The node's status is read raw
   (`get_transaction` with verbosity 1), because CCC returns nothing for "unknown" and "rejected". The SDK loads this when its signer
   starts and before every `findCells` (the step CCC uses to pick inputs), then marks the transactions in CCC's cache
   in the order they were signed, so their spent cells are skipped and their change can be used.
@@ -214,6 +217,16 @@ counted send, and fund channels only from there.
 - Turning recovery on, which moves everything to an address the new backups can spend, with a backup and an email
   the server picks: on an account with a send-limit cell, the code for it goes only to the cell's bound address,
   and the enable is refused while more than one send-limit cell shows.
+- Value that appears without leaving an input: the interest a Nervos DAO withdrawal adds counts as the account's
+  CKB, and new supply of a token the account issued counts as that token leaving. A token counted per cell (one
+  whose amounts KeyWay can't read) always needs the code once it has a daily amount.
+- Inputs under a lock this key can unlock in a form KeyWay doesn't use (anyone-can-pay, other Omnilocks): refused,
+  since nothing they hold would be counted.
+- Freezing an account with planted cells: look-alike send-limit cells don't count toward any cap until proven the
+  key's own, a block full of cells sent to the key is read past, and a look-alike can be destroyed like any other
+  Type ID cell. Only past 16 pages of look-alikes (about 530k CKB given to the account) is the lookup refused.
+- A lagging indexer: an empty answer counts as "no limits" only from a node whose indexer is within 3 blocks of
+  its tip; when every node lags, nothing is signed.
 
 ## 5. What stays trusted
 
@@ -291,7 +304,7 @@ server: roughly +0.4 s per send with limits on. Today's policy signer takes 0.65
 
 1. Run the migration (`npm run migrate:production`): it adds `keyway_v2_pending_transactions`.
 2. In the Chipotle dashboard, paste `lit-actions/sign-ckb-transaction.js` into **Action Runner**, click **Get Lit
-   Action IPFS CID**, and check it is `QmZ2sYky6JNvaPjREfhZza4zQYfKVSCQqbVsL4ej2CpRzj`, the same as `LIT_ACTION_CIDS["sign-ckb-transaction"]` in
+   Action IPFS CID**, and check it is `QmYZQ2LTyLkrEWixfxcCtY7eq6KSuejHxfxaRYRGRjTQKi`, the same as `LIT_ACTION_CIDS["sign-ckb-transaction"]` in
    `src/server/lit-config.ts`.
 3. Register it under **IPFS Actions** (for example as `keyway-ckb-policy-signer-v2`) and add it to group 1,
    `CKB Keyway`.

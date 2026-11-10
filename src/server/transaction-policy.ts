@@ -237,6 +237,29 @@ export function describeTransaction(
   };
   ownInputs.forEach((cell) => addToken(cell, -1n));
   ownOutputs.forEach((cell) => addToken(cell, 1n));
+  // Minting, as the policy Action counts it: a token whose owner (args[0..32]) is the lock of one of the account's
+  // inputs can grow its supply here, and new supply leaves the account wherever it goes (minted to the account
+  // itself, it nets out above).
+  const ownInputLocks = new Set(ownInputs.map(({ cellOutput }) => cellOutput.lock.hash()));
+  const supply = new Map<string, { standard: "xUDT" | "sUDT"; delta: bigint }>();
+  const addSupply = (cell: { cellOutput: ccc.CellOutput; outputData: ccc.Hex }, sign: 1n | -1n) => {
+    const kind = typeKind(cell.cellOutput.type);
+    if (kind !== "xUDT" && kind !== "sUDT") return;
+    const args = ccc.bytesFrom(cell.cellOutput.type!.args);
+    if (args.length < 32 || !ownInputLocks.has(ccc.hexFrom(args.slice(0, 32)))) return;
+    const id = cell.cellOutput.type!.hash();
+    const entry = supply.get(id) ?? { standard: kind, delta: 0n };
+    entry.delta += sign * udtAmount(cell.outputData);
+    supply.set(id, entry);
+  };
+  inputCells.forEach((cell) => addSupply(cell, -1n));
+  outputs.forEach((cell) => addSupply(cell, 1n));
+  for (const [id, { standard, delta }] of supply) {
+    if (delta <= 0n) continue;
+    const entry = tokenTotals.get(id) ?? { standard, delta: 0n };
+    entry.delta -= delta;
+    tokenTotals.set(id, entry);
+  }
   const tokens = [...tokenTotals].filter(([, { delta }]) => delta !== 0n)
     .map(([id, { standard, delta }]) => ({
       id: shortHash(id), asset: id, standard, amount: `${delta > 0n ? "+" : ""}${delta}`,

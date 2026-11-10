@@ -190,12 +190,21 @@ test("turning recovery on needs the code the Action emailed, to the address boun
   const swapped = plan.transaction.clone();
   setEmailBinding(swapped, other.binding!);
   await assert.rejects(sign(swapped, { code, ticket: sent.ticket }), /isn't the email address bound/);
+  // The ticket is bound to the transaction, the address and the PKP, so it can't be used for another transaction.
   const changed = bound.clone();
   changed.outputs[changed.outputs.length - 1].capacity -= 1n;
-  await assert.rejects(sign(changed, { code, ticket: sent.ticket }), /isn't right/);
-  // An expired or far-future ticket is refused.
-  await assert.rejects(sign(bound, { code, ticket: `v1.${Date.now() - 1}.${"0".repeat(32)}` }), /expired/);
-  await assert.rejects(sign(bound, { code, ticket: `v1.${Date.now() + 3_600_000}.${"0".repeat(32)}` }), /ticket is invalid/);
+  await assert.rejects(sign(changed, { code, ticket: sent.ticket }), /ticket is invalid/);
+  // Only the Action issues tickets: one made up, or a real one with its expiry or random part changed, is refused
+  // before any code is compared, so guessing a code always costs an email the user sees.
+  const [, expiry, random, tag] = sent.ticket.split(".");
+  assert.match(sent.ticket, /^v2\.\d{13}\.[0-9a-f]{32}\.[0-9a-f]{64}$/);
+  for (const ticket of [`v1.${Date.now() + 60_000}.${"0".repeat(32)}`, `v2.${Number(expiry) + 1}.${random}.${tag}`, `v2.${expiry}.${"0".repeat(32)}.${tag}`, `v2.${expiry}.${random}.${"0".repeat(64)}`]) {
+    await assert.rejects(sign(bound, { code, ticket }), /ticket is invalid/);
+  }
+  // A real ticket stops working once it expires.
+  const realNow = Date.now;
+  Date.now = () => Number(expiry) + 1;
+  try { await assert.rejects(sign(bound, { code, ticket: sent.ticket }), /expired/); } finally { Date.now = realNow; }
   const signed = await sign(bound, { code, ticket: sent.ticket });
   assert.equal(signed.hash(), plan.transaction.hash());
 });
