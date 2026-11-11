@@ -523,7 +523,7 @@ test("a hosted payment can't pay a higher fee than the one counted toward the da
   await fiberPayment(h.context, h.node, { method: "sendPayment", params, stage: "send", confirmationNonce: preview.confirmationNonce });
   const sent = h.sent.at(-1) as Record<string, unknown>;
   assert.equal(sent.max_fee_amount, `0x${fee.toString(16)}`, "capped at the counted fee");
-  assert.equal(sent.max_fee_rate, undefined, "no second, looser cap from the caller");
+  assert.equal(sent.max_fee_rate, undefined, "the caller's fee rate isn't passed on: the counted fee is the one cap");
 
   // A caller's own lower cap still holds.
   const lower = { invoice: "fibt1test", max_fee_amount: "0x3e8" };
