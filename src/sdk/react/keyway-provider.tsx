@@ -410,6 +410,9 @@ export function KeyWayProvider({
           },
         });
         if (run !== runRef.current) {
+          // A logout (here or handed from another tab) may be what overtook it: it delivers this node's channel
+          // updates and backs it up along with the other stopped nodes.
+          stoppedNodes.add(next.keyway);
           await next.keyway.stop();
           throw new Error("KeyWay connection was superseded");
         }
