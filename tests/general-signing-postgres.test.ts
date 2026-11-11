@@ -424,6 +424,30 @@ test("wrong step-up codes add up across codes, to 20 a day per user", { skip: !e
     await verifyCode(context.user, "message", nonce, codeFrom());
   });
 
+  await t.test("they count per session, so another session of the same user still gets codes, up to 60 a day", async () => {
+    const { context, codeFrom } = harness(0n);
+    const session = (sessionId: string) => ({ ...context, user: { ...context.user, sessionId } });
+    const nonce = await issueRequest(context.user, "message", "digest", {}, true);
+    const twenty = async (signing: SigningContext) => {
+      for (let round = 0; round < 4; round++) {
+        await sendCode(signing, "message", nonce, "Sign a message", []);
+        const code = codeFrom();
+        for (let i = 0; i < 5; i++) await assert.rejects(() => verifyCode(signing.user, "message", nonce, wrong(code)), /isn't right/);
+      }
+    };
+    const stolen = session("stolen");
+    await twenty(stolen);
+    await assert.rejects(() => sendCode(stolen, "message", nonce, "Sign a message", []), /today/);
+    // The owner's own sign-in, a session of its own, isn't held back by it.
+    const owner = session("owner");
+    await sendCode(owner, "message", nonce, "Sign a message", []);
+    await verifyCode(owner.user, "message", nonce, codeFrom());
+    // Across all of a user's sessions, 60 a day.
+    await twenty(owner);
+    await twenty(session("third"));
+    await assert.rejects(() => sendCode(session("fourth"), "message", nonce, "Sign a message", []), /today/);
+  });
+
   await t.test("wrong codes tried at once still stop at 20", async () => {
     const { context, codeFrom } = harness(0n);
     const nonces: Array<{ nonce: string; code: string }> = [];

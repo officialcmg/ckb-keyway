@@ -410,10 +410,11 @@ export const migrations: Array<{
   {
     version: 24, name: "step-up-code-failures",
     up: async (sql) => {
-      // Wrong step-up codes per user, kept for a day: each code allows five tries, and codes can be sent again.
+      // Wrong step-up codes per user and session, kept for a day: each code allows five tries, and codes can be sent again.
       await sql`create table keyway_v2_step_up_failures (
         id bigint generated always as identity primary key,
         user_id uuid not null,
+        session_id text not null,
         created_at timestamptz not null default now()
       )`;
       await sql`create index keyway_v2_step_up_failures_user on keyway_v2_step_up_failures (user_id, created_at)`;

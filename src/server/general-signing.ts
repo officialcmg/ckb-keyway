@@ -43,9 +43,11 @@ const REQUEST_TTL_MS = 5 * 60_000;
 const CODE_TTL_MS = 10 * 60_000;
 export const REQUEST_EXPIRED = "This request expired. Start again.";
 const MAX_CODE_ATTEMPTS = 5;
-// Wrong six-digit codes per user in 24 hours, across every code sent. Each code allows five tries and codes can be
-// sent again, so without this the tries add up day after day. Only someone signed in to the account can make them.
-const MAX_CODE_FAILURES_PER_DAY = 20;
+// Wrong six-digit codes in 24 hours, across every code sent. Each code allows five tries and codes can be sent again,
+// so without this the tries add up day after day. Only someone signed in can make them, and they are counted per
+// session, so a stolen session can't use up the owner's own: a new session needs a login code from the inbox.
+const MAX_CODE_FAILURES_PER_SESSION = 20;
+const MAX_CODE_FAILURES_PER_USER = 60;
 const CODE_FAILURES_MESSAGE = "Too many wrong email codes today. Try again tomorrow";
 const MAX_MESSAGE_BYTES = 4096;
 
@@ -545,7 +547,7 @@ export async function consumeRequest(user: User, purpose: Purpose, nonce: string
  */
 export async function sendCode(context: Pick<SigningContext, "user" | "appName" | "email" | "sendEmail" | "rateLimit">, purpose: Purpose, nonce: string, heading: string, lines: string[], options: { limited?: boolean } = {}): Promise<string> {
   const sql = await database();
-  if (await codeFailures(sql, context.user) >= MAX_CODE_FAILURES_PER_DAY) throw new Error(CODE_FAILURES_MESSAGE);
+  if (overFailureLimit(await codeFailures(sql, context.user))) throw new Error(CODE_FAILURES_MESSAGE);
   if (!options.limited) await codeLimit(context);
   const code = randomInt(0, 1_000_000).toString().padStart(6, "0");
   const rows = await sql`
@@ -610,7 +612,7 @@ export async function verifyCode(user: User, purpose: Purpose, nonce: string, co
     const query = tx as unknown as DatabaseSql;
     const [{ locked }] = await query<Array<{ locked: boolean }>>`select pg_try_advisory_xact_lock(hashtextextended(${`step-up-failures:${user.id}`}, 0)) as locked`;
     if (!locked) return "busy";
-    if (await codeFailures(query, user) >= MAX_CODE_FAILURES_PER_DAY) return "failures";
+    if (overFailureLimit(await codeFailures(query, user))) return "failures";
     const [row] = await query<Array<{ email_code_hash: string | null; email_attempts: number }>>`
       update keyway_v2_signature_requests set email_attempts = email_attempts + 1
       where user_id = ${user.id} and purpose = ${purpose} and nonce = ${nonce} and expires_at > now() and email_code_expires_at > now()
@@ -621,8 +623,9 @@ export async function verifyCode(user: User, purpose: Purpose, nonce: string, co
     const expected = Buffer.from(row.email_code_hash, "hex");
     const supplied = Buffer.from(codeHash(nonce, code), "hex");
     if (expected.length === supplied.length && timingSafeEqual(expected, supplied)) return "ok";
-    await query`insert into keyway_v2_step_up_failures (user_id) values (${user.id})`;
-    return await codeFailures(query, user) === MAX_CODE_FAILURES_PER_DAY ? "wrong-last" : "wrong";
+    await query`insert into keyway_v2_step_up_failures (user_id, session_id) values (${user.id}, ${user.sessionId ?? ""})`;
+    const failures = await codeFailures(query, user);
+    return failures.session === MAX_CODE_FAILURES_PER_SESSION || failures.user === MAX_CODE_FAILURES_PER_USER ? "wrong-last" : "wrong";
   });
   if (outcome === "ok") return;
   if (outcome === "busy") throw new Error("Another email code check is in progress. Try again in a moment");
@@ -637,11 +640,17 @@ export async function verifyCode(user: User, purpose: Purpose, nonce: string, co
   throw new Error("That email code isn't right");
 }
 
-async function codeFailures(sql: DatabaseSql, user: User): Promise<number> {
-  const [row] = await sql<Array<{ count: number }>>`
-    select count(*)::int as count from keyway_v2_step_up_failures where user_id = ${user.id} and created_at > now() - interval '1 day'
+/** Wrong codes in the last day: from this session, and from all of the user's sessions. */
+async function codeFailures(sql: DatabaseSql, user: User): Promise<{ session: number; user: number }> {
+  const [row] = await sql<Array<{ session: number; user: number }>>`
+    select count(*) filter (where session_id = ${user.sessionId ?? ""})::int as session, count(*)::int as user
+    from keyway_v2_step_up_failures where user_id = ${user.id} and created_at > now() - interval '1 day'
   `;
-  return row.count;
+  return row;
+}
+
+function overFailureLimit(failures: { session: number; user: number }): boolean {
+  return failures.session >= MAX_CODE_FAILURES_PER_SESSION || failures.user >= MAX_CODE_FAILURES_PER_USER;
 }
 
 /**
