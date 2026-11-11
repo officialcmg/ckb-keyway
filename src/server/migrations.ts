@@ -406,4 +406,13 @@ export const migrations: Array<{
     // When each kind of alert last went out, so concurrent signings raise one alert per window between them.
     up: (sql) => sql`create table keyway_security_alert_state (kind text primary key, alerted_at timestamptz not null, claim_id uuid not null)`,
   },
+  {
+    version: 24, name: "wallet-provisioning-claims",
+    // The one request setting up a new account's wallet, so its Lit calls run without holding the wallet lock.
+    up: (sql) => sql`create table keyway_v2_provisioning_claims (
+      user_id text primary key,
+      claim_id uuid not null,
+      claimed_at timestamptz not null default now()
+    )`,
+  },
 ];

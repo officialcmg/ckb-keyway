@@ -9,6 +9,7 @@ import { authSchemaOptions } from "../src/server/auth-options.ts";
 import { database, withUserLock } from "../src/server/database.ts";
 import { addApplicationOrigin, createApplication } from "../src/server/applications.ts";
 import { closeAuthPool, sendEmailCode, setAuthDeliveryForTests, verifyEmailCode } from "../src/server/auth.ts";
+import { bootstrap, type Provisioning } from "../src/server/bootstrap.ts";
 import { acquireLease } from "../src/server/device-lease.ts";
 import { handleKeyWayRequest } from "../src/server/http.ts";
 import { runIdempotentMutation } from "../src/server/idempotency.ts";
@@ -229,5 +230,69 @@ test("L3: the unusual-signing alert survives concurrent signings and failed deli
     assert.equal(delivered, 0);
     await recordSigningEvent(crypto.randomUUID());
     assert.ok(await eventually(() => delivered === 1), "the next signing raises it again");
+  });
+});
+
+test("L5: first-time wallet setup holds no wallet lock while Lit works", { skip }, async (t) => {
+  const { sql } = await setup();
+
+  await t.test("three new accounts' setups don't stall another user's wallet lock", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let chipotleCalls = 0;
+    globalThis.fetch = (async () => {
+      chipotleCalls += 1;
+      await gate;
+      throw new Error("test Chipotle unavailable");
+    }) as typeof fetch;
+    try {
+      const setups = Array.from({ length: 3 }, () => bootstrap({ id: crypto.randomUUID() } as User, DEVICE_A).then(() => "ok", () => "failed"));
+      assert.ok(await within((async () => { while (chipotleCalls < 3) await delay(20); })(), 5_000), "every setup is calling Chipotle");
+      assert.ok(await within(withUserLock(crypto.randomUUID(), async () => "ok"), 2_000), "another user's lock is taken at once");
+      release();
+      assert.deepEqual(await Promise.all(setups), ["failed", "failed", "failed"]);
+    } finally {
+      release();
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  await t.test("one request sets an account up; a second one meanwhile is refused, and nothing is replaced", async (st) => {
+    globalThis.fetch = (async () => { throw new Error("no Lit or Chipotle calls in this test"); }) as typeof fetch;
+    st.after(() => { globalThis.fetch = realFetch; });
+    const user = { id: crypto.randomUUID() } as User;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let created = 0;
+    const provisioning: Provisioning = {
+      createPkp: async () => { created += 1; await gate; return `0x${"ab".repeat(20)}`; },
+      complete: async () => ({ litPublicKey: `0x02${"cd".repeat(32)}`, ckbAddress: "ckt1new", encryptedFiberKey: "new-fiber-key" }),
+    };
+    const first = bootstrap(user, DEVICE_A, "browser", provisioning);
+    while (created === 0) await delay(10);
+    await assert.rejects(bootstrap(user, DEVICE_A, "browser", provisioning), /still being set up/);
+    release();
+    const result = await first;
+    assert.equal(result.provisioned, true);
+    assert.equal(result.wallet.litPkpId, `0x${"ab".repeat(20)}`);
+    assert.equal(created, 1, "one PKP");
+    const again = await bootstrap(user, DEVICE_A, "browser", provisioning);
+    assert.equal(again.provisioned, false);
+    assert.equal(created, 1);
+    const [{ count }] = await sql<Array<{ count: number }>>`select count(*)::int as count from keyway_v2_provisioning_claims where user_id = ${user.id}`;
+    assert.equal(count, 0, "the claim is released");
+
+    // A setup whose wallet became ready meanwhile (its claim expired and another request finished) keeps that wallet.
+    const raced = { id: crypto.randomUUID() } as User;
+    const late: Provisioning = {
+      createPkp: async () => `0x${"ef".repeat(20)}`,
+      complete: async (litPkpId) => {
+        await saveWallet(raced, readyWallet(DEVICE_A, { litPkpId, encryptedFiberKey: "fiber-key-in-use" }));
+        return { litPublicKey: `0x02${"cd".repeat(32)}`, ckbAddress: "ckt1late", encryptedFiberKey: "replacement" };
+      },
+    };
+    assert.equal((await bootstrap(raced, DEVICE_A, "browser", late)).provisioned, false);
+    const kept = await readWallet(raced);
+    assert.equal(kept?.status === "ready" && kept.encryptedFiberKey, "fiber-key-in-use");
   });
 });
