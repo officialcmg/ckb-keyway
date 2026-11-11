@@ -81,15 +81,29 @@ export function applySendLimitRecord(transaction: ccc.Transaction, plan: Pick<Se
   setSendLimitRecord(transaction, plan.recordIndex!, plan.record);
 }
 
-/** The record a send-limit cell's creating transaction carries, if any (a genesis has none). */
-function recordOf(transaction: ccc.Transaction): ccc.Hex | undefined {
-  for (let i = 0; i < transaction.witnesses.length; i++) {
+/**
+ * The record a send-limit cell's creating transaction carries, read as the Action reads it: the one on the input that
+ * spent the previous send-limit cell (the account's secp256k1 lock and this cell's Type ID). Witnesses of other
+ * parties' inputs aren't covered by the account's signature, so a record-shaped one there is ignored; more or fewer
+ * than one on the account's own input means the cell isn't one the Action will chain on. None at all is a genesis.
+ */
+async function recordOf(
+  transaction: ccc.Transaction,
+  cell: ccc.CellOutput,
+  cellsAt: (outPoints: ccc.OutPoint[]) => Promise<Array<ccc.CellOutput | undefined>>,
+): Promise<ccc.Hex | undefined> {
+  const records: Array<{ index: number; record: ccc.Hex }> = [];
+  for (let i = 0; i < Math.min(transaction.witnesses.length, transaction.inputs.length); i++) {
     try {
       const inputType = transaction.getWitnessArgsAt(i)?.inputType;
-      if (inputType?.startsWith(SEND_LIMIT_RECORD_MAGIC)) return inputType;
+      if (inputType?.startsWith(SEND_LIMIT_RECORD_MAGIC)) records.push({ index: i, record: inputType });
     } catch { /* not WitnessArgs */ }
   }
-  return undefined;
+  if (records.length === 0) return undefined;
+  const spent = await cellsAt(records.map(({ index }) => transaction.inputs[index].previousOutput));
+  const own = records.filter((_, i) => Boolean(spent[i]?.lock.eq(cell.lock) && cell.type && spent[i]?.type?.eq(cell.type)));
+  if (own.length !== 1) throw new Error("The send-limit cell isn't one this account made");
+  return own[0].record;
 }
 
 /**
@@ -122,11 +136,16 @@ export async function sendLimitHead(
   // Only transactions the node holds spend anything; one that never reached it doesn't.
   const live = known.filter(({ status }) => inPool(status));
   const spent = new Set(live.flatMap(({ transaction }) => transaction.inputs.map((input) => `${input.previousOutput.txHash}:${input.previousOutput.index}`)));
-  const head = (transaction: ccc.Transaction, index: number): SendLimitHead => ({
+  // The cells a pending send-limit transaction spent: from the account's other pending transactions, else the chain.
+  const byHash = new Map(live.map(({ transaction }) => [transaction.hash(), transaction]));
+  const cellsAt = (outPoints: ccc.OutPoint[]) => Promise.all(outPoints.map(async (outPoint) => (
+    byHash.get(outPoint.txHash)?.outputs[Number(outPoint.index)] ?? (await client.getCell(outPoint))?.cellOutput
+  )));
+  const head = async (transaction: ccc.Transaction, index: number): Promise<SendLimitHead> => ({
     outPoint: { txHash: transaction.hash(), index },
     cellOutput: transaction.outputs[index],
     outputData: ccc.hexFrom(transaction.outputsData[index]),
-    recordEntriesBytes: recordEntriesBytes(recordOf(transaction) ?? "0x"),
+    recordEntriesBytes: recordEntriesBytes(await recordOf(transaction, transaction.outputs[index], cellsAt) ?? "0x"),
   });
   for (const { transaction } of [...live].reverse()) {
     const index = limitOutput(transaction);
@@ -195,7 +214,17 @@ async function liveSendLimitCellAt(url: string, secp: ccc.Script, spent: Set<str
   const [found] = await rpcBatch(url, [{ method: "get_transaction", params: [real.outPoint.txHash] }]) as Array<{ transaction?: JsonRpcTransaction }>;
   const creator = found.transaction ? JsonRpcTransformers.transactionTo(found.transaction) : undefined;
   if (!creator || creator.hash() !== real.outPoint.txHash) throw new Error("CKB RPC returned the wrong transaction");
-  return { outPoint: { txHash: real.outPoint.txHash, index: Number(real.outPoint.index) }, cellOutput: real.cellOutput, outputData: real.outputData, recordEntriesBytes: recordEntriesBytes(recordOf(creator) ?? "0x") };
+  // The inputs that carry a record, from the same node.
+  const cellsAt = async (outPoints: ccc.OutPoint[]) => {
+    const found = await rpcBatch(url, outPoints.map((outPoint) => ({ method: "get_transaction", params: [outPoint.txHash] }))) as Array<{ transaction?: JsonRpcTransaction }>;
+    return found.map(({ transaction }, i) => {
+      const spent = transaction ? JsonRpcTransformers.transactionTo(transaction) : undefined;
+      if (!spent || spent.hash() !== outPoints[i].txHash) throw new Error("CKB RPC returned the wrong transaction");
+      return spent.outputs[Number(outPoints[i].index)];
+    });
+  };
+  const record = await recordOf(creator, real.cellOutput, cellsAt);
+  return { outPoint: { txHash: real.outPoint.txHash, index: Number(real.outPoint.index) }, cellOutput: real.cellOutput, outputData: real.outputData, recordEntriesBytes: recordEntriesBytes(record ?? "0x") };
 }
 
 /** How the search reaches CKB nodes; tests replace `fetch` with a fake chain. */
