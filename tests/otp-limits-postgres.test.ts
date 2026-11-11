@@ -187,8 +187,9 @@ test("a stranger's wrong codes don't lock the user out", { skip }, async () => {
   const { challengeId } = await sendEmailCode(stranger, victim);
   const code = codes.get(`${appId}:${victim}`)!;
   for (let i = 0; i < 20; i++) await assert.rejects(verifyEmailCode(stranger, challengeId, wrong(code)), /Incorrect/);
-  await assert.rejects(verifyEmailCode(stranger, challengeId, wrong(code)), /Too many authentication requests/);
-  // Only the 5 codes Better Auth compared count. The rest met a used-up code or its rate limit.
+  // Only the 5 codes Better Auth compared count. After them the code is used up, and its challenge is dead.
+  const [dead] = await sql<Array<{ status: string }>>`select status from keyway_auth_challenges where id = ${challengeId}`;
+  assert.equal(dead.status, "failed");
   const [row] = await sql<Array<{ count: number }>>`select count(*)::int as count from keyway_otp_events where app_id = ${appId} and outcome = 'verify_failed'`;
   assert.equal(row.count, 5);
   await later(sql, 61);
@@ -555,6 +556,27 @@ test("one requester's queued sign-in requests don't refuse anyone else's", { ski
     await Promise.all([...stranger, ...network]);
   } finally {
     release();
+  }
+});
+
+test("a used-up challenge is refused without waiting for its email's lock", { skip }, async () => {
+  const { codes } = await setup();
+  const origin = "https://dead.example";
+  const { appId } = await application([origin]);
+  const victim = email();
+  const stranger = appRequest(appId, origin, "192.0.2.145");
+  const { challengeId } = await sendEmailCode(stranger, victim);
+  for (let i = 0; i < 5; i++) await assert.rejects(verifyEmailCode(stranger, challengeId, wrong(codes.get(`${appId}:${victim}`)!)), /Incorrect/);
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const holder = withLoginCodeLock(`otp:${appId}:${victim}`, () => held);
+  await delay(50);
+  try {
+    const attempt = verifyEmailCode(stranger, challengeId, "123456").then(() => "signed in", (error: Error) => error.message);
+    assert.equal(await Promise.race([attempt, delay(500).then(() => "waiting")]), "Incorrect or expired code");
+  } finally {
+    release();
+    await holder;
   }
 });
 

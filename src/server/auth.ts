@@ -23,6 +23,8 @@ const requestEmails = new WeakMap<Request, string>();
 let pool: Pool | undefined;
 const instances = new Map<string, Promise<Awaited<ReturnType<typeof createScopedAuth>>>>();
 let delivery: EmailDelivery = sendOtpEmail;
+// Tries per login code. Wrong ones are counted on the challenge too, so a used-up challenge is refused before its lock.
+const LOGIN_CODE_ATTEMPTS = 5;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Login-code requests in progress in this process, per source (IPv6 /64) and per network (IPv6 /48). The lock for
 // one email is open to anyone, so the cap is on who is asking: one requester can't queue without end, and can't
@@ -103,7 +105,7 @@ export async function createScopedAuth(scope: AuthScope) {
     // The origin a session is issued at, so removing that origin from the app ends it.
     databaseHooks: { session: { create: { before: async (session, context) => ({ data: { ...session, scopeId: scope.id, origin: context?.headers?.get("origin") ?? null } }) } } },
     plugins: [bearer({ requireSignature: true }), emailOTP({
-      otpLength: 6, expiresIn: 600, allowedAttempts: 5, storeOTP: "hashed", resendStrategy: "rotate",
+      otpLength: 6, expiresIn: 600, allowedAttempts: LOGIN_CODE_ATTEMPTS, storeOTP: "hashed", resendStrategy: "rotate",
       sendVerificationOTP: async ({ email, otp, type }) => {
         const context = challengeContext.getStore();
         if (type !== "sign-in" || !context) throw new Error("Login challenge context is required");
@@ -193,25 +195,37 @@ export function verifyEmailCode(request: Request, challengeId: string, code: str
     if (!UUID.test(challengeId)) throw new Error("Incorrect or expired code");
     const scope = await resolveAuthScope(request);
     const sql = await database();
-    const [challenge] = await sql<Array<{ email: string }>>`select email from keyway_auth_challenges where id = ${challengeId}::uuid and scope_id = ${scope.id}`;
+    // A challenge that is used up or expired is refused here, before it takes the email's lock.
+    const [challenge] = await sql<Array<{ email: string }>>`select email from keyway_auth_challenges
+      where id = ${challengeId}::uuid and scope_id = ${scope.id} and status = 'sent' and expires_at > now()`;
     if (!challenge) throw new Error("Incorrect or expired code");
     return withLoginCodeLock(`otp:${scope.id}:${challenge.email}`, async (connection) => {
       const [current] = await connection<Array<{ wrong_attempts: number }>>`
         select wrong_attempts from keyway_auth_challenges
         where id = ${challengeId}::uuid and scope_id = ${scope.id} and status = 'sent' and expires_at > now()`;
       if (!current) throw new Error("Incorrect or expired code");
+      // Better Auth removes a code once its tries are used up: the challenge is then dead, and isn't checked again.
+      const identifier = `keyway:${scope.id}:${challengeId}:sign-in-otp-${challenge.email}`;
+      const [live] = await connection`select 1 from keyway_auth_verifications where identifier = ${identifier} and "expiresAt" > now()`;
+      if (!live) {
+        await connection`update keyway_auth_challenges set status = 'failed' where id = ${challengeId}::uuid`;
+        throw new Error("Incorrect or expired code");
+      }
       const context = otpSubject(scope.id, challenge.email, requestIp(request));
       const { bypass } = await checkOtpFailures(context, { wrongAttempts: current.wrong_attempts });
       const response = await withOtpChallenge(challengeId, () => callAuthEndpoint(request, scope, "/sign-in/email-otp", { email: challenge.email, otp: code }));
       if (!response.ok) {
         // Count a wrong code only when Better Auth compared it. After a wrong code it keeps the record (one more attempt
         // used); a rate-limit refusal, a server error, or a code already used up or expired leaves nothing to guess at.
-        const identifier = `keyway:${scope.id}:${challengeId}:sign-in-otp-${challenge.email}`;
-        const [open] = response.status === 400 ? await connection`select 1 from keyway_auth_verifications where identifier = ${identifier}` : [];
-        if (open) {
-          await connection`update keyway_auth_challenges set wrong_attempts = wrong_attempts + 1 where id = ${challengeId}::uuid`;
+        const [open] = await connection`select 1 from keyway_auth_verifications where identifier = ${identifier}`;
+        if (open && response.status === 400) {
+          await connection`update keyway_auth_challenges set wrong_attempts = wrong_attempts + 1,
+            status = case when wrong_attempts + 1 >= ${LOGIN_CODE_ATTEMPTS} then 'failed' else status end
+            where id = ${challengeId}::uuid`;
           await recordOtpVerification(context, "verify_failed", bypass);
         }
+        // Its code is used up: later checks are refused before they wait for the lock.
+        if (!open) await connection`update keyway_auth_challenges set status = 'failed' where id = ${challengeId}::uuid`;
         throw new Error(response.status === 429 ? "Too many authentication requests" : "Incorrect or expired code");
       }
       const result = await response.json();
