@@ -83,6 +83,7 @@ const email = () => `limits-${crypto.randomUUID()}@example.com`;
 async function later(sql: postgres.Sql, seconds: number) {
   await sql`update keyway_otp_events set created_at = created_at - ${`${seconds} seconds`}::interval where outcome in ('requested', 'sent', 'rate_limited')`;
   await sql`update keyway_auth_challenges set created_at = created_at - ${`${seconds} seconds`}::interval`;
+  await sql`update keyway_security_alert_marks set sent_at = sent_at - ${`${seconds} seconds`}::interval`;
 }
 
 // Wrong codes for `victim` in `appId`, `each` from every source in `sources`, as if tried `minutes` ago.
@@ -335,26 +336,32 @@ test("someone else asking for a code doesn't cancel the code already sent", { sk
 });
 
 test("a developer's apps share one per-minute login-code budget", { skip }, async () => {
-  await setup();
+  const { alerts } = await setup();
   const owner = { id: crypto.randomUUID() } as User;
   const { appId: first } = await application([], 120, owner);
   const { appId: second } = await application([], 120, owner);
+  const before = count(alerts, "otp_owner_ceiling");
   for (let i = 0; i < 120; i++) {
     await prepareOtpSend({ appId: i % 2 ? first : second, email: email(), ipAddress: `100.64.${Math.floor(i / 50)}.1` });
   }
   await assert.rejects(prepareOtpSend({ appId: second, email: email(), ipAddress: "100.64.2.1" }), /Too many login codes/);
+  await prepareOtpSend({ appId: second, email: email(), ipAddress: "100.64.9.1" });
+  assert.equal(count(alerts, "otp_owner_ceiling"), before + 1, "One alert when the developer's budget is reached");
 });
 
 test("apps of different developers together stay under one per-minute ceiling", { skip }, async () => {
-  await setup();
+  const { alerts } = await setup();
+  const before = count(alerts, "otp_global_ceiling");
   const { appId: first } = await application([], 120);
   const { appId: second } = await application([], 120);
   for (let i = 0; i < 200; i++) {
     await prepareOtpSend({ appId: i % 2 ? first : second, email: email(), ipAddress: `100.65.${i % 4}.1` });
   }
   await assert.rejects(prepareOtpSend({ appId: second, email: email(), ipAddress: "100.65.0.1" }), /Too many login codes/);
-  // Like every shared budget, it doesn't refuse a source's first request in a minute.
+  // Like every shared budget, it doesn't refuse a source's first request in a minute, so it raises an alert, once.
   await prepareOtpSend({ appId: second, email: email(), ipAddress: "100.65.9.1" });
+  await prepareOtpSend({ appId: second, email: email(), ipAddress: "100.65.10.1" });
+  assert.equal(count(alerts, "otp_global_ceiling"), before + 1);
 });
 
 test("a developer account has a limited number of apps", { skip }, async () => {
@@ -365,9 +372,10 @@ test("a developer account has a limited number of apps", { skip }, async () => {
 });
 
 test("past an inbox's 30 codes in 10 minutes, only a network that had none for it gets one", { skip }, async () => {
-  const { sql } = await setup();
+  const { sql, alerts } = await setup();
   const { appId } = await application([], 120);
   const victim = email();
+  const before = count(alerts, "otp_inbox_ceiling");
   for (let i = 1; i <= 30; i++) await prepareOtpSend({ appId, email: victim, ipAddress: `100.66.0.${i}` });
   await later(sql, 61);
   // A source that already had a code for this inbox is refused, in any app.
@@ -379,6 +387,7 @@ test("past an inbox's 30 codes in 10 minutes, only a network that had none for i
   // An IPv6 /48 is one network: one code, whichever of its /64s asks.
   await prepareOtpSend({ appId, email: victim, ipAddress: "2001:db8:66:1::1" });
   await assert.rejects(prepareOtpSend({ appId, email: victim, ipAddress: "2001:db8:66:2::1" }), /Too many login codes/);
+  assert.equal(count(alerts, "otp_inbox_ceiling"), before + 1, "One alert while the inbox is past its limit");
 });
 
 test("wallet locks held for a long time don't hold up sign-in", { skip, timeout: 30_000 }, async () => {

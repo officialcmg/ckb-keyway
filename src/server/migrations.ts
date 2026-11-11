@@ -431,4 +431,9 @@ export const migrations: Array<{
       await sql`alter table keyway_otp_events add column network_hash text, add column bypass boolean not null default false`;
     },
   },
+  {
+    version: 26, name: "security-alert-marks",
+    // When each deduplicated security alert last went out, by kind and hashed subject.
+    up: (sql) => sql`create table keyway_security_alert_marks (key text primary key, sent_at timestamptz not null)`,
+  },
 ];

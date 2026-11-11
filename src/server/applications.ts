@@ -2,7 +2,7 @@ import { createHmac, randomBytes } from "node:crypto";
 import { isIP } from "node:net";
 import type { User } from "./auth-user.ts";
 import { database, type DatabaseSql } from "./database";
-import { sendSecurityAlert } from "./security-alerts";
+import { sendSecurityAlert, sendSecurityAlertOnce } from "./security-alerts";
 
 const APP_ID = /^keyway_[A-Za-z0-9_-]{24}$/;
 const LEGACY_APP_ID = "dashboard";
@@ -174,6 +174,7 @@ const OTP_EMAIL_HARD_LIMIT = 30;
 const DASHBOARD_OTP_LIMIT_PER_MINUTE = 30;
 const OWNER_OTP_LIMIT_PER_MINUTE = 120; // all of one developer's apps together, the most a single app may set
 const GLOBAL_OTP_LIMIT_PER_MINUTE = 200; // every app together, shared: all login email goes out through one sender
+const OTP_CEILING_ALERT_MINUTES = 10; // one alert per shared ceiling (and inbox) reached in this long
 // Wrong codes, for one email in one app over 24 hours. Codes stay six digits, so these bound guessing for the day:
 // at most OTP_FAILURE_PAUSE + OTP_BYPASS_LIMIT wrong codes (90 of a million) reach Better Auth.
 const OTP_FAILURE_LIMIT = 20; // from one source: that source is refused
@@ -199,7 +200,8 @@ export async function prepareOtpSend(input: {
   const { appId, emailHash, ipHash, networkHash } = context;
   const owner = app?.owner_user_id ?? null;
   const appLimit = app?.otp_limit_per_minute ?? DASHBOARD_OTP_LIMIT_PER_MINUTE;
-  const result = await sql.begin(async (transaction) => {
+  type Ceiling = "global" | "owner" | "inbox";
+  const result = await sql.begin(async (transaction): Promise<"failures" | "cooldown" | "limited" | "limited-first" | { ceilings: Ceiling[] }> => {
     const keys = [`otp:app:${appId}`, `otp:email:${emailHash}`, `otp:ip:${ipHash}`, ...owner ? [`otp:owner:${owner}`] : []];
     for (const key of keys.sort()) {
       await transaction`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`;
@@ -244,15 +246,24 @@ export async function prepareOtpSend(input: {
       return limits.app_limited === 0 ? "limited-first" : "limited";
     }
     await insertOtpEvent(transaction as unknown as DatabaseSql, context, "requested");
-    return "allowed";
+    // A shared ceiling only slows sources that asked recently, so the codes it lets through are worth an alert.
+    const ceilings: Ceiling[] = [];
+    if (limits.global_count + 1 >= GLOBAL_OTP_LIMIT_PER_MINUTE) ceilings.push("global");
+    if (owner && limits.owner_count + 1 >= OWNER_OTP_LIMIT_PER_MINUTE) ceilings.push("owner");
+    if (limits.email_count + 1 >= OTP_EMAIL_HARD_LIMIT) ceilings.push("inbox");
+    return { ceilings };
   });
   await pruneOtpEvents(sql);
   if (result === "failures") throw new Error(OTP_FAILURE_MESSAGE);
   if (result === "cooldown") throw new Error("Too many login codes requested. Wait 60 seconds before resending");
-  if (result !== "allowed") {
+  if (typeof result === "string") {
     // Not awaited: the caller holds a per-email lock and a pool connection.
     if (result === "limited-first") void sendSecurityAlert("otp_rate_limit", { appId });
     throw new Error("Too many login codes requested. Try again later");
+  }
+  const subjects: Record<Ceiling, string> = { global: "all", owner: owner ?? "", inbox: emailHash };
+  for (const ceiling of result.ceilings) {
+    await sendSecurityAlertOnce(`otp_${ceiling}_ceiling`, subjects[ceiling], OTP_CEILING_ALERT_MINUTES, { appId });
   }
   return context;
 }

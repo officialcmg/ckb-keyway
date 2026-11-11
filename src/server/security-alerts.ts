@@ -17,6 +17,26 @@ export async function recordSigningEvent(userId: string): Promise<void> {
   if (row.count === threshold) await sendSecurityAlert("unusual_signing_volume", { count: row.count, windowMinutes: 5 });
 }
 
+/**
+ * Sends an alert at most once per `windowMinutes` for one kind and subject, however many callers reach it at once.
+ * Waits only for the database; the alert itself goes out in the background.
+ */
+export async function sendSecurityAlertOnce(kind: string, subject: string, windowMinutes: number, details: Record<string, string | number>): Promise<void> {
+  const sql = await database();
+  const key = `${kind}:${createHash("sha256").update(subject).digest("hex")}`;
+  const rows = await sql`
+    insert into keyway_security_alert_marks (key, sent_at) values (${key}, now())
+    on conflict (key) do update set sent_at = now()
+    where keyway_security_alert_marks.sent_at < now() - ${`${windowMinutes} minutes`}::interval
+    returning 1
+  `;
+  if (!rows[0]) return;
+  void sendSecurityAlert(kind, details);
+  await sql`delete from keyway_security_alert_marks where key in (
+    select key from keyway_security_alert_marks where sent_at < now() - interval '1 day' limit 100
+  )`;
+}
+
 export async function sendSecurityAlert(kind: string, details: Record<string, string | number>): Promise<void> {
   console.warn("[keyway-security]", JSON.stringify({ kind, ...details }));
   const webhook = process.env.KEYWAY_SECURITY_ALERT_WEBHOOK_URL;
