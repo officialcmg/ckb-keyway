@@ -120,6 +120,40 @@ test("opening a channel to any public peer dials its checked IPs and never saves
   assert.deepEqual(dialed, [{ address: "/ip4/203.0.113.9/tcp/8228/p2p/Qm1", save: false }]);
 });
 
+test("opening a channel connects a new peer only while the hosted node has room for it", async () => {
+  const others = Array.from({ length: 32 }, (_, index) => ({ pubkey: `0x02${index.toString(16).padStart(64, "0")}` }));
+  const open = (pubkey: string, node: unknown) => managedNodeRequest("full-user", {
+    operation: "open-channel",
+    params: { pubkey, funding_amount: "0x5f5e100", funding_lock_script: lock },
+  }, node as never, async () => lock as never);
+  for (const peer of [PEER, OFFICIAL]) {
+    const { node, dialed } = hostedNode(["/ip4/203.0.113.5/tcp/8228/p2p/Qm1"]);
+    node.listPeers = async () => ({ peers: others });
+    await assert.rejects(open(peer, node), /at most 32 peers/, peer);
+    assert.deepEqual(dialed, [], peer);
+  }
+  // A peer it's already connected to needs no room.
+  const { node } = hostedNode([]);
+  let channels = 0;
+  node.listPeers = async () => ({ peers: [...others.slice(1), { pubkey: OFFICIAL }] });
+  node.openChannelWithExternalFunding = async () => { channels++; return { channel_id: `0x${"33".repeat(32)}` }; };
+  (node as { connectPeer: unknown }).connectPeer = async () => undefined;
+  await open(OFFICIAL, node);
+  assert.equal(channels, 1);
+});
+
+test("a hosted node dials only the first few addresses a peer announces", async () => {
+  const announced = Array.from({ length: 20 }, (_, index) => `/ip4/203.0.113.${index + 1}/tcp/8228/p2p/Qm1`);
+  for (const request of [
+    { operation: "act", method: "connectPeer", params: { pubkey: PEER } },
+    { operation: "open-channel", params: { pubkey: PEER, funding_amount: "0x5f5e100", funding_lock_script: lock } },
+  ]) {
+    const { node, dialed } = hostedNode(announced);
+    await managedNodeRequest("many-addresses", request, node as never, async () => lock as never);
+    assert.deepEqual(dialed.map(({ address }) => address), announced.slice(0, 4), request.operation);
+  }
+});
+
 test("IPv6 spellings of internal addresses are private", () => {
   for (const address of [
     "::ffff:7f00:1", "::ffff:a00:1", "0::1", "0:0:0:0:0:0:0:1", "::0:1", "::127.0.0.1", "::",

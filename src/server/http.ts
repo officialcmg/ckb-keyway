@@ -109,13 +109,10 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
   if (operation === "status" || operation === "list-channels" || operation === "call") {
     sweepHostedSettlement(user.id, () => ownLockScript(user));
   }
-  if (operation === "call") {
-    const limit = await consumeRateLimit(`fiber-call:${user.id}`, { max: 120, window: 60 });
-    if (!limit.allowed) throw new Error(`Too many Fiber node requests. Try again in ${limit.retryAfter ?? 60} seconds`);
-  }
-  if (operation === "act") {
-    const limit = await consumeRateLimit(`fiber-act:${user.id}`, { max: 30, window: 60 });
-    if (!limit.allowed) throw new Error(`Too many Fiber node changes. Try again in ${limit.retryAfter ?? 60} seconds`);
+  const rateLimit = managedNodeRateLimit(operation);
+  if (rateLimit) {
+    const limit = await consumeRateLimit(`${rateLimit.key}:${user.id}`, rateLimit.rule);
+    if (!limit.allowed) throw new Error(`${rateLimit.message}. Try again in ${limit.retryAfter ?? 60} seconds`);
   }
   if (operation === "pay") {
     const scope = await resolveAuthScope(request);
@@ -135,6 +132,13 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
   return Response.json(result, {
     headers: { "Cache-Control": "no-store" },
   });
+}
+
+/** Per-user limits on hosted-node requests: free calls, and changes such as peers and channel opens. */
+export function managedNodeRateLimit(operation: string): { key: string; rule: { max: number; window: number }; message: string } | undefined {
+  if (operation === "call") return { key: "fiber-call", rule: { max: 120, window: 60 }, message: "Too many Fiber node requests" };
+  if (operation === "act" || operation === "open-channel") return { key: "fiber-act", rule: { max: 30, window: 60 }, message: "Too many Fiber node changes" };
+  return undefined;
 }
 
 /**

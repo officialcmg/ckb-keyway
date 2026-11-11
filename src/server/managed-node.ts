@@ -307,6 +307,8 @@ function submitFundingParams(value: unknown): SubmitSignedFundingTxParams {
 }
 
 const MAX_PEERS = 32;
+// A peer's announced addresses are checked and dialed; only this many, however many it announces.
+const MAX_PEER_ADDRESSES = 4;
 
 /**
  * Connecting by pubkey makes the node dial the addresses the peer announced to the network, so those must
@@ -329,7 +331,7 @@ async function assertKnownPublicPeer(node: ManagedNodeClient, peer: string): Pro
       const tcp = found.addresses.filter((address) => /\/tcp\/\d+(\/p2p\/|$)/.test(address) && !/\/(ws|wss)(\/|$)/.test(address));
       if (tcp.length === 0) throw new Error("This peer announces no address a hosted node can reach; pass one with connectPeer");
       const pinned: string[] = [];
-      for (const address of tcp) pinned.push(await pinPublicPeerAddress(address));
+      for (const address of tcp.slice(0, MAX_PEER_ADDRESSES)) pinned.push(await pinPublicPeerAddress(address));
       return pinned;
     }
     if (result.nodes.length < 256) break;
@@ -338,8 +340,12 @@ async function assertKnownPublicPeer(node: ManagedNodeClient, peer: string): Pro
   throw new Error("This peer isn't in the Fiber network graph yet; connect to it first with connectPeer and its address");
 }
 
-async function assertPeerRoom(node: ManagedNodeClient): Promise<void> {
-  if ((await node.listPeers()).peers.length >= MAX_PEERS) throw new Error(`A hosted node can connect to at most ${MAX_PEERS} peers`);
+async function assertPeerRoom(node: ManagedNodeClient, peer?: string): Promise<void> {
+  const { peers } = await node.listPeers();
+  const bare = peer?.toLowerCase().replace(/^0x/, "");
+  // A peer that is already connected takes no more room.
+  if (bare && peers.some(({ pubkey }) => pubkey.toLowerCase().replace(/^0x/, "") === bare)) return;
+  if (peers.length >= MAX_PEERS) throw new Error(`A hosted node can connect to at most ${MAX_PEERS} peers`);
 }
 
 /**
@@ -360,9 +366,11 @@ async function connectManagedPeer(node: ManagedNodeClient, peer: Pubkey): Promis
     // Any public peer: its announced addresses must be public, and the handshake must match its key.
     const addresses = await assertKnownPublicPeer(node, peer);
     if (addresses.length === 0) return;
+    await assertPeerRoom(node);
     await connectGraphPeer(node, peer, addresses);
     return;
   }
+  await assertPeerRoom(node, peer);
   // Native nodes resolve current TCP addresses from gossip, not browser WSS seeds.
   let addresses: string[] = [];
   try {
