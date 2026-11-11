@@ -43,26 +43,42 @@ let waitingRepeats = 0;
 export const waitingRepeatCount = () => waitingRepeats;
 
 const STORE_ATTEMPTS = 3;
-/** Expired records of other accounts removed per new record, so the table stays at about one day of records. */
+/** Expired records pruned per new record, so the table never holds more than a few days of them. */
 export const PRUNE_BATCH = 100;
+/**
+ * How long an expired record stays as a tombstone, its response dropped: a repeat with its key is still refused
+ * ("use a new key") rather than run again.
+ */
+const TOMBSTONE = "7 days";
 
 /**
- * Removes the caller's expired records, and a batch of anyone's, before a new one is stored. Every new record
- * removes up to `PRUNE_BATCH` expired ones, so records of accounts that never come back don't pile up either.
+ * Before a new record is stored, drops the stored responses of up to `PRUNE_BATCH` expired records (anyone's, oldest
+ * first) and removes as many tombstones past `TOMBSTONE`. Each new record clears more than it adds, so the table
+ * holds responses for at most a day and small tombstones for a week, whatever one account sends.
  */
-async function pruneExpiredRecords(sql: DatabaseSql, userId: string): Promise<void> {
-  await sql`delete from keyway_v2_idempotency_keys where user_id = ${userId} and expires_at <= now()`;
+async function pruneExpiredRecords(sql: DatabaseSql): Promise<void> {
+  await sql`
+    update keyway_v2_idempotency_keys set response = null
+    where (user_id, operation, idempotency_key) in (
+      select user_id, operation, idempotency_key from keyway_v2_idempotency_keys
+      where expires_at <= now() and response is not null
+      order by expires_at
+      limit ${PRUNE_BATCH}
+      for update skip locked
+    )
+  `;
   await sql`
     delete from keyway_v2_idempotency_keys
     where (user_id, operation, idempotency_key) in (
       select user_id, operation, idempotency_key from keyway_v2_idempotency_keys
-      where expires_at <= now()
+      where expires_at <= now() - ${TOMBSTONE}::interval
       order by expires_at
       limit ${PRUNE_BATCH}
       for update skip locked
     )
   `;
 }
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export async function runIdempotentMutation<T>(
@@ -78,7 +94,7 @@ export async function runIdempotentMutation<T>(
   const staleSeconds = (options.staleAfterMs ?? DEFAULT_STALE_MS) / 1000;
 
   const sql = await database();
-  await pruneExpiredRecords(sql, userId);
+  await pruneExpiredRecords(sql);
   const [claimed] = await sql<Array<{ id: number }>>`
     insert into keyway_v2_idempotency_keys (
       user_id, operation, idempotency_key, request_digest, status, expires_at

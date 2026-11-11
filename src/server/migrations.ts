@@ -415,4 +415,14 @@ export const migrations: Array<{
       claimed_at timestamptz not null default now()
     )`,
   },
+  {
+    version: 25, name: "idempotency-pruning",
+    up: async (sql) => {
+      // Node-backup loads are plain reads now, so their stored copies (up to 16 MB each) go; expired records keep
+      // only a tombstone. The partial index lets each new record find expired responses to drop.
+      await sql`delete from keyway_v2_idempotency_keys where operation = 'node-backup:claim'`;
+      await sql`update keyway_v2_idempotency_keys set response = null where expires_at <= now() and response is not null`;
+      await sql`create index keyway_v2_idempotency_keys_unpruned on keyway_v2_idempotency_keys (expires_at) where response is not null`;
+    },
+  },
 ];
