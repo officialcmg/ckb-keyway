@@ -97,6 +97,12 @@ async function pastFailures(sql: postgres.Sql, appId: string, victim: string, so
   }
 }
 
+// As if someone had signed in to `victim`'s account in `appId` from `ip`'s network.
+async function knownNetworkFor(sql: postgres.Sql, appId: string, victim: string, ip: string) {
+  const { emailHash, networkHash } = otpSubject(appId, victim, ip);
+  await sql`insert into keyway_otp_known_networks (app_id, email_hash, network_hash, verified_at) values (${appId}, ${emailHash}, ${networkHash}, now())`;
+}
+
 const count = (alerts: string[], kind: string) => alerts.filter((alert) => JSON.parse(alert).kind === kind).length;
 
 // Every test starts with the per-minute and per-10-minute budgets clear of earlier tests' requests.
@@ -235,12 +241,11 @@ test("strangers' wrong codes pause other checks but not the owner's fresh code",
   const theirCode = codes.get(`${appId}:${victim}`)!;
   await assert.rejects(verifyEmailCode(stranger, theirs.challengeId, wrong(theirCode)), /Incorrect/);
   await assert.rejects(verifyEmailCode(stranger, theirs.challengeId, theirCode), /Try again later/);
-  // The owner, from somewhere else, asks for a code and signs in with it. A stranger can't try it for them.
-  const user = appRequest(appId, origin, "198.18.2.7");
-  const mine = await sendEmailCode(user, victim);
+  // The owner, from somewhere else, asks for a code and signs in with it, even if the browser checks it from another
+  // address than it asked from (IPv6 to ask, IPv4 to check).
+  const mine = await sendEmailCode(appRequest(appId, origin, "2001:db8:2:7::1"), victim);
   const myCode = codes.get(`${appId}:${victim}`)!;
-  await assert.rejects(verifyEmailCode(stranger, mine.challengeId, myCode), /Try again later/);
-  assert.ok((await verifyEmailCode(user, mine.challengeId, myCode)).sessionToken);
+  assert.ok((await verifyEmailCode(appRequest(appId, origin, "198.18.2.7"), mine.challengeId, myCode)).sessionToken);
 });
 
 test("wrong codes add up over a day, not only an hour", { skip }, async () => {
@@ -249,14 +254,16 @@ test("wrong codes add up over a day, not only an hour", { skip }, async () => {
   const { appId } = await application([origin]);
   const victim = email();
   await pastFailures(sql, appId, victim, [1, 2, 3, 4, 5, 6].map((i) => `198.18.3.${i}`), 5, 120);
+  // One of those sources tries again, two hours later, on a code of its own: still paused.
+  const stranger = appRequest(appId, origin, "198.18.3.1");
+  const theirs = await sendEmailCode(stranger, victim);
+  await assert.rejects(verifyEmailCode(stranger, theirs.challengeId, wrong(codes.get(`${appId}:${victim}`)!)), /Try again later/);
+  // Once the wrong codes are a day old, checks resume.
+  await sql`update keyway_otp_events set created_at = created_at - interval '22 hours 1 minute' where app_id = ${appId} and outcome = 'verify_failed'`;
+  await assert.rejects(verifyEmailCode(stranger, theirs.challengeId, wrong(codes.get(`${appId}:${victim}`)!)), /Incorrect/);
   const user = appRequest(appId, origin, "198.18.3.10");
   const mine = await sendEmailCode(user, victim);
-  const myCode = codes.get(`${appId}:${victim}`)!;
-  const stranger = appRequest(appId, origin, "198.18.3.9");
-  await assert.rejects(verifyEmailCode(stranger, mine.challengeId, wrong(myCode)), /Try again later/);
-  await sql`update keyway_otp_events set created_at = created_at - interval '22 hours 1 minute' where app_id = ${appId} and outcome = 'verify_failed'`;
-  await assert.rejects(verifyEmailCode(stranger, mine.challengeId, wrong(myCode)), /Incorrect/);
-  assert.ok((await verifyEmailCode(user, mine.challengeId, myCode)).sessionToken);
+  assert.ok((await verifyEmailCode(user, mine.challengeId, codes.get(`${appId}:${victim}`)!)).sessionToken);
 });
 
 test("while checks are paused, fresh codes' first tries are limited per network and in all", { skip }, async () => {
@@ -265,6 +272,10 @@ test("while checks are paused, fresh codes' first tries are limited per network 
   const { appId } = await application([origin]);
   const victim = email();
   const code = () => codes.get(`${appId}:${victim}`)!;
+  // The owner signed in from home some time ago.
+  const home = appRequest(appId, origin, "198.18.4.30");
+  const first = await sendEmailCode(home, victim);
+  await verifyEmailCode(home, first.challengeId, code());
   await pastFailures(sql, appId, victim, [1, 2, 3, 4, 5, 6].map((i) => `198.18.4.${i}`), 5, 10);
   // Separate /64s in one IPv6 /48 are one network: three wrong first tries, then none.
   for (let i = 1; i <= 3; i++) {
@@ -285,6 +296,10 @@ test("while checks are paused, fresh codes' first tries are limited per network 
   const next = appRequest(appId, origin, "198.18.4.21");
   const nextChallenge = await sendEmailCode(next, victim);
   await assert.rejects(verifyEmailCode(next, nextChallenge.challengeId, code()), /Try again later/);
+  // Strangers can use those up, but not the owner's own: a network that signed in recently keeps its first tries.
+  await later(sql, 61);
+  const again = await sendEmailCode(home, victim);
+  assert.ok((await verifyEmailCode(home, again.challengeId, code())).sessionToken);
 });
 
 test("a stranger's requests don't hold up the user's own code", { skip }, async () => {
@@ -389,6 +404,38 @@ test("past an inbox's 30 codes in 10 minutes, only a network that had none for i
   await prepareOtpSend({ appId, email: victim, ipAddress: "2001:db8:66:1::1" });
   await assert.rejects(prepareOtpSend({ appId, email: victim, ipAddress: "2001:db8:66:2::1" }), /Too many login codes/);
   assert.equal(count(alerts, "otp_inbox_ceiling"), before + 1, "One alert while the inbox is past its limit");
+  // At 100 codes, a new network gets none either; one the owner signed in from recently still does.
+  for (let i = 1; i <= 68; i++) await prepareOtpSend({ appId, email: victim, ipAddress: `100.66.2.${i}` });
+  await assert.rejects(prepareOtpSend({ appId, email: victim, ipAddress: "100.66.3.1" }), /Too many login codes/);
+  await knownNetworkFor(sql, appId, victim, "100.66.3.2");
+  await prepareOtpSend({ appId, email: victim, ipAddress: "100.66.3.2" });
+});
+
+test("past 1,000 codes a minute from everyone, only networks people signed in from recently get one", { skip, timeout: 120_000 }, async () => {
+  const { sql } = await setup();
+  const { appId } = await application([], 120);
+  for (let i = 0; i < 1000; i++) await prepareOtpSend({ appId, email: email(), ipAddress: `100.70.${Math.floor(i / 250)}.${(i % 250) + 1}` });
+  await assert.rejects(prepareOtpSend({ appId, email: email(), ipAddress: "100.70.9.1" }), /Too many login codes/);
+  const returning = email();
+  await knownNetworkFor(sql, appId, returning, "100.70.9.2");
+  await prepareOtpSend({ appId, email: returning, ipAddress: "100.70.9.2" });
+});
+
+test("wrong codes across every app and email raise one alert an hour past 500", { skip }, async () => {
+  const { sql, codes, alerts } = await setup();
+  const origin = "https://platform.example";
+  const { appId } = await application([origin]);
+  const [{ total }] = await sql<Array<{ total: number }>>`select count(*)::int as total from keyway_otp_events where outcome = 'verify_failed' and created_at >= now() - interval '1 hour'`;
+  await sql`delete from keyway_security_alert_marks where key like 'otp_platform_failures:%'`;
+  await pastFailures(sql, appId, email(), ["192.0.2.160"], Math.max(0, 499 - total), 5);
+  const before = count(alerts, "otp_platform_failures");
+  for (const ip of ["192.0.2.161", "192.0.2.162"]) {
+    const request = appRequest(appId, origin, ip);
+    const user = email();
+    const { challengeId } = await sendEmailCode(request, user);
+    await assert.rejects(verifyEmailCode(request, challengeId, wrong(codes.get(`${appId}:${user}`)!)), /Incorrect/);
+  }
+  assert.equal(count(alerts, "otp_platform_failures"), before + 1);
 });
 
 test("wallet locks held for a long time don't hold up sign-in", { skip, timeout: 30_000 }, async () => {

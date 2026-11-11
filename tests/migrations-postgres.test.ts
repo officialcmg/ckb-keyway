@@ -22,7 +22,7 @@ test("migrations apply once and drop the unused hosted-node confirmations table"
   assert.equal(kept?.name, "keyway_v2_signature_requests");
 });
 
-test("migration 23 signs out sessions issued before sessions recorded their origin", { skip: !enabled }, async (t) => {
+test("migrations 23 and 25 sign out sessions without an origin and remove expired challenges", { skip: !enabled }, async (t) => {
   const admin = postgres(process.env.KEYWAY_AUTH_TEST_DATABASE_URL!, { max: 1 });
   const name = `keyway_migration_${crypto.randomUUID().replaceAll("-", "")}`;
   await admin.unsafe(`create database ${name}`);
@@ -46,7 +46,13 @@ test("migration 23 signs out sessions issued before sessions recorded their orig
   await sql`insert into keyway_auth_sessions ("expiresAt", token, "updatedAt", "userId", "scopeId", "origin") values
     (now() + interval '1 day', 'before-origins', now(), ${user.id}, 'dashboard', null),
     (now() + interval '1 day', 'after-origins', now(), ${user.id}, 'dashboard', 'https://dashboard.example')`;
+  const [expired, open] = [crypto.randomUUID(), crypto.randomUUID()];
+  await sql`insert into keyway_auth_challenges (id, scope_id, email, expires_at, status) values
+    (${expired}, 'dashboard', 'old@example.com', now() - interval '1 minute', 'sent'),
+    (${open}, 'dashboard', 'old@example.com', now() + interval '5 minutes', 'sent')`;
   await migrateDatabase(sql);
+  const challenges = await sql<Array<{ id: string }>>`select id from keyway_auth_challenges`;
+  assert.deepEqual(challenges.map(({ id }) => id), [open]);
   const sessions = await sql<Array<{ token: string }>>`select token from keyway_auth_sessions order by token`;
   assert.deepEqual(sessions.map(({ token }) => token), ["after-origins"]);
 });

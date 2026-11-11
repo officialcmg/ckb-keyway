@@ -168,8 +168,7 @@ export function sendEmailCode(request: Request, emailInput: string): Promise<{ c
       // Expired challenges are no use to anyone, and hold the emails people typed.
       await sql`delete from keyway_auth_challenges where id in (select id from keyway_auth_challenges where expires_at < now() limit 100)`;
       // Earlier challenges for this email stay open: each has its own code, and anyone may ask for one.
-      await sql`insert into keyway_auth_challenges (id, scope_id, email, expires_at, status, ip_hash)
-        values (${challengeId}, ${scope.id}, ${email}, ${new Date(Date.now() + 600_000)}, 'pending', ${context.ipHash})`;
+      await sql`insert into keyway_auth_challenges (id, scope_id, email, expires_at, status) values (${challengeId}, ${scope.id}, ${email}, ${new Date(Date.now() + 600_000)}, 'pending')`;
       try {
         const deliveryState = { challengeId, delivered: false };
         const response = await challengeContext.run(deliveryState, () => callAuthEndpoint(request, scope, "/email-otp/send-verification-otp", { email, type: "sign-in" }));
@@ -197,12 +196,12 @@ export function verifyEmailCode(request: Request, challengeId: string, code: str
     const [challenge] = await sql<Array<{ email: string }>>`select email from keyway_auth_challenges where id = ${challengeId}::uuid and scope_id = ${scope.id}`;
     if (!challenge) throw new Error("Incorrect or expired code");
     return withLoginCodeLock(`otp:${scope.id}:${challenge.email}`, async (connection) => {
-      const [current] = await connection<Array<{ ip_hash: string | null; wrong_attempts: number }>>`
-        select ip_hash, wrong_attempts from keyway_auth_challenges
+      const [current] = await connection<Array<{ wrong_attempts: number }>>`
+        select wrong_attempts from keyway_auth_challenges
         where id = ${challengeId}::uuid and scope_id = ${scope.id} and status = 'sent' and expires_at > now()`;
       if (!current) throw new Error("Incorrect or expired code");
       const context = otpSubject(scope.id, challenge.email, requestIp(request));
-      const { bypass } = await checkOtpFailures(context, { ipHash: current.ip_hash, wrongAttempts: current.wrong_attempts });
+      const { bypass } = await checkOtpFailures(context, { wrongAttempts: current.wrong_attempts });
       const response = await withOtpChallenge(challengeId, () => callAuthEndpoint(request, scope, "/sign-in/email-otp", { email: challenge.email, otp: code }));
       if (!response.ok) {
         // Count a wrong code only when Better Auth compared it. After a wrong code it keeps the record (one more attempt

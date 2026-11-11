@@ -423,14 +423,21 @@ export const migrations: Array<{
   {
     version: 25, name: "login-code-sources",
     up: async (sql) => {
-      // The source (IP address or IPv6 /64) that asked for each login code and the wrong codes tried on it, so the
-      // person who asked can still use a fresh code while wrong codes from others pause the email's checks.
-      await sql`alter table keyway_auth_challenges add column ip_hash text, add column wrong_attempts integer not null default 0`;
-      // Expired challenges are removed as new ones are made.
+      // The wrong codes tried on each login challenge, so its owner can still use a fresh code while wrong codes from
+      // others pause the email's checks.
+      await sql`alter table keyway_auth_challenges add column wrong_attempts integer not null default 0`;
+      // Expired challenges hold the emails people typed: removed now, and from here on as new ones are made.
+      await sql`delete from keyway_auth_challenges where expires_at < now()`;
       await sql`create index keyway_auth_challenges_expiry on keyway_auth_challenges (expires_at)`;
       // The network (IPv4 address or IPv6 /48) of each login-code event, and whether a wrong code was tried while
       // the email's checks were paused.
       await sql`alter table keyway_otp_events add column network_hash text, add column bypass boolean not null default false`;
+      // Networks that signed in to an email's account in an app, kept 90 days: the owner's own, which strangers can't add.
+      await sql`create table keyway_otp_known_networks (
+        app_id text not null, email_hash text not null, network_hash text not null, verified_at timestamptz not null,
+        primary key (app_id, email_hash, network_hash)
+      )`;
+      await sql`create index keyway_otp_known_networks_age on keyway_otp_known_networks (verified_at)`;
     },
   },
   {
