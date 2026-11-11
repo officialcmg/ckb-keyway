@@ -318,25 +318,12 @@ test("a send-limit change never leaves the server's daily amounts looser than th
   assert.deepEqual(await amounts(), { ckb: (10n * CKB).toString() });
   world.add(sent.at(-1)!, "committed");
 
-  // Another change, made while this one was under way, already wrote a stricter amount: it isn't overwritten.
-  const sql = await database();
-  context.broadcast = broadcast;
-  const rateLimit = context.rateLimit;
-  context.rateLimit = async (key, rule) => {
-    await sql`update keyway_v2_daily_amounts set amount = ${(5n * CKB).toString()} where user_id = ${user.id} and asset = 'ckb'`;
-    return rateLimit(key, rule);
-  };
-  await set(8n * CKB);
-  context.rateLimit = rateLimit;
-  assert.deepEqual(await amounts(), { ckb: (5n * CKB).toString() });
-  world.add(sent.at(-1)!, "committed");
-
   // Raising it fails to send: the server keeps the stricter amount.
   context.broadcast = async () => { throw new Error("connection reset"); };
   const raise = await set(1_000n * CKB);
   assert.equal(raise.requiresEmailCode, true);
   await assert.rejects(set(1_000n * CKB, { confirmationNonce: raise.confirmationNonce, emailCode: codeFrom(world) }), /connection reset/);
-  assert.deepEqual(await amounts(), { ckb: (5n * CKB).toString() });
+  assert.deepEqual(await amounts(), { ckb: (10n * CKB).toString() });
 
   t.after(async () => {
     const sql = await database();
@@ -406,7 +393,8 @@ test("setting the old amount again while a tightening is being signed can't leav
   context.recordSigning = async () => {
     if (raced) return;
     raced = set(150n * CKB).catch((error: Error) => error);
-    await raced;
+    // Give it time to run alongside, as far as it can, without waiting on it (it may be waiting on this change).
+    await Promise.race([raced, new Promise((resolve) => setTimeout(resolve, 1_000))]);
   };
   const lowered = await set(10n * CKB).catch((error: Error) => error);
   await raced;
@@ -419,4 +407,60 @@ test("setting the old amount again while a tightening is being signed can't leav
     const sql = await database();
     await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
   });
+});
+
+/** The amount in the account's newest send-limit cell among these transactions: the one no other of them spends. */
+function newestCellAmount(sent: ccc.Transaction[], secp: ccc.Script): bigint | undefined {
+  const spent = new Set(sent.flatMap((tx) => tx.inputs.map((input) => `${input.previousOutput.txHash}:${Number(input.previousOutput.index)}`)));
+  for (const tx of sent) {
+    const index = tx.outputs.findIndex((output, i) => isSendLimitCell(output, tx.outputsData[i], secp));
+    if (index !== -1 && !spent.has(`${tx.hash()}:${index}`)) return decodeSendLimitSettings(tx.outputsData[index]).ckb;
+  }
+  return undefined;
+}
+
+test("a lowering made while a raise is being sent leaves the server no looser than the chain", { skip: !enabled }, async (t) => {
+  const { world, secp, user, context, sent } = await setUp();
+  t.after(() => { litSignerOverride.mode = undefined; });
+  const { set, amounts } = await limitsOn(world, context, sent, 150n * CKB);
+  const raise = await set(1_000n * CKB);
+  // The raise reaches the node; before the server hears back, the same session lowers the amount to 50 CKB.
+  const broadcast = context.broadcast!;
+  let lowering: Promise<unknown> | undefined;
+  context.broadcast = async (tx) => {
+    const hash = await broadcast(tx);
+    if (!lowering) {
+      lowering = set(50n * CKB).catch((error: Error) => error);
+      await Promise.race([lowering, new Promise((resolve) => setTimeout(resolve, 4_000))]);
+    }
+    return hash;
+  };
+  await set(1_000n * CKB, { confirmationNonce: raise.confirmationNonce, emailCode: codeFrom(world) });
+  const lowered = await lowering;
+  assert.ok(!(lowered instanceof Error), lowered instanceof Error ? lowered.message : "");
+  const onChain = newestCellAmount(sent, secp)!;
+  assert.equal(onChain, 50n * CKB, "the lowering is the newest cell");
+  assert.deepEqual(await amounts(), { ckb: onChain.toString() });
+
+  t.after(async () => {
+    const sql = await database();
+    await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
+  });
+});
+
+test("two token amounts added at once can't take the account past the eight the send-limit cell holds", { skip: !enabled }, async (t) => {
+  const { world, context } = await setUp();
+  t.after(() => { litSignerOverride.mode = undefined; });
+  const token = (i: number) => `0x${i.toString(16).padStart(2, "0").repeat(32)}`;
+  const quick = { ...context, signDigest: async () => "0x" as ccc.Hex };
+  for (let i = 1; i <= 7; i++) await signingSettings(quick, { operation: "set-daily-amount", asset: token(i), amount: "1000" });
+  // An account that can't afford the send-limit cell (no plain cell, found after a slow lookup) keeps its amounts
+  // on the server; the lookup sits between reading the amounts and writing the new one.
+  const slow = Object.assign(world.client(), { findCellsOnChain: async function* () { await new Promise((resolve) => setTimeout(resolve, 300)); } });
+  const set = (asset: string) => signingSettings({ ...context, client: slow }, { operation: "set-daily-amount", asset, amount: "1000" });
+  const results = await Promise.allSettled([set(token(8)), set(token(9))]);
+  assert.equal(results.filter(({ status }) => status === "rejected").length, 1, JSON.stringify(results.map((result) => result.status === "rejected" ? String(result.reason) : "ok")));
+  assert.match(String((results.find(({ status }) => status === "rejected") as PromiseRejectedResult).reason), /At most 8 tokens/);
+  const stored = (await signingSettings(context, { operation: "get" }) as { dailyAmounts: Record<string, string> }).dailyAmounts;
+  assert.equal(Object.keys(stored).length, 8);
 });

@@ -4,7 +4,7 @@ import * as ccc from "@ckb-ccc/core";
 import { sha256 } from "@noble/hashes/sha2.js";
 import type { User } from "./auth-user.ts";
 import type { TransactionSql } from "postgres";
-import { database, type DatabaseSql } from "./database.ts";
+import { database, withUserLock, type DatabaseSql } from "./database.ts";
 import { createConfirmationEmailTemplate } from "./email-template.ts";
 import { formatCkbSignature, serializeTransaction, signAccountGroups, signingGroups, type SigningGroup } from "./funding-transaction.ts";
 import { accountLocks, secp256k1Lock } from "../sdk/browser/account-lock.ts";
@@ -310,14 +310,22 @@ export async function messageSigning(context: SigningContext, body: Record<strin
  * confirmation off) needs a code from the user's inbox.
  */
 export async function signingSettings(context: SigningContext, body: Record<string, unknown>): Promise<unknown> {
-  const current = await readDailyAmounts(context.user);
-  const view = (amounts: DailyAmounts) => ({
-    dailyAmounts: Object.fromEntries([...amounts].map(([asset, amount]) => [asset, amount.toString()])),
-  });
-  if (body.operation === "get") return view(current);
+  if (body.operation === "get") return dailyAmountsView(await readDailyAmounts(context.user));
   if (body.operation !== "set-daily-amount") throw new Error("A valid settings operation is required");
   // A change can sign and send a send-limit transaction and look up the chain, so it is limited like a signing.
   await limit(context, "sign", { max: 10, window: 60 });
+  // One change at a time per user, from reading the amounts to writing them: each change is checked against, and
+  // written over, the amounts the one before it left, so overlapping changes can't undo each other.
+  return withUserLock(`daily-amounts:${context.user.id}`, () => setDailyAmount(context, body));
+}
+
+function dailyAmountsView(amounts: DailyAmounts) {
+  return { dailyAmounts: Object.fromEntries([...amounts].map(([asset, amount]) => [asset, amount.toString()])) };
+}
+
+async function setDailyAmount(context: SigningContext, body: Record<string, unknown>): Promise<unknown> {
+  const current = await readDailyAmounts(context.user);
+  const view = dailyAmountsView;
   const change = { asset: parseAsset(body.asset), amount: parseThreshold(body.amount) };
   const next = new Map(current);
   if (change.amount === null) next.delete(change.asset); else next.set(change.asset, change.amount);
