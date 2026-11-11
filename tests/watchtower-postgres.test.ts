@@ -294,7 +294,7 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     });
   }
 
-  await t.test("a revocation reopens only a close it can punish, and never takes an account over the cap", async () => {
+  await t.test("a revocation reopens only a close it can punish, even with the account at the cap", async () => {
     await sql`delete from keyway_v2_watchtower_channels`;
     // The peer force-closes with commitment 1 (the testnet proof's) before any revocation reached KeyWay; the other
     // two channels close cooperatively and by the user's own commitment.
@@ -337,19 +337,17 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     assert.equal(await stored(revoke(peerClosed, 0)), true);
     assert.deepEqual(await state(peerClosed), closed);
 
-    // Revocation 1 does, but the account already has as many channels checked every pass as it may.
+    // Revocation 2 (the proof's) does. The account already has as many channels checked every pass as it may, but a
+    // revoked close left alone would lose the user the channel: it reopens, and the next pass punishes it.
     await sql`insert into keyway_v2_watchtower_channels (user_id, channel_id, local_funding_pubkey, remote_funding_pubkey, funding_lock_args, peer_commitment_key)
       select ${user.id}, '0x' || lpad(to_hex(n), 64, '0'), ${K1}, ${K2}, ${fundingLockArgs(K1, K2)}, ${peerCommitmentKey(K1, K2)} from generate_series(1, ${MAX_WATCHED_CHANNELS}) n`;
-    assert.equal(await stored(revoke(peerClosed, 1)), true);
-    assert.deepEqual(await state(peerClosed), closed);
-    const [{ count }] = await sql<Array<{ count: string }>>`
-      select count(*) from keyway_v2_watchtower_channels where user_id = ${user.id} and (state in ('watching', 'penalty-sent') or not resolution_confirmed)
-    `;
-    assert.equal(Number(count), MAX_WATCHED_CHANNELS);
-    // With room under the cap, the next one reopens it for the pass to punish.
-    await sql`delete from keyway_v2_watchtower_channels where user_id = ${user.id} and channel_id = ${`0x${"0".repeat(63)}1`}`;
     assert.equal(await stored(proofRevocation(peerClosed)), true);
     assert.deepEqual(await state(peerClosed), { state: "watching", resolution_confirmed: false });
+    const punished: string[] = [];
+    await sql`update keyway_v2_watchtower_channels set state = 'closed', resolution_confirmed = true where user_id = ${user.id} and channel_id <> ${peerClosed} and state = 'watching'`;
+    await runWatchtowerPass({ sql, chain, punish: async (row) => { punished.push(row.channel_id); return `0x${"cd".repeat(32)}`; }, log: () => undefined });
+    assert.deepEqual(punished, [peerClosed]);
+    assert.equal((await state(peerClosed)).state, "penalty-sent");
     await sql`delete from keyway_v2_watchtower_channels where user_id = ${user.id}`;
   });
 

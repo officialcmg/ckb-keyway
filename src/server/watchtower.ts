@@ -319,14 +319,13 @@ export async function watchtowerRequest(user: User, request: WatchtowerRequest, 
       }
       // The peer may have force-closed with a commitment this revocation covers (it arrived late): the next pass
       // looks at the close again and punishes it. Only such a close reopens; a cooperative close or the user's own
-      // force-close never does.
-      let reopen = existing.state === "closed" && existing.closing_commitment_number !== null
+      // force-close never does. It reopens even when the account is at the cap: the cap bounds new registrations, and
+      // a revoked close left unpunished loses the user the channel. The row already exists, the peer had to put that
+      // close on-chain, and the next pass settles it for good (penalty, or `invalid` if this revocation can't unlock
+      // it), so this can't grow an account's checks beyond its real closes; the per-account share of each pass
+      // (`ACCOUNT_BUDGET_MS`) keeps them from slowing anyone else's.
+      const reopen = existing.state === "closed" && existing.closing_commitment_number !== null
         && BigInt(existing.closing_commitment_number) <= revocation.commitmentNumber;
-      if (reopen && existing.resolution_confirmed) {
-        // A confirmed close no longer counts toward the cap, so reopening it must not take the account over it.
-        await tx`select pg_advisory_xact_lock(hashtextextended(${`watchtower:${user.id}`}, 0))`;
-        reopen = await checkedChannels(tx, user.id) < MAX_WATCHED_CHANNELS;
-      }
       const [row] = await tx<Row[]>`
         update keyway_v2_watchtower_channels set
           commitment_number = ${revocation.commitmentNumber.toString()},
