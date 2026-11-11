@@ -346,3 +346,16 @@ test("L16: a database error caused by the request's own input is a 400, not an o
   assert.equal(response.status, 400);
   assert.deepEqual(await response.json(), { error: "The request is invalid" });
 });
+
+test("L16: a repeat of a mutation that failed on a database or network error doesn't get that error's text", { skip }, async () => {
+  const userId = crypto.randomUUID();
+  const failure = Object.assign(new Error("connect ECONNREFUSED 10.1.2.3:5432 (db.internal)"), { errno: -111, syscall: "connect" });
+  await assert.rejects(runIdempotentMutation(userId, "test", "internal-failure-0001", {}, async () => { throw failure; }), /ECONNREFUSED/);
+  await assert.rejects(runIdempotentMutation(userId, "test", "internal-failure-0001", {}, async () => undefined), (error: Error) => {
+    assert.equal(error.message, "Managed operation failed");
+    return true;
+  });
+  // KeyWay's own errors are still replayed as they were.
+  await assert.rejects(runIdempotentMutation(userId, "test", "own-failure-00001", {}, async () => { throw new Error("Payment amount is too large"); }));
+  await assert.rejects(runIdempotentMutation(userId, "test", "own-failure-00001", {}, async () => undefined), /Payment amount is too large/);
+});
