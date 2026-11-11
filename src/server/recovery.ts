@@ -220,9 +220,8 @@ export async function settleRecoveryChange(context: Pick<RecoveryContext, "user"
     if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
     const pending = wallet.recoveryPending;
     if (!pending) return { wallet };
-    // No node that is caught up with the change's inputs could decide: it stays pending until one can.
-    const state = await onOneNode(context.client ? [context.client] : settlementNodes(), (client) => pendingState(context, client, pending, now))
-      .catch((error: unknown) => { if (error instanceof NodeBehind) return "kept" as const; throw error; });
+    // When no node that has caught up with the change's inputs can decide, it stays pending until one can.
+    const state = await onOneNode(context.client ? [context.client] : settlementNodes(), (client) => pendingState(context, client, pending, now), "kept");
     if (state === "kept") return { wallet };
     const { recoveryPending: _done, ...rest } = wallet;
     if (state === "committed") {
@@ -249,25 +248,29 @@ export function settlementNodes(): ccc.Client[] {
   return SETTLEMENT_NODES.map((url) => new ccc.ClientPublicTestnet({ url, fallbacks: [] }));
 }
 
+/** The node doesn't know a cell the change spends, so it can't say whether that cell is spent: ask another. */
+export class NodeBehind extends Error {}
+
 /**
  * Runs `read` against one node at a time, so every answer it combines comes from the same node: CCC's fallback
  * would send a failed request to another node mid-way, and two nodes can disagree (one lagging, one reorged).
- * If a node fails, the whole read starts again on the next one; the last failure is thrown.
+ * If a node fails, the whole read starts again on the next one. When none answers, `undecided` is returned if a
+ * node was only behind (`NodeBehind`), and the last failure is thrown otherwise.
  */
-export async function onOneNode<T>(nodes: ccc.Client[], read: (client: ccc.Client) => Promise<T>): Promise<T> {
+export async function onOneNode<T>(nodes: ccc.Client[], read: (client: ccc.Client) => Promise<T>, undecided?: T): Promise<T> {
   let failure: unknown;
+  let behind = false;
   for (const node of nodes) {
     try {
       return await read(node);
     } catch (error) {
       failure = error;
+      behind ||= error instanceof NodeBehind;
     }
   }
+  if (behind && undecided !== undefined) return undecided;
   throw failure ?? new Error("No CKB node to read from");
 }
-
-/** The node doesn't know a cell the change spends, so it can't say whether that cell is spent: ask another. */
-class NodeBehind extends Error {}
 
 /** Where a pending change stands on this node: committed, dropped for good, or still pending (and sent again if needed). */
 async function pendingState(context: Pick<RecoveryContext, "broadcast">, client: ccc.Client, pending: PendingRecoveryChange, now: Date): Promise<"kept" | "committed" | "dropped"> {

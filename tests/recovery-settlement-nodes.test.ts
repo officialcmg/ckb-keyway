@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
-import { onOneNode, settlementNodes } from "../src/server/recovery.ts";
+import { NodeBehind, onOneNode, settlementNodes } from "../src/server/recovery.ts";
 
 const HASH = `0x${"ab".repeat(32)}`;
 
@@ -50,4 +50,14 @@ test("a settlement read is answered by one node from start to finish", async () 
   assert.deepEqual(await onOneNode([node("lagging", 2), node("current")], read), ["current", "current"]);
   assert.deepEqual(await onOneNode([node("first"), node("second")], read), ["first", "first"]);
   await assert.rejects(onOneNode([node("a", 1), node("b", 1)], read), /b is unreachable/);
+});
+
+test("a change stays pending when the only node that answered was behind, even if the next one is unreachable", async () => {
+  const behind = { getTransaction: async () => { throw new NodeBehind("behind"); } } as unknown as ccc.Client;
+  const unreachable = { getTransaction: async () => { throw new Error("unreachable"); } } as unknown as ccc.Client;
+  const read = async (client: ccc.Client) => (await client.getTransaction(HASH))?.status as string;
+  assert.equal(await onOneNode([behind, unreachable], read, "kept"), "kept");
+  assert.equal(await onOneNode([unreachable, behind], read, "kept"), "kept");
+  // With no node behind, a node failure is still an error, not a decision.
+  await assert.rejects(onOneNode([unreachable, unreachable], read, "kept"), /unreachable/);
 });
