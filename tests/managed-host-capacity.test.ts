@@ -59,6 +59,7 @@ const ABORTED_FUNDING = [{ state: { state_name: "Closed", state_flags: "FUNDING_
 // Signed on our side, with funding that may or may not have reached the chain.
 const FUNDING_TX = `0x${"77".repeat(32)}`;
 const SIGNED_CHANNEL = [{ state: { state_name: "AwaitingTxSignatures", state_flags: "OUR_TX_SIGNATURES_SENT" }, channel_outpoint: `${FUNDING_TX}00000000` }];
+const BROADCAST_CHANNEL = [{ state: { state_name: "AwaitingChannelReady", state_flags: "OUR_CHANNEL_READY" }, channel_outpoint: `${FUNDING_TX}00000000` }];
 const exists = (path: string) => stat(path).then(() => true, () => false);
 
 async function until(check: () => Promise<boolean>) {
@@ -119,8 +120,8 @@ async function host(context: TestContext) {
     await module.shutdown();
     await rm(root, { recursive: true, force: true });
   });
-  const request = (user: string, method = "node_info") => module
-    .proxyUserRequest(user, Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: [] })))
+  const request = (user: string, method = "node_info", signal?: AbortSignal) => module
+    .proxyUserRequest(user, Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: [] })), signal)
     .then(({ status }) => status, () => 502);
   const running = () => module.runningUsers().sort();
   const marked = (user: string) => stat(join(root, "users", user, "keyway-channels")).then(() => true, () => false);
@@ -440,7 +441,7 @@ test("a channel a peer opened to the node marks it once the node's channels show
 test("a node whose channels can hold nothing more makes room once its user has stopped, and loses its marker", async (context) => {
   // Force-closed and settled on-chain (by either side), opened but never funded, signed but with funding CKB has
   // never seen, and funding aborted by Fiber.
-  for (const channels of [SETTLED_FORCE_CLOSE, SETTLED_REMOTE_CLOSE, UNFUNDED_CHANNEL, SIGNED_CHANNEL, ABORTED_FUNDING]) {
+  for (const channels of [SETTLED_FORCE_CLOSE, SETTLED_REMOTE_CLOSE, UNFUNDED_CHANNEL, SIGNED_CHANNEL, BROADCAST_CHANNEL, ABORTED_FUNDING]) {
     context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
     const { request, running, marked, markedNode } = await host(context);
     await markedNode(F, channels);
@@ -455,7 +456,7 @@ test("a node whose channels can hold nothing more makes room once its user has s
 });
 
 test("a node whose channel is settling, or whose funding has reached the chain, keeps running", async (context) => {
-  for (const [channels, status] of [[SETTLING_FORCE_CLOSE, undefined], [SIGNED_CHANNEL, "pending"], [SIGNED_CHANNEL, "committed"], [SIGNED_CHANNEL, "down"]] as const) {
+  for (const [channels, status] of [[SETTLING_FORCE_CLOSE, undefined], [SIGNED_CHANNEL, "pending"], [SIGNED_CHANNEL, "committed"], [SIGNED_CHANNEL, "down"], [BROADCAST_CHANNEL, "committed"]] as const) {
     context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
     const { chain, request, running, marked, markedNode } = await host(context);
     if (status === "down") chain.down = true;
@@ -501,7 +502,7 @@ test("a node can be retired once its channels are finished and nothing of it is 
   assert.equal(await exists(join(root, "retired", F)), true);
 });
 
-test("a node in the middle of a setup step is never stopped to make room, even for a node with channels", async (context) => {
+test("a node handing its signed funding to Fiber is never stopped to make room, even for a node with channels", async (context) => {
   const { module, root, request, running, markedNode } = await host(context);
   assert.equal(await request(A), 200);
   assert.equal(await request(B), 200);
@@ -551,4 +552,58 @@ test("a Fiber binary that can't be run fails the start without stopping the host
   }
   assert.equal(await started, 502);
   assert.deepEqual(running(), []);
+});
+
+test("a slow channel setup step keeps its node only briefly, and never from a node with channels", async (context) => {
+  // Fiber can take long to answer an open, for example when the peer doesn't accept it.
+  {
+    const { module, root, request, running, markedNode } = await host(context);
+    assert.equal(await request(A), 200);
+    assert.equal(await request(B), 200);
+    for (const user of [A, B]) await writeFile(join(root, "users", user, "slow-rpc"), "");
+    const slow = [request(A, "open_channel_with_external_funding"), request(B, "open_channel_with_external_funding")];
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await markedNode(F);
+    await module.startKnownNodes([F]);
+    assert.ok(running().includes(F), running().join(","));
+    await Promise.all(slow);
+  }
+  {
+    context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+    const { root, request, running } = await host(context);
+    assert.equal(await request(A), 200);
+    assert.equal(await request(B, "connect_peer"), 200);
+    await writeFile(join(root, "users", A, "slow-rpc"), "");
+    const slow = request(A, "open_channel_with_external_funding");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Within the first half minute A's request keeps it; after that, a new user may take its place.
+    assert.equal(await request(C), 502);
+    context.mock.timers.tick(31_000);
+    assert.equal(await request(C), 200);
+    assert.deepEqual(running(), [B, C]);
+    await slow;
+  }
+});
+
+test("a call is given up once the API stops waiting for it", async (context) => {
+  const { root, request } = await host(context);
+  assert.equal(await request(A), 200);
+  await writeFile(join(root, "users", A, "slow-rpc"), "");
+  const gone = new AbortController();
+  const startedAt = Date.now();
+  const call = request(A, "open_channel_with_external_funding", gone.signal);
+  setTimeout(() => gone.abort(), 100);
+  assert.equal(await call, 502);
+  assert.ok(Date.now() - startedAt < 1_000);
+});
+
+test("a restore that leaves a node with channels stopped has it started", async (context) => {
+  const { module, running, markedNode } = await host(context);
+  process.env.KEYWAY_MANAGED_BACKUP_KEY = "07".repeat(32);
+  await markedNode(F);
+  const { name } = await module.createSnapshot({ userId: F });
+  // F wasn't running; its restored data has channels, so it must run.
+  await module.withUserOperation(F, () => module.restoreUser(F, name));
+  await until(async () => running().includes(F));
+  assert.equal(module.readiness().offline, 0);
 });

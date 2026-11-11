@@ -79,13 +79,13 @@ export async function managedNodeRequest(
         if (addresses.length === 0) return { done: true };
         // The room check and the dial run one at a time per user, so parallel requests can't both pass it.
         await serializeMutation(userId, async () => {
-          await assertPeerRoom(node);
+          await assertPeerRoom(node, undefined, addresses.length);
           await connectGraphPeer(node, peer, addresses);
         });
         return { done: true };
       }
       await serializeMutation(userId, async () => {
-        await assertPeerRoom(node);
+        await assertPeerRoom(node, typeof params.pubkey === "string" ? params.pubkey : undefined);
         await node.call(FIBER_METHODS[method as FiberMethod].rpc, [dial]);
       });
       return { done: true };
@@ -347,12 +347,15 @@ async function assertKnownPublicPeer(node: ManagedNodeClient, peer: string): Pro
   throw new Error("This peer isn't in the Fiber network graph yet; connect to it first with connectPeer and its address");
 }
 
-async function assertPeerRoom(node: ManagedNodeClient, peer?: string): Promise<void> {
+/**
+ * Refuses a connection that could take the node past MAX_PEERS. Each address dialed may reach a different node,
+ * so dialing several needs room for each. A peer that is already connected takes no more room.
+ */
+async function assertPeerRoom(node: ManagedNodeClient, peer?: string, dials = 1): Promise<void> {
   const { peers } = await node.listPeers();
   const bare = peer?.toLowerCase().replace(/^0x/, "");
-  // A peer that is already connected takes no more room.
   if (bare && peers.some(({ pubkey }) => pubkey.toLowerCase().replace(/^0x/, "") === bare)) return;
-  if (peers.length >= MAX_PEERS) throw new Error(`A hosted node can connect to at most ${MAX_PEERS} peers`);
+  if (peers.length + dials > MAX_PEERS) throw new Error(`A hosted node can connect to at most ${MAX_PEERS} peers`);
 }
 
 /**
@@ -373,7 +376,7 @@ async function connectManagedPeer(node: ManagedNodeClient, peer: Pubkey): Promis
     // Any public peer: its announced addresses must be public, and the handshake must match its key.
     const addresses = await assertKnownPublicPeer(node, peer);
     if (addresses.length === 0) return;
-    await assertPeerRoom(node);
+    await assertPeerRoom(node, undefined, addresses.length);
     await connectGraphPeer(node, peer, addresses);
     return;
   }

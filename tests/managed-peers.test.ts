@@ -165,6 +165,21 @@ test("parallel peer connections can't take a hosted node past its peer limit", a
   assert.equal(connected.length, 1);
 });
 
+test("connecting a peer by key needs room for every address it dials, and reconnecting an official peer needs none", async () => {
+  // 30 peers: a peer announcing 4 addresses could reach 4 different nodes.
+  const others = Array.from({ length: 30 }, (_, index) => ({ pubkey: `0x02${index.toString(16).padStart(64, "0")}` }));
+  const announced = Array.from({ length: 4 }, (_, index) => `/ip4/203.0.113.${index + 1}/tcp/8228/p2p/Qm1`);
+  const { node, dialed } = hostedNode(announced);
+  node.listPeers = async () => ({ peers: others });
+  await assert.rejects(managedNodeRequest("room-user", { operation: "act", method: "connectPeer", params: { pubkey: PEER } }, node as never), /at most 32 peers/);
+  assert.deepEqual(dialed, []);
+  // At the limit, an official peer that is already connected can still be connected again.
+  const full = hostedNode([]);
+  full.node.listPeers = async () => ({ peers: [...others, { pubkey: `0x02${"ff".repeat(32)}` }, { pubkey: OFFICIAL }] });
+  await managedNodeRequest("room-user", { operation: "act", method: "connectPeer", params: { pubkey: OFFICIAL } }, full.node as never);
+  assert.deepEqual(full.dialed, [{ pubkey: OFFICIAL, addr_type: "tcp", save: false }]);
+});
+
 test("a hosted node dials only the first few addresses a peer announces", async () => {
   const announced = Array.from({ length: 20 }, (_, index) => `/ip4/203.0.113.${index + 1}/tcp/8228/p2p/Qm1`);
   for (const request of [

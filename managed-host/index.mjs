@@ -26,6 +26,13 @@ const SETUPS_PER_HOUR = 3;
 // A user's node may take another node's place at most this many times in ten minutes, which bounds how much
 // stopping and starting any one account can cause.
 const ROOM_STARTS_PER_10_MIN = 6;
+// A node serving requests isn't stopped to make room for a node without channels until its user's requests
+// have kept it busy this long, however long Fiber takes to answer them.
+const BUSY_PROTECTION_MS = 30_000;
+// A node handing its user's signed funding to Fiber isn't stopped for this long, even for a node with channels.
+const SUBMIT_PROTECTION_MS = 60_000;
+// After the host found no room, an admission without channels is refused at once for this long.
+const NO_ROOM_RETRY_MS = 2_000;
 // Only these calls may create a node for a user who has none: connecting a hosted node (the SDK's start and its
 // fee reserve read node_info) and setting up a channel. Any other read of a user without a node is refused.
 const PROVISIONING = new Set(["node_info", "connect_peer", "open_channel", "open_channel_with_external_funding"]);
@@ -48,6 +55,9 @@ const failedStarts = new Map();
 // Per user: when their held setups began, and when their node took another node's place.
 const setups = new Map();
 const roomStarts = new Map();
+// When each user's queue of requests last went from idle to busy.
+const busySince = new Map();
+let noRoomAt = 0;
 let shuttingDown = false;
 let uses = 0;
 
@@ -121,7 +131,10 @@ async function handleRequest(request, response) {
     }
     const match = request.method === "POST" && /^\/users\/([0-9a-f]{64})$/.exec(request.url ?? "");
     if (!match) return send(response, 404, { error: "Not found" });
-    const upstream = await proxyUserRequest(match[1], await readBody(request, 1_048_576));
+    // A call is given up once the API stops waiting for it, so a slow one can't keep the node busy.
+    const gone = new AbortController();
+    response.once("close", () => { if (!response.writableFinished) gone.abort(); });
+    const upstream = await proxyUserRequest(match[1], await readBody(request, 1_048_576), gone.signal);
     response.writeHead(upstream.status, { "content-type": upstream.contentType });
     response.end(upstream.body);
   } catch (error) {
@@ -142,20 +155,21 @@ export function readiness() {
  * Passes one JSON-RPC request to the user's node, starting it if needed. Only connecting a node or setting up a
  * channel may create one, and only a channel setup step holds it (see PROVISIONING and CHANNEL_SETUP).
  */
-export function proxyUserRequest(userId, body) {
+export function proxyUserRequest(userId, body, signal) {
   const method = rpcMethod(body);
   return withUserOperation(userId, async () => {
     const node = await ensureNode(userId, { provision: PROVISIONING.has(method) });
     const setup = CHANNEL_SETUP.has(method);
-    // A node in the middle of a setup step is never stopped to make room, whatever needs it.
-    if (setup) node.settingUp = (node.settingUp ?? 0) + 1;
+    // A node handing over its user's signed funding is never stopped to make room (see SUBMIT_PROTECTION_MS).
+    const submitting = method === "submit_signed_funding_tx";
+    if (submitting) node.submittingSince = Date.now();
     let result;
     try {
       const upstream = await fetch(`http://127.0.0.1:${node.port}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body,
-        signal: AbortSignal.timeout(120_000),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(120_000)]) : AbortSignal.timeout(120_000),
       });
       result = {
         ok: upstream.ok,
@@ -164,7 +178,7 @@ export function proxyUserRequest(userId, body) {
         body: Buffer.from(await upstream.arrayBuffer()),
       };
     } finally {
-      if (setup) node.settingUp--;
+      if (submitting) node.submittingSince = 0;
     }
     const answer = result.ok ? rpcResult(result.body) : undefined;
     delete result.ok;
@@ -203,7 +217,7 @@ function rpcResult(body) {
  */
 async function markChannels(userId, hasChannels) {
   const marker = join(managedDataDir(userId), CHANNELS_MARKER);
-  if (hasChannels) await writeFile(marker, "", { mode: 0o600 });
+  if (hasChannels) { if (!(await fileExists(marker))) await writeFile(marker, "", { mode: 0o600 }); }
   else await rm(marker, { force: true });
 }
 
@@ -245,13 +259,17 @@ async function checkChannels(userId, node) {
 }
 
 export async function withUserOperation(userId, operation) {
+  if (!operations.has(userId)) busySince.set(userId, Date.now());
   const previous = operations.get(userId) ?? Promise.resolve();
   const current = previous.catch(() => {}).then(operation);
   operations.set(userId, current);
   try {
     return await current;
   } finally {
-    if (operations.get(userId) === current) operations.delete(userId);
+    if (operations.get(userId) === current) {
+      operations.delete(userId);
+      busySince.delete(userId);
+    }
   }
 }
 
@@ -274,8 +292,15 @@ async function ensureNode(userId, { provision = true } = {}) {
   if (existing) return existing;
   if (!provision && !(await fileExists(managedDataDir(userId)))) throw new Error("This account has no hosted Fiber node yet");
   // Checked before any node is stopped to make room for one that can't start.
-  await requireCleanRestore(managedDataDir(userId));
-  const priority = (failedStarts.get(userId) ?? 0) < PRIORITY_FAILED_STARTS && await mayHoldChannels(userId);
+  try {
+    await requireCleanRestore(managedDataDir(userId));
+  } catch (error) {
+    if (!shuttingDown && await mayHoldChannels(userId).catch(() => true)) superviseNode(userId);
+    throw error;
+  }
+  const failed = failedStarts.get(userId);
+  const failing = failed && failed.count >= PRIORITY_FAILED_STARTS && Date.now() - failed.at < 10 * 60_000;
+  const priority = !failing && await mayHoldChannels(userId);
   // Looked up again after the waits above.
   const again = current();
   if (again) return again;
@@ -284,15 +309,15 @@ async function ensureNode(userId, { provision = true } = {}) {
   if (full && !priority && recent(roomStarts, userId, 10 * 60_000) >= ROOM_STARTS_PER_10_MIN) {
     throw new Error("This hosted node has been restarted too often; try again in a few minutes");
   }
+  if (full && !priority && Date.now() - noRoomAt < NO_ROOM_RETRY_MS) throw new RoomError("Managed node capacity is full");
   const promise = (full ? makeRoom(userId, priority).then(() => { if (!priority) record(roomStarts, userId); }) : Promise.resolve())
     .then(() => startNode(userId))
     .then(async (node) => {
       forgetOffline(userId);
-      failedStarts.delete(userId);
       await checkChannels(userId, node).catch(logError);
       return node;
     }, async (error) => {
-      if (!(error instanceof RoomError)) failedStarts.set(userId, (failedStarts.get(userId) ?? 0) + 1);
+      if (!(error instanceof RoomError)) failedStart(userId);
       // A node that may hold channels keeps being started until it runs.
       if (!shuttingDown && await mayHoldChannels(userId).catch(() => true)) superviseNode(userId);
       throw error;
@@ -337,15 +362,26 @@ function hold(userId, node) {
 
 class RoomError extends Error {}
 
+/** Counts a failed start; after PRIORITY_FAILED_STARTS within ten minutes, the node loses its priority. */
+function failedStart(userId) {
+  const previous = failedStarts.get(userId);
+  const count = previous && Date.now() - previous.at < 10 * 60_000 ? previous.count + 1 : 1;
+  failedStarts.set(userId, { count, at: Date.now() });
+}
+
 /**
  * When the host is full, a new node takes the place of the least recently used one that holds no channels, so
  * accounts that never funded a channel can't hold the host's capacity. A node with channels is never stopped
- * this way, nor is one in a setup step, nor one serving a request or held after a setup step, unless the new
- * node may hold channels itself: it must run to watch them.
+ * this way, nor one handing its user's signed funding to Fiber (for up to a minute). Nor, unless the new node
+ * may hold channels itself and must run to watch them, one held after a setup step or kept busy by requests for
+ * less than BUSY_PROTECTION_MS.
  */
 async function makeRoom(userId, priority = false) {
-  const reusable = (id, node) => id !== userId && !node.stopping && !node.settingUp &&
-    (priority || (!operations.has(id) && Date.now() >= node.heldUntil));
+  const now = () => Date.now();
+  const busy = (id) => operations.has(id) && now() - (busySince.get(id) ?? 0) < BUSY_PROTECTION_MS;
+  const reusable = (id, node) => id !== userId && !node.stopping &&
+    !(node.submittingSince && now() - node.submittingSince < SUBMIT_PROTECTION_MS) &&
+    (priority || (!busy(id) && now() >= node.heldUntil));
   const candidates = [...nodes.entries()]
     .filter(([id, node]) => reusable(id, node))
     .sort(([, left], [, right]) => left.lastUsed - right.lastUsed);
@@ -363,6 +399,7 @@ async function makeRoom(userId, priority = false) {
     await markChannels(id, false);
     return;
   }
+  if (!priority) noRoomAt = Date.now();
   throw new RoomError("Managed node capacity is full");
 }
 
@@ -473,14 +510,18 @@ async function startNode(userId) {
   ], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
   child.stdout.on("data", (chunk) => process.stdout.write(`[fnn:${userId.slice(0, 8)}] ${chunk}`));
   child.stderr.on("data", (chunk) => process.stderr.write(`[fnn:${userId.slice(0, 8)}] ${chunk}`));
-  const node = { child, port, lastUsed: 0, startedAt: 0, heldUntil: 0, setupStartedAt: 0, settingUp: 0 };
+  const node = { child, port, lastUsed: 0, startedAt: 0, heldUntil: 0, setupStartedAt: 0, submittingSince: 0 };
   // A missing or unrunnable binary is reported here, and the start then fails in waitForRpc.
   child.once("error", logError);
   child.once("exit", (code, signal) => {
     const wasRunning = nodes.get(userId)?.child === child;
     if (wasRunning) nodes.delete(userId);
     console.error(`[managed-host] fnn ${userId.slice(0, 8)} exited code=${code} signal=${signal}`);
-    if (wasRunning && Date.now() - node.startedAt >= RESTART_STABLE_MS) restarts.delete(userId);
+    if (wasRunning && Date.now() - node.startedAt >= RESTART_STABLE_MS) {
+      restarts.delete(userId);
+      failedStarts.delete(userId);
+    // Dying soon after starting counts as a failed start, so a node that keeps doing it loses its priority.
+    } else if (wasRunning && !node.stopping) failedStart(userId);
     // A node that exits unexpectedly is started again, as it may hold a channel it was never marked for; one that
     // may hold channels keeps being started until it runs (see superviseNode).
     if (wasRunning && !node.stopping && !shuttingDown) {
@@ -529,16 +570,22 @@ async function snapshotUser(userId) {
   const wasRunning = await stopNode(userId);
   return completeDatabaseOperation(
     () => createSnapshot({ userId }),
-    async () => { if (wasRunning) await ensureNode(userId); },
+    () => resumeNode(userId, wasRunning),
   );
 }
 
-async function restoreUser(userId, name) {
+export async function restoreUser(userId, name) {
   const wasRunning = await stopNode(userId);
   return completeDatabaseOperation(
     () => restoreSnapshot({ userId, name }),
-    async () => { if (wasRunning) await ensureNode(userId); },
+    () => resumeNode(userId, wasRunning),
   );
+}
+
+/** Starts a node again after a database operation, or has it started if it may now hold channels. */
+async function resumeNode(userId, wasRunning) {
+  if (wasRunning) return void await ensureNode(userId);
+  if (!shuttingDown && await mayHoldChannels(userId).catch(() => true)) superviseNode(userId);
 }
 
 export async function completeDatabaseOperation(operation, resume) {
@@ -646,7 +693,7 @@ function stateName(channel) {
 }
 
 // States before a channel's funding is on chain: it holds funds only once its funding transaction is.
-const BEFORE_FUNDING = ["negotiatingfunding", "collaboratingfundingtx", "signingcommitment", "awaitingtxsignatures"];
+const BEFORE_FUNDING = ["negotiatingfunding", "collaboratingfundingtx", "signingcommitment", "awaitingtxsignatures", "awaitingchannelready"];
 
 /** "finished", "unfunded" (before its funding is on chain, see BEFORE_FUNDING), or "open". */
 function channelClass(channel) {
