@@ -528,7 +528,7 @@ test("a hosted payment can't pay a higher fee than the one counted toward the da
   const sent = h.sent.at(-1) as Record<string, unknown>;
   assert.equal(sent.max_fee_amount, `0x${fee.toString(16)}`, "capped at the counted fee");
   assert.equal(sent.max_fee_rate, undefined, "the counted fee is the one cap");
-  assert.equal(h.dryRuns.at(-1)!.max_fee_rate, "0x3e8", "the caller's fee rate shapes the estimate that is counted");
+  assert.equal(h.dryRuns.at(-1)!.max_fee_rate, undefined, "the estimate is made under the same rules the send runs under");
 
   // A caller's own lower cap still holds.
   const lower = { invoice: "fibt1test", max_fee_amount: "0x3e8" };
