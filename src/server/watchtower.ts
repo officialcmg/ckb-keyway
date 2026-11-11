@@ -754,8 +754,14 @@ export async function runWatchtowerPass(passDeps: PassDependencies): Promise<voi
   const rows = [...funded, ...unfunded];
   // Penalties are sent one at a time, so two never pick the same fee cells.
   let sending: Promise<unknown> = Promise.resolve();
+  /** Time each account's checks spent queued behind other penalties: not counted against its share of the pass. */
+  const queued = new Map<string, number>();
   const punish: PassDependencies["punish"] = (row, commitment) => {
-    const sent = sending.then(() => deps.punish(row, commitment));
+    const enqueued = Date.now();
+    const sent = sending.then(() => {
+      queued.set(row.user_id, (queued.get(row.user_id) ?? 0) + Date.now() - enqueued);
+      return deps.punish(row, commitment);
+    });
     sending = sent.catch(() => undefined);
     return sent;
   };
@@ -781,10 +787,12 @@ export async function runWatchtowerPass(passDeps: PassDependencies): Promise<voi
       // Past its share: left unchecked (so least recently checked, and first in its account's turn next pass).
       if ((spent.get(row.user_id) ?? 0) >= accountBudget) continue;
       const started = Date.now();
+      const waitedBefore = queued.get(row.user_id) ?? 0;
       try {
         if (await check(row, 0)) behind.push(row);
       } finally {
-        spent.set(row.user_id, (spent.get(row.user_id) ?? 0) + Date.now() - started);
+        const waited = (queued.get(row.user_id) ?? 0) - waitedBefore;
+        spent.set(row.user_id, (spent.get(row.user_id) ?? 0) + Math.max(0, Date.now() - started - waited));
       }
     }
   }));

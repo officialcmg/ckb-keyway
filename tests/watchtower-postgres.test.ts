@@ -403,6 +403,56 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     await sql`delete from keyway_v2_watchtower_channels`;
   });
 
+  await t.test("time spent queued behind another account's penalty doesn't use up an account's share of the pass", async () => {
+    const { id: slowId, closing } = await revokedChannel(proof.revocationSignature);
+    const [{ user_id: slowUser }] = await sql<Array<{ user_id: string }>>`select user_id from keyway_v2_watchtower_channels where channel_id = ${slowId}`;
+    // A second account with a revoked channel of its own (a copy of the first) and an ordinary funded one.
+    const other = { id: crypto.randomUUID() };
+    const [revokedId, openId] = [channelId(), channelId()];
+    await sql.begin(async (tx) => {
+      await tx`create temp table copy on commit drop as select * from keyway_v2_watchtower_channels where channel_id = ${slowId}`;
+      await tx`update copy set user_id = ${other.id}, channel_id = ${revokedId}, history_cursor = 'other'`;
+      await tx`insert into keyway_v2_watchtower_channels select * from copy`;
+    });
+    await watchtowerRequest(other, parseWatchtowerRequest({ operation: "watch", channelId: openId, localFundingPubkey: K1, remoteFundingPubkey: K3, fundingUdtTypeScript: null }));
+    // A third account whose check is slow keeps the other worker busy, so the order below is fixed.
+    const third = { id: crypto.randomUUID() };
+    const thirdId = channelId();
+    await watchtowerRequest(third, parseWatchtowerRequest({ operation: "watch", channelId: thirdId, localFundingPubkey: K2, remoteFundingPubkey: K3, fundingUdtTypeScript: null }));
+    await sql`update keyway_v2_watchtower_channels set funding_seen = true where channel_id in (${slowId}, ${revokedId}, ${openId}, ${thirdId})`;
+    // Checked in this order: the slow penalty, the other account's revoked channel, the third account, the open one.
+    for (const [id, hours] of [[slowId, 4], [revokedId, 3], [thirdId, 2], [openId, 1]] as const) {
+      await sql`update keyway_v2_watchtower_channels set checked_at = now() - ${`${hours} hours`}::interval where channel_id = ${id}`;
+    }
+    const openLock = fundingLockArgs(K1, K3);
+    const thirdLock = fundingLockArgs(K2, K3);
+    const chain: ChainView = {
+      async fundingHistory(lock, scan) {
+        if (lock.args === openLock) return { sawOutput: true };
+        if (lock.args === thirdLock) {
+          await new Promise((resolve) => setTimeout(resolve, 1_000));
+          return { sawOutput: true };
+        }
+        // The other account's revoked channel reaches the penalty queue second.
+        if (scan.cursor === "other") await new Promise((resolve) => setTimeout(resolve, 50));
+        return { sawOutput: true, spend: { txHash: closing.hash(), index: 0 } };
+      },
+      transaction: async (hash) => (hash === closing.hash() ? { tx: closing, committed: true, status: "committed" } : undefined),
+      isLive: async () => true,
+    };
+    await runWatchtowerPass({
+      sql, chain, concurrency: 2, accountBudgetMs: 150, log: () => undefined,
+      // The first account's penalty is slow to send; the other's is quick but has to wait its turn.
+      punish: async (row) => {
+        if (row.user_id === slowUser) await new Promise((resolve) => setTimeout(resolve, 400));
+        return ccc.hexFrom(ccc.hashCkb(ccc.bytesFrom(row.channel_id)));
+      },
+    });
+    const [open] = await sql<Array<{ recent: boolean }>>`select checked_at > now() - interval '1 minute' as recent from keyway_v2_watchtower_channels where channel_id = ${openId}`;
+    assert.equal(open.recent, true, "the other account's open channel is still checked this pass");
+    await sql`delete from keyway_v2_watchtower_channels`;
+  });
+
   await t.test("closed channels count toward the cap until confirmed, and a pass reads each lock and transaction once", async () => {
     await sql`delete from keyway_v2_watchtower_channels`;
     const flooder = { id: crypto.randomUUID() };
