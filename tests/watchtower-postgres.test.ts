@@ -453,6 +453,27 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     await sql`delete from keyway_v2_watchtower_channels`;
   });
 
+  await t.test("a sent penalty one read can't find isn't taken for missed until the recheck window has passed", async () => {
+    const { id, closing } = await revokedChannel(proof.revocationSignature);
+    const penalty = `0x${"cd".repeat(32)}`;
+    await sql`update keyway_v2_watchtower_channels set state = 'penalty-sent', funding_seen = true, funding_spend = ${`${closing.hash()}:0`}, penalty_tx = ${penalty}, detail = 'penalty sent' where channel_id = ${id}`;
+    // This node doesn't know the penalty (it may not have seen it yet), and the commitment is spent.
+    const chain: ChainView = {
+      fundingHistory: async () => ({ sawOutput: true }),
+      transaction: async (hash) => (hash === closing.hash() ? { tx: closing, committed: true, status: "committed" } : undefined),
+      isLive: async () => false,
+    };
+    const pass = () => runWatchtowerPass({ sql, chain, log: () => undefined, punish: async () => { throw new Error("no"); } });
+    const state = async () => (await sql<Array<{ state: string }>>`select state from keyway_v2_watchtower_channels where channel_id = ${id}`)[0].state;
+    await pass();
+    await pass();
+    assert.equal(await state(), "penalty-sent");
+    await sql`update keyway_v2_watchtower_channels set updated_at = now() - interval '40 minutes' where channel_id = ${id}`;
+    await pass();
+    assert.equal(await state(), "missed");
+    await sql`delete from keyway_v2_watchtower_channels`;
+  });
+
   await t.test("closed channels count toward the cap until confirmed, and a pass reads each lock and transaction once", async () => {
     await sql`delete from keyway_v2_watchtower_channels`;
     const flooder = { id: crypto.randomUUID() };

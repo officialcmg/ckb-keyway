@@ -932,6 +932,15 @@ async function checkChannel(deps: PassDependencies, row: Row, log: (message: str
     }
   }
   if (!(await chain.isLive(commitment.outPoint))) {
+    // A penalty was sent and the node doesn't know it now: it may have been dropped, or this read hit a node that
+    // hasn't seen it (it may be what spent the commitment). Only a penalty still unknown after the recheck window
+    // counts as missed.
+    const rechecking = "the revoked commitment is spent; checking whether by the penalty";
+    // (The window starts when this detail is first saved, which sets updated_at.)
+    if (row.penalty_tx && (row.detail !== rechecking || Date.now() - row.updated_at.getTime() < REORG_RECHECK_MINUTES * 60_000)) {
+      await save({ detail: rechecking });
+      return false;
+    }
     // Only logged: finding the spender would mean walking the commitment lock's whole history, which anyone can pad.
     log(`${row.channel_id}: revoked commitment ${commitment.outPoint.txHash}:${Number(commitment.outPoint.index)} already spent`);
     await save({ state: "missed", detail: "the revoked commitment was spent before the penalty", closing_tx: assessment.closingTx });
@@ -982,10 +991,17 @@ export function penaltySender(client: ccc.Client, feeSigner: ccc.Signer, inFligh
   // cells), so a new penalty chains on them instead of conflicting with them.
   const refresh = async () => {
     await client.cache.clear();
+    const pending: ccc.Transaction[] = [];
     for (const hash of await inFlight()) {
       const found = await client.getTransactionNoCache(hash).catch(() => undefined);
-      if (found && (found.status === "pending" || found.status === "proposed")) await client.cache.markTransactions(found.transaction);
+      if (found && (found.status === "pending" || found.status === "proposed")) pending.push(found.transaction);
     }
+    // Every output first, then every input: a penalty that chained on another's change marks that change spent
+    // whatever order they come in (marking a cell usable would undo an earlier "spent").
+    for (const tx of pending) {
+      await client.cache.markUsable(tx.outputs.map((cellOutput, index) => ({ cellOutput, outputData: tx.outputsData[index] ?? "0x", outPoint: { txHash: tx.hash(), index } })));
+    }
+    for (const tx of pending) await client.cache.markUnusable(tx.inputs.map((input) => input.previousOutput));
   };
   return async (row: Row, commitment: Commitment) => {
     await (cleared ??= refresh());

@@ -586,7 +586,10 @@ test("a penalty still in the mempool from an earlier pass keeps its fee cell spe
     getCell: async (outPoint: ccc.OutPointLike) => [...commitments, feeCell].find((cell) => cell.outPoint.eq(ccc.OutPoint.from(outPoint))) ?? await client.cache.getCell(outPoint),
     findSingletonCellByType: async () => commitments[0],
     sendTransactionNoCache: async (tx: ccc.Transaction) => { sent.push(ccc.Transaction.from(tx)); return ccc.Transaction.from(tx).hash(); },
-    getTransactionNoCache: async (hash: ccc.Hex) => (sent[0]?.hash() === hash ? { transaction: sent[0], status: "pending" } : undefined),
+    getTransactionNoCache: async (hash: ccc.Hex) => {
+      const found = sent.find((tx) => tx.hash() === hash);
+      return found ? { transaction: found, status: "pending" } : undefined;
+    },
   });
   const row = (n: number) => ({
     channel_id: `0x${String(n).repeat(64)}`, peer_commitment_key: `0x${"77".repeat(32)}`,
@@ -595,8 +598,11 @@ test("a penalty still in the mempool from an earlier pass keeps its fee cell spe
   const commitment = (cell: ccc.Cell) => ({ outPoint: cell.outPoint, capacity: cell.cellOutput.capacity, lock: cell.cellOutput.lock });
   const pending = await penaltySender(client, feeSigner)(row(1), commitment(commitments[0]));
   // The next pass: the first penalty is still pending, so the new one spends its change, not the fee cell again.
-  await penaltySender(client, feeSigner, async () => [pending])(row(2), commitment(commitments[1]));
+  const second = await penaltySender(client, feeSigner, async () => [pending])(row(2), commitment(commitments[1]));
   assert.deepEqual(sent[1].inputs.slice(1).map((input) => input.previousOutput.toHex()), [ccc.OutPoint.from({ txHash: pending, index: 1 }).toHex()]);
+  // A pass later both are still pending, listed child first: the next one spends the second's change, not the first's.
+  await penaltySender(client, feeSigner, async () => [second, pending])(row(3), commitment(commitments[0]));
+  assert.deepEqual(sent[2].inputs.slice(1).map((input) => input.previousOutput.toHex()), [ccc.OutPoint.from({ txHash: second, index: 1 }).toHex()]);
 });
 
 test("the watchtower refuses revocations that would move capacity between it and the channel", async () => {
