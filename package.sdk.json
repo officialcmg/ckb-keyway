@@ -29,13 +29,13 @@
     "./package.json": "./package.json"
   },
   "dependencies": {
-    "@ckb-ccc/core": "^1.16.1",
-    "@fiber-pay/sdk": "^0.2.7",
+    "@ckb-ccc/core": "1.16.1",
+    "@fiber-pay/sdk": "0.2.7",
     "@joyid/common": "0.2.2",
     "@nervosnetwork/fiber-js": "0.9.1",
-    "@noble/curves": "^2.0.1",
-    "@noble/hashes": "^2.0.1",
-    "cbor-x": "^1.6.5"
+    "@noble/curves": "2.0.1",
+    "@noble/hashes": "2.0.1",
+    "cbor-x": "1.6.5"
   },
   "peerDependencies": {
     "react": ">=18.2.0"

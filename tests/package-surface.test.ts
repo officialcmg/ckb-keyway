@@ -68,3 +68,16 @@ test("defaults to managed testnet while retaining an explicit browser-wallet rou
   assert.match(demo, /\/app\?mode=browser/);
   assert.match(view, /Each mode runs its own Fiber node\. Switching doesn&apos;t move open channels\./);
 });
+
+test("the published SDK depends on exactly the versions this repository tests", async () => {
+  const packageJson = JSON.parse(await readFile(new URL("../package.sdk.json", import.meta.url), "utf8"));
+  const lockfile = JSON.parse(await readFile(new URL("../package-lock.json", import.meta.url), "utf8"));
+  const runtime = ["dependencies", "optionalDependencies", "bundleDependencies", "bundledDependencies"]
+    .flatMap((field) => Object.entries((packageJson[field] ?? {}) as Record<string, string>));
+  assert.ok(runtime.length > 0);
+  for (const [name, range] of runtime) {
+    // An exact version, never a range, tag, URL or workspace link that would let consumers install something else.
+    assert.match(range, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/, `${name} is pinned to an exact version, not "${range}"`);
+    assert.equal(range, lockfile.packages[`node_modules/${name}`]?.version, `${name} is the version package-lock.json installs and tests`);
+  }
+});
