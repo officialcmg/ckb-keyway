@@ -1,3 +1,4 @@
+import * as ccc from "@ckb-ccc/core";
 import type { ParseInvoiceResult } from "@fiber-pay/sdk/node";
 import { FIBER_METHODS, paymentFiberParams } from "../sdk/browser/fiber-methods.ts";
 import { describePayment } from "../sdk/browser/fiber-payment.ts";
@@ -8,6 +9,7 @@ import {
   limit,
   loadRequest,
   outflowNeedsEmailCode,
+  REQUEST_EXPIRED,
   requiredNonce,
   reserveOutflow,
   sendCode,
@@ -105,6 +107,9 @@ async function payOnce(context: PaymentContext, node: FiberCaller, body: Record<
   if (!method) throw new Error("A Fiber payment method is required");
   const params = paymentFiberParams(method, body.params, "testnet");
   if (params.dry_run === true) throw new Error("Use the node call for dry runs");
+  // The fee a payment may pay is capped at the one counted toward the daily amount (max_fee_amount, below). A fee
+  // rate would be a second, separate cap, so it is left to the node's default rather than taken from the caller.
+  delete params.max_fee_rate;
   const digest = hashText(JSON.stringify({ method, params }));
 
   if (body.stage === "preview") {
@@ -121,7 +126,7 @@ async function payOnce(context: PaymentContext, node: FiberCaller, body: Record<
       `Estimated network fee: ${preview.feeText}`,
       ...(preview.payee ? [`To Fiber node ${preview.payee.slice(0, 10)}…${preview.payee.slice(-6)}`] : []),
     ];
-    const confirmationNonce = await issueRequest(context.user, "payment", digest, { lines, outflow: outflow.toString(), asset }, requiresEmailCode);
+    const confirmationNonce = await issueRequest(context.user, "payment", digest, { lines, outflow: outflow.toString(), asset, fee: preview.fee }, requiresEmailCode);
     return { preview: { ...preview, requiresEmailCode }, confirmationNonce, requiresEmailCode };
   }
 
@@ -151,7 +156,7 @@ async function payOnce(context: PaymentContext, node: FiberCaller, body: Record<
     throw error;
   }
   try {
-    return await node.call(FIBER_METHODS[method].rpc, [params]);
+    return await node.call(FIBER_METHODS[method].rpc, [withCountedFee(method, params, request.summary.fee)]);
   } catch (error) {
     // A timeout or dropped connection looks like a rejection, but the node may have taken the payment, or still be
     // making it. With its hash recorded, ask the node: a payment it made is this send's result. Otherwise only
@@ -169,6 +174,19 @@ async function payOnce(context: PaymentContext, node: FiberCaller, body: Record<
     }
     throw new OutcomeUnknownError(`The payment's outcome isn't known yet (${error instanceof Error ? error.message : "the node didn't answer"}). Repeat the request with the same idempotency key to check it`);
   }
+}
+
+/**
+ * The payment as sent: a `sendPayment` may pay at most the fee its preview counted (the caller's own max_fee_amount
+ * when that is lower), so a route dearer than the dry run's fails rather than spending more than was counted. A
+ * `sendPaymentWithRouter` pays exactly its route's first-hop amount, which is what was counted.
+ */
+function withCountedFee(method: "sendPayment" | "sendPaymentWithRouter", params: Record<string, unknown>, counted: unknown): Record<string, unknown> {
+  if (method !== "sendPayment") return params;
+  if (typeof counted !== "string" || !/^\d+$/.test(counted)) throw new Error(REQUEST_EXPIRED);
+  const fee = BigInt(counted);
+  const requested = typeof params.max_fee_amount === "string" ? BigInt(params.max_fee_amount) : undefined;
+  return { ...params, max_fee_amount: ccc.numToHex(requested !== undefined && requested < fee ? requested : fee) };
 }
 
 /** A CKB payment counts toward the CKB amount; a token payment, fee included, toward that token's. */
