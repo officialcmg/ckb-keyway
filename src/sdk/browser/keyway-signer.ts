@@ -120,6 +120,10 @@ export class KeyWaySigner extends KeyWayAccountSigner {
     if (typeof chosen !== "bigint" || chosen <= 0n || chosen >= SEND_LIMIT_UNLIMITED) throw new Error("Enter a daily limit above 0 CKB");
     try {
       await this.setDailyConfirmationAmount("ckb", chosen);
+      // Raising an amount KeyWay's server alone kept is confirmed with the server's code first, which leaves limits
+      // still off; the same amount again then turns them on.
+      const after = await this.pending.refresh(true);
+      if (!after.sendLimit && after.sendLimitOffer) await this.setDailyConfirmationAmount("ckb", chosen);
     } catch (error) {
       // A send of this account's is still in the pool, so its oldest cell can't start the limits yet: send as
       // before, and offer them again next time.
