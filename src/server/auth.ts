@@ -26,11 +26,12 @@ let delivery: EmailDelivery = sendOtpEmail;
 // Tries per login code. Wrong ones are counted on the challenge too, so a used-up challenge is refused before its lock.
 const LOGIN_CODE_ATTEMPTS = 5;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-// Login-code requests in progress in this process, per source (IPv6 /64) and per network (IPv6 /48). The lock for
-// one email is open to anyone, so the cap is on who is asking: one requester can't queue without end, and can't
-// fill the queue for someone else's email either.
-const LOGIN_REQUESTS_PER_SOURCE = 4;
-const LOGIN_REQUESTS_PER_NETWORK = 16;
+// Login-code requests in progress in this process: per source (IPv6 /64) for one email or challenge, per source, and
+// per network (IPv6 /48). The lock for one email is open to anyone, so the cap is on who is asking: one requester
+// can't queue without end, and people sharing an address (a NAT, a carrier) don't share the tightest cap.
+const LOGIN_REQUESTS_PER_TARGET = 2;
+const LOGIN_REQUESTS_PER_SOURCE = 16;
+const LOGIN_REQUESTS_PER_NETWORK = 64;
 const loginRequests = new Map<string, number>();
 
 export function setAuthDeliveryForTests(callback: EmailDelivery): void {
@@ -141,10 +142,15 @@ export function withOtpChallenge<T>(challengeId: string, task: () => T): T {
   return challengeContext.run({ challengeId, delivered: false }, task);
 }
 
-/** Runs one login-code request, refusing it at once if its requester already has too many in progress. */
-async function withLoginRequest<T>(request: Request, task: () => Promise<T>): Promise<T> {
+/** Runs one login-code request for `target`, refusing it at once if its requester already has too many in progress. */
+async function withLoginRequest<T>(request: Request, target: string, task: () => Promise<T>): Promise<T> {
   const ip = requestIp(request);
-  const slots = [[`source:${otpSource(ip)}`, LOGIN_REQUESTS_PER_SOURCE], [`network:${otpNetwork(ip)}`, LOGIN_REQUESTS_PER_NETWORK]] as const;
+  const source = otpSource(ip);
+  const slots = [
+    [`target:${source}:${target}`, LOGIN_REQUESTS_PER_TARGET],
+    [`source:${source}`, LOGIN_REQUESTS_PER_SOURCE],
+    [`network:${otpNetwork(ip)}`, LOGIN_REQUESTS_PER_NETWORK],
+  ] as const;
   if (slots.some(([key, max]) => (loginRequests.get(key) ?? 0) >= max)) {
     throw new Error("Too many sign-in requests in progress. Try again in a moment");
   }
@@ -160,12 +166,13 @@ async function withLoginRequest<T>(request: Request, task: () => Promise<T>): Pr
 }
 
 export function sendEmailCode(request: Request, emailInput: string): Promise<{ challengeId: string }> {
-  return withLoginRequest(request, async () => {
+  const email = emailInput.trim().toLowerCase();
+  return withLoginRequest(request, `email:${email}`, async () => {
     const scope = await resolveAuthScope(request);
-    const email = emailInput.trim().toLowerCase();
+    // Decided before the email's lock (the limits take their own locks), so refused requests never queue on it. Also
+    // applies the 60-second wait between codes, counted per requester so a stranger's request doesn't delay yours.
+    const context = await prepareOtpSend({ appId: scope.id === "dashboard" ? undefined : scope.id, email, ipAddress: requestIp(request) });
     return withLoginCodeLock(`otp:${scope.id}:${email}`, async (sql) => {
-      // Also applies the 60-second wait between codes, counted per requester so a stranger's request doesn't delay yours.
-      const context = await prepareOtpSend({ appId: scope.id === "dashboard" ? undefined : scope.id, email, ipAddress: requestIp(request) });
       const challengeId = randomUUID();
       // Expired challenges are no use to anyone, and hold the emails people typed.
       await sql`delete from keyway_auth_challenges where id in (select id from keyway_auth_challenges where expires_at < now() limit 100)`;
@@ -191,7 +198,7 @@ export function sendEmailCode(request: Request, emailInput: string): Promise<{ c
 }
 
 export function verifyEmailCode(request: Request, challengeId: string, code: string) {
-  return withLoginRequest(request, async () => {
+  return withLoginRequest(request, `challenge:${challengeId}`, async () => {
     if (!UUID.test(challengeId)) throw new Error("Incorrect or expired code");
     const scope = await resolveAuthScope(request);
     const sql = await database();
