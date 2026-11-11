@@ -103,6 +103,7 @@ function fundingLines({ preview }: ValidatedFunding): string[] {
   return [
     `Open a Fiber channel with ${preview.amountCkb} CKB`,
     ...(preview.token ? [`Token ${formatAsset(BigInt(preview.token.amount), preview.token.asset)} (${preview.token.asset})`] : []),
+    ...(preview.heldUnderScriptsCkb ? [`Also counted as sent: ${preview.heldUnderScriptsCkb} CKB your change puts under the token's script, which could keep it`] : []),
     `Network fee ${preview.feeCkb} CKB`,
     `Channel ${preview.destination}`,
   ];

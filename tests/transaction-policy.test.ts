@@ -157,7 +157,7 @@ test("cells with a type script KeyWay can't read count as tokens leaving, per ce
     [{ lock: alice, capacity: 200n * CKB, type: mystery }, { lock: own, capacity: 1_000n * CKB - 1_000n }],
   );
   assert.equal(tokensLeaving, true);
-  assert.deepEqual(tokenOutflows, [{ asset: mystery.hash(), amount: 1n }]);
+  assert.deepEqual(tokenOutflows, [{ asset: mystery.hash(), amount: 1n, perCell: true }]);
 });
 
 test("with recovery on, the Omnilock and the old secp256k1 lock are both the user's", () => {
@@ -203,14 +203,14 @@ test("CKB moved under a type script the account doesn't control counts as leavin
 test("a token balance of an unlisted type (or xUDT referenced by data hash) can't leave while an empty cell comes back", () => {
   const xudtByData = ccc.Script.from({ codeHash: "0x50bd8d6680b8b9cf98b73f3c08faf8b2a21914311954118ad6609be6e78a1b95", hashType: "data1", args: `0x${"cd".repeat(32)}` });
   const otherUdt = ccc.Script.from({ codeHash: `0x${"5a".repeat(32)}`, hashType: "type", args: `0x${"01".repeat(32)}` });
-  for (const [token, amount] of [[xudtByData, 1_000n], [otherUdt, 1n]] as const) {
+  for (const [token, expected] of [[xudtByData, { amount: 1_000n }], [otherUdt, { amount: 1n, perCell: true }]] as const) {
     // Someone else pays for the recipient's cell; an empty cell of the token comes back to the account.
     const { tokensLeaving, tokenOutflows } = build(
       [{ lock: own, capacity: 200n * CKB, type: token, data: u128(1_000n) }, { lock: alice, capacity: 300n * CKB }],
       [{ lock: own, capacity: 200n * CKB, type: token, data: u128(0n) }, { lock: alice, capacity: 300n * CKB - 2_000n, type: token, data: u128(1_000n) }],
     );
     assert.equal(tokensLeaving, true, token.codeHash);
-    assert.deepEqual(tokenOutflows, [{ asset: token.hash(), amount }], token.codeHash);
+    assert.deepEqual(tokenOutflows, [{ asset: token.hash(), ...expected }], token.codeHash);
   }
   // The same cell coming back unchanged isn't a transfer.
   const moved = build(
@@ -230,7 +230,7 @@ test("Spore, Cluster, Type ID and Unique cells leaving the account count as asse
       [{ lock: alice, capacity: 300n * CKB, type, data: "0x01" }, { lock: own, capacity: 1_000n * CKB - 1_000n }],
     );
     assert.equal(tokensLeaving, true, type.codeHash);
-    assert.deepEqual(tokenOutflows, [{ asset: type.hash(), amount: 1n }], type.codeHash);
+    assert.deepEqual(tokenOutflows, [{ asset: type.hash(), amount: 1n, perCell: true }], type.codeHash);
   }
   // Kept by the account, moved between its own cells: nothing leaves.
   const kept = build(
@@ -329,4 +329,69 @@ test("a channel funding's inputs are read from the chain, never from cell detail
   const attempted = await previewFundingTransaction(offlineWallet, forged, client);
   assert.equal(honest.preview.amountCkb, "1500");
   assert.deepEqual(attempted.preview, honest.preview);
+});
+
+test("CKB put under a token script with extension args is what the confirmation says is sent (audit M7)", () => {
+  // xUDT args with flags after the owner's lock hash name extension scripts, which could keep the CKB under them.
+  const extended = ccc.Script.from({ codeHash: known.xudt.codeHash, hashType: "type", args: `0x${"aa".repeat(32)}01000000` });
+  const fee = 1_000n;
+  const { preview, outflowShannons } = build(
+    [{ lock: own, capacity: 500n * CKB }],
+    [{ lock: own, capacity: 500n * CKB - fee, type: extended, data: u128(0n) }],
+  );
+  assert.equal(outflowShannons, 500n * CKB, "the daily amount counts it all");
+  assert.equal(preview.sendingCkb, "499.99999", "never 'Send 0 CKB' while a code is asked for it");
+  assert.equal(preview.heldUnderScriptsCkb, "499.99999");
+  const lines = previewSummaryLines(preview);
+  assert.equal(lines[0], "Send 499.99999 CKB");
+  assert.match(lines[1], /^Of which 499\.99999 CKB stays in your account under a type script that could keep it$/);
+
+  // A plain transfer reads as before, with no such line.
+  const plain = build([{ lock: own, capacity: 500n * CKB }], [{ lock: alice, capacity: 100n * CKB }, { lock: own, capacity: 400n * CKB - fee }]);
+  assert.equal(plain.preview.sendingCkb, "100");
+  assert.equal(plain.preview.heldUnderScriptsCkb, undefined);
+  assert.ok(!previewSummaryLines(plain.preview).some((line) => line.startsWith("Of which")));
+});
+
+test("a token cell too short to hold an amount counts per cell, as the policy Action counts it (audit M30)", () => {
+  const { tokensLeaving, tokenOutflows } = build(
+    [{ lock: own, capacity: 200n * CKB, type: xudt, data: "0x01" }, { lock: own, capacity: 1_000n * CKB }],
+    [{ lock: alice, capacity: 200n * CKB, type: xudt, data: "0x01" }, { lock: own, capacity: 1_000n * CKB - 1_000n }],
+  );
+  assert.equal(tokensLeaving, true);
+  assert.deepEqual(tokenOutflows, [{ asset: xudt.hash(), amount: 1n, perCell: true }]);
+});
+
+test("channel funding counts change the token's extension scripts could keep, as the policy Action does (audit M8)", async () => {
+  const { client: probe } = chainOf([]);
+  const mine = await secp256k1Lock(probe, offlineWallet.litPublicKey);
+  const channel = ccc.Script.from({ codeHash: "0x6c67887fe201ee0c7853f1682c0b77c0e6214044c156c7558269390a8afa6d7c", hashType: "type", args: `0x${"cc".repeat(20)}` });
+  const fee = 10_000n;
+  const fund = async (args: ccc.Hex) => {
+    const token = await ccc.Script.fromKnownScript(probe, ccc.KnownScript.XUdt, args);
+    const cells = [live(5, mine, 200n * CKB, token, u128(1_000n)), live(6, mine, 2_000n * CKB)];
+    const { client } = chainOf(cells);
+    const transaction = serializeTransaction(ccc.Transaction.from({
+      inputs: cells.map(({ outPoint }) => ({ previousOutput: outPoint })),
+      // 200 CKB into the channel; the token change takes 1,000 CKB where the account held 200 under the token.
+      outputs: [
+        { lock: channel, type: token, capacity: 200n * CKB },
+        { lock: mine, type: token, capacity: 1_000n * CKB },
+        { lock: mine, capacity: 1_000n * CKB - fee },
+      ],
+      outputsData: [u128(600n), u128(400n), "0x"],
+      witnesses: [ccc.hexFrom(ccc.WitnessArgs.from({ lock: `0x${"00".repeat(65)}` }).toBytes()), "0x"],
+    }));
+    return previewFundingTransaction(offlineWallet, transaction, client);
+  };
+
+  const plainArgs = await fund(`0x${"55".repeat(32)}`);
+  assert.equal(plainArgs.preview.amountCkb, "200");
+  assert.equal(plainArgs.outflowShannons, 200n * CKB + fee, "a token without extension scripts can't keep the change");
+  assert.equal(plainArgs.preview.heldUnderScriptsCkb, undefined);
+
+  const extended = await fund(`0x${"55".repeat(32)}01000000`);
+  assert.equal(extended.preview.amountCkb, "200", "what goes into the channel is unchanged");
+  assert.equal(extended.outflowShannons, 200n * CKB + fee + 800n * CKB, "the 800 CKB more than it held under the token counts as sent");
+  assert.equal(extended.preview.heldUnderScriptsCkb, "800");
 });

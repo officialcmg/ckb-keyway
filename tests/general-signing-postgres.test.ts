@@ -6,7 +6,7 @@ import { formatCkbSignature, type ValidatedFunding } from "../src/server/funding
 import { fundingSigning, type FundingContext } from "../src/server/funding-signing.ts";
 import { database } from "../src/server/database.ts";
 import { countLitCodeAttempt, issueRequest, loadRequest, messageSigning, outflowNeedsEmailCode, recordLitCode, reserveOutflow, signingSettings, transactionSigning, type SigningContext } from "../src/server/general-signing.ts";
-import type { ValidatedTransaction } from "../src/server/transaction-policy.ts";
+import type { TokenOutflow, ValidatedTransaction } from "../src/server/transaction-policy.ts";
 import type { ReadyWallet } from "../src/server/user-wallet.ts";
 
 const enabled = Boolean(process.env.KEYWAY_AUTH_TEST_DATABASE_URL);
@@ -20,7 +20,7 @@ function signWithKey(digest: ccc.Hex): ccc.Hex {
   return formatCkbSignature({ recoveryParam: raw[0] as 0 | 1, r: ccc.hexFrom(raw.slice(1, 33)), s: ccc.hexFrom(raw.slice(33, 65)) });
 }
 
-function harness(outflow: bigint, tokenOutflows: Array<{ asset: string; amount: bigint }> = []) {
+function harness(outflow: bigint, tokenOutflows: TokenOutflow[] = []) {
   const emails: Array<{ to: string; subject: string; plaintext: string }> = [];
   const user = { id: crypto.randomUUID() };
   const wallet = { litPkpId: `0x${"11".repeat(20)}`, litPublicKey: publicKey, status: "ready" } as unknown as ReadyWallet;
@@ -386,4 +386,47 @@ test("general signing binds approvals, email codes and threshold changes", { ski
     assert.equal((await loadRequest(user, "recovery", nonce, "digest")).summary.litTicket, "v1.2.ticket");
     await assert.rejects(() => recordLitCode(user, "recovery", crypto.randomUUID(), {}), /expired/);
   });
+});
+
+test("an asset counted per cell always needs the code once it has a daily amount, as in the policy Action (audit M30)", { skip: !enabled }, async () => {
+  process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
+  const SPORE = `0x${"5e".repeat(32)}`;
+  // One cell of an asset KeyWay can't read by amount: it counts as 1, but that one cell may hold the whole balance.
+  const perCell = harness(0n, [{ asset: SPORE, amount: 1n, perCell: true }]);
+  await signingSettings(perCell.context, { operation: "set-daily-amount", asset: SPORE, amount: "5" });
+  const preview = await transactionSigning(perCell.context, { operation: "preview", transaction: tx(30) }) as { requiresEmailCode: boolean; confirmationNonce: string };
+  assert.equal(preview.requiresEmailCode, true);
+  await assert.rejects(transactionSigning(perCell.context, { operation: "sign", transaction: tx(30), confirmationNonce: preview.confirmationNonce }), /six-digit code/);
+  assert.equal(await outflowNeedsEmailCode(perCell.context.user, { id: "per-cell", shannons: 0n, tokens: [{ asset: SPORE, amount: 1n, perCell: true }] }), true);
+  // Without an amount of its own it has no limit, as before; a token read by amount compares its amount.
+  assert.equal(await outflowNeedsEmailCode(perCell.context.user, { id: "other", shannons: 0n, tokens: [{ asset: RUSD, amount: 1n, perCell: true }] }), false);
+  assert.equal(await outflowNeedsEmailCode(perCell.context.user, { id: "by-amount", shannons: 0n, tokens: [{ asset: SPORE, amount: 1n }] }), false);
+});
+
+test("a channel funding's email names the change its token's script could keep (audit M8)", { skip: !enabled }, async () => {
+  process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
+  const { context: signing, emails, codeFrom } = harness(0n);
+  await signingSettings(signing, { operation: "set-daily-amount", asset: "ckb", amount: (100n * CKB).toString() });
+  const context: FundingContext = {
+    ...signing,
+    preview: async (_wallet, input) => {
+      const transaction = ccc.Transaction.from(input as ccc.TransactionLike);
+      const script = ccc.Script.from({ codeHash: `0x${"9b".repeat(32)}`, hashType: "type", args: "0x" });
+      return {
+        transaction,
+        signer: { client: new ccc.ClientPublicTestnet() } as unknown as ccc.SignerCkbPublicKey,
+        script,
+        groups: [{ script, kind: "secp256k1" }],
+        preview: { amountCkb: "20", feeCkb: "0.0001", destination: "0x6c:0xcc", transactionHash: transaction.hash(), heldUnderScriptsCkb: "800" },
+        outflowShannons: 820n * CKB + 10_000n,
+      } as ValidatedFunding;
+    },
+    sign: async (validated) => validated.transaction,
+  };
+  const preview = await fundingSigning(context, { operation: "preview", transaction: tx(31) }) as { requiresEmailCode: boolean; confirmationNonce: string };
+  assert.equal(preview.requiresEmailCode, true, "the 800 CKB counts toward the 100 CKB amount");
+  await fundingSigning(context, { operation: "request-email-code", transaction: tx(31), confirmationNonce: preview.confirmationNonce });
+  assert.match(emails.at(-1)!.plaintext, /Open a Fiber channel with 20 CKB/);
+  assert.match(emails.at(-1)!.plaintext, /Also counted as sent: 800 CKB your change puts under the token's script, which could keep it/);
+  assert.ok(codeFrom());
 });

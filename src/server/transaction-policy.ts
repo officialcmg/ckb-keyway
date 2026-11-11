@@ -1,7 +1,7 @@
 import * as ccc from "@ckb-ccc/core";
 import { formatAsset, isXudtByDataHash, isXudtCompatible } from "../sdk/browser/tokens.ts";
 import { accountLocks, refuseAdminListSpend, refuseForeignOmnilockOutputs, verifyRecoveryAnchor, type KeyWayRecovery } from "../sdk/browser/account-lock.ts";
-import { signingGroups, withChainInputs, type SigningGroup } from "./funding-transaction.ts";
+import { keptCapacity, signingGroups, withChainInputs, type SigningGroup } from "./funding-transaction.ts";
 import type { ReadyWallet } from "./user-wallet.ts";
 
 const SHANNONS_PER_CKB = 100_000_000n;
@@ -43,8 +43,13 @@ export type CellSummary = { lock: string; type?: string; capacityCkb: string; da
 
 export type TransactionPreview = {
   network: "CKB testnet";
-  /** Plain CKB leaving the user's account, excluding the fee when the user pays all of it. */
+  /**
+   * CKB leaving the user's account as the daily amount counts it, excluding the fee when the user pays all of it. It
+   * includes CKB put into the account's own cells under a type script that could keep it (`heldUnderScriptsCkb`).
+   */
   sendingCkb: string;
+  /** CKB that stays in the user's cells but under a type script that could keep it, counted as sent. */
+  heldUnderScriptsCkb?: string;
   /** Plain CKB arriving in the user's account. */
   receivingCkb: string;
   feeCkb: string;
@@ -81,7 +86,11 @@ export type ValidatedTransaction = {
   tokenOutflows: TokenOutflow[];
 };
 
-export type TokenOutflow = { asset: string; amount: bigint };
+/**
+ * `perCell` marks an asset whose amounts KeyWay can't read, counted one per cell: a cell can hold any balance, so
+ * with a daily amount set for it, it always needs the code (as the policy Action rules).
+ */
+export type TokenOutflow = { asset: string; amount: bigint; perCell?: true };
 
 export async function loadKnownScripts(client: ccc.Client): Promise<KnownScripts> {
   const get = (script: ccc.KnownScript) => client.getKnownScript(script);
@@ -206,33 +215,25 @@ export function describeTransaction(
     return kind === "none" || kind === "dao" || (type!.codeHash === TYPE_ID_CODE_HASH && type!.hashType === "type")
       || ((kind === "xUDT" || kind === "sUDT") && ccc.bytesFrom(type!.args).length === 32);
   };
-  const heldUnder = new Map<string, bigint>();
-  for (const { cellOutput } of ownInputs) {
-    if (!keepsCkbFree(cellOutput.type)) heldUnder.set(cellOutput.type!.hash(), (heldUnder.get(cellOutput.type!.hash()) ?? 0n) + cellOutput.capacity);
-  }
-  let kept = 0n;
-  for (const { cellOutput } of ownOutputs) {
-    if (keepsCkbFree(cellOutput.type)) {
-      kept += cellOutput.capacity;
-      continue;
-    }
-    const held = heldUnder.get(cellOutput.type!.hash()) ?? 0n;
-    const amount = cellOutput.capacity < held ? cellOutput.capacity : held;
-    heldUnder.set(cellOutput.type!.hash(), held - amount);
-    kept += amount;
-  }
-  const leaving = ownIn > kept ? ownIn - kept : 0n;
-  const sending = userPaysFee ? maxBig(0n, outflow - fee) : outflow;
+  const leaving = maxBig(0n, ownIn - keptCapacity(ownInputs, ownOutputs, keepsCkbFree));
+  // What the user is told they send is what the daily amount counts, so a code asked for CKB put under a script that
+  // could keep it never reads as "Send 0 CKB". That part, still in the account's own cells, is shown on its own.
+  const sending = userPaysFee ? maxBig(0n, leaving - fee) : leaving;
+  const atRisk = leaving - outflow;
   const receiving = ownOut > ownIn ? ownOut - ownIn : 0n;
 
   // Tokens: net change per token for this account.
   const tokenTotals = new Map<string, { standard: "xUDT" | "sUDT"; delta: bigint }>();
+  // A token cell too short to hold an amount counts as one, per cell, as the policy Action counts it.
+  const unreadTokens = new Set<string>();
   const addToken = (cell: { cellOutput: ccc.CellOutput; outputData: ccc.Hex }, sign: 1n | -1n) => {
     const kind = typeKind(cell.cellOutput.type);
     if (kind !== "xUDT" && kind !== "sUDT") return;
     const id = cell.cellOutput.type!.hash();
     const entry = tokenTotals.get(id) ?? { standard: kind, delta: 0n };
-    entry.delta += sign * udtAmount(cell.outputData);
+    const readable = ccc.bytesFrom(cell.outputData).length >= 16;
+    if (!readable) unreadTokens.add(id);
+    entry.delta += sign * (readable ? udtAmount(cell.outputData) : 1n);
     tokenTotals.set(id, entry);
   };
   ownInputs.forEach((cell) => addToken(cell, -1n));
@@ -333,12 +334,14 @@ export function describeTransaction(
     // cell (and whenever one doesn't come back unchanged). Like a token, they have no limit unless the user sets an
     // amount for their type script hash, as the Lit Action reads the send-limit cell KeyWay writes.
     tokenOutflows: [
-      ...[...tokenTotals].filter(([, { delta }]) => delta < 0n).map(([asset, { delta }]) => ({ asset, amount: -delta })),
+      ...[...tokenTotals].filter(([, { delta }]) => delta < 0n)
+        .map(([asset, { delta }]) => ({ asset, amount: -delta, ...(unreadTokens.has(asset) ? { perCell: true as const } : {}) })),
       ...cellsLeaving(ownInputs, ownOutputs, countsPerCell),
     ],
     preview: {
       network: "CKB testnet",
       sendingCkb: formatCkb(sending),
+      ...(atRisk > 0n ? { heldUnderScriptsCkb: formatCkb(atRisk) } : {}),
       receivingCkb: formatCkb(receiving),
       feeCkb: formatCkb(fee),
       tokens,
@@ -359,7 +362,12 @@ export function describeTransaction(
  * by its whole address: the start and the checksum are all two look-alike addresses need to share.
  */
 export function previewSummaryLines(preview: TransactionPreview): string[] {
-  const lines = [`Send ${preview.sendingCkb} CKB`, `Network fee ${preview.feeCkb} CKB`, `Network ${preview.network}`];
+  const lines = [
+    `Send ${preview.sendingCkb} CKB`,
+    ...(preview.heldUnderScriptsCkb ? [`Of which ${preview.heldUnderScriptsCkb} CKB stays in your account under a type script that could keep it`] : []),
+    `Network fee ${preview.feeCkb} CKB`,
+    `Network ${preview.network}`,
+  ];
   for (const token of preview.tokens) lines.push(`Token ${token.amountText} (${token.standard} ${token.id})`);
   for (const nft of preview.nfts) lines.push(`${nft.kind} ${nft.id}: ${nft.change}`);
   for (const action of preview.dao) lines.push(`Nervos DAO ${action.action}: ${action.amountCkb} CKB`);
@@ -429,7 +437,7 @@ function cellsLeaving(
   ownInputs.forEach((cell) => count(cell, 1n));
   ownOutputs.forEach((cell) => count(cell, -1n));
   return [...counts].flatMap(([asset, left]) => {
-    if (left > 0n) return [{ asset, amount: left }];
-    return [...byData.get(asset)!.values()].some((cells) => cells > 0n) ? [{ asset, amount: 1n }] : [];
+    if (left > 0n) return [{ asset, amount: left, perCell: true as const }];
+    return [...byData.get(asset)!.values()].some((cells) => cells > 0n) ? [{ asset, amount: 1n, perCell: true as const }] : [];
   });
 }

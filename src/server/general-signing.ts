@@ -180,7 +180,7 @@ type Query = DatabaseSql | TransactionSql;
  * Money leaving the account: an on-chain transaction (by hash) or a Fiber payment (by approval nonce), with
  * the CKB it sends and each token by its type script hash.
  */
-export type Outflow = { id: string; shannons: bigint; tokens: Array<{ asset: string; amount: bigint }> };
+export type Outflow = { id: string; shannons: bigint; tokens: Array<{ asset: string; amount: bigint; perCell?: true }> };
 
 /** Daily amounts by asset: "ckb", or a token's type script hash. Empty means email confirmation is off. */
 export type DailyAmounts = Map<string, bigint>;
@@ -189,7 +189,9 @@ export type DailyAmounts = Map<string, bigint>;
  * Email confirmation is off until the user sets a daily amount. Once one is set, the emailed code is needed
  * when that asset's 24-hour total (signed transactions and Fiber payments together) reaches its amount, so
  * splitting a transfer doesn't avoid it. An asset without an amount of its own (a token, an NFT, any cell
- * KeyWay can't read) has no limit, as in the send-limit cell KeyWay writes (tokens unlimited).
+ * KeyWay can't read) has no limit, as in the send-limit cell KeyWay writes (tokens unlimited). An asset counted per
+ * cell (one whose amounts KeyWay can't read) always needs the code once it has an amount, as in the policy Action:
+ * a single cell can hold its whole balance.
  */
 export async function outflowNeedsEmailCode(user: User, outflow: Outflow, connection?: Query): Promise<boolean> {
   const amounts = await readDailyAmounts(user, connection);
@@ -197,7 +199,8 @@ export async function outflowNeedsEmailCode(user: User, outflow: Outflow, connec
   if (ckb !== "unlimited" && outflow.shannons > 0n && await recentOutflow(user, outflow.id, connection) + outflow.shannons >= ckb) return true;
   for (const token of outflow.tokens) {
     const limit = dailyAllowance(amounts, token.asset);
-    if (limit !== "unlimited" && await recentTokenOutflow(user, outflow.id, token.asset, connection) + token.amount >= limit) return true;
+    if (limit === "unlimited") continue;
+    if (token.perCell || await recentTokenOutflow(user, outflow.id, token.asset, connection) + token.amount >= limit) return true;
   }
   return false;
 }

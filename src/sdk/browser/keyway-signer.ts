@@ -11,8 +11,13 @@ export type { RequestEmailCode };
 /** What a transaction does to the user's account, decoded by the KeyWay backend from the chain. */
 export type TransactionPreview = {
   network: "CKB testnet";
-  /** Plain CKB leaving the account, excluding the fee when the user pays all of it. */
+  /**
+   * CKB leaving the account as the daily amount counts it, excluding the fee when the user pays all of it. It
+   * includes CKB put into the account's own cells under a type script that could keep it (`heldUnderScriptsCkb`).
+   */
   sendingCkb: string;
+  /** CKB that stays in the account's cells but under a type script that could keep it, counted as sent. */
+  heldUnderScriptsCkb?: string;
   /** Plain CKB arriving in the account. */
   receivingCkb: string;
   feeCkb: string;
