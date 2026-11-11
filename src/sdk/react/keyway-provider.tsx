@@ -28,6 +28,7 @@ import {
 } from "../browser/connect-managed-keyway";
 import { bootstrapKeyWay, type PublicWallet } from "../browser/bootstrap";
 import { createStoppedNodes, recoverFailedLogout } from "../browser/node-migration";
+import { handOffLogout, newTabId, refuseWhileFiberRuns, serveLogoutHandoff } from "../browser/logout-handoff";
 import type { ApproveFiberChannelOpen, FiberChannelOpenPreview } from "../browser/remote-ckb-signer";
 import type { ApproveFiberPayment } from "../browser/fiber-payment";
 import type { EmailCodeReason, RequestEmailCode } from "../browser/email-code";
@@ -274,6 +275,11 @@ export function KeyWayProvider({
   const connectionRunRef = useRef(0);
   // Stopped nodes may still be sending channel updates to KeyWay's watchtower: a logout delivers them first.
   const [stoppedNodes] = useState(() => createStoppedNodes<KeyWayConnection["keyway"]>());
+  // From this tab's first connect until a logout, a logout started in another tab of the session is handed here
+  // first (logout-handoff.ts), so it can't end the session before this tab's nodes have logged out.
+  const [tabId] = useState(newTabId);
+  const handoffRef = useRef<{ release(): void } | undefined>(undefined);
+  const handoffHandlerRef = useRef<() => Promise<void>>(async () => undefined);
   const operationRef = useRef<Promise<void>>(Promise.resolve());
   const runRef = useRef(0);
   const callbacksRef = useRef({ approveFiberChannelOpen, approveFiberPayment, approveFiberChannelClose, approveFiberPeerConnect, approveFiberChannelSettings, approveCkbTransaction, approveCkbMessage, approveDailyLimit, approveRecovery, approveBackupChange, onError, onFiberStartup });
@@ -346,6 +352,7 @@ export function KeyWayProvider({
   async function connect() {
     if (isJoyIdHelperWindow()) throw new Error("The JoyID window doesn't run Fiber");
     if (!authToken) throw new Error("Log in before connecting KeyWay");
+    if (user) handoffRef.current ??= serveLogoutHandoff({ scope: handoffScope(appId, user.id), tabId, handle: () => handoffHandlerRef.current() });
     const run = ++runRef.current;
     setStatus("connecting");
     setError(undefined);
@@ -464,7 +471,12 @@ export function KeyWayProvider({
     try {
       if (current) await current.keyway.stopForLogout();
       await stoppedNodes.logout();
+      // Another tab of this session may run Fiber: it logs out there first, or this logout fails.
+      if (user) await handOffLogout({ scope: handoffScope(appId, user.id), tabId });
+      if (wallet) await refuseWhileFiberRuns(wallet.litPkpId);
       if (token) await api.logout(token);
+      handoffRef.current?.release();
+      handoffRef.current = undefined;
       ++runRef.current;
       connectionRef.current = undefined;
       setConnection(undefined);
@@ -492,6 +504,39 @@ export function KeyWayProvider({
       throw logoutError;
     }
   }
+
+  /**
+   * A logout started in another tab of this session: this tab's nodes log out here (stop, deliver to KeyWay's
+   * watchtower, back up, release the device) before that tab ends the session. A failure is reported back, which
+   * fails that logout, and a node that kept the device runs again, as after a failed logout here.
+   */
+  handoffHandlerRef.current = async () => {
+    const handoffRun = ++runRef.current;
+    for (const approval of [funding, channelClose, peer, channelSettings]) approval.dismiss();
+    await operationRef.current;
+    const current = connectionRef.current;
+    const currentRun = connectionRunRef.current;
+    try {
+      if (current) await current.keyway.stopForLogout();
+      await stoppedNodes.logout();
+    } catch (cause) {
+      if (current) {
+        await recoverFailedLogout(current.keyway, connect, () => {
+          if (runRef.current === handoffRun) runRef.current = currentRun;
+        });
+      }
+      throw cause;
+    }
+    handoffRef.current = undefined;
+    connectionRef.current = undefined;
+    setConnection(undefined);
+    setStatus("idle");
+    setFiberStartupStage(undefined);
+  };
+  useEffect(() => () => {
+    handoffRef.current?.release();
+    handoffRef.current = undefined;
+  }, []);
 
   useEffect(() => {
     if (isJoyIdHelperWindow()) {
@@ -530,6 +575,8 @@ export function KeyWayProvider({
     let active = true;
     const invalidate = () => {
       ++runRef.current;
+      handoffRef.current?.release();
+      handoffRef.current = undefined;
       const current = connectionRef.current;
       connectionRef.current = undefined;
       if (current) void current.keyway.stop().catch(() => undefined);
@@ -1119,6 +1166,11 @@ function MailIcon() {
 type StoredSession = { authToken: string; user: KeyWayUser; appId?: string; expiresAt: string };
 
 const SESSION_STORAGE_KEY = "ckb-keyway.session.v2";
+
+/** The tabs that share a session: the same app's, signed in as the same user. */
+function handoffScope(appId: string | undefined, userId: string): string {
+  return `${appId ?? "unregistered"}:${userId}`;
+}
 
 function sessionStorageKey(appId?: string): string { return `${SESSION_STORAGE_KEY}:${appId ?? "unregistered"}`; }
 
