@@ -5,7 +5,7 @@ import { Pool } from "pg";
 import { getMigrations } from "better-auth/db/migration";
 import type { User } from "../src/server/auth-user.ts";
 import { authSchemaOptions } from "../src/server/auth-options.ts";
-import { database, withDailyAmountLock, withUserLock } from "../src/server/database.ts";
+import { database, withUserLock } from "../src/server/database.ts";
 import { addApplicationOrigin, createApplication, prepareOtpSend, removeApplicationOrigin } from "../src/server/applications.ts";
 import { closeAuthPool, sendEmailCode, sessionForRequest, setAuthDeliveryForTests, verifyEmailCode } from "../src/server/auth.ts";
 
@@ -318,23 +318,6 @@ test("wallet locks held for a long time don't hold up sign-in", { skip, timeout:
   } finally {
     release();
     await Promise.all(wallets);
-  }
-});
-
-test("daily-amount changes held for a long time don't hold up wallet locks or sign-in", { skip, timeout: 30_000 }, async () => {
-  await setup();
-  const { appId } = await application(["https://wallet.example"]);
-  let release!: () => void;
-  const held = new Promise<void>((resolve) => { release = resolve; });
-  // Five accounts' send-limit changes, each holding its lock across slow Lit and CKB calls.
-  const changes = Array.from({ length: 5 }, () => withDailyAmountLock(crypto.randomUUID(), () => held));
-  await delay(200);
-  try {
-    assert.ok(await within(withUserLock(`wallet-${crypto.randomUUID()}`, async () => undefined), 1_000), "a wallet's lock is not held up");
-    assert.ok(await within(sendEmailCode(appRequest(appId, "https://wallet.example", "192.0.2.131"), email()), 3_000), "a login code still goes out");
-  } finally {
-    release();
-    await Promise.all(changes);
   }
 });
 

@@ -287,7 +287,8 @@ test("send-limit settings changes are rate limited, and nothing is signed when t
   t.after(() => { litPolicyRunner.run = run; });
 
   const { set } = await limitsOn(world, context, sent, 150n * CKB);
-  assert.ok(limited.includes(`sign:${user.id}`), "a settings change counts as a signing request");
+  assert.ok(limited.includes(`settings:${user.id}`), "a settings change is rate limited");
+  assert.ok(!limited.includes(`sign:${user.id}`), "in its own bucket: signing requests can't use it up");
 
   // The same amounts the cell already holds: nothing to build, sign or send.
   const before = { sent: sent.length, signings };
@@ -296,7 +297,7 @@ test("send-limit settings changes are rate limited, and nothing is signed when t
   assert.equal(signings, before.signings, "no Lit signing for an unchanged amount");
 
   allow = false;
-  await assert.rejects(set(100n * CKB), /Too many signing requests/);
+  await assert.rejects(set(100n * CKB), /Too many/);
   assert.equal(sent.length, before.sent);
 
   t.after(async () => {
@@ -513,4 +514,17 @@ test("a change asked for while the account had no send-limit cell can't be confi
     const sql = await database();
     await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
   });
+});
+
+test("lowering an amount applies on the server at once, even while turning limits on waits for the Lit code", { skip: !enabled }, async (t) => {
+  const { world, user, context, sent } = await setUp();
+  t.after(() => { litSignerOverride.mode = undefined; });
+  const sql = await database();
+  await sql`insert into keyway_v2_daily_amounts (user_id, asset, amount) values (${user.id}, 'ckb', ${(100n * CKB).toString()})`;
+  const asked = await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (50n * CKB).toString() }) as { requiresEmailCode: boolean; confirmationNonce: string };
+  assert.equal(asked.requiresEmailCode, true, "turning limits on binds the email with the Lit code");
+  assert.match(world.lit.emails.at(-1)!.text, /Turn on daily send limits/);
+  assert.equal(sent.length, 0);
+  const stored = (await signingSettings(context, { operation: "get" }) as { dailyAmounts: Record<string, string> }).dailyAmounts;
+  assert.deepEqual(stored, { ckb: (50n * CKB).toString() }, "the lower amount already gates what the server checks");
 });
