@@ -107,9 +107,6 @@ async function payOnce(context: PaymentContext, node: FiberCaller, body: Record<
   if (!method) throw new Error("A Fiber payment method is required");
   const params = paymentFiberParams(method, body.params, "testnet");
   if (params.dry_run === true) throw new Error("Use the node call for dry runs");
-  // The fee a payment may pay is capped at the one counted toward the daily amount (max_fee_amount, below). A fee
-  // rate would be a second, separate cap, so it is left to the node's default rather than taken from the caller.
-  delete params.max_fee_rate;
   const digest = hashText(JSON.stringify({ method, params }));
 
   if (body.stage === "preview") {
@@ -180,15 +177,17 @@ async function payOnce(context: PaymentContext, node: FiberCaller, body: Record<
 
 /**
  * The payment as sent: a `sendPayment` may pay at most the fee its preview counted (the caller's own max_fee_amount
- * when that is lower), so a route dearer than the dry run's fails rather than spending more than was counted. A
- * `sendPaymentWithRouter` pays exactly its route's first-hop amount, which is what was counted.
+ * when that is lower), so a route dearer than the dry run's fails rather than spending more than was counted. The
+ * caller's max_fee_rate already shaped the dry run, so the counted fee respects it; it isn't sent, so the counted fee
+ * is the one cap. A `sendPaymentWithRouter` pays exactly its route's first-hop amount, which is what was counted.
  */
 function withCountedFee(method: "sendPayment" | "sendPaymentWithRouter", params: Record<string, unknown>, counted: unknown): Record<string, unknown> {
   if (method !== "sendPayment") return params;
   if (typeof counted !== "string" || !/^\d+$/.test(counted)) throw new Error(REQUEST_EXPIRED);
   const fee = BigInt(counted);
   const requested = typeof params.max_fee_amount === "string" ? BigInt(params.max_fee_amount) : undefined;
-  return { ...params, max_fee_amount: ccc.numToHex(requested !== undefined && requested < fee ? requested : fee) };
+  const { max_fee_rate: _rate, ...rest } = params;
+  return { ...rest, max_fee_amount: ccc.numToHex(requested !== undefined && requested < fee ? requested : fee) };
 }
 
 /** A CKB payment counts toward the CKB amount; a token payment, fee included, toward that token's. */

@@ -144,7 +144,7 @@ const settled = await fiber.payInvoice(invoice, {
 
 Payments have no built-in dialog, because Fiber is for fast payments. Show your own confirmation before calling `payInvoice`, or pass `approveFiberPayment` to `KeyWayProvider` so every payment from the node goes through it; see [Fiber node](/fiber-node#approvals).
 
-With a hosted node, payments count toward the user's 24-hour email-confirmation total, and KeyWay asks for the emailed code once that total reaches the user's daily amount. Browser-node payments aren't counted; see [Fiber node](/fiber-node#email-confirmation). A hosted `sendPayment` pays at most the fee its preview estimated, which is what counts toward the total (or your `max_fee_amount` when that is lower); `max_fee_rate` isn't passed on. If the route costs more by the time the payment is sent, it fails with `FEE_LIMIT_EXCEEDED` and can be tried again.
+With a hosted node, payments count toward the user's 24-hour email-confirmation total, and KeyWay asks for the emailed code once that total reaches the user's daily amount. Browser-node payments aren't counted; see [Fiber node](/fiber-node#email-confirmation). A hosted `sendPayment` pays at most the fee its preview estimated, which is what counts toward the total (or your `max_fee_amount` when that is lower); `max_fee_rate` limits that estimate. If the route costs more by the time the payment is sent, the payment fails and can be tried again.
 
 The sender doesn't need a direct channel to the receiver. Fiber uses its public channel graph to find a route whose channels have enough liquidity.
 

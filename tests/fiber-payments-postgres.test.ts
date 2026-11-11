@@ -11,6 +11,7 @@ const CKB = 100_000_000n;
 function harness(amount: bigint, options: { failSend?: boolean; fee?: bigint } = {}) {
   const emails: Array<{ subject: string; plaintext: string }> = [];
   const sent: unknown[] = [];
+  const dryRuns: Array<Record<string, unknown>> = [];
   const context: PaymentContext = {
     user: { id: crypto.randomUUID() },
     appName: "Acme Pay",
@@ -23,7 +24,10 @@ function harness(amount: bigint, options: { failSend?: boolean; fee?: bigint } =
       if (method === "parse_invoice") {
         return { invoice: { amount: `0x${amount.toString(16)}`, data: { payment_hash: `0x${"ab".repeat(32)}`, attrs: [{ description: "tea" }] } } } as T;
       }
-      if (method === "send_payment" && params[0]?.dry_run) return { fee: `0x${(options.fee ?? 0n).toString(16)}` } as T;
+      if (method === "send_payment" && params[0]?.dry_run) {
+        dryRuns.push(params[0]);
+        return { fee: `0x${(options.fee ?? 0n).toString(16)}` } as T;
+      }
       if (method === "send_payment") {
         // As Fiber refuses: its own error, with the request's params attached as data.
         if (options.failSend) throw Object.assign(new Error("no route"), { code: -32000, data: params[0] });
@@ -37,7 +41,7 @@ function harness(amount: bigint, options: { failSend?: boolean; fee?: bigint } =
   };
   // The amounts as the server keeps them (a test signer, so no send-limit cell is built on chain).
   const settings = (threshold: bigint | null, asset = "ckb") => signingSettings({ ...context, wallet: {}, signDigest: async () => "0x" } as unknown as SigningContext, { operation: "set-daily-amount", asset, amount: threshold?.toString() ?? null });
-  return { context, node, emails, sent, settings, codeFrom: () => /code is (\d{6})/.exec(emails.at(-1)!.plaintext)![1] };
+  return { context, node, emails, sent, dryRuns, settings, codeFrom: () => /code is (\d{6})/.exec(emails.at(-1)!.plaintext)![1] };
 }
 
 /** Moves a pending request, and its code, this many minutes into the past, as if that time had gone by. */
@@ -523,7 +527,8 @@ test("a hosted payment can't pay a higher fee than the one counted toward the da
   await fiberPayment(h.context, h.node, { method: "sendPayment", params, stage: "send", confirmationNonce: preview.confirmationNonce });
   const sent = h.sent.at(-1) as Record<string, unknown>;
   assert.equal(sent.max_fee_amount, `0x${fee.toString(16)}`, "capped at the counted fee");
-  assert.equal(sent.max_fee_rate, undefined, "the caller's fee rate isn't passed on: the counted fee is the one cap");
+  assert.equal(sent.max_fee_rate, undefined, "the counted fee is the one cap");
+  assert.equal(h.dryRuns.at(-1)!.max_fee_rate, "0x3e8", "the caller's fee rate shapes the estimate that is counted");
 
   // A caller's own lower cap still holds.
   const lower = { invoice: "fibt1test", max_fee_amount: "0x3e8" };
