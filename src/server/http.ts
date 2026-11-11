@@ -320,9 +320,8 @@ async function loadNodeBackupRequest(request: Request): Promise<Response> {
     throw new Error("Fiber wallet is bound to another device");
   }
   await requireLease(user, deviceIdHash, leaseId);
-  const backup = await versionedMutation(request, user.id, "node-backup:claim", body, () =>
-    readClaimedNodeBackup(user, deviceIdHash),
-  );
+  // A plain read, safe to repeat: it isn't run as an idempotent mutation, which would store the whole backup again.
+  const backup = await readClaimedNodeBackup(user, deviceIdHash);
   const { sourceDeviceIdHash: _source, status: _status, claimedDeviceIdHash: _claimed, ...publicBackup } = backup;
   return Response.json(publicBackup, { headers: { "Cache-Control": "no-store" } });
 }

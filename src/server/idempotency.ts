@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { database } from "./database.ts";
+import { database, type DatabaseSql } from "./database.ts";
 
 type StoredResult = {
   request_digest: string;
@@ -43,6 +43,26 @@ let waitingRepeats = 0;
 export const waitingRepeatCount = () => waitingRepeats;
 
 const STORE_ATTEMPTS = 3;
+/** Expired records of other accounts removed per new record, so the table stays at about one day of records. */
+export const PRUNE_BATCH = 100;
+
+/**
+ * Removes the caller's expired records, and a batch of anyone's, before a new one is stored. Every new record
+ * removes up to `PRUNE_BATCH` expired ones, so records of accounts that never come back don't pile up either.
+ */
+async function pruneExpiredRecords(sql: DatabaseSql, userId: string): Promise<void> {
+  await sql`delete from keyway_v2_idempotency_keys where user_id = ${userId} and expires_at <= now()`;
+  await sql`
+    delete from keyway_v2_idempotency_keys
+    where (user_id, operation, idempotency_key) in (
+      select user_id, operation, idempotency_key from keyway_v2_idempotency_keys
+      where expires_at <= now()
+      order by expires_at
+      limit ${PRUNE_BATCH}
+      for update skip locked
+    )
+  `;
+}
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export async function runIdempotentMutation<T>(
@@ -58,6 +78,7 @@ export async function runIdempotentMutation<T>(
   const staleSeconds = (options.staleAfterMs ?? DEFAULT_STALE_MS) / 1000;
 
   const sql = await database();
+  await pruneExpiredRecords(sql, userId);
   const [claimed] = await sql<Array<{ id: number }>>`
     insert into keyway_v2_idempotency_keys (
       user_id, operation, idempotency_key, request_digest, status, expires_at

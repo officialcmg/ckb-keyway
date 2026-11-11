@@ -119,3 +119,47 @@ test("M3: the paid Fiber key Action is rate limited per user", { skip }, async (
     globalThis.fetch = realFetch;
   }
 });
+
+test("M13: expired idempotency records are removed, and node-backup loads aren't stored", { skip }, async (t) => {
+  const { sql } = await setup();
+
+  await t.test("a new record removes the caller's expired records and a batch of anyone's", async () => {
+    const userId = crypto.randomUUID();
+    const others = Array.from({ length: 3 }, () => crypto.randomUUID());
+    const insert = (owner: string, key: string, expired: boolean) => sql`
+      insert into keyway_v2_idempotency_keys (user_id, operation, idempotency_key, request_digest, status, response, expires_at)
+      values (${owner}, 'test', ${key}, 'digest', 'completed', ${sql.json({ payload: "x".repeat(1_000) })},
+        ${expired ? sql`now() - interval '1 minute'` : sql`now() + interval '1 hour'`})
+    `;
+    for (let index = 0; index < 5; index++) await insert(userId, `own-expired-key-${index}`, true);
+    for (const other of others) await insert(other, "other-expired-key", true);
+    await insert(others[0], "other-current-key", false);
+
+    const result = await runIdempotentMutation(userId, "test", "fresh-idempotency-key", { a: 1 }, async () => ({ ok: true }));
+    assert.deepEqual(result, { ok: true });
+    const rows = await sql<Array<{ user_id: string; idempotency_key: string }>>`
+      select user_id, idempotency_key from keyway_v2_idempotency_keys where user_id in ${sql([userId, ...others])} order by idempotency_key
+    `;
+    assert.deepEqual(rows.map((row) => row.idempotency_key), ["fresh-idempotency-key", "other-current-key"]);
+  });
+
+  await t.test("loading a claimed node backup stores no copy of it", async () => {
+    const { user, call } = await signedIn();
+    await saveWallet(user, readyWallet(DEVICE_A));
+    const ciphertext = Buffer.alloc(200_000, 7).toString("base64");
+    await saveNodeBackup(user, DEVICE_A, {
+      formatVersion: 1, databasePrefix: `/wasm-0x${"11".repeat(20)}`, salt: Buffer.alloc(32, 1).toString("base64"),
+      iv: Buffer.alloc(12, 2).toString("base64"), ciphertext, digest: createHash("sha256").update(Buffer.from(ciphertext, "base64")).digest("hex"),
+    });
+    await prepareBackupForDevice(user, DEVICE_A, DEVICE_B, undefined, sql);
+    await saveWallet(user, readyWallet(DEVICE_B, { hasOpenedChannel: true }));
+    const lease = await acquireLease(user, DEVICE_B);
+    for (const key of ["load-backup-key-0001", "load-backup-key-0002"]) {
+      const response = await call("node-backup/load", { deviceIdHash: DEVICE_B, leaseId: lease.leaseId }, { "Idempotency-Key": key });
+      assert.equal(response.status, 200);
+      assert.equal((await response.json() as { ciphertext: string }).ciphertext, ciphertext);
+    }
+    const [{ count }] = await sql<Array<{ count: number }>>`select count(*)::int as count from keyway_v2_idempotency_keys where user_id = ${user.id}`;
+    assert.equal(count, 0);
+  });
+});
