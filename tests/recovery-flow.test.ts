@@ -424,6 +424,13 @@ test("builds the list update: same AdminList cell with the new root and record, 
   assert.equal(joyPlan.preview.backup.label, `JoyID ${joy.address}`);
   assert.ok(backupChangeLines(joyPlan.preview).includes(`Adding: JoyID ${joy.address}`));
   assert.ok(backupChangeLines(joyPlan.preview).every((line) => !line.includes("…")));
+  // Given in CKB's old full-address format, the same passkey is still named as JoyID shows it.
+  const { bech32 } = await import("bech32");
+  const joyIdScript = await client.getKnownScript(ccc.KnownScript.JoyId);
+  const oldFormat = bech32.encode("ckt", bech32.toWords([0x04, ...ccc.bytesFrom(joyIdScript.codeHash), ...ccc.bytesFrom((await ccc.Address.fromString(joy.address, client)).script.args)]), 1023);
+  assert.notEqual(oldFormat, joy.address);
+  const oldPlan = await planBackupChange(client, wallet, { change: "add", backup: { kind: "joyid", address: oldFormat } });
+  assert.ok(backupChangeLines(oldPlan.preview).includes(`Adding: JoyID ${joy.address}`));
 
   const removal = await planBackupChange(client, walletFor(publicKey, recovery), { change: "remove", backup: backups[0] }).catch((error: Error) => error);
   assert.match(String(removal), /Keep at least one backup\. Add another backup before removing this one/);

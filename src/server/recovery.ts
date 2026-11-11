@@ -243,7 +243,7 @@ export async function settleRecoveryChange(context: Pick<RecoveryContext, "user"
   if (settled.notice) {
     const { kind, ckbAddress, recovery, transactionHash } = settled.notice;
     const heading = kind === "enable" ? "Account recovery is on" : kind === "add" ? "A recovery backup was added" : "A recovery backup was removed";
-    await sendRecoveryNotice(context, heading, ckbAddress, recovery.backups ?? [], transactionHash);
+    await sendRecoveryNotice(context, client, heading, ckbAddress, recovery.backups ?? [], transactionHash);
   }
   return settled.wallet;
 }
@@ -301,9 +301,11 @@ function challengeTag(user: Pick<User, "id">, expiry: string, random: string): s
  * reach their funds with a backup even if KeyWay is gone. The change already happened, so a failed email is
  * logged, not thrown.
  */
-async function sendRecoveryNotice(context: Pick<RecoveryContext, "appName" | "email" | "sendEmail">, heading: string, address: string, backups: RecoveryBackup[], transactionHash: string): Promise<void> {
+async function sendRecoveryNotice(context: Pick<RecoveryContext, "appName" | "email" | "sendEmail">, client: ccc.Client, heading: string, address: string, backups: RecoveryBackup[], transactionHash: string): Promise<void> {
   try {
-    const template = createRecoveryNoticeEmailTemplate(context.appName, { heading, address, backups: backups.map(({ kind, address }) => `${kind === "evm" ? "EVM wallet" : "JoyID"} ${address}`), network: "CKB testnet" });
+    // Each backup named as the confirmation email named it.
+    const labels = await Promise.all(backups.map((backup) => backupLabel(client, backup)));
+    const template = createRecoveryNoticeEmailTemplate(context.appName, { heading, address, backups: labels, network: "CKB testnet" });
     await context.sendEmail(await context.email(), template, `keyway-recovery-notice/${transactionHash}`);
   } catch (error) {
     console.error("[keyway] recovery notice email failed", { cause: error instanceof Error ? error.message.slice(0, 200) : "email" });
