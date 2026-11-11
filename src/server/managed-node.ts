@@ -132,9 +132,12 @@ export async function managedNodeRequest(
     // And the account funds it: a lock nobody signs for would leave the channel waiting for funding forever.
     if (!sameScript(params.funding_lock_script, own)) throw new Error("Channels can only be funded from your own KeyWay address");
     params.funding_lock_script = own;
-    await serializeMutation(userId, () => assertChannelRoom(node));
-    await serializeMutation(userId, () => connectManagedPeer(node, params.pubkey));
-    return serializeMutation(userId, () => node.openChannelWithExternalFunding(params));
+    // One at a time per user, so parallel opens can't all pass the room check.
+    return serializeMutation(userId, async () => {
+      await assertChannelRoom(node);
+      await connectManagedPeer(node, params.pubkey);
+      return node.openChannelWithExternalFunding(params);
+    });
   }
   if (body.operation === "submit-channel-funding") {
     return serializeMutation(userId, () => node.submitSignedFundingTx(submitFundingParams(body.params)));
@@ -316,8 +319,8 @@ function submitFundingParams(value: unknown): SubmitSignedFundingTxParams {
 }
 
 const MAX_PEERS = 32;
-// Fiber keeps every channel record, aborted ones included, and each unfinished channel keeps a hosted node
-// running; so a hosted node opens no more once it has this many unfinished channels or records in all.
+// Each unfinished channel keeps a hosted node running, and Fiber keeps the record of every closed one; so a
+// hosted node opens no more once it has this many unfinished channels or channel records in all.
 const MAX_UNFINISHED_CHANNELS = 32;
 const MAX_CHANNEL_RECORDS = 200;
 

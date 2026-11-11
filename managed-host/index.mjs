@@ -78,12 +78,11 @@ async function main() {
   required("FIBER_SECRET_KEY_PASSWORD");
   required("KEYWAY_MANAGED_HOST_TOKEN");
   backupKey();
-  booting = true;
   const server = createServer(handleRequest);
   server.listen(Number(process.env.PORT ?? 8080), "0.0.0.0", () => {
     console.log(`[managed-host] listening on ${process.env.PORT ?? 8080}`);
   });
-  void existingUsers().then(startKnownNodes).catch(logError).finally(() => { booting = false; });
+  void bootKnownNodes();
   const stop = () => {
     server.close();
     void shutdown();
@@ -161,6 +160,8 @@ export function readiness() {
 export function proxyUserRequest(userId, body, signal) {
   const method = rpcMethod(body);
   return withUserOperation(userId, async () => {
+    // A request the API gave up on while it waited in the queue starts nothing.
+    if (signal?.aborted) throw new Error("The request was abandoned");
     const node = await ensureNode(userId, { provision: PROVISIONING.has(method) });
     const setup = CHANNEL_SETUP.has(method);
     // A node handing over its user's signed funding is never stopped to make room (see SUBMIT_PROTECTION_MS).
@@ -309,7 +310,7 @@ async function ensureNode(userId, { provision = true } = {}) {
   if (shuttingDown) throw new Error("Managed host is shutting down");
   const full = new Set([...nodes.keys(), ...starting.keys()]).size >= maxNodes();
   if (full && !priority && recent(roomStarts, userId, 10 * 60_000) >= ROOM_STARTS_PER_10_MIN) {
-    throw new Error("This hosted node has been restarted too often; try again in a few minutes");
+    throw new Error("Too many restarts of this hosted node; try again in a few minutes");
   }
   if (full && !priority && Date.now() - noRoomAt < NO_ROOM_RETRY_MS) throw new RoomError("Managed node capacity is full");
   const promise = (full ? makeRoom(userId, priority).then(() => { if (!priority) record(roomStarts, userId); }) : Promise.resolve())
@@ -425,6 +426,22 @@ export async function startKnownNodes(users) {
   booting = false;
   await Promise.all(withChannels.slice(0, maxNodes()).map(restartNode));
   for (const userId of withChannels.slice(maxNodes())) await restartNode(userId);
+}
+
+/**
+ * Finds and starts the nodes to run after a restart. Until they are known /readyz isn't ready, and if they can't
+ * be listed, listing is tried again with the restart backoff.
+ */
+export async function bootKnownNodes(attempt = 0) {
+  booting = true;
+  try {
+    await startKnownNodes(await existingUsers());
+  } catch (error) {
+    logError(error);
+    if (shuttingDown) return;
+    const timer = setTimeout(() => void bootKnownNodes(attempt + 1), Math.min(RESTART_MAX_MS, RESTART_BASE_MS * 2 ** attempt));
+    timer.unref?.();
+  }
 }
 
 /** Schedules the next start of an offline node that may hold channels, backing off after each failure. */
@@ -569,8 +586,8 @@ async function waitForRpc(port, child) {
   throw new Error("Fiber node startup timed out");
 }
 
-async function snapshotUser(userId) {
-  const wasRunning = await stopNode(userId);
+export async function snapshotUser(userId) {
+  const wasRunning = await stopNodeForDatabase(userId);
   return completeDatabaseOperation(
     () => createSnapshot({ userId }),
     () => resumeNode(userId, wasRunning),
@@ -578,11 +595,18 @@ async function snapshotUser(userId) {
 }
 
 export async function restoreUser(userId, name) {
-  const wasRunning = await stopNode(userId);
+  const wasRunning = await stopNodeForDatabase(userId);
   return completeDatabaseOperation(
     () => restoreSnapshot({ userId, name }),
     () => resumeNode(userId, wasRunning),
   );
+}
+
+/** Stops a node for a snapshot or restore; one that may hold channels counts as offline until it runs again. */
+async function stopNodeForDatabase(userId) {
+  const stopped = await stopNode(userId);
+  if (stopped && await mayHoldChannels(userId).catch(() => true) && !offline.has(userId)) offline.set(userId, {});
+  return stopped;
 }
 
 /** Starts a node again after a database operation, or has it started if it may now hold channels. */
@@ -696,21 +720,14 @@ function stateName(channel) {
 }
 
 /**
- * "finished"; "unfunded" while Fiber could still abort its funding, before our funding signatures were sent
- * (Fiber's can_abort_funding_on_timeout); or "open". An unfunded channel holds nothing of the user's on chain,
- * and Fiber aborts it if it stalls. Once our signatures are sent, the peer may broadcast the funding at any time,
- * so the channel counts as open.
+ * "finished"; "unfunded" while the channel is still negotiating its funding, before the user's signed funding
+ * was handed to Fiber; or "open". Fiber passes submitted funding straight to the peer, which may then broadcast
+ * it at any time, so every later state counts as open. An open that stalls before submission is aborted by
+ * Fiber after its external-funding timeout, and then it is finished.
  */
 function channelClass(channel) {
   if (channelFinished(channel)) return "finished";
-  const name = stateName(channel);
-  if (["negotiatingfunding", "collaboratingfundingtx", "signingcommitment"].includes(name)) return "unfunded";
-  if (name === "awaitingtxsignatures") {
-    const flags = new Set(JSON.stringify(channel?.state?.state_flags ?? "").match(/\b[A-Z][A-Z0-9_]*\b/g) ?? []);
-    // TX_SIGNATURES_SENT is Fiber's name for both sides having sent them.
-    return flags.has("OUR_TX_SIGNATURES_SENT") || flags.has("TX_SIGNATURES_SENT") ? "open" : "unfunded";
-  }
-  return "open";
+  return stateName(channel) === "negotiatingfunding" ? "unfunded" : "open";
 }
 
 /** Whether a node must keep running for its channels: any channel that isn't finished or unfunded. */
@@ -979,7 +996,8 @@ async function existingUsers() {
     const users = (await readdir(required("KEYWAY_MANAGED_DATA_DIR", "/fiber/users"), { withFileTypes: true }))
       .filter((entry) => entry.isDirectory() && USER_ID.test(entry.name))
       .map((entry) => entry.name);
-    const retired = await Promise.all(users.map((userId) => isRetired(userId)));
+    // A user whose tombstone can't be read is listed: its node's own start checks again, and is retried.
+    const retired = await Promise.all(users.map((userId) => isRetired(userId).catch(() => false)));
     return users.filter((_, index) => !retired[index]);
   } catch (error) {
     if (error?.code === "ENOENT") return [];

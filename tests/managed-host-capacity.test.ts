@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -54,16 +54,17 @@ const CLOSED_CHANNEL = [{ state: { state_name: "Closed", state_flags: "COOPERATI
 const SETTLING_FORCE_CLOSE = [{ state: { state_name: "Closed", state_flags: "UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT" } }];
 const SETTLED_FORCE_CLOSE = [{ state: { state_name: "Closed", state_flags: "UNCOOPERATIVE_LOCAL" } }];
 const SETTLED_REMOTE_CLOSE = [{ state: { state_name: "Closed", state_flags: "UNCOOPERATIVE_REMOTE" } }];
-const UNFUNDED_CHANNEL = [{ state: { state_name: "NegotiatingFunding", state_flags: "OUR_INIT_SENT|THEIR_INIT_SENT|AWAITING_EXTERNAL_FUNDING" } }];
+// Fiber names every flag constant that shares a bit with the value, composite ones included.
+const UNFUNDED_CHANNEL = [{ state: { state_name: "NegotiatingFunding", state_flags: "OUR_INIT_SENT|THEIR_INIT_SENT|INIT_SENT|AWAITING_EXTERNAL_FUNDING" } }];
 const ABORTED_FUNDING = [{ state: { state_name: "Closed", state_flags: "FUNDING_ABORTED" } }];
-// Signed on our side: the peer may broadcast the funding at any time.
 const FUNDING_TX = `0x${"77".repeat(32)}`;
-const SIGNED_CHANNEL = [{ state: { state_name: "AwaitingTxSignatures", state_flags: "OUR_TX_SIGNATURES_SENT" }, channel_outpoint: `${FUNDING_TX}00000000` }];
-const BOTH_SIGNED_CHANNEL = [{ state: { state_name: "AwaitingTxSignatures", state_flags: "TX_SIGNATURES_SENT" }, channel_outpoint: `${FUNDING_TX}00000000` }];
-// Before our funding signatures are sent, Fiber can still abort the funding.
-const UNSIGNED_CHANNEL = [{ state: { state_name: "AwaitingTxSignatures", state_flags: "THEIR_TX_SIGNATURES_SENT" }, channel_outpoint: `${FUNDING_TX}00000000` }];
-const COMMITTING_CHANNEL = [{ state: { state_name: "SigningCommitment", state_flags: "COMMITMENT_SIGNED_SENT" } }];
-const BROADCAST_CHANNEL = [{ state: { state_name: "AwaitingChannelReady", state_flags: "OUR_CHANNEL_READY" }, channel_outpoint: `${FUNDING_TX}00000000` }];
+// After the user's signed funding was submitted, which Fiber passes straight to the peer: the peer may
+// broadcast the funding at any time.
+const COLLABORATED_CHANNEL = [{ state: { state_name: "CollaboratingFundingTx", state_flags: "OUR_TX_COMPLETE_SENT|THEIR_TX_COMPLETE_SENT|COLLABORATION_COMPLETED" } }];
+const COMMITTING_CHANNEL = [{ state: { state_name: "SigningCommitment", state_flags: "THEIR_COMMITMENT_SIGNED_SENT|COMMITMENT_SIGNED_SENT" } }];
+const THEIRS_SIGNED_CHANNEL = [{ state: { state_name: "AwaitingTxSignatures", state_flags: "THEIR_TX_SIGNATURES_SENT|TX_SIGNATURES_SENT" }, channel_outpoint: `${FUNDING_TX}00000000` }];
+const SIGNED_CHANNEL = [{ state: { state_name: "AwaitingTxSignatures", state_flags: "OUR_TX_SIGNATURES_SENT|TX_SIGNATURES_SENT" }, channel_outpoint: `${FUNDING_TX}00000000` }];
+const BROADCAST_CHANNEL = [{ state: { state_name: "AwaitingChannelReady", state_flags: "OUR_CHANNEL_READY|CHANNEL_READY" }, channel_outpoint: `${FUNDING_TX}00000000` }];
 const exists = (path: string) => stat(path).then(() => true, () => false);
 
 async function until(check: () => Promise<boolean>) {
@@ -443,8 +444,8 @@ test("a channel a peer opened to the node marks it once the node's channels show
 });
 
 test("a node whose channels can hold nothing more makes room once its user has stopped, and loses its marker", async (context) => {
-  // Force-closed and settled on-chain (by either side), opened but not yet signed by us, and funding aborted by Fiber.
-  for (const channels of [SETTLED_FORCE_CLOSE, SETTLED_REMOTE_CLOSE, UNFUNDED_CHANNEL, COMMITTING_CHANNEL, UNSIGNED_CHANNEL, ABORTED_FUNDING]) {
+  // Force-closed and settled on-chain (by either side), opened but not yet funded, and funding aborted by Fiber.
+  for (const channels of [SETTLED_FORCE_CLOSE, SETTLED_REMOTE_CLOSE, UNFUNDED_CHANNEL, ABORTED_FUNDING]) {
     context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
     const { request, running, marked, markedNode } = await host(context);
     await markedNode(F, channels);
@@ -458,9 +459,8 @@ test("a node whose channels can hold nothing more makes room once its user has s
   }
 });
 
-test("a node whose channel is settling, or whose funding we have signed, keeps running whatever CKB shows", async (context) => {
-  // Once our signatures are sent, the peer may broadcast the funding at any time.
-  for (const channels of [SETTLING_FORCE_CLOSE, SIGNED_CHANNEL, BOTH_SIGNED_CHANNEL, BROADCAST_CHANNEL]) {
+test("a node whose channel is settling, or whose funding was submitted, keeps running whatever CKB shows", async (context) => {
+  for (const channels of [SETTLING_FORCE_CLOSE, COLLABORATED_CHANNEL, COMMITTING_CHANNEL, THEIRS_SIGNED_CHANNEL, SIGNED_CHANNEL, BROADCAST_CHANNEL]) {
     context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
     const { request, running, marked, markedNode } = await host(context);
     await markedNode(F, channels);
@@ -608,4 +608,57 @@ test("a restore that leaves a node with channels stopped has it started", async 
   await module.withUserOperation(F, () => module.restoreUser(F, name));
   await until(async () => running().includes(F));
   assert.equal(module.readiness().offline, 0);
+});
+
+test("once its funding is submitted, a node keeps running and stays marked, even when a node with channels needs room", async (context) => {
+  const { module, request, running, marked, withChannels, markedNode } = await host(context);
+  await withChannels(A, UNFUNDED_CHANNEL);
+  assert.equal(await request(A), 200);
+  assert.equal(await request(B), 200);
+  await withChannels(A, COLLABORATED_CHANNEL);
+  assert.equal(await request(A, "submit_signed_funding_tx"), 200);
+  // B is used after A, so A is the least recently used.
+  assert.equal(await request(B, "list_channels"), 200);
+  await markedNode(F);
+  await module.startKnownNodes([F]);
+  assert.deepEqual(running(), [A, F].sort());
+  assert.equal(await marked(A), true);
+});
+
+test("if the nodes to start can't be listed at boot, /readyz isn't ready and listing is tried again", async (context) => {
+  const { module, root, running, markedNode } = await host(context);
+  await markedNode(F);
+  process.env.KEYWAY_MANAGED_DATA_DIR = join(root, "not-yet");
+  await writeFile(join(root, "not-yet"), "");
+  await module.bootKnownNodes();
+  assert.equal(module.readiness().status, "degraded");
+  await rm(join(root, "not-yet"));
+  await rename(join(root, "users"), join(root, "not-yet"));
+  await until(async () => running().includes(F));
+  assert.equal(module.readiness().status, "ready");
+});
+
+test("a request the API gave up on while it waited starts no node", async (context) => {
+  const { root, request, running } = await host(context);
+  assert.equal(await request(A), 200);
+  await writeFile(join(root, "users", A, "slow-rpc"), "");
+  const first = request(A, "slow_call");
+  const gone = new AbortController();
+  const queued = request(B, "node_info", gone.signal);
+  gone.abort();
+  assert.equal(await queued, 502);
+  await first;
+  assert.deepEqual(running(), [A]);
+});
+
+test("a node with channels stopped for a snapshot counts as offline until it runs again", async (context) => {
+  const { module, root, request, withChannels } = await host(context);
+  process.env.KEYWAY_MANAGED_BACKUP_KEY = "07".repeat(32);
+  await withChannels(F);
+  assert.equal(await request(F), 200);
+  await writeFile(join(root, "users", F, "fail-start"), "");
+  await assert.rejects(module.withUserOperation(F, () => module.snapshotUser(F)));
+  assert.equal(module.readiness().offline, 1);
+  await rm(join(root, "users", F, "fail-start"));
+  await until(async () => module.readiness().offline === 0);
 });
