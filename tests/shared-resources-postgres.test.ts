@@ -163,3 +163,71 @@ test("M13: expired idempotency records are removed, and node-backup loads aren't
     assert.equal(count, 0);
   });
 });
+
+test("L3: the unusual-signing alert survives concurrent signings and failed deliveries", { skip }, async (t) => {
+  const { sql } = await setup();
+  const threshold = 3;
+  process.env.KEYWAY_SIGNING_ALERT_THRESHOLD = String(threshold);
+  process.env.KEYWAY_SECURITY_ALERT_WEBHOOK_URL = "https://alerts.example/hook";
+  const warn = console.warn;
+  console.warn = (...args: unknown[]) => { if (args[0] !== "[keyway-security]") warn(...args); };
+  let failures = 0;
+  let attempts = 0;
+  let delivered = 0;
+  globalThis.fetch = (async () => {
+    attempts += 1;
+    if (failures > 0) { failures -= 1; return new Response("unavailable", { status: 503 }); }
+    delivered += 1;
+    return new Response(null, { status: 204 });
+  }) as typeof fetch;
+  const reset = async () => {
+    await sql`delete from keyway_security_events where kind = 'signing'`;
+    await sql`delete from keyway_security_alert_state`.catch(() => undefined);
+    failures = 0; attempts = 0; delivered = 0;
+  };
+  const eventually = async (check: () => boolean, ms = 8_000) => {
+    const deadline = Date.now() + ms;
+    while (!check() && Date.now() < deadline) await delay(50);
+    return check();
+  };
+  const signers = () => Array.from({ length: 2 * threshold }, () => crypto.randomUUID());
+  t.after(() => {
+    console.warn = warn;
+    globalThis.fetch = realFetch;
+    delete process.env.KEYWAY_SECURITY_ALERT_WEBHOOK_URL;
+    delete process.env.KEYWAY_SIGNING_ALERT_THRESHOLD;
+  });
+
+  await t.test("signings that step past the threshold together still raise it", async () => {
+    await reset();
+    // Signings that committed together, so no signing saw the count at exactly the threshold.
+    for (let index = 0; index <= threshold; index++) {
+      await sql`insert into keyway_security_events (kind, subject_hash) values ('signing', ${`concurrent-${index}`})`;
+    }
+    await recordSigningEvent(crypto.randomUUID());
+    assert.ok(await eventually(() => delivered === 1), "the alert is delivered");
+  });
+
+  await t.test("a burst raises one alert, and a failed delivery is retried", async () => {
+    await reset();
+    failures = 2;
+    await Promise.all(signers().map((id) => recordSigningEvent(id)));
+    assert.ok(await eventually(() => delivered === 1), "the alert is delivered after retries");
+    await Promise.all(signers().map((id) => recordSigningEvent(id)));
+    await delay(500);
+    assert.equal(delivered, 1, "one alert per window");
+    assert.equal(attempts, 3);
+  });
+
+  await t.test("an alert that can't be delivered is raised again by a later signing in the burst", async () => {
+    await reset();
+    failures = 3;
+    await Promise.all(signers().map((id) => recordSigningEvent(id)));
+    assert.ok(await eventually(() => attempts === 3 && failures === 0), "every attempt is made");
+    const deadline = Date.now() + 5_000;
+    while ((await sql`select 1 from keyway_security_alert_state`).length > 0 && Date.now() < deadline) await delay(50);
+    assert.equal(delivered, 0);
+    await recordSigningEvent(crypto.randomUUID());
+    assert.ok(await eventually(() => delivered === 1), "the next signing raises it again");
+  });
+});

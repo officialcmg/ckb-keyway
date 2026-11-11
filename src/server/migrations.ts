@@ -401,4 +401,9 @@ export const migrations: Array<{
     // close reopens it only when it can punish that commitment.
     up: (sql) => sql`alter table keyway_v2_watchtower_channels add column closing_commitment_number numeric(20, 0)`,
   },
+  {
+    version: 23, name: "security-alert-state",
+    // When each kind of alert last went out, so concurrent signings raise one alert per window between them.
+    up: (sql) => sql`create table keyway_security_alert_state (kind text primary key, alerted_at timestamptz not null, claim_id uuid not null)`,
+  },
 ];
