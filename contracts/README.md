@@ -49,8 +49,9 @@ Lines are joined by `\n`, with no trailing newline.
 - **Move everything to**: the outputs' lock in CKB's full address format (bech32m over `0x00 ‖ code_hash ‖
   hash_type ‖ args`, no 90-character limit), prefix `ckt` on testnet and `ckb` on mainnet.
 - **CKB**: the total capacity of the outputs, which is everything the destination receives.
-- **Tokens**: how many outputs have a type script: `none`, `1 token cell` or `N token cells`. The count stands
-  for the account's own token cells, moved unchanged (see below), so it can't hide a changed or burned one.
+- **Tokens**: how many outputs have a type script: `none`, `1 token cell` or `N token cells`. From version 4 (not
+  deployed yet, see Testnet deployments) the count stands for the account's own token cells, moved unchanged (see
+  below), so it can't hide a changed or burned one.
 - **Fee**: the inputs' capacity less the outputs', read by the verifier from the real input cells.
 - Amounts use thousands separators and up to 8 decimals, trailing zeros dropped.
 - **Transaction**: the sighash from Omnilock's argument. It binds the signature to one transaction.
@@ -70,7 +71,11 @@ refuses, with exit code 111, any transaction that isn't a rescue:
   twice, taken from someone else's input, made under a type script the account didn't hold, or given more CKB
   than it held, is refused. The last one matters because anyone can send the account a cell under their own type
   script, and that script could keep any CKB put in it: the rescued CKB beyond what token cells held must arrive
-  in plain cells;
+  in plain cells. A cell whose type script needs its data changed when it is spent can't be moved by a backup
+  under this rule: that includes a Nervos DAO deposit, whose withdrawal rewrites its data and then drops its type
+  script. The rescue page never moved such cells (it lists them as staying), but under version 3 a hand-built
+  transaction could; under version 4 they stay at the account. Whether to allow the Nervos DAO's two
+  withdrawal steps is open (audit run 3, M19);
 - more than 256 token cells (`MAX_TOKEN_CELLS`; the rescue page moves at most 100 cells at a time);
 - outputs above inputs.
 
@@ -201,8 +206,7 @@ cargo test --release -- --nocapture                # runs the binaries in CKB-VM
 The builds are reproducible: a fresh copy of `contracts/` built in another directory gives the same bytes.
 `tests/tests/verifier.rs` runs the WebAuthn verifier against `tests/tests/rescue.json` (a mock rescue transaction
 for ckb-debugger); `approval.rs` runs both verifiers on the random transactions and 40,000 signature mutations, and checks the salt (an identity from one account refused in another, 114 for a lock that isn't a KeyWay account's);
-`approval.rs` also runs both verifiers on the token-cell attempts above, and the EVM verifier on 100, 256 and 257
-token cells;
+`approval.rs` also runs both verifiers on the token-cell attempts above and on 100, 256 and 257 token cells;
 `audit_fable51_parity.rs` checks the clientDataJSON rules against the server's. `p256-check` is a test-only binary
 that runs the P-256 code on `public_key:rs:message`.
 
@@ -212,7 +216,7 @@ that runs the P-256 code on `public_key:rs:message`.
 |---|---|
 | EVM verifier, random rescue transactions | up to 7.9M |
 | WebAuthn verifier, random rescue transactions | up to 7.2M |
-| EVM verifier, 100 token cells (the most the rescue page moves at once) | 9.3M |
-| EVM verifier, 256 token cells (the most it accepts) | 13.2M |
+| EVM / WebAuthn verifier, 100 token cells (the most the rescue page moves at once) | 9.3M / 8.5M |
+| EVM / WebAuthn verifier, 256 token cells (the most it accepts) | 13.2M / 12.4M |
 | Whole administrator-path spend on testnet, EVM backup | 8.05M |
 | Whole administrator-path spend on testnet, JoyID-style backup | 7.34M |

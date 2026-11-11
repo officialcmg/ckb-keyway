@@ -362,7 +362,8 @@ export async function planRescue(client: ccc.Client, account: RescueAccount, ent
       // The plain CKB is too little for a cell of its own and more than the token cells held: it stays here, and
       // the page says so. Only the token cells move.
       const tokensAlone = await attempt(false, tokenCells);
-      if (tokensAlone.spare < 0n) throw short(-tokensAlone.spare);
+      // Short of what a plain cell at the destination needs: with that much more, everything moves.
+      if (tokensAlone.spare < 0n) throw short(minimumPlain - built.spare);
       intoTokenCells(tokensAlone);
       built = tokensAlone;
     }

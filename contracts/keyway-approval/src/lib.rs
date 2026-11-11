@@ -22,7 +22,9 @@
 //! transaction that isn't a rescue: at least one output, every output locked by the same lock, which isn't the
 //! account's own (the running script), no output carrying data without a type script, and token cells that are
 //! exactly the account's own moved unchanged (each output with a type script has the type script hash and data
-//! hash of a distinct input of the account, and each of the account's inputs with a type script is one of them).
+//! hash of a distinct input of the account, each of the account's inputs with a type script is one of them, and
+//! the outputs of each kind hold no more CKB than those inputs did). The token-cell rule is new in version 4,
+//! which isn't deployed yet (contracts/README.md, Testnet deployments).
 //!
 //! The same running script gives each account's salt (`account_salt`): a backup's identity on chain is
 //! `blake160(backup id ‖ salt)`, never the backup's own id, so one backup used by two accounts has two unrelated

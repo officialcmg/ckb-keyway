@@ -316,7 +316,8 @@ fn token_cells_must_be_the_accounts_own_moved_unchanged() {
     }
 }
 
-/// At most `MAX_TOKEN_CELLS` (256) token cells: 256 of the account's own are moved, 257 are refused (111).
+/// At most `MAX_TOKEN_CELLS` (256) token cells: 256 of the account's own are moved, 257 are refused (111), by
+/// both verifiers.
 #[test]
 fn moves_at_most_256_token_cells() {
     let cases: Vec<TransactionCase> = fixture("approval-transaction-cases.json");
@@ -333,8 +334,13 @@ fn moves_at_most_256_token_cells() {
         let text = sdk_text(&case, count as u64, (count as u128) * 150 * CKB as u128, CKB as u128);
         let argument = exec_argument(&[0x42u8; 32], &identity(&address, &case), &unhex(&case.sighash), &evm_blob(0, &personal_sign(&key, text.as_bytes())));
         let (code, cycles) = run("evm-personal-sign", &case, &argument);
-        assert_eq!(code, expected, "{count} token cells");
-        println!("{count} token cells: exit {code}, {cycles} cycles");
+        assert_eq!(code, expected, "{count} token cells, EVM");
+        let passkey = Passkey(SigningKey::from_slice(&[3u8; 32]).unwrap());
+        let pubkey_hash = identity(&joyid_webauthn::blake160(&passkey.public_key()), &case);
+        let blob = passkey.blob(0, &text, 1024);
+        let (webauthn_code, webauthn_cycles) = run("joyid-webauthn", &case, &exec_argument(&[0x24u8; 32], &pubkey_hash, &unhex(&case.sighash), &blob));
+        assert_eq!(webauthn_code, expected, "{count} token cells, WebAuthn");
+        println!("{count} token cells: EVM exit {code}, {cycles} cycles; WebAuthn exit {webauthn_code}, {webauthn_cycles} cycles");
     }
 }
 

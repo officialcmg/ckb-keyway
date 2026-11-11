@@ -15,7 +15,8 @@ import * as ccc from "@ckb-ccc/core";
  * cells), `Tokens` counts the outputs with a type script, `Fee` is the inputs less the outputs. The sighash line
  * binds the signature to one transaction. A transaction that isn't a rescue (every output to one lock other than
  * the account's, no data without a type script, and token cells that are exactly the account's own, moved
- * unchanged) has no approval text, and the verifiers refuse it.
+ * unchanged) has no approval text. The deployed verifiers (version 3) refuse the first two; the token-cell rule
+ * is enforced on chain only from version 4 (contracts/keyway-approval), which isn't deployed yet.
  */
 export type RescueApproval = {
   destination: ccc.Script;

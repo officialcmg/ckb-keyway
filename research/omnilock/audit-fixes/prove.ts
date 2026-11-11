@@ -110,7 +110,7 @@ async function rescueFor(name: "E1" | "J1", destination: string) {
 /** Puts `signature` (made over whatever text) into the backup's admin witness of the prepared transaction. */
 async function withSignature(name: "E1" | "J1", destination: string, text: (approval: string, sighash: ccc.Hex) => string) {
   const { rescue, entry, plan } = await rescueFor(name, destination);
-  const spend = { client, lock: rescue.lock, omnilock: rescue.omnilock, auths: rescue.auths, entry, adminList: rescue.adminList.outPoint, inputCells: rescue.movable };
+  const spend = { client, lock: rescue.lock, omnilock: rescue.omnilock, auths: rescue.auths, entry, adminList: rescue.adminList.outPoint, inputCells: plan.transaction.inputs.map(({ previousOutput }) => rescue.movable.find((cell) => cell.outPoint.eq(previousOutput))!) };
   const prepared = await prepareRecoverySpend(plan.transaction, spend);
   const signed = text(prepared.text, prepared.sighash);
   const signature = name === "E1"

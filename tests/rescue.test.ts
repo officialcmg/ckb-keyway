@@ -309,6 +309,14 @@ test("never gives a token cell more CKB than it held: plain CKB that can't be a 
   assert.match(plan.approvalText, /\nCKB: 21[78](\.\d+)?\nTokens: 1 token cell\n/);
   // Signed and checked as the verifier will check it.
   await signRescueWithEvm(chain.client, account, plan, evmWallet());
+  // A token cell at exactly its size and the smallest plain cell, to an address as large as the account's: the
+  // plain CKB less the fee is too little for a plain cell there, and the token cell has no room for it. Short by
+  // what a plain cell there still needs: sending that much more moves everything.
+  const tight = await rescueChain({ plainCkb: [95n * CKB] });
+  const tightAccount = await openRescueAccount(tight.client, tight.address);
+  const same = ccc.Address.fromScript(ccc.Script.from({ ...omnilock, args: `0x00${"12".repeat(20)}01${"34".repeat(32)}` }), tight.client).toString();
+  await assert.rejects(planRescue(tight.client, tightAccount, await rescueEntryForEvm(tight.client, tightAccount, [evmAddress]), same), (error: unknown) =>
+    error instanceof RescueError && error.code === "short" && /0\.0000\d+ CKB more is needed/.test(error.message));
   // A plain destination fits everything: nothing stays.
   assert.equal((await planRescue(chain.client, account, await rescueEntryForEvm(chain.client, account, [evmAddress]), chain.destination)).plainLeft, 0n);
 });
