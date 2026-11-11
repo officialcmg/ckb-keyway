@@ -227,28 +227,28 @@ async function fiberKeyRequest(request: Request): Promise<Response> {
   if (typeof deviceIdHash !== "string") throw new Error("Device ID hash is required");
   if (typeof leaseId !== "string") throw new Error("Device lease is required");
   if (typeof recipientPublicKey !== "string") throw new Error("Update @ckb-keyway/react to 0.2.4 or later");
-  const wallet = await fiberKeyAccess(user, deviceIdHash, leaseId);
-
   // Lit seals the key to the browser's one-time key, so this server only relays ciphertext.
-  const bundle = await wrapFiberKey(wallet.encryptedFiberKey, wallet.litPkpId, recipientPublicKey, deviceIdHash, {
+  const bundle = await fiberKeyAccess(user, deviceIdHash, leaseId, async (wallet) => wrapFiberKey(wallet.encryptedFiberKey, wallet.litPkpId, recipientPublicKey, deviceIdHash, {
     apiKey: requiredEnv("LIT_USAGE_API_KEY"),
     actionCid: LIT_ACTION_CIDS["wrap-fiber-key"],
     actionCode: await loadLitAction("wrap-fiber-key"),
-  });
+  }));
   return Response.json(bundle, { headers: { "Cache-Control": "no-store" } });
 }
 
 /**
- * Whether this device may have its Fiber key: the wallet's device, holding the lease. Its node runs again once it
- * has the key, so every backup it made before stops being restorable elsewhere (see `retireOwnBackups`).
+ * Hands this device its Fiber key (`deliver` wraps it) if it may have it: the wallet's device, holding the lease.
+ * Its node runs again once it has the key, so once the key is wrapped for it, every backup it made before stops
+ * being restorable elsewhere (see `retireOwnBackups`). A key that couldn't be wrapped retires nothing.
  */
-export async function fiberKeyAccess(user: User, deviceIdHash: string, leaseId: string): Promise<ReadyWallet> {
+export async function fiberKeyAccess<T>(user: User, deviceIdHash: string, leaseId: string, deliver: (wallet: ReadyWallet) => Promise<T>): Promise<T> {
   const wallet = await readWallet(user);
   if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
   if (wallet.primaryDeviceIdHash !== deviceIdHash) throw new Error("Fiber wallet is bound to another device");
   await requireLease(user, deviceIdHash, leaseId);
+  const delivered = await deliver(wallet);
   await retireOwnBackups(user, deviceIdHash);
-  return wallet;
+  return delivered;
 }
 
 async function channelStateRequest(request: Request): Promise<Response> {

@@ -118,7 +118,8 @@ export async function confirmNodeBackupRestored(user: User, deviceIdHash: string
  * Called when a device that holds the lease gets its Fiber key back, i.e. is about to run its node again (a logout
  * that saved its backup and then failed resumes the node this way). From then on the node moves its channels past
  * whatever this device backed up earlier, so no other device may restore those backups: restoring one would bring
- * back revoked channel state. A claim of one by another device is stale too, since this device holds the lease.
+ * back revoked channel state. A claim of one by another device is stale too, since this device holds the lease. A
+ * claim by this device itself is the restore it is about to run (it loads the key first), so that one stays.
  */
 export async function retireOwnBackups(user: User, deviceIdHash: string, connection?: DatabaseSql): Promise<void> {
   const sql = connection ?? await database();
@@ -126,7 +127,7 @@ export async function retireOwnBackups(user: User, deviceIdHash: string, connect
     update keyway_v2_node_backups set status = 'consumed', claim_expires_at = null, updated_at = now()
     where user_id = ${user.id}
       and source_device_id_hash = ${deviceIdHash}
-      and status in ('available', 'claimed')
+      and (status = 'available' or (status = 'claimed' and claimed_device_id_hash is distinct from ${deviceIdHash}))
   `;
 }
 

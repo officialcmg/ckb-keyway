@@ -3,11 +3,13 @@ import test from "node:test";
 import { createHash } from "node:crypto";
 import { database } from "../src/server/database.ts";
 import { acquireLease } from "../src/server/device-lease.ts";
-import { fiberKeyAccess } from "../src/server/http.ts";
+import { fiberKeyAccess as access } from "../src/server/http.ts";
 import { prepareBackupForDevice, readClaimedNodeBackup, saveNodeBackup } from "../src/server/node-backup.ts";
 import { saveWallet, type ReadyWallet } from "../src/server/user-wallet.ts";
 
 const enabled = Boolean(process.env.KEYWAY_AUTH_TEST_DATABASE_URL);
+/** The Fiber-key request, with Lit's wrapping of the key replaced. */
+const fiberKeyAccess = (user: { id: string }, device: string, leaseId: string) => access(user, device, leaseId, async () => "wrapped key");
 const A = "a".repeat(64);
 const B = "b".repeat(64);
 
@@ -66,6 +68,28 @@ test("a node that runs again after its logout saved a backup retires that backup
     await saveNodeBackup(user, A, payload("state at logout"));
     await lapse(user.id);
     assert.deepEqual(await prepareBackupForDevice(user, A, B, undefined, sql), { restoreRequired: true, canRebind: true });
+  });
+
+  await t.test("a key that couldn't be wrapped retires nothing", async () => {
+    const { user, lease } = await device();
+    await saveNodeBackup(user, A, payload("state at logout"));
+    await assert.rejects(access(user, A, lease.leaseId, async () => { throw new Error("Lit unavailable"); }), /Lit unavailable/);
+    await lapse(user.id);
+    assert.equal((await prepareBackupForDevice(user, A, B, undefined, sql)).restoreRequired, true);
+  });
+
+  await t.test("the device's own claim of its backup survives the key it loads to restore it", async () => {
+    const { user } = await device();
+    await saveNodeBackup(user, A, payload("state at logout"));
+    await lapse(user.id);
+    // Another device claimed it and was rebound, then gave up; the first device signs in again and claims it back.
+    assert.equal((await prepareBackupForDevice(user, A, B, undefined, sql)).restoreRequired, true);
+    await sql`update keyway_v2_node_backups set claim_expires_at = now() - interval '1 second' where user_id = ${user.id}`;
+    assert.equal((await prepareBackupForDevice(user, B, A, undefined, sql)).restoreRequired, true);
+    // The restore loads the key first, then reads the claimed backup.
+    const again = await acquireLease(user, A);
+    await fiberKeyAccess(user, A, again.leaseId);
+    assert.equal((await readClaimedNodeBackup(user, A)).status, "claimed");
   });
 
   await t.test("only a device holding the lease gets its key, and nothing is retired otherwise", async () => {
