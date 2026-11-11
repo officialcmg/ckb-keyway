@@ -2,7 +2,7 @@ import * as ccc from "@ckb-ccc/core";
 import { currentLock, verifyRecoveryAnchor } from "../sdk/browser/account-lock.ts";
 import type { User } from "./auth-user.ts";
 import { bootstrap } from "./bootstrap.ts";
-import { markChannelOpened, readWallet } from "./user-wallet.ts";
+import { markChannelOpened, readWallet, type ReadyWallet } from "./user-wallet.ts";
 import {
   authenticateUser,
   publicUser,
@@ -21,7 +21,7 @@ import { LIT_ACTION_CIDS } from "./lit-config.ts";
 import { wrapFiberKey } from "./lit.ts";
 import { serializeTransaction } from "./funding-transaction.ts";
 import { database } from "./database.ts";
-import { confirmNodeBackupRestored, readClaimedNodeBackup, saveNodeBackup } from "./node-backup.ts";
+import { confirmNodeBackupRestored, readClaimedNodeBackup, retireOwnBackups, saveNodeBackup } from "./node-backup.ts";
 import {
   addApplicationOrigin,
   createApplication,
@@ -227,10 +227,7 @@ async function fiberKeyRequest(request: Request): Promise<Response> {
   if (typeof deviceIdHash !== "string") throw new Error("Device ID hash is required");
   if (typeof leaseId !== "string") throw new Error("Device lease is required");
   if (typeof recipientPublicKey !== "string") throw new Error("Update @ckb-keyway/react to 0.2.4 or later");
-  const wallet = await readWallet(user);
-  if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
-  if (wallet.primaryDeviceIdHash !== deviceIdHash) throw new Error("Fiber wallet is bound to another device");
-  await requireLease(user, deviceIdHash, leaseId);
+  const wallet = await fiberKeyAccess(user, deviceIdHash, leaseId);
 
   // Lit seals the key to the browser's one-time key, so this server only relays ciphertext.
   const bundle = await wrapFiberKey(wallet.encryptedFiberKey, wallet.litPkpId, recipientPublicKey, deviceIdHash, {
@@ -239,6 +236,19 @@ async function fiberKeyRequest(request: Request): Promise<Response> {
     actionCode: await loadLitAction("wrap-fiber-key"),
   });
   return Response.json(bundle, { headers: { "Cache-Control": "no-store" } });
+}
+
+/**
+ * Whether this device may have its Fiber key: the wallet's device, holding the lease. Its node runs again once it
+ * has the key, so every backup it made before stops being restorable elsewhere (see `retireOwnBackups`).
+ */
+export async function fiberKeyAccess(user: User, deviceIdHash: string, leaseId: string): Promise<ReadyWallet> {
+  const wallet = await readWallet(user);
+  if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
+  if (wallet.primaryDeviceIdHash !== deviceIdHash) throw new Error("Fiber wallet is bound to another device");
+  await requireLease(user, deviceIdHash, leaseId);
+  await retireOwnBackups(user, deviceIdHash);
+  return wallet;
 }
 
 async function channelStateRequest(request: Request): Promise<Response> {
