@@ -453,6 +453,27 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     await sql`delete from keyway_v2_watchtower_channels`;
   });
 
+  await t.test("an account's closed channel goes first in its turn, ahead of its slow open ones", async () => {
+    const { user, id, closing } = await revokedChannel(proof.revocationSignature);
+    // Found closed in an earlier pass whose check then failed; the account's open channels are slow to read.
+    await sql`update keyway_v2_watchtower_channels set funding_seen = true, funding_spend = ${`${closing.hash()}:0`}, checked_at = now() - interval '1 minute' where channel_id = ${id}`;
+    const openIds = [channelId(), channelId(), channelId()];
+    for (const openId of openIds) await watchtowerRequest(user, watch(openId));
+    await sql`update keyway_v2_watchtower_channels set funding_seen = true, history_cursor = channel_id, checked_at = now() - interval '3 hours' where channel_id in ${sql(openIds)}`;
+    const chain: ChainView = {
+      async fundingHistory() {
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        return { sawOutput: true };
+      },
+      transaction: async (hash) => (hash === closing.hash() ? { tx: closing, committed: true, status: "committed" } : undefined),
+      isLive: async () => true,
+    };
+    const punished: string[] = [];
+    await runWatchtowerPass({ sql, chain, concurrency: 1, accountBudgetMs: 100, log: () => undefined, punish: async (row) => { punished.push(row.channel_id); return `0x${"cd".repeat(32)}`; } });
+    assert.deepEqual(punished, [id]);
+    await sql`delete from keyway_v2_watchtower_channels`;
+  });
+
   await t.test("a sent penalty one read can't find isn't taken for missed until the recheck window has passed", async () => {
     const { id, closing } = await revokedChannel(proof.revocationSignature);
     const penalty = `0x${"cd".repeat(32)}`;

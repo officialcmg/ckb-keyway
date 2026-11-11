@@ -729,7 +729,10 @@ export async function runWatchtowerPass(passDeps: PassDependencies): Promise<voi
   // most UNFUNDED_PER_PASS of them are checked per pass, so registrations can't slow down the funded channels' checks.
   const funded = await sql<Row[]>`
     select * from (
-      select *, row_number() over (partition by user_id order by checked_at asc nulls first, created_at asc) as turn
+      select *, row_number() over (
+        -- A closed channel (a penalty to send or follow) goes first in its account's turn: its check reads no history.
+        partition by user_id order by (funding_spend is not null or state = 'penalty-sent') desc, checked_at asc nulls first, created_at asc
+      ) as turn
       from keyway_v2_watchtower_channels
       where state in ('watching', 'penalty-sent') and (funding_seen or funding_spend is not null)
     ) funded_rows
