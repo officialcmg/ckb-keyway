@@ -77,11 +77,18 @@ export async function managedNodeRequest(
         const peer = `0x${String(params.pubkey).toLowerCase().replace(/^0x/, "")}` as Pubkey;
         const addresses = await assertKnownPublicPeer(node, peer);
         if (addresses.length === 0) return { done: true };
-        await assertPeerRoom(node);
-        await connectGraphPeer(node, peer, addresses);
+        // The room check and the dial run one at a time per user, so parallel requests can't both pass it.
+        await serializeMutation(userId, async () => {
+          await assertPeerRoom(node);
+          await connectGraphPeer(node, peer, addresses);
+        });
         return { done: true };
       }
-      await assertPeerRoom(node);
+      await serializeMutation(userId, async () => {
+        await assertPeerRoom(node);
+        await node.call(FIBER_METHODS[method as FiberMethod].rpc, [dial]);
+      });
+      return { done: true };
     }
     await serializeMutation(userId, () => node.call(FIBER_METHODS[method as FiberMethod].rpc, [dial]));
     return { done: true };
@@ -124,7 +131,7 @@ export async function managedNodeRequest(
     // And the account funds it: a lock nobody signs for would leave the channel waiting for funding forever.
     if (!sameScript(params.funding_lock_script, own)) throw new Error("Channels can only be funded from your own KeyWay address");
     params.funding_lock_script = own;
-    await connectManagedPeer(node, params.pubkey);
+    await serializeMutation(userId, () => connectManagedPeer(node, params.pubkey));
     return serializeMutation(userId, () => node.openChannelWithExternalFunding(params));
   }
   if (body.operation === "submit-channel-funding") {

@@ -134,11 +134,15 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
   });
 }
 
-/** Per-user limits on hosted-node requests: free calls, and changes such as peers and channel opens. */
+/**
+ * Per-user limits on hosted-node requests: free calls, changes such as peers, channel opens and their funding,
+ * and every other read (status and the fee reserve also start the node). Payments have limits of their own.
+ */
 export function managedNodeRateLimit(operation: string): { key: string; rule: { max: number; window: number }; message: string } | undefined {
+  if (operation === "pay") return undefined;
   if (operation === "call") return { key: "fiber-call", rule: { max: 120, window: 60 }, message: "Too many Fiber node requests" };
-  if (operation === "act" || operation === "open-channel") return { key: "fiber-act", rule: { max: 30, window: 60 }, message: "Too many Fiber node changes" };
-  return undefined;
+  if (["act", "open-channel", "submit-channel-funding"].includes(operation)) return { key: "fiber-act", rule: { max: 30, window: 60 }, message: "Too many Fiber node changes" };
+  return { key: "fiber-read", rule: { max: 120, window: 60 }, message: "Too many Fiber node requests" };
 }
 
 /**

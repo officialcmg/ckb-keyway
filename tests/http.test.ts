@@ -63,5 +63,10 @@ test("opening a hosted channel counts against the same per-user limit as other n
   assert.deepEqual(managedNodeRateLimit("open-channel"), managedNodeRateLimit("act"));
   assert.equal(managedNodeRateLimit("act")?.key, "fiber-act");
   assert.equal(managedNodeRateLimit("call")?.key, "fiber-call");
-  assert.equal(managedNodeRateLimit("status"), undefined);
+  assert.deepEqual(managedNodeRateLimit("submit-channel-funding"), managedNodeRateLimit("act"));
+  // Every other hosted-node request has a limit too; status and the fee reserve start the node.
+  for (const operation of ["status", "fee-reserve", "list-channels", "get-invoice", "parse-invoice", "get-payment", "wait-for-payment", "wait-channel-ready", "unknown"]) {
+    assert.equal(managedNodeRateLimit(operation)?.key, "fiber-read", operation);
+  }
+  assert.equal(managedNodeRateLimit("pay"), undefined);
 });

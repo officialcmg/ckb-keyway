@@ -142,6 +142,29 @@ test("opening a channel connects a new peer only while the hosted node has room 
   assert.equal(channels, 1);
 });
 
+test("parallel peer connections can't take a hosted node past its peer limit", async () => {
+  const connected: string[] = [];
+  const others = Array.from({ length: 31 }, (_, index) => ({ pubkey: `0x02${index.toString(16).padStart(64, "0")}` }));
+  const node = {
+    // Answers with the peers as they were when asked, after a while, as a node over the network does.
+    listPeers: async () => {
+      const peers = [...others, ...connected.map((pubkey) => ({ pubkey }))];
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return { peers };
+    },
+    call: async (_method: string, [params]: [{ address: string }]) => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      connected.push(`0x03${params.address.split(".")[3].split("/")[0].padStart(64, "0")}`);
+      return {};
+    },
+  };
+  const results = await Promise.allSettled([1, 2].map((host) => managedNodeRequest("race-user", {
+    operation: "act", method: "connectPeer", params: { address: `/ip4/203.0.113.${host}/tcp/8228` },
+  }, node as never)));
+  assert.equal(results.filter(({ status }) => status === "fulfilled").length, 1);
+  assert.equal(connected.length, 1);
+});
+
 test("a hosted node dials only the first few addresses a peer announces", async () => {
   const announced = Array.from({ length: 20 }, (_, index) => `/ip4/203.0.113.${index + 1}/tcp/8228/p2p/Qm1`);
   for (const request of [
