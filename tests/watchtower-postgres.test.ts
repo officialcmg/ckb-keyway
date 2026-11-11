@@ -96,7 +96,6 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
         return undefined;
       },
       async isLive() { return true; },
-      async spender() { return undefined; },
     };
     const punished: string[] = [];
     const pass = () => runWatchtowerPass({ sql, chain, punish: async (row) => { punished.push(row.channel_id); return penalty; }, log: () => undefined });
@@ -123,7 +122,6 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
       fundingHistory: async () => ({ sawOutput: true, spend: { txHash: closing.hash(), index: 0 } }),
       transaction: async (hash) => (hash === closing.hash() ? { tx: closing, committed: true, status: "committed" } : undefined),
       isLive: async () => true,
-      spender: async () => undefined,
     };
     let punished = 0;
     for (let i = 0; i < 2; i++) await runWatchtowerPass({ sql, chain, punish: async () => { punished++; return `0x${"cd".repeat(32)}`; }, log: () => undefined });
@@ -137,7 +135,6 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
       fundingHistory: async () => ({ sawOutput: true, spend: { txHash: closing.hash(), index: 0 } }),
       transaction: async (hash) => (hash === closing.hash() ? { tx: closing, committed: true, status: "committed" } : undefined),
       isLive: async () => true,
-      spender: async () => undefined,
     };
     let tries = 0;
     for (let i = 0; i < 3; i++) await runWatchtowerPass({ sql, chain, punish: async () => { tries++; throw new Error("fee key empty"); }, log: () => undefined });
@@ -151,7 +148,7 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     const id = channelId();
     await sql`delete from keyway_v2_watchtower_channels where state in ('watching', 'penalty-sent')`;
     await watchtowerRequest(user, watch(id));
-    const chain: ChainView = { fundingHistory: async () => { throw new Error("indexer unavailable"); }, transaction: async () => undefined, isLive: async () => false, spender: async () => undefined };
+    const chain: ChainView = { fundingHistory: async () => { throw new Error("indexer unavailable"); }, transaction: async () => undefined, isLive: async () => false };
     await runWatchtowerPass({ sql, chain, punish: async () => { throw new Error("no"); }, log: () => undefined });
     const status = (await watchtowerRequest(user, { operation: "status" })) as { channels: Array<{ state: string; detail: string }> };
     assert.deepEqual(status.channels.map((c) => [c.state, c.detail]), [["watching", "check failed: indexer unavailable"]]);
@@ -168,7 +165,6 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
       fundingHistory: async () => { historyReads++; return { sawOutput: true, spend: { txHash: spendHash, index: 0 }, cursor: "c1" }; },
       transaction: async () => { throw new Error("node unavailable"); },
       isLive: async () => true,
-      spender: async () => undefined,
     };
     const pass = () => runWatchtowerPass({ sql, chain, punish: async () => { throw new Error("no"); }, log: () => undefined });
     await pass();
@@ -196,7 +192,6 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
       },
       transaction: async (hash) => (hash === closing.hash() ? { tx: closing, committed: true, status: "committed" } : undefined),
       isLive: async () => true,
-      spender: async () => undefined,
     };
     await runWatchtowerPass({
       sql, chain, concurrency: 1, catchUpBudgetMs: 400, log: () => undefined,
@@ -228,7 +223,6 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
       },
       transaction: async () => undefined,
       isLive: async () => false,
-      spender: async () => undefined,
     };
     await runWatchtowerPass({ sql, chain, concurrency: 1, punish: async () => { throw new Error("no"); }, log: () => undefined });
     const rows = await sql<Array<{ channel_id: string; state: string; funding_seen: boolean; funding_spend: string | null }>>`
@@ -251,7 +245,6 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
       fundingHistory: async () => ({ sawOutput: true, spend: { txHash: onChain.hash(), index: 0 } }),
       transaction: async (hash) => (hash === onChain.hash() ? { tx: onChain, committed: true, status: "committed" } : undefined),
       isLive: async () => true,
-      spender: async () => undefined,
     };
     const pass = () => runWatchtowerPass({ sql, chain, punish: async (row) => { punished.push(row.channel_id); return `0x${"cd".repeat(32)}`; }, log: () => undefined });
     const state = async () => (await sql<Array<{ state: string }>>`select state from keyway_v2_watchtower_channels where channel_id = ${id}`)[0].state;
@@ -284,7 +277,6 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
           return undefined;
         },
         isLive: async () => true,
-        spender: async () => undefined,
       };
       const punished: string[] = [];
       const pass = () => runWatchtowerPass({ sql, chain, punish: async (row) => { punished.push(row.channel_id); return penalty; }, log: () => undefined });
@@ -328,7 +320,6 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
         return tx ? { tx, committed: true, status: "committed" } : undefined;
       },
       isLive: async () => true,
-      spender: async () => undefined,
     };
     await runWatchtowerPass({ sql, chain, punish: async () => { throw new Error("no"); }, log: () => undefined });
     // The closes stayed on-chain through the window: they no longer count toward the cap.
@@ -362,6 +353,21 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     await sql`delete from keyway_v2_watchtower_channels where user_id = ${user.id}`;
   });
 
+  await t.test("a revoked commitment already spent is recorded as missed without walking its lock's history", async () => {
+    const { id, closing } = await revokedChannel(proof.revocationSignature);
+    let walks = 0;
+    const chain = {
+      fundingHistory: async () => ({ sawOutput: true, spend: { txHash: closing.hash(), index: 0 } }),
+      transaction: async (hash: ccc.Hex) => (hash === closing.hash() ? { tx: closing, committed: true, status: "committed" } : undefined),
+      isLive: async () => false,
+      // What the pass used to call: a walk of the commitment lock's whole history, which anyone can pad.
+      spender: async () => { walks++; return undefined; },
+    } as ChainView;
+    await runWatchtowerPass({ sql, chain, punish: async () => { throw new Error("no"); }, log: () => undefined });
+    assert.equal(walks, 0);
+    assert.equal((await sql<Array<{ state: string }>>`select state from keyway_v2_watchtower_channels where channel_id = ${id}`)[0].state, "missed");
+  });
+
   await t.test("closed channels count toward the cap until confirmed, and a pass reads each lock and transaction once", async () => {
     await sql`delete from keyway_v2_watchtower_channels`;
     const flooder = { id: crypto.randomUUID() };
@@ -384,7 +390,6 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
         return hash === close ? { tx: ccc.Transaction.from({}), committed: true, status: "committed" } : undefined;
       },
       isLive: async () => false,
-      spender: async () => undefined,
     };
     const pass = () => runWatchtowerPass({ sql, chain, punish: async () => { throw new Error("no"); }, log: () => undefined });
     await pass();
@@ -410,7 +415,6 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
       fundingHistory: async () => ({ sawOutput: true }),
       transaction: async (hash) => (hash === keptClose ? { tx: ccc.Transaction.from({}), committed: true, status: "committed" } : undefined),
       isLive: async () => false,
-      spender: async () => undefined,
     };
     await runWatchtowerPass({ sql, chain, punish: async () => { throw new Error("no"); }, log: () => undefined });
     const rows = await sql<Array<{ channel_id: string; state: string; resolution_confirmed: boolean }>>`select channel_id, state, resolution_confirmed from keyway_v2_watchtower_channels`;
@@ -426,7 +430,7 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     for (let i = 0; i < 5; i++) await watchtowerRequest(flooder, watch(channelId()));
     const honestId = channelId();
     await watchtowerRequest(honest, watch(honestId));
-    const chain: ChainView = { fundingHistory: async () => ({ sawOutput: false }), transaction: async () => undefined, isLive: async () => false, spender: async () => undefined };
+    const chain: ChainView = { fundingHistory: async () => ({ sawOutput: false }), transaction: async () => undefined, isLive: async () => false };
     await runWatchtowerPass({ sql, chain, unfundedPerPass: 2, punish: async () => { throw new Error("no"); }, log: () => undefined });
     const checked = await sql<Array<{ user_id: string; channel_id: string }>>`select user_id, channel_id from keyway_v2_watchtower_channels where checked_at is not null`;
     assert.equal(checked.length, 2);
@@ -438,7 +442,7 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     const id = channelId();
     await watchtowerRequest(user, watch(id));
     await watchtowerRequest(user, { operation: "unwatch", channelId: id });
-    const chain: ChainView = { fundingHistory: async () => ({ sawOutput: false }), transaction: async () => undefined, isLive: async () => false, spender: async () => undefined };
+    const chain: ChainView = { fundingHistory: async () => ({ sawOutput: false }), transaction: async () => undefined, isLive: async () => false };
     await runWatchtowerPass({ sql, chain, punish: async () => { throw new Error("no"); }, log: () => undefined });
     assert.equal((await sql`select 1 from keyway_v2_watchtower_channels where channel_id = ${id}`).length, 0);
   });

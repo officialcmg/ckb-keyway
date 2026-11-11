@@ -448,9 +448,9 @@ export type ChainView = {
    * before it, with the error.
    */
   fundingHistory(lock: ccc.Script, scan: HistoryScan, options?: { backlogBudgetMs?: number; recentScan?: boolean }): Promise<HistoryProgress>;
+  /** What the node says about a transaction now: never a status remembered from an earlier send or read. */
   transaction(hash: ccc.Hex): Promise<{ tx: ccc.Transaction; committed: boolean; status: string } | undefined>;
   isLive(outPoint: ccc.OutPoint): Promise<boolean>;
-  spender(outPoint: ccc.OutPoint, lock: ccc.Script): Promise<ccc.Hex | undefined>;
 };
 
 /**
@@ -575,19 +575,13 @@ export function chainView(client: ccc.Client, options: { recentBudgetMs?: number
 
     },
     async transaction(hash) {
-      const response = await client.getTransaction(hash);
+      // Not `getTransaction`: when the node doesn't know a hash, ccc answers from its cache, where a penalty this
+      // process sent stays "sent" (and a reorganized close "committed") however long ago the chain dropped it.
+      const response = await client.getTransactionNoCache(hash);
       return response ? { tx: response.transaction, committed: response.status === "committed", status: response.status } : undefined;
     },
     async isLive(outPoint) {
       return Boolean(await client.getCellLive(outPoint, false));
-    },
-    async spender(outPoint, lock) {
-      for await (const item of client.findTransactions({ script: lock, scriptType: "lock", scriptSearchMode: "exact" }, "asc", 50)) {
-        if (!item.isInput) continue;
-        const tx = (await client.getTransaction(item.txHash))?.transaction;
-        if (tx?.inputs.some((input) => input.previousOutput.eq(outPoint))) return item.txHash;
-      }
-      return undefined;
     },
   };
 }
@@ -907,8 +901,8 @@ async function checkChannel(deps: PassDependencies, row: Row, log: (message: str
     }
   }
   if (!(await chain.isLive(commitment.outPoint))) {
-    const by = await chain.spender(commitment.outPoint, commitment.lock);
-    log(`${row.channel_id}: revoked commitment already spent by ${by ?? "an unknown transaction"}`);
+    // Only logged: finding the spender would mean walking the commitment lock's whole history, which anyone can pad.
+    log(`${row.channel_id}: revoked commitment ${commitment.outPoint.txHash}:${Number(commitment.outPoint.index)} already spent`);
     await save({ state: "missed", detail: "the revoked commitment was spent before the penalty", closing_tx: assessment.closingTx });
     return false;
   }
@@ -944,9 +938,16 @@ function storedRevocation(row: Row): Revocation | undefined {
   };
 }
 
-/** The penalty, built from a stored row and sent with the watchtower's fee key. */
+/**
+ * The penalty, built from a stored row and sent with the watchtower's fee key. Make one per pass: ccc's client cache
+ * marks a sent penalty's fee cells spent and its change cell live, which lets the penalties of one pass (sent one at
+ * a time) chain on each other, but a penalty the chain dropped would leave that change cell in the cache for good, and
+ * every later penalty would spend a cell that doesn't exist. So the first penalty of each sender clears the cache.
+ */
 export function penaltySender(client: ccc.Client, feeSigner: ccc.Signer) {
+  let cleared: Promise<void> | undefined;
   return async (row: Row, commitment: Commitment) => {
+    await (cleared ??= client.cache.clear());
     const revocation = storedRevocation(row);
     if (!revocation) throw new Error("No revocation data");
     const tx = await buildPenaltyTransaction({ client, commitment, revocation, peerKey: row.peer_commitment_key, feeSigner });
