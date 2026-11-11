@@ -38,7 +38,7 @@ import { openWatchtowerStore } from "./watchtower-store";
 import { settleChannel } from "./watchtower-settle";
 import { createRemoteWatchtower, remoteWatchUpdate, updatesForStoredChannel } from "./watchtower-remote";
 import { createNodeLifecycle } from "./node-lifecycle";
-import { refuseFundingBeyondRequest, type FundingRequest } from "./funding-limit";
+import { createChannelOpenings, refuseFundingBeyondRequest, type ChannelOpening } from "./funding-limit";
 import { createFeeReserve, FEE_RESERVE, needsFeeReserve } from "./fee-reserve";
 import type { RequestEmailCode } from "./email-code";
 
@@ -146,22 +146,20 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   });
   let deviceLock: DeviceLock | undefined;
   const api = options.apiClient ?? new KeyWayApiClient();
-  let activationProgress: ChannelOpenProgress | undefined;
-  let openingPeer: string | undefined;
-  let openingWithReserve = false;
-  let openingRequest: FundingRequest | undefined;
+  const openings = createChannelOpenings();
   let preparedPeers: Promise<ChannelPeer[]> | undefined;
   let preparedFundingAmount: bigint | undefined;
   const fundingSigner = new RemoteCkbSigner(options.authToken, options.ckbPublicKey, async (preview) => {
+    const opening = openings.current();
     // The account's share may not exceed what the app asked Fiber for, whatever the peer did to the transaction.
-    refuseFundingBeyondRequest(preview, openingRequest);
-    activationProgress?.("confirming");
+    refuseFundingBeyondRequest(preview, opening?.request);
+    opening?.progress?.("confirming");
     const approved = await options.approveFiberChannelOpen({
       ...preview,
-      ...(openingPeer ? { peer: openingPeer } : {}),
-      ...(openingWithReserve ? { feeReserveCkb: ccc.fixedPointToString(FEE_RESERVE) } : {}),
+      ...(opening?.peer ? { peer: opening.peer } : {}),
+      ...(opening?.withReserve ? { feeReserveCkb: ccc.fixedPointToString(FEE_RESERVE) } : {}),
     });
-    if (approved) activationProgress?.("signing");
+    if (approved) opening?.progress?.("signing");
     return approved;
   }, undefined, api, options.recovery, (error) => options.approvals?.().settled?.("funding", error), options.requestEmailCode);
   const resolveCccFunding = createCccExternalFundingResolver({
@@ -441,13 +439,20 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     restoreRequired = false;
   }
 
-  /** Opens a channel funded from the account, recording the request so its funding preview can be checked against it. */
-  async function openFundedChannel(params: KeyWayFundingParams) {
+  /**
+   * Opens a channel funded from the account, recording the request so its funding preview can be checked against it.
+   * Opens run one at a time (see `createChannelOpenings`).
+   */
+  function openFundedChannel(params: KeyWayFundingParams, progress?: ChannelOpenProgress) {
+    return openings.run((opening) => openFundedChannelNow(opening, params, progress));
+  }
+  async function openFundedChannelNow(opening: ChannelOpening, params: KeyWayFundingParams, progress?: ChannelOpenProgress) {
     if (!node.isRunning) throw new Error("Start the Fiber node before opening a channel");
-    openingPeer = params.pubkey;
-    openingWithReserve = await feeReserve.needed();
+    opening.peer = params.pubkey;
+    opening.progress = progress;
+    opening.withReserve = await feeReserve.needed();
     const funding = await resolveExternalFunding(undefined);
-    openingRequest = { fundingAmount: BigInt(params.funding_amount), udtTypeScript: params.funding_udt_type_script, shutdownScript: funding.shutdownScript };
+    opening.request = { fundingAmount: BigInt(params.funding_amount), udtTypeScript: params.funding_udt_type_script, shutdownScript: funding.shutdownScript };
     const result = await openChannelWithExternalFundingFlow({
       node,
       params: {
@@ -460,7 +465,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       signFundingTx: funding.signFundingTx,
     });
     await markChannelOpened(options.authToken, api);
-    const feeReserveTxHash = openingWithReserve ? await feeReserve.send(result.fundingTxHash) : undefined;
+    const feeReserveTxHash = opening.withReserve ? await feeReserve.send(result.fundingTxHash) : undefined;
     return { ...result, ...(feeReserveTxHash ? { feeReserveTxHash } : {}) };
   }
 
@@ -482,39 +487,34 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     const config: OpenKeyWayChannelOptions = typeof input === "bigint" ? { fundingAmount: input } : input;
     if (config.udtTypeScript && config.fundingAmount === undefined) throw new Error("A token channel needs a fundingAmount");
     const fundingAmount = config.fundingAmount ?? DEFAULT_CHANNEL_FUNDING;
-    activationProgress = onProgress;
-    activationProgress?.("connecting");
-    try {
-      const candidates = config.peer
-        ? [{ pubkey: normalizeFiberPubkey(config.peer), nodeName: "selected peer" }]
-        // The official peers' minimums are in CKB, so any of them will do for a token channel.
-        : await prepareCkbChannel(config.udtTypeScript ? ANY_FUNDING : fundingAmount);
-      let lastAbort: unknown;
-      for (const candidate of candidates) {
-        try {
-          activationProgress?.("negotiating");
-          const result = await openFundedChannel({
-            pubkey: normalizeFiberPubkey(candidate.pubkey),
-            funding_amount: `0x${fundingAmount.toString(16)}`,
-            public: config.public ?? true,
-            ...(config.udtTypeScript ? { funding_udt_type_script: config.udtTypeScript } : {}),
-            funding_fee_rate: config.fundingFeeRate === undefined ? undefined : toHex(config.fundingFeeRate),
-            commitment_fee_rate: config.commitmentFeeRate === undefined ? undefined : toHex(config.commitmentFeeRate),
-          });
-          activationProgress?.("broadcasting");
-          return result;
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          if (!shouldDiagnoseFundingAbortError(message)) throw error;
-          lastAbort = error;
-        }
+    onProgress?.("connecting");
+    const candidates = config.peer
+      ? [{ pubkey: normalizeFiberPubkey(config.peer), nodeName: "selected peer" }]
+      // The official peers' minimums are in CKB, so any of them will do for a token channel.
+      : await prepareCkbChannel(config.udtTypeScript ? ANY_FUNDING : fundingAmount);
+    let lastAbort: unknown;
+    for (const candidate of candidates) {
+      try {
+        onProgress?.("negotiating");
+        const result = await openFundedChannel({
+          pubkey: normalizeFiberPubkey(candidate.pubkey),
+          funding_amount: `0x${fundingAmount.toString(16)}`,
+          public: config.public ?? true,
+          ...(config.udtTypeScript ? { funding_udt_type_script: config.udtTypeScript } : {}),
+          funding_fee_rate: config.fundingFeeRate === undefined ? undefined : toHex(config.fundingFeeRate),
+          commitment_fee_rate: config.commitmentFeeRate === undefined ? undefined : toHex(config.commitmentFeeRate),
+        }, onProgress);
+        onProgress?.("broadcasting");
+        return result;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!shouldDiagnoseFundingAbortError(message)) throw error;
+        lastAbort = error;
       }
-      preparedPeers = undefined;
-      preparedFundingAmount = undefined;
-      throw new Error("Available Fiber peers declined the channel funding request", { cause: lastAbort });
-    } finally {
-      activationProgress = undefined;
     }
+    preparedPeers = undefined;
+    preparedFundingAmount = undefined;
+    throw new Error("Available Fiber peers declined the channel funding request", { cause: lastAbort });
   }
 
   async function getCkbBalance(): Promise<bigint> {
