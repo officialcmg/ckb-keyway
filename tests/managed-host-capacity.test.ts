@@ -328,7 +328,7 @@ test("a setup holds its node at most 15 minutes from its first step, a few setup
   }
 });
 
-test("accounts that only connect can't keep the host full, and one account can't stop and start nodes without end", async (context) => {
+test("accounts that only connect can't keep the host full, nor lock out a user they keep pushing out", async (context) => {
   context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const { request, running } = await host(context);
   const crowd = ["1", "2", "3", "4"].map((digit) => digit.repeat(64));
@@ -336,15 +336,14 @@ test("accounts that only connect can't keep the host full, and one account can't
   for (const user of crowd) assert.equal(await request(user), 200);
   assert.equal(await request(A), 200);
   assert.ok(running().includes(A));
-  // B is stopped and started over and over by others: after six times in ten minutes it waits.
-  for (let round = 0; round < 6; round++) {
+  // B is stopped by the crowd over and over, yet always gets its node back.
+  for (let round = 0; round < 10; round++) {
     assert.equal(await request(B), 200, `round ${round}`);
     assert.equal(await request(crowd[round % 4]), 200);
     assert.equal(await request(crowd[(round + 1) % 4]), 200);
+    assert.ok(!running().includes(B));
+    context.mock.timers.tick(10_000);
   }
-  assert.equal(await request(B), 502);
-  context.mock.timers.tick(10 * 60_000);
-  assert.equal(await request(B), 200);
 });
 
 test("a node started on demand is recorded as checked, so a restart starts it only if it has channels", async (context) => {
@@ -499,6 +498,9 @@ test("a node can be retired once its channels are finished and nothing of it is 
   chain.live.clear();
   await withChannels(F, SETTLING_FORCE_CLOSE);
   await assert.rejects(retire(), /closure is incomplete/);
+  // Funding aborted after it was built: the peer may still broadcast it.
+  await withChannels(F, [{ ...ABORTED_FUNDING[0], channel_outpoint: `${FUNDING_TX}00000000` }]);
+  await assert.rejects(retire(), /aborted after it was built/);
   await withChannels(F, SETTLED_REMOTE_CLOSE);
   assert.deepEqual(await retire(), { retired: true, databasePreserved: true });
   assert.equal(await exists(join(root, "retired", F)), true);
@@ -661,4 +663,42 @@ test("a node with channels stopped for a snapshot counts as offline until it run
   assert.equal(module.readiness().offline, 1);
   await rm(join(root, "users", F, "fail-start"));
   await until(async () => module.readiness().offline === 0);
+});
+
+test("a node is marked before its signed funding goes to Fiber, even if no answer comes back", async (context) => {
+  const { root, request, marked } = await host(context);
+  await mkdir(join(root, "users", A), { recursive: true });
+  await writeFile(join(root, "users", A, "channels.json"), JSON.stringify(UNFUNDED_CHANNEL));
+  assert.equal(await request(A), 200);
+  await writeFile(join(root, "users", A, "slow-rpc"), "");
+  await writeFile(join(root, "users", A, "channels.json"), JSON.stringify(COLLABORATED_CHANNEL));
+  const gone = new AbortController();
+  const submit = request(A, "submit_signed_funding_tx", gone.signal);
+  setTimeout(() => gone.abort(), 200);
+  assert.equal(await submit, 502);
+  assert.equal(await marked(A), true);
+});
+
+test("a node with a channel nothing has listed is marked as the host shuts down", async (context) => {
+  const { module, request, marked, withChannels } = await host(context);
+  assert.equal(await request(A), 200);
+  await withChannels(A);
+  assert.equal(await marked(A), false);
+  await module.shutdown();
+  assert.equal(await marked(A), true);
+});
+
+test("a node that no longer may hold channels after a failed restore isn't left counted as offline", async (context) => {
+  const { module, root, request, withChannels } = await host(context);
+  process.env.KEYWAY_MANAGED_BACKUP_KEY = "07".repeat(32);
+  assert.equal(await request(F), 200);
+  // A snapshot from before F had channels, which can't start (it holds a fail-start file).
+  await writeFile(join(root, "users", F, "fail-start"), "");
+  const { name } = await module.withUserOperation(F, () => module.snapshotUser(F)).catch(async () => (await module.listSnapshots({ userId: F }))[0]);
+  await rm(join(root, "users", F, "fail-start"));
+  assert.equal(await request(F), 200);
+  await withChannels(F);
+  assert.equal(await request(F, "list_channels"), 200);
+  await assert.rejects(module.withUserOperation(F, () => module.restoreUser(F, name)));
+  assert.equal(module.readiness().offline, 0);
 });

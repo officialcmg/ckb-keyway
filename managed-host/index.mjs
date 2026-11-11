@@ -23,9 +23,6 @@ const CHECKED_MARKER = "keyway-channels-checked";
 const RECENT_USE_MS = 5 * 60_000;
 const MAX_HOLD_MS = 15 * 60_000;
 const SETUPS_PER_HOUR = 3;
-// A user's node may take another node's place at most this many times in ten minutes, which bounds how much
-// stopping and starting any one account can cause.
-const ROOM_STARTS_PER_10_MIN = 6;
 // A node serving requests isn't stopped to make room for a node without channels until its user's requests
 // have kept it busy this long, however long Fiber takes to answer them.
 const BUSY_PROTECTION_MS = 30_000;
@@ -52,9 +49,10 @@ const operations = new Map();
 const offline = new Map();
 const restarts = new Map();
 const failedStarts = new Map();
-// Per user: when their held setups began, and when their node took another node's place.
+// Per user: when their held setups began, and since when they have been handing signed funding to Fiber.
 const setups = new Map();
-const roomStarts = new Map();
+const submitting = new Map();
+let bootTimer;
 // When each user's queue of requests last went from idle to busy.
 const busySince = new Map();
 let noRoomAt = 0;
@@ -162,13 +160,16 @@ export function proxyUserRequest(userId, body, signal) {
   return withUserOperation(userId, async () => {
     // A request the API gave up on while it waited in the queue starts nothing.
     if (signal?.aborted) throw new Error("The request was abandoned");
-    const node = await ensureNode(userId, { provision: PROVISIONING.has(method) });
     const setup = CHANNEL_SETUP.has(method);
-    // A node handing over its user's signed funding is never stopped to make room (see SUBMIT_PROTECTION_MS).
-    const submitting = method === "submit_signed_funding_tx";
-    if (submitting) node.submittingSince = Date.now();
+    // A node handing over its user's signed funding is never stopped to make room (see SUBMIT_PROTECTION_MS),
+    // from before it is found or started. It is marked before the funding goes to Fiber, which passes it to the
+    // peer at once: an answer may never come back. Its channels are checked again later.
+    const funding = method === "submit_signed_funding_tx";
+    if (funding) submitting.set(userId, Date.now());
     let result;
     try {
+      const node = await ensureNode(userId, { provision: PROVISIONING.has(method) });
+      if (funding) await markChannels(userId, true);
       const upstream = await fetch(`http://127.0.0.1:${node.port}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -180,13 +181,18 @@ export function proxyUserRequest(userId, body, signal) {
         status: upstream.status,
         contentType: upstream.headers.get("content-type") ?? "application/json",
         body: Buffer.from(await upstream.arrayBuffer()),
+        node,
       };
     } finally {
-      if (submitting) node.submittingSince = 0;
+      if (funding) submitting.delete(userId);
     }
+    const { node } = result;
+    delete result.node;
     const answer = result.ok ? rpcResult(result.body) : undefined;
     delete result.ok;
     if (answer && setup) hold(userId, node);
+    // Funding Fiber refused leaves the channel as it was, so its marker follows its channels again.
+    if (funding && !answer) await checkChannels(userId, node).catch(logError);
     // A channel holds funds once they are handed to Fiber: the user's signed funding, or the node's own for
     // open_channel. An external-funding open alone holds nothing, and Fiber keeps it only in memory.
     if (answer && ["open_channel", "submit_signed_funding_tx"].includes(method)) await markChannels(userId, true);
@@ -309,11 +315,8 @@ async function ensureNode(userId, { provision = true } = {}) {
   if (again) return again;
   if (shuttingDown) throw new Error("Managed host is shutting down");
   const full = new Set([...nodes.keys(), ...starting.keys()]).size >= maxNodes();
-  if (full && !priority && recent(roomStarts, userId, 10 * 60_000) >= ROOM_STARTS_PER_10_MIN) {
-    throw new Error("Too many restarts of this hosted node; try again in a few minutes");
-  }
   if (full && !priority && Date.now() - noRoomAt < NO_ROOM_RETRY_MS) throw new RoomError("Managed node capacity is full");
-  const promise = (full ? makeRoom(userId, priority).then(() => { if (!priority) record(roomStarts, userId); }) : Promise.resolve())
+  const promise = (full ? makeRoom(userId, priority) : Promise.resolve())
     .then(() => startNode(userId))
     .then(async (node) => {
       forgetOffline(userId);
@@ -321,8 +324,9 @@ async function ensureNode(userId, { provision = true } = {}) {
       return node;
     }, async (error) => {
       if (!(error instanceof RoomError)) failedStart(userId);
-      // A node that may hold channels keeps being started until it runs.
+      // A node that may hold channels keeps being started until it runs; one that no longer may isn't offline.
       if (!shuttingDown && await mayHoldChannels(userId).catch(() => true)) superviseNode(userId);
+      else forgetOffline(userId);
       throw error;
     })
     .finally(() => starting.delete(userId));
@@ -383,7 +387,7 @@ async function makeRoom(userId, priority = false) {
   const now = () => Date.now();
   const busy = (id) => operations.has(id) && now() - (busySince.get(id) ?? 0) < BUSY_PROTECTION_MS;
   const reusable = (id, node) => id !== userId && !node.stopping &&
-    !(node.submittingSince && now() - node.submittingSince < SUBMIT_PROTECTION_MS) &&
+    !(submitting.has(id) && now() - submitting.get(id) < SUBMIT_PROTECTION_MS) &&
     (priority || (!busy(id) && now() >= node.heldUntil));
   const candidates = [...nodes.entries()]
     .filter(([id, node]) => reusable(id, node))
@@ -439,8 +443,8 @@ export async function bootKnownNodes(attempt = 0) {
   } catch (error) {
     logError(error);
     if (shuttingDown) return;
-    const timer = setTimeout(() => void bootKnownNodes(attempt + 1), Math.min(RESTART_MAX_MS, RESTART_BASE_MS * 2 ** attempt));
-    timer.unref?.();
+    bootTimer = setTimeout(() => void bootKnownNodes(attempt + 1), Math.min(RESTART_MAX_MS, RESTART_BASE_MS * 2 ** attempt));
+    bootTimer.unref?.();
   }
 }
 
@@ -500,7 +504,11 @@ export function runningUsers() {
 
 export async function shutdown() {
   shuttingDown = true;
+  clearTimeout(bootTimer);
   for (const entry of offline.values()) clearTimeout(entry.timer);
+  // Each running node is marked by its channels first, so one with a channel a peer opened, never listed, still
+  // starts after the restart.
+  await Promise.all([...nodes.entries()].map(([userId, node]) => checkChannels(userId, node).catch(logError)));
   // A node still starting either stops before it spawns or stops itself once it is up (see startNode).
   await Promise.all([
     ...[...nodes.values()].map((node) => waitForExit(node.child).catch(logError)),
@@ -530,7 +538,7 @@ async function startNode(userId) {
   ], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
   child.stdout.on("data", (chunk) => process.stdout.write(`[fnn:${userId.slice(0, 8)}] ${chunk}`));
   child.stderr.on("data", (chunk) => process.stderr.write(`[fnn:${userId.slice(0, 8)}] ${chunk}`));
-  const node = { child, port, lastUsed: 0, startedAt: 0, heldUntil: 0, setupStartedAt: 0, submittingSince: 0 };
+  const node = { child, port, lastUsed: 0, startedAt: 0, heldUntil: 0, setupStartedAt: 0 };
   // A missing or unrunnable binary is reported here, and the start then fails in waitForRpc.
   child.once("error", logError);
   child.once("exit", (code, signal) => {
@@ -779,6 +787,10 @@ export async function retireUser(userId) {
   const node = await ensureNode(userId);
   const channels = await nodeChannels(node);
   requireClosedChannels(channels);
+  // Funding aborted after it was signed may still be broadcast by the peer, and only this node can co-sign it.
+  if (channels.some((channel) => channel?.channel_outpoint && /\b(FUNDING_ABORTED|ABANDONED)\b/.test(JSON.stringify(channel?.state?.state_flags ?? "")))) {
+    throw new Error("A channel's funding was aborted after it was built; preserve the node database");
+  }
   await requireNothingOnChain(node, channels);
   await mkdir(required("KEYWAY_MANAGED_RETIRED_DIR", "/fiber/retired"), { recursive: true });
   await writeFile(retiredPath(userId), JSON.stringify({ retiredAt: new Date().toISOString() }), { flag: "wx", mode: 0o600 });
