@@ -385,11 +385,13 @@ test("a recovery change whose send fails stays pending until the chain settles i
     const h = await harness();
     const result = await enable(h, { before: TIMEOUT() });
     const input = ccc.Transaction.from(result.transaction).inputs[0].previousOutput;
-    const getCellLive = h.client.getCellLive.bind(h.client);
+    const { getCellLive, getTransaction } = h.client;
     // The change's block is rolled back between reads: unknown first, its input spent, then back in the pool.
     const statuses: ccc.TransactionStatus[] = ["unknown", "pending"];
     const reorged = Object.assign(Object.create(h.client) as ccc.Client, {
-      getTransaction: async () => ({ transaction: ccc.Transaction.from(result.transaction), status: statuses.shift() ?? "pending" }),
+      getTransaction: async (hash: ccc.HexLike) => ccc.hexFrom(hash) === result.transactionHash
+        ? { transaction: ccc.Transaction.from(result.transaction), status: statuses.shift() ?? "pending" }
+        : getTransaction(hash),
       getCellLive: async (outPoint: ccc.OutPointLike, withData?: boolean) => ccc.OutPoint.from(outPoint).eq(input) ? undefined : getCellLive(outPoint, withData),
     });
     const kept = await settleRecoveryChange({ ...(await current(h)), client: reorged }, later(11));
@@ -414,6 +416,36 @@ test("a recovery change whose send fails stays pending until the chain settles i
     assert.equal(settled.recovery?.enableTransactionHash, result.transactionHash);
     assert.equal(h.emails.filter(({ subject }) => /Account recovery is on/.test(subject)).length, 1);
     assert.equal(h.broadcasts.length, 0, "not sent again");
+  });
+
+  await t.test("past the grace period, a node that doesn't know the change's inputs can't drop it", async () => {
+    const h = await harness();
+    const result = await enable(h, { before: TIMEOUT() });
+    const inputs = ccc.Transaction.from(result.transaction).inputs.map(({ previousOutput }) => previousOutput.txHash);
+    const { getTransaction } = h.client;
+    // A node behind the block that made the inputs reads them as not live, and doesn't know the change either.
+    const behind = Object.assign(Object.create(h.client) as ccc.Client, {
+      getCellLive: async () => undefined,
+      getTransaction: async (hash: ccc.HexLike) => inputs.includes(ccc.hexFrom(hash)) ? undefined : getTransaction(hash),
+    });
+    const kept = await settleRecoveryChange({ ...(await current(h)), client: behind }, later(11));
+    assert.equal(kept.recoveryPending?.transactionHash, result.transactionHash);
+    assert.equal(kept.ckbAddress, h.legacyAddress);
+    assert.equal(h.broadcasts.length, 0, "not sent to a node that can't place it");
+  });
+
+  await t.test("a change recorded without its transaction is applied, not dropped, when its AdminList output is live", async () => {
+    const h = await harness();
+    const result = await enable(h, { before: TIMEOUT() });
+    const stored = await readWallet(h.user) as ReadyWallet;
+    const { transaction: _transaction, ...older } = stored.recoveryPending!;
+    await saveWallet(h.user, { ...stored, recoveryPending: older });
+    // Committed, though the lookup reads unknown as on a node that hasn't caught up.
+    h.chain.set(result.transactionHash, { transaction: ccc.Transaction.from(result.transaction), status: "committed" });
+    const lagging = Object.assign(Object.create(h.client) as ccc.Client, { getTransaction: async () => undefined });
+    const settled = await settleRecoveryChange({ ...(await current(h)), client: lagging }, later(11));
+    assert.equal(settled.recoveryPending, undefined);
+    assert.equal(settled.ckbAddress, result.ckbAddress);
   });
 
   await t.test("one the node reports rejected while its inputs are unspent stays pending, is sent again, and is applied once committed", async () => {
