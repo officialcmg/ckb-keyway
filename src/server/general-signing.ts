@@ -604,10 +604,12 @@ function waitText(seconds: number): string {
 export async function verifyCode(user: User, purpose: Purpose, nonce: string, code: unknown): Promise<void> {
   if (typeof code !== "string" || !/^\d{6}$/.test(code)) throw new Error("Enter the six-digit code from your email");
   const sql = await database();
-  // One check at a time per user, so the day's wrong codes are counted before the next one is compared.
+  // One check at a time per user, so the day's wrong codes are counted before the next one is compared. Another
+  // check already running is refused rather than waited for, so checks never queue on pool connections.
   const outcome = await sql.begin(async (tx) => {
     const query = tx as unknown as DatabaseSql;
-    await query`select pg_advisory_xact_lock(hashtextextended(${`step-up-failures:${user.id}`}, 0))`;
+    const [{ locked }] = await query<Array<{ locked: boolean }>>`select pg_try_advisory_xact_lock(hashtextextended(${`step-up-failures:${user.id}`}, 0)) as locked`;
+    if (!locked) return "busy";
     if (await codeFailures(query, user) >= MAX_CODE_FAILURES_PER_DAY) return "failures";
     const [row] = await query<Array<{ email_code_hash: string | null; email_attempts: number }>>`
       update keyway_v2_signature_requests set email_attempts = email_attempts + 1
@@ -623,6 +625,7 @@ export async function verifyCode(user: User, purpose: Purpose, nonce: string, co
     return await codeFailures(query, user) === MAX_CODE_FAILURES_PER_DAY ? "wrong-last" : "wrong";
   });
   if (outcome === "ok") return;
+  if (outcome === "busy") throw new Error("Another email code check is in progress. Try again in a moment");
   if (outcome === "failures") throw new Error(CODE_FAILURES_MESSAGE);
   if (outcome === "expired") throw new Error("The email code has expired. Request a new one");
   if (outcome === "attempts") throw new Error("Too many wrong codes. Request a new one");

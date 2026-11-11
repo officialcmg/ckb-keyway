@@ -434,7 +434,17 @@ test("wrong step-up codes add up across codes, to 20 a day per user", { skip: !e
     }
     const outcomes = await Promise.all(nonces.flatMap(({ nonce, code }) => Array.from({ length: 5 }, () =>
       verifyCode(context.user, "payment", nonce, wrong(code)).then(() => "ok", (error: Error) => error.message))));
-    assert.equal(outcomes.filter((message) => /isn't right/.test(message)).length, 20);
-    assert.equal(outcomes.filter((message) => /today/.test(message)).length, 10);
+    // Checks running at once are refused rather than queued; however they interleave, no more than 20 are compared.
+    assert.equal(outcomes.filter((message) => message === "ok").length, 0);
+    assert.ok(outcomes.filter((message) => /isn't right/.test(message)).length <= 20);
+    assert.ok(outcomes.every((message) => /isn't right|today|in progress/.test(message)), outcomes.join(", "));
+    const [{ failures }] = await sql<Array<{ failures: number }>>`select count(*)::int as failures from keyway_v2_step_up_failures where user_id = ${context.user.id}`;
+    assert.ok(failures <= 20);
+    // Then the rest, one at a time, stop at exactly 20.
+    for (const { nonce, code } of nonces) {
+      for (let i = 0; i < 5; i++) await verifyCode(context.user, "payment", nonce, wrong(code)).catch(() => undefined);
+    }
+    const [{ total }] = await sql<Array<{ total: number }>>`select count(*)::int as total from keyway_v2_step_up_failures where user_id = ${context.user.id}`;
+    assert.equal(total, 20);
   });
 });
