@@ -726,6 +726,22 @@ test("M5/M26: 1100 planted look-alike send-limit cells in one block hide neither
   assert.ok((await fresh.run("transaction", cleanup) as { signatures: unknown[] }).signatures.length > 0);
 });
 
+test("M26: one transaction can destroy many well-formed look-alikes within Lit's request limit", async () => {
+  const env = await account();
+  // Each look-alike has a correct Type ID from its creator's input 0 (an outsider's cell) and minimal "KWSL" data.
+  const planted = Array.from({ length: 60 }, () => {
+    const source = plant(env, { lock: stranger, capacity: 200n * CKB });
+    const input = ccc.CellInput.from({ previousOutput: source.outPoint });
+    return cellOf(env.add(ccc.Transaction.from({ inputs: [input], outputs: [{ lock: env.secp, type: typeIdScript(ccc.hashTypeId(input, 0)), capacity: 130n * CKB }], outputsData: ["0x4b57534c"] })), 0);
+  });
+  const cleanup = ccc.Transaction.from({ inputs: planted.map((cell) => ({ previousOutput: cell.outPoint })), outputs: [{ lock: env.secp, capacity: 60n * 130n * CKB - FEE }], outputsData: ["0x"] });
+  prepare(env, cleanup, [env.secp]);
+  const before = env.requests.length;
+  assert.equal((await env.run("plan", cleanup) as Plan).limits, "exempt");
+  // The creators' inputs are read in one batch, not one request per look-alike.
+  assert.ok(env.requests.length - before <= 3, `${env.requests.length - before} requests`);
+});
+
 test("M27: an indexer behind its chain is never read as 'no send limits'", async () => {
   const lagging = await account({ indexerLag: (url) => (url === "https://testnet.ckb.dev/" ? 10 : 0) });
   await turnOn(lagging, { ckb: 100n * CKB });

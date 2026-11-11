@@ -1174,21 +1174,50 @@ function recordIn(witness) {
  */
 const NOT_MADE_BY_KEY = "The send-limit cell isn't one this account made";
 
-async function previousEntries(account, input) {
-  const created = input.createdBy;
+/** The record-shaped witnesses on the inputs of the transaction that created a send-limit-shaped cell. */
+function creatorRecords(created) {
   const records = [];
   created.witnesses.forEach((witness, index) => { const record = recordIn(witness); if (record && index < created.inputs.length) records.push({ index, record }); });
+  return records;
+}
+
+const outPointKey = (outPoint) => `${bytesToHex(outPoint.txHash)}:${outPoint.index}`;
+
+/**
+ * The cells previousEntries reads for these send-limit-shaped inputs (each creator's input 0, or the inputs its
+ * records sit on), in one batch, so a transaction destroying many look-alikes costs one request, not one each.
+ */
+async function creatorCells(shaped) {
+  const wanted = shaped.flatMap(({ createdBy, output, outputIndex }) => {
+    const records = creatorRecords(createdBy);
+    if (records.length > 0) return records.map(({ index }) => createdBy.inputs[index]);
+    // Without records, only a cell whose Type ID comes from its creator's input 0 needs that input read.
+    return equalBytes(output.type.args, typeIdArgs(createdBy.inputs[0], outputIndex)) ? [createdBy.inputs[0]] : [];
+  });
+  const cells = wanted.length > 0 ? await inputCellsOf({ inputs: wanted }) : [];
+  return new Map(wanted.map((input, i) => [outPointKey(input.previousOutput), cells[i]]));
+}
+
+async function previousEntries(account, input, known = new Map()) {
+  const created = input.createdBy;
+  const cellsOf = async (inputs) => {
+    const missing = inputs.filter((one) => !known.has(outPointKey(one.previousOutput)));
+    const fetched = missing.length > 0 ? await inputCellsOf({ inputs: missing }) : [];
+    missing.forEach((one, i) => known.set(outPointKey(one.previousOutput), fetched[i]));
+    return inputs.map((one) => known.get(outPointKey(one.previousOutput)));
+  };
+  const records = creatorRecords(created);
   if (records.length === 0) {
     if (!equalBytes(input.output.type.args, typeIdArgs(created.inputs[0], input.outputIndex))) throw new Error(NOT_MADE_BY_KEY);
     const check = async () => {
-      const [first] = await inputCellsOf({ inputs: [created.inputs[0]] });
+      const [first] = await cellsOf([created.inputs[0]]);
       if (lockKind(account, first.output.lock) !== "secp256k1" || !isPlain(first.output, first.data)) throw new Error(NOT_MADE_BY_KEY);
     };
     return { entries: [], check };
   }
   // The record is the one on the input that spent the previous send-limit cell. Witnesses of other parties' inputs
   // aren't covered by the account's signature, so anyone could add a record-shaped one there; those are ignored.
-  const cells = await inputCellsOf({ inputs: records.map(({ index }) => created.inputs[index]) });
+  const cells = await cellsOf(records.map(({ index }) => created.inputs[index]));
   const own = records.filter((_, i) => sameScript(cells[i].output.lock, account.secp) && sameScript(cells[i].output.type, input.output.type));
   if (own.length !== 1) throw new Error(NOT_MADE_BY_KEY);
   const entries = parseRecord(own[0].record);
@@ -1368,9 +1397,11 @@ async function limitAnalysis(analysis, params) {
   // A send-limit-shaped input counts only if the transaction that made it shows it is the key's own; a look-alike
   // someone planted at the address is an ordinary Type ID cell, so it can be destroyed like any other.
   const settingsInputs = [];
-  for (const cell of inputs.map((cell, index) => ({ ...cell, index })).filter((cell) => isSettingsShaped(account, cell.output, cell.data))) {
+  const shaped = inputs.map((cell, index) => ({ ...cell, index })).filter((cell) => isSettingsShaped(account, cell.output, cell.data));
+  const known = await creatorCells(shaped);
+  for (const cell of shaped) {
     try {
-      const previous = await previousEntries(account, cell);
+      const previous = await previousEntries(account, cell, known);
       await previous.check();
       settingsInputs.push({ ...cell, previous });
     } catch (error) {

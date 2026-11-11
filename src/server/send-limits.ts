@@ -244,7 +244,7 @@ const TYPE_ID_CODE_HASH = "0x000000000000000000000000000000000000000000000000005
 const RPC_URLS = ["https://testnet.ckb.dev/", "https://testnet.ckbapp.dev/"];
 /** How long after signing a transaction the node doesn't know yet is waited for: its client is sending it. */
 const JUST_SIGNED_MS = 10_000;
-/** Indexer pages of send-limit-shaped cells, as in the Action: past 4096 look-alikes (about 530k CKB) it's an error. */
+/** Indexer pages of send-limit-shaped cells, as in the Action: from 4096 such cells (each at least 130 CKB) it's an error. */
 const PAGE_SIZE = 256;
 const MAX_PAGES = 16;
 /** History lookups in one request. */

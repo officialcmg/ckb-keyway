@@ -3,7 +3,7 @@ import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { secp256k1Lock, type KeyWayRecovery } from "../src/sdk/browser/account-lock.ts";
-import { formatCkbSignature, previewFundingTransaction, serializeTransaction } from "../src/server/funding-transaction.ts";
+import { calculateFundingSpend, formatCkbSignature, previewFundingTransaction, serializeTransaction } from "../src/server/funding-transaction.ts";
 import { describeTransaction, previewGeneralTransaction, previewSummaryLines, type KnownScripts } from "../src/server/transaction-policy.ts";
 import { parseThreshold } from "../src/server/general-signing.ts";
 import type { ReadyWallet } from "../src/server/user-wallet.ts";
@@ -105,6 +105,16 @@ test("minting a token the account issued to someone else counts as that token le
     [{ lock: alice, capacity: 200n * CKB, type: xudt, data: u128(10n ** 30n) }, { lock: own, capacity: 500n * CKB - 2_000n }],
   );
   assert.equal(foreign.tokensLeaving, false);
+});
+
+test("a Nervos DAO withdrawal whose interest makes the outputs exceed the inputs is refused, so the server never has it signed", () => {
+  // Phase 2: the withdrawing cell (its deposit block number as data) plus the interest, all sent away.
+  assert.throws(() => build(
+    [{ lock: own, capacity: 10_000n * CKB, type: dao, data: ccc.hexFrom(ccc.numLeToBytes(1234, 8)) }],
+    [{ lock: alice, capacity: 10_050n * CKB }],
+  ), /outputs exceed its inputs/);
+  // A channel funding refuses it too.
+  assert.throws(() => calculateFundingSpend({ ownedInputCapacity: 10_000n * CKB, ownedChangeCapacity: 0n, totalInputCapacity: 10_000n * CKB, totalOutputCapacity: 10_050n * CKB }), /fee exceeds/);
 });
 
 test("recognizes a Nervos DAO deposit", () => {

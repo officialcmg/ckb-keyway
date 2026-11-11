@@ -223,8 +223,12 @@ counted send, and fund channels only from there.
 - Inputs under a lock this key can unlock in a form KeyWay doesn't use (anyone-can-pay, other Omnilocks): refused,
   since nothing they hold would be counted.
 - Freezing an account with planted cells: look-alike send-limit cells don't count toward any cap until proven the
-  key's own, a block full of cells sent to the key is read past, and a look-alike can be destroyed like any other
-  Type ID cell. Only past 16 pages of look-alikes (about 530k CKB given to the account) is the lookup refused.
+  key's own, a block full of cells sent to the key is read past, and look-alikes can be destroyed like any other
+  Type ID cell (the cells their creators spent are read in one batch, so one transaction can destroy many). The
+  lookup is refused only from 4,096 send-limit-shaped cells at the address (16 full pages of 256): 4,095
+  look-alikes on an account with limits, each at least 130 CKB (532,350 CKB, all left at the account's address).
+  Measured with the fake chain, every look-alike in its own block: the heaviest run below that (turning recovery
+  on) makes 36 CKB RPC requests plus the code email, within Lit's 50.
 - A lagging indexer: an empty answer counts as "no limits" only from a node whose indexer is within 3 blocks of
   its tip; when every node lags, nothing is signed.
 
@@ -304,7 +308,7 @@ server: roughly +0.4 s per send with limits on. Today's policy signer takes 0.65
 
 1. Run the migration (`npm run migrate:production`): it adds `keyway_v2_pending_transactions`.
 2. In the Chipotle dashboard, paste `lit-actions/sign-ckb-transaction.js` into **Action Runner**, click **Get Lit
-   Action IPFS CID**, and check it is `QmYZQ2LTyLkrEWixfxcCtY7eq6KSuejHxfxaRYRGRjTQKi`, the same as `LIT_ACTION_CIDS["sign-ckb-transaction"]` in
+   Action IPFS CID**, and check it is `QmRt1kZYTrgEEPYrnNrLWDCoJe9yr7LiNowPUMEK42db5H`, the same as `LIT_ACTION_CIDS["sign-ckb-transaction"]` in
    `src/server/lit-config.ts`.
 3. Register it under **IPFS Actions** (for example as `keyway-ckb-policy-signer-v2`) and add it to group 1,
    `CKB Keyway`.
