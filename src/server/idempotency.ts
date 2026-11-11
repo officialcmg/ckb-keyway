@@ -164,7 +164,10 @@ export async function runIdempotentMutation<T>(
   } catch (error) {
     // Its outcome isn't known, so it isn't recorded as failed: repeats reconcile it, or say it's unknown.
     if (error instanceof OutcomeUnknownError) throw error;
-    const message = error instanceof Error ? error.message : "Managed operation failed";
+    // Database and network error text (Postgres errors, Node system errors) isn't replayed to repeats.
+    const { name, syscall, errno } = (error ?? {}) as { name?: unknown; syscall?: unknown; errno?: unknown };
+    const internal = name === "PostgresError" || typeof syscall === "string" || errno !== undefined;
+    const message = error instanceof Error && !internal ? error.message : "Managed operation failed";
     await sql`
       update keyway_v2_idempotency_keys
       set status = 'failed', error_message = ${message}, updated_at = now()
