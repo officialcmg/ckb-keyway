@@ -430,7 +430,8 @@ async function sendLimitSettings(
  */
 async function serverAmountsAround(user: User, current: DailyAmounts, next: DailyAmounts, change: { asset: string; amount: bigint | null }, send: () => Promise<void>): Promise<void> {
   const tightens = !weakens(current, next);
-  if (tightens) await writeDailyAmount(user, change.asset, change.amount);
+  // Only ever lower here: another change made since `current` was read may already have written a stricter amount.
+  if (tightens) await writeDailyAmount(user, change.asset, change.amount, { onlyLower: true });
   await send();
   if (!tightens) await writeDailyAmount(user, change.asset, change.amount);
 }
@@ -698,10 +699,18 @@ async function readDailyAmounts(user: User, connection?: Query): Promise<DailyAm
   return new Map(rows.map(({ asset, amount }) => [asset, BigInt(amount)]));
 }
 
-async function writeDailyAmount(user: User, asset: string, amount: bigint | null): Promise<void> {
+async function writeDailyAmount(user: User, asset: string, amount: bigint | null, options: { onlyLower?: boolean } = {}): Promise<void> {
   const sql = await database();
   if (amount === null) {
-    await sql`delete from keyway_v2_daily_amounts where user_id = ${user.id} and asset = ${asset}`;
+    if (!options.onlyLower) await sql`delete from keyway_v2_daily_amounts where user_id = ${user.id} and asset = ${asset}`;
+    return;
+  }
+  if (options.onlyLower) {
+    await sql`
+      insert into keyway_v2_daily_amounts (user_id, asset, amount, updated_at)
+      values (${user.id}, ${asset}, ${amount.toString()}, now())
+      on conflict (user_id, asset) do update set amount = least(keyway_v2_daily_amounts.amount, excluded.amount), updated_at = now()
+    `;
     return;
   }
   await sql`

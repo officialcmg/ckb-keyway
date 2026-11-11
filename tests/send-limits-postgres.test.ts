@@ -318,12 +318,25 @@ test("a send-limit change never leaves the server's daily amounts looser than th
   assert.deepEqual(await amounts(), { ckb: (10n * CKB).toString() });
   world.add(sent.at(-1)!, "committed");
 
+  // Another change, made while this one was under way, already wrote a stricter amount: it isn't overwritten.
+  const sql = await database();
+  context.broadcast = broadcast;
+  const rateLimit = context.rateLimit;
+  context.rateLimit = async (key, rule) => {
+    await sql`update keyway_v2_daily_amounts set amount = ${(5n * CKB).toString()} where user_id = ${user.id} and asset = 'ckb'`;
+    return rateLimit(key, rule);
+  };
+  await set(8n * CKB);
+  context.rateLimit = rateLimit;
+  assert.deepEqual(await amounts(), { ckb: (5n * CKB).toString() });
+  world.add(sent.at(-1)!, "committed");
+
   // Raising it fails to send: the server keeps the stricter amount.
   context.broadcast = async () => { throw new Error("connection reset"); };
   const raise = await set(1_000n * CKB);
   assert.equal(raise.requiresEmailCode, true);
   await assert.rejects(set(1_000n * CKB, { confirmationNonce: raise.confirmationNonce, emailCode: codeFrom(world) }), /connection reset/);
-  assert.deepEqual(await amounts(), { ckb: (10n * CKB).toString() });
+  assert.deepEqual(await amounts(), { ckb: (5n * CKB).toString() });
 
   t.after(async () => {
     const sql = await database();
