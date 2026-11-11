@@ -16,14 +16,16 @@ const CHANNELS_MARKER = "keyway-channels";
 const CHECKED_MARKER = "keyway-channels-checked";
 // A node is never stopped to make room for this long after a successful step of a channel setup, so a user's
 // steps that span several requests, such as connecting to a peer, opening a channel and signing its funding,
-// can't lose the node in between. Reads, such as a page polling its node, don't hold a node. A node is held at
-// most MAX_HOLD_MS after it starts, and at most half the host's nodes are held at once, so accounts that keep
-// repeating setup steps can't keep the host full.
+// can't lose the node in between. Reads, such as a page polling its node, don't hold a node, and a node serving
+// a request is never stopped to make room for one without channels. A setup holds its node at most MAX_HOLD_MS
+// from its first step, each user starts at most SETUPS_PER_HOUR held setups an hour, and at most half the host's
+// nodes are held at once, so accounts that keep repeating setup steps can't keep the host full.
 const RECENT_USE_MS = 5 * 60_000;
 const MAX_HOLD_MS = 15 * 60_000;
-// Nor for this long after it starts, so the request that started it is served, and no node can be made to stop
-// and start more than once in this time.
-const START_GRACE_MS = 60_000;
+const SETUPS_PER_HOUR = 3;
+// A user's node may take another node's place at most this many times in ten minutes, which bounds how much
+// stopping and starting any one account can cause.
+const ROOM_STARTS_PER_10_MIN = 6;
 // Only these calls may create a node for a user who has none: connecting a hosted node (the SDK's start and its
 // fee reserve read node_info) and setting up a channel. Any other read of a user without a node is refused.
 const PROVISIONING = new Set(["node_info", "connect_peer", "open_channel", "open_channel_with_external_funding"]);
@@ -34,12 +36,18 @@ const CHANNEL_SETUP = new Set(["connect_peer", "open_channel", "open_channel_wit
 const RESTART_BASE_MS = 1_000;
 const RESTART_MAX_MS = 60_000;
 const RESTART_STABLE_MS = 60_000;
+// After this many failed starts in a row, a node that may hold channels no longer stops other nodes to start.
+const PRIORITY_FAILED_STARTS = 3;
 const nodes = new Map();
 const starting = new Map();
 const operations = new Map();
 // Nodes that may hold channels but aren't running, with their pending retry; and each node's restart attempts.
 const offline = new Map();
 const restarts = new Map();
+const failedStarts = new Map();
+// Per user: when their held setups began, and when their node took another node's place.
+const setups = new Map();
+const roomStarts = new Map();
 let shuttingDown = false;
 let uses = 0;
 
@@ -138,22 +146,32 @@ export function proxyUserRequest(userId, body) {
   const method = rpcMethod(body);
   return withUserOperation(userId, async () => {
     const node = await ensureNode(userId, { provision: PROVISIONING.has(method) });
-    const upstream = await fetch(`http://127.0.0.1:${node.port}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body,
-      signal: AbortSignal.timeout(120_000),
-    });
-    const result = {
-      status: upstream.status,
-      contentType: upstream.headers.get("content-type") ?? "application/json",
-      body: Buffer.from(await upstream.arrayBuffer()),
-    };
-    const answer = upstream.ok ? rpcResult(result.body) : undefined;
-    if (answer && CHANNEL_SETUP.has(method)) hold(node);
+    const setup = CHANNEL_SETUP.has(method);
+    // A node in the middle of a setup step is never stopped to make room, whatever needs it.
+    if (setup) node.settingUp = (node.settingUp ?? 0) + 1;
+    let result;
+    try {
+      const upstream = await fetch(`http://127.0.0.1:${node.port}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        signal: AbortSignal.timeout(120_000),
+      });
+      result = {
+        ok: upstream.ok,
+        status: upstream.status,
+        contentType: upstream.headers.get("content-type") ?? "application/json",
+        body: Buffer.from(await upstream.arrayBuffer()),
+      };
+    } finally {
+      if (setup) node.settingUp--;
+    }
+    const answer = result.ok ? rpcResult(result.body) : undefined;
+    delete result.ok;
+    if (answer && setup) hold(userId, node);
     if (answer && ["open_channel", "open_channel_with_external_funding", "submit_signed_funding_tx"].includes(method)) await markChannels(userId, true);
     // A channel can also be opened to the node by a peer: it is marked once the node's channels show it.
-    if (answer && method === "list_channels" && Array.isArray(answer.result?.channels) && answer.result.channels.some((channel) => channelClass(channel) === "holds")) {
+    if (answer && method === "list_channels" && Array.isArray(answer.result?.channels) && answer.result.channels.some((channel) => channelClass(channel) === "open")) {
       await markChannels(userId, true);
     }
     return result;
@@ -215,11 +233,14 @@ async function fileExists(path) {
   catch (error) { if (error?.code === "ENOENT") return false; throw error; }
 }
 
-/** Marks a node by its current channels and records that it has been checked. */
+/**
+ * Marks a node by its current channels and records that it has been checked. If the channels can't be read, the
+ * node is marked; if only CKB can't be asked about a channel's funding, its marker stays as it was.
+ */
 async function checkChannels(userId, node) {
-  let open = true;
-  try { open = await holdsChannels(await nodeChannels(node)); } catch {}
-  await markChannels(userId, open);
+  let holds = "yes";
+  try { holds = await holdsChannels(await nodeChannels(node)); } catch {}
+  if (holds !== "unknown") await markChannels(userId, holds === "yes");
   await writeFile(join(managedDataDir(userId), CHECKED_MARKER), "", { mode: 0o600 });
 }
 
@@ -252,19 +273,26 @@ async function ensureNode(userId, { provision = true } = {}) {
   const existing = current();
   if (existing) return existing;
   if (!provision && !(await fileExists(managedDataDir(userId)))) throw new Error("This account has no hosted Fiber node yet");
-  const priority = await mayHoldChannels(userId);
+  // Checked before any node is stopped to make room for one that can't start.
+  await requireCleanRestore(managedDataDir(userId));
+  const priority = (failedStarts.get(userId) ?? 0) < PRIORITY_FAILED_STARTS && await mayHoldChannels(userId);
   // Looked up again after the waits above.
   const again = current();
   if (again) return again;
   if (shuttingDown) throw new Error("Managed host is shutting down");
   const full = new Set([...nodes.keys(), ...starting.keys()]).size >= maxNodes();
-  const promise = (full ? makeRoom(userId, priority) : Promise.resolve())
+  if (full && !priority && recent(roomStarts, userId, 10 * 60_000) >= ROOM_STARTS_PER_10_MIN) {
+    throw new Error("This hosted node has been restarted too often; try again in a few minutes");
+  }
+  const promise = (full ? makeRoom(userId, priority).then(() => { if (!priority) record(roomStarts, userId); }) : Promise.resolve())
     .then(() => startNode(userId))
     .then(async (node) => {
       forgetOffline(userId);
+      failedStarts.delete(userId);
       await checkChannels(userId, node).catch(logError);
       return node;
     }, async (error) => {
+      if (!(error instanceof RoomError)) failedStarts.set(userId, (failedStarts.get(userId) ?? 0) + 1);
       // A node that may hold channels keeps being started until it runs.
       if (!shuttingDown && await mayHoldChannels(userId).catch(() => true)) superviseNode(userId);
       throw error;
@@ -279,31 +307,54 @@ function use(node) {
   return node;
 }
 
-/** Holds a node after a setup step: up to MAX_HOLD_MS after its start, and while at most half the host is held. */
-function hold(node) {
-  const now = Date.now();
-  const held = [...nodes.values()].filter((other) => other !== node && other.heldUntil > now).length;
-  if (node.heldUntil <= now && held >= Math.max(1, Math.floor(maxNodes() / 2))) return;
-  node.heldUntil = Math.max(node.heldUntil, Math.min(now + RECENT_USE_MS, node.startedAt + MAX_HOLD_MS));
+/** How many of a user's timestamps in `map` fall in the last `windowMs`; older ones are dropped. */
+function recent(map, userId, windowMs) {
+  const since = Date.now() - windowMs;
+  const kept = (map.get(userId) ?? []).filter((at) => at > since);
+  if (kept.length) map.set(userId, kept);
+  else map.delete(userId);
+  return kept.length;
 }
+
+function record(map, userId) {
+  map.set(userId, [...(map.get(userId) ?? []), Date.now()]);
+}
+
+/**
+ * Holds a node after a successful setup step for RECENT_USE_MS, up to MAX_HOLD_MS from the setup's first step.
+ * A new setup is held only within the user's SETUPS_PER_HOUR and while at most half the host is held.
+ */
+function hold(userId, node) {
+  const now = Date.now();
+  if (node.heldUntil <= now) {
+    const held = [...nodes.values()].filter((other) => other !== node && other.heldUntil > now).length;
+    if (held >= Math.max(1, Math.floor(maxNodes() / 2)) || recent(setups, userId, 60 * 60_000) >= SETUPS_PER_HOUR) return;
+    record(setups, userId);
+    node.setupStartedAt = now;
+  }
+  node.heldUntil = Math.max(node.heldUntil, Math.min(now + RECENT_USE_MS, node.setupStartedAt + MAX_HOLD_MS));
+}
+
+class RoomError extends Error {}
 
 /**
  * When the host is full, a new node takes the place of the least recently used one that holds no channels, so
  * accounts that never funded a channel can't hold the host's capacity. A node with channels is never stopped
- * this way, nor is one serving a request or held (just started, or in a channel setup), unless the new node may
- * hold channels itself: it must run to watch them, so it may stop such a node even mid-request.
+ * this way, nor is one in a setup step, nor one serving a request or held after a setup step, unless the new
+ * node may hold channels itself: it must run to watch them.
  */
 async function makeRoom(userId, priority = false) {
-  const reusable = (id, node) => id !== userId && !node.stopping &&
-    (priority || (!operations.has(id) && Date.now() >= Math.max(node.graceUntil, node.heldUntil)));
+  const reusable = (id, node) => id !== userId && !node.stopping && !node.settingUp &&
+    (priority || (!operations.has(id) && Date.now() >= node.heldUntil));
   const candidates = [...nodes.entries()]
     .filter(([id, node]) => reusable(id, node))
     .sort(([, left], [, right]) => left.lastUsed - right.lastUsed);
   for (const [id, node] of candidates) {
     let channels;
     try { channels = await nodeChannels(node); } catch { continue; }
-    const idle = !(await holdsChannels(channels));
-    if (!idle) await markChannels(id, true).catch(logError);
+    const holds = await holdsChannels(channels);
+    const idle = holds === "no";
+    if (holds === "yes") await markChannels(id, true).catch(logError);
     // Checked again after the wait, in case the node was stopped or picked up a request meanwhile.
     if (!idle || nodes.get(id) !== node || !reusable(id, node)) continue;
     // Stopping marks the node at once, so no request can pick it up in between; its marker goes only once
@@ -312,7 +363,7 @@ async function makeRoom(userId, priority = false) {
     await markChannels(id, false);
     return;
   }
-  throw new Error("Managed node capacity is full");
+  throw new RoomError("Managed node capacity is full");
 }
 
 /**
@@ -370,6 +421,17 @@ async function restartNode(userId) {
   }
 }
 
+/** Starts a crashed node without channel markers once, after the restart backoff, where there is room. */
+function restartOnce(userId) {
+  const attempts = restarts.get(userId) ?? 0;
+  restarts.set(userId, attempts + 1);
+  const timer = setTimeout(() => {
+    if (shuttingDown || nodes.has(userId)) return;
+    void withUserOperation(userId, () => ensureNode(userId)).catch(logError);
+  }, Math.min(RESTART_MAX_MS, RESTART_BASE_MS * 2 ** attempts));
+  timer.unref?.();
+}
+
 function forgetOffline(userId) {
   clearTimeout(offline.get(userId)?.timer);
   offline.delete(userId);
@@ -411,15 +473,18 @@ async function startNode(userId) {
   ], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
   child.stdout.on("data", (chunk) => process.stdout.write(`[fnn:${userId.slice(0, 8)}] ${chunk}`));
   child.stderr.on("data", (chunk) => process.stderr.write(`[fnn:${userId.slice(0, 8)}] ${chunk}`));
-  const node = { child, port, lastUsed: 0, startedAt: 0, graceUntil: 0, heldUntil: 0 };
+  const node = { child, port, lastUsed: 0, startedAt: 0, heldUntil: 0, setupStartedAt: 0, settingUp: 0 };
+  // A missing or unrunnable binary is reported here, and the start then fails in waitForRpc.
+  child.once("error", logError);
   child.once("exit", (code, signal) => {
     const wasRunning = nodes.get(userId)?.child === child;
     if (wasRunning) nodes.delete(userId);
     console.error(`[managed-host] fnn ${userId.slice(0, 8)} exited code=${code} signal=${signal}`);
     if (wasRunning && Date.now() - node.startedAt >= RESTART_STABLE_MS) restarts.delete(userId);
-    // A node that may hold channels is started again until it runs; any other starts on its user's next request.
+    // A node that exits unexpectedly is started again, as it may hold a channel it was never marked for; one that
+    // may hold channels keeps being started until it runs (see superviseNode).
     if (wasRunning && !node.stopping && !shuttingDown) {
-      void mayHoldChannels(userId).catch(() => true).then((may) => { if (may) superviseNode(userId); });
+      void mayHoldChannels(userId).catch(() => true).then((may) => may ? superviseNode(userId) : restartOnce(userId));
     }
   });
   await waitForRpc(port, child);
@@ -429,7 +494,6 @@ async function startNode(userId) {
   }
   node.lastUsed = ++uses;
   node.startedAt = Date.now();
-  node.graceUntil = node.startedAt + START_GRACE_MS;
   nodes.set(userId, node);
   return node;
 }
@@ -568,13 +632,13 @@ async function nodeRpc(node, method, params) {
 /**
  * Whether a channel is finished: closed and not waiting for its on-chain settlement. Fiber 0.9.1 reports a force
  * close as UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT (or _REMOTE) and drops WAITING_ONCHAIN_SETTLEMENT once
- * it has settled; ONCHAIN_SETTLEMENT_CONFIRMED is accepted too, though its RPC doesn't send it. Flags are read as
- * whole names. Kept equal to channelFinished in src/sdk/browser/settlement-sweep.ts by a test.
+ * it has settled. Flags are read as whole names. Kept equal to channelFinished in
+ * src/sdk/browser/settlement-sweep.ts by a test.
  */
 export function channelFinished(channel) {
   if (stateName(channel) !== "closed") return false;
   const flags = new Set(JSON.stringify(channel?.state?.state_flags ?? "").match(/\b[A-Z][A-Z0-9_]*\b/g) ?? []);
-  return !flags.has("WAITING_ONCHAIN_SETTLEMENT") || flags.has("ONCHAIN_SETTLEMENT_CONFIRMED");
+  return !flags.has("WAITING_ONCHAIN_SETTLEMENT");
 }
 
 function stateName(channel) {
@@ -584,36 +648,51 @@ function stateName(channel) {
 // States before a channel's funding is on chain: it holds funds only once its funding transaction is.
 const BEFORE_FUNDING = ["negotiatingfunding", "collaboratingfundingtx", "signingcommitment", "awaitingtxsignatures"];
 
-/** "finished", "unfunded" (before its funding is on chain, see BEFORE_FUNDING), or "holds". */
+/** "finished", "unfunded" (before its funding is on chain, see BEFORE_FUNDING), or "open". */
 function channelClass(channel) {
   if (channelFinished(channel)) return "finished";
-  return BEFORE_FUNDING.includes(stateName(channel)) ? "unfunded" : "holds";
+  return BEFORE_FUNDING.includes(stateName(channel)) ? "unfunded" : "open";
 }
 
 /**
- * Whether a node must keep running for its channels. A channel that hasn't reached ready counts only once its
- * funding transaction is known to CKB: before that the funding may never come, and nothing of the user's is in
- * the channel. If CKB can't be asked, it counts.
+ * Whether a node must keep running for its channels: "yes", "no", or "unknown" when only CKB couldn't be asked
+ * whether a channel's funding exists (such a node isn't stopped, and its marker isn't changed). A channel that
+ * hasn't reached ready counts only once CKB knows its funding transaction: before that the funding may never
+ * come, and nothing of the user's is in the channel.
  */
 async function holdsChannels(channels) {
-  if (!Array.isArray(channels)) return true;
-  for (const channel of channels) {
-    const kind = channelClass(channel);
-    if (kind === "holds") return true;
-    if (kind === "unfunded" && await fundingSeen(channel)) return true;
+  if (!Array.isArray(channels)) return "yes";
+  if (channels.some((channel) => channelClass(channel) === "open")) return "yes";
+  const outpoints = [...new Set(channels.filter((channel) => channelClass(channel) === "unfunded")
+    .map((channel) => String(channel?.channel_outpoint ?? ""))
+    .filter((outpoint) => /^0x[0-9a-f]{72}$/i.test(outpoint)))];
+  let unknown = false;
+  // A few lookups at a time, each answered from a short cache when it can be.
+  for (let index = 0; index < outpoints.length; index += 8) {
+    const seen = await Promise.all(outpoints.slice(index, index + 8).map(fundingSeen));
+    if (seen.includes(true)) return "yes";
+    if (seen.includes(undefined)) unknown = true;
   }
-  return false;
+  return unknown ? "unknown" : "no";
 }
 
-async function fundingSeen(channel) {
-  const outpoint = String(channel?.channel_outpoint ?? "");
-  if (!/^0x[0-9a-f]{72}$/i.test(outpoint)) return false;
+const fundingLookups = new Map();
+// A funding transaction CKB knows stays known; one it doesn't is asked about again after a minute.
+const UNSEEN_FUNDING_TTL_MS = 60_000;
+
+/** True if CKB knows the channel's funding transaction, false if not, undefined if CKB couldn't be asked. */
+async function fundingSeen(outpoint) {
+  const hash = outpoint.slice(0, 66).toLowerCase();
+  const cached = fundingLookups.get(hash);
+  if (cached && (cached.seen || Date.now() - cached.at < UNSEEN_FUNDING_TTL_MS)) return cached.seen;
   try {
-    const result = await ckbRpc("get_transaction", [outpoint.slice(0, 66)]);
-    const status = result?.tx_status?.status;
-    return status !== "unknown" && status !== "rejected";
+    const status = (await ckbRpc("get_transaction", [hash]))?.tx_status?.status;
+    const seen = status !== "unknown" && status !== "rejected";
+    if (fundingLookups.size >= 10_000) fundingLookups.clear();
+    fundingLookups.set(hash, { seen, at: Date.now() });
+    return seen;
   } catch {
-    return true;
+    return undefined;
   }
 }
 

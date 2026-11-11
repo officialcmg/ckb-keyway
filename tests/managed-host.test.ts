@@ -61,11 +61,11 @@ test("node retirement rejects active, settling, or unknown channel states", () =
 
 test("a force-closed channel counts as finished once it has settled on-chain, read by flag, not by string", () => {
   // As Fiber 0.9.1's list_channels reports them: WAITING_ONCHAIN_SETTLEMENT goes once the close has settled.
-  const closed = (state_flags: unknown) => [{ state: { state_name: "CLOSED", state_flags } }];
-  for (const flags of ["UNCOOPERATIVE_LOCAL", "UNCOOPERATIVE_REMOTE", "FUNDING_ABORTED", "ABANDONED", "COOPERATIVE", "UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT|ONCHAIN_SETTLEMENT_CONFIRMED"]) {
+  const closed = (state_flags: unknown) => [{ state: { state_name: "Closed", state_flags } }];
+  for (const flags of ["UNCOOPERATIVE_LOCAL", "UNCOOPERATIVE_REMOTE", "FUNDING_ABORTED", "ABANDONED", "COOPERATIVE"]) {
     requireClosedChannels(closed(flags));
   }
-  for (const flags of ["UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT", "UNCOOPERATIVE_REMOTE | WAITING_ONCHAIN_SETTLEMENT", ["WAITING_ONCHAIN_SETTLEMENT"]]) {
+  for (const flags of ["UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT", "UNCOOPERATIVE_REMOTE | WAITING_ONCHAIN_SETTLEMENT", ["WAITING_ONCHAIN_SETTLEMENT"], "UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT|ONCHAIN_SETTLEMENT_CONFIRMED"]) {
     assert.throws(() => requireClosedChannels(closed(flags)), /preserve/, String(flags));
   }
   // A channel still negotiating its funding isn't closed, so it still blocks retirement.
@@ -79,7 +79,8 @@ test("the hosted node and the settlement sweep agree on which channels are finis
     ["CLOSED", "COOPERATIVE"], ["Closed", "COOPERATIVE"], ["CLOSED", "UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT"],
     ["CLOSED", "UNCOOPERATIVE_LOCAL"], ["CLOSED", "UNCOOPERATIVE_REMOTE"], ["CLOSED", "UNCOOPERATIVE_REMOTE|WAITING_ONCHAIN_SETTLEMENT"],
     ["CLOSED", "UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT|ONCHAIN_SETTLEMENT_CONFIRMED"], ["CLOSED", "FUNDING_ABORTED"],
-    ["CLOSED", "ABANDONED"], ["CLOSED", undefined], ["CLOSED", ["WAITING_ONCHAIN_SETTLEMENT"]], ["CLOSED", "NOT_WAITING_ONCHAIN_SETTLEMENT_YET"],
+    ["CLOSED", "ABANDONED"], ["Closed", "UNCOOPERATIVE_LOCAL"], ["Closed", "UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT"],
+    ["NegotiatingFunding", "AWAITING_EXTERNAL_FUNDING"], ["AwaitingTxSignatures", "OUR_TX_SIGNATURES_SENT"], ["CLOSED", undefined], ["CLOSED", ["WAITING_ONCHAIN_SETTLEMENT"]], ["CLOSED", "NOT_WAITING_ONCHAIN_SETTLEMENT_YET"],
   ] as const;
   for (const [state_name, state_flags] of states) {
     const channel = { state: { state_name, state_flags } };
