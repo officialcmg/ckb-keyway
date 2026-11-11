@@ -95,6 +95,28 @@ test("readiness checks tell anonymous callers only ready or unavailable", async 
   assert.doesNotMatch(JSON.stringify(errors), /internal\.invalid|not-a-secret/);
 });
 
+test("database and DNS failures inside the API get a fixed message", async (t) => {
+  const saved = process.env.DATABASE_URL;
+  const error = console.error;
+  const logged: unknown[][] = [];
+  console.error = (...args: unknown[]) => { logged.push(args); };
+  t.after(() => {
+    console.error = error;
+    if (saved === undefined) delete process.env.DATABASE_URL; else process.env.DATABASE_URL = saved;
+  });
+  process.env.KEYWAY_DASHBOARD_ORIGINS = "https://wallet.example";
+  process.env.DATABASE_URL = "postgres://keyway:not-a-secret@db.internal.invalid:5432/keyway";
+  const response = await handleKeyWayRequest(new Request("https://api.example/api/v1/keyway/auth/send-code", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: "https://wallet.example", "X-KeyWay-Auth-Scope": "dashboard" },
+    body: JSON.stringify({ email: "someone@example.com" }),
+  }));
+  assert.equal(response.status, 503);
+  const body = await response.text();
+  assert.deepEqual(JSON.parse(body), { error: "KeyWay is temporarily unavailable. Try again in a moment." });
+  assert.doesNotMatch(JSON.stringify(logged), /internal\.invalid|not-a-secret|someone@example/);
+});
+
 test("errors outside the API handler get a fixed message", async (t) => {
   const error = console.error;
   console.error = () => undefined;

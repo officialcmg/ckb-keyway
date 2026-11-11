@@ -88,13 +88,19 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
     for (const [name, value] of cors) response.headers.set(name, value);
     return response;
   } catch (error) {
+    // Database, network and DNS failures name internal hosts: callers get one plain sentence, operators a code.
+    if (isInternalError(error)) {
+      console.error("[keyway] request failed", { status: 503, cause: "internal", code: errorCode(error) });
+      return jsonError("KeyWay is temporarily unavailable. Try again in a moment.", 503, cors);
+    }
     const message = error instanceof Error ? error.message : "KeyWay request failed";
     const unauthorized = /session|bearer/i.test(message);
     const rateLimited = /too many/i.test(message);
+    const status = unauthorized ? 401 : rateLimited ? 429 : 400;
     // A sanitized cause for operators: Lit refuses everything once the account's credit runs out.
     const cause = /payment_required|HTTP 402/i.test(message) ? "lit-out-of-credit" : PROVIDER_ERROR.test(message) ? "provider" : undefined;
-    console.error("[keyway] request failed", { status: unauthorized ? 401 : rateLimited ? 429 : 400, ...(cause ? { cause } : {}) });
-    return jsonError(publicErrorMessage(message), unauthorized ? 401 : rateLimited ? 429 : 400, cors);
+    console.error("[keyway] request failed", { status, ...(cause ? { cause } : {}) });
+    return jsonError(publicErrorMessage(message), status, cors);
   }
 }
 
@@ -110,6 +116,21 @@ async function readiness(check: string, probe: () => Promise<unknown>, cors: Hea
     console.error("[keyway] readiness check failed", { check, code: errorCode(error) });
     return Response.json({ status: "unavailable" }, { status: 503, headers: cors });
   }
+}
+
+const INTERNAL_CODE = /^(CONNECT_TIMEOUT|CONNECTION_[A-Z_]+|E[A-Z]+|[0-9A-Z]{5})$/;
+const INTERNAL_MESSAGE = /CONNECT_TIMEOUT|CONNECTION_(CLOSED|ENDED|DESTROYED)|ECONN|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|getaddrinfo|DATABASE_URL/;
+
+/**
+ * A database, network or DNS error rather than one of KeyWay's own: a Postgres error, a Node system error, a
+ * postgres.js connection error, or a message naming one.
+ */
+export function isInternalError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const { name, code, syscall, errno, message } = error as { name?: unknown; code?: unknown; syscall?: unknown; errno?: unknown; message?: unknown };
+  if (name === "PostgresError" || typeof syscall === "string" || errno !== undefined) return true;
+  if (typeof code === "string" && INTERNAL_CODE.test(code)) return true;
+  return typeof message === "string" && INTERNAL_MESSAGE.test(message);
 }
 
 /** A short code for an error (ECONNREFUSED, 28P01, ...) that names no host, address or account. */
