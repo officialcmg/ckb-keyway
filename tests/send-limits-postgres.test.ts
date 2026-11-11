@@ -264,3 +264,113 @@ test("a token without an amount of its own sends without a code through the serv
     await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
   });
 });
+
+/** Turns limits on (genesis committed) at this CKB amount; returns a setter and a reader for the server's amounts. */
+async function limitsOn(world: ReturnType<typeof chain>, context: SigningContext, sent: ccc.Transaction[], amount: bigint) {
+  const set = (value: bigint | null, extra: Record<string, unknown> = {}) => signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: value?.toString() ?? null, ...extra }) as Promise<Record<string, unknown>>;
+  const amounts = async () => ((await signingSettings(context, { operation: "get" })) as { dailyAmounts: Record<string, string> }).dailyAmounts;
+  const asked = await set(amount);
+  await set(amount, { confirmationNonce: asked.confirmationNonce, emailCode: codeFrom(world) });
+  world.add(sent.at(-1)!, "committed");
+  return { set, amounts };
+}
+
+test("send-limit settings changes are rate limited, and nothing is signed when the cell already holds the amounts (audit M23)", { skip: !enabled }, async (t) => {
+  const { world, user, context, sent } = await setUp();
+  t.after(() => { litSignerOverride.mode = undefined; });
+  const limited: string[] = [];
+  let allow = true;
+  context.rateLimit = async (key) => { limited.push(key); return { allowed: allow, retryAfter: allow ? null : 42 }; };
+  let signings = 0;
+  const run = litPolicyRunner.run;
+  litPolicyRunner.run = async (config, params) => { if ((params as { mode?: string }).mode !== "send-code") signings++; return run(config, params); };
+  t.after(() => { litPolicyRunner.run = run; });
+
+  const { set } = await limitsOn(world, context, sent, 150n * CKB);
+  assert.ok(limited.includes(`sign:${user.id}`), "a settings change counts as a signing request");
+
+  // The same amounts the cell already holds: nothing to build, sign or send.
+  const before = { sent: sent.length, signings };
+  assert.deepEqual((await set(150n * CKB)).dailyAmounts, { ckb: (150n * CKB).toString() });
+  assert.equal(sent.length, before.sent, "no transaction for an unchanged amount");
+  assert.equal(signings, before.signings, "no Lit signing for an unchanged amount");
+
+  allow = false;
+  await assert.rejects(set(100n * CKB), /Too many signing requests/);
+  assert.equal(sent.length, before.sent);
+
+  t.after(async () => {
+    const sql = await database();
+    await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
+  });
+});
+
+test("a send-limit change never leaves the server's daily amounts looser than the chain's (audit L2)", { skip: !enabled }, async (t) => {
+  const { world, user, context, sent } = await setUp();
+  t.after(() => { litSignerOverride.mode = undefined; });
+  const { set, amounts } = await limitsOn(world, context, sent, 150n * CKB);
+
+  // Lowering it: the node takes the change, then the server goes away before it hears back. The server's amount,
+  // the one hosted Fiber payments use, is already the lower one.
+  const broadcast = context.broadcast!;
+  context.broadcast = async (tx) => { await broadcast(tx); throw new Error("connection reset"); };
+  await assert.rejects(set(10n * CKB), /connection reset/);
+  assert.deepEqual(await amounts(), { ckb: (10n * CKB).toString() });
+  world.add(sent.at(-1)!, "committed");
+
+  // Raising it fails to send: the server keeps the stricter amount.
+  context.broadcast = async () => { throw new Error("connection reset"); };
+  const raise = await set(1_000n * CKB);
+  assert.equal(raise.requiresEmailCode, true);
+  await assert.rejects(set(1_000n * CKB, { confirmationNonce: raise.confirmationNonce, emailCode: codeFrom(world) }), /connection reset/);
+  assert.deepEqual(await amounts(), { ckb: (10n * CKB).toString() });
+
+  t.after(async () => {
+    const sql = await database();
+    await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
+  });
+});
+
+test("loosening amounts kept on the server alone goes through the server's code, showing them before and after (audit L13)", { skip: !enabled }, async (t) => {
+  const { world, user, context, sent } = await setUp();
+  t.after(() => { litSignerOverride.mode = undefined; });
+  // An amount the account chose while it couldn't afford the send-limit cell, so the server alone keeps it.
+  const sql = await database();
+  await sql`insert into keyway_v2_daily_amounts (user_id, asset, amount) values (${user.id}, 'ckb', ${(10n * CKB).toString()})`;
+  const emails: string[] = [];
+  context.sendEmail = async (_to, message) => { emails.push(message.plaintext); };
+  const litEmails = world.lit.emails.length;
+
+  const asked = await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (100n * CKB).toString() }) as { requiresEmailCode: boolean; enforcedByLit: boolean; confirmationNonce: string };
+  assert.equal(asked.requiresEmailCode, true);
+  assert.equal(asked.enforcedByLit, false);
+  assert.equal(world.lit.emails.length, litEmails, "not a 'turn on daily send limits' email from the Action");
+  assert.equal(sent.length, 0);
+  assert.match(emails.at(-1)!, /Email confirmation for CKB: once 10 CKB is sent in 24 hours/);
+  assert.match(emails.at(-1)!, /Change: once 100 CKB is sent in 24 hours/);
+  const code = /\b(\d{6})\b/.exec(emails.at(-1)!)![1];
+  const done = await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (100n * CKB).toString(), confirmationNonce: asked.confirmationNonce, emailCode: code }) as { dailyAmounts: Record<string, string> };
+  assert.deepEqual(done.dailyAmounts, { ckb: (100n * CKB).toString() });
+  assert.equal(sent.length, 0);
+});
+
+test("daily amounts the send-limit cell can't hold are refused, so turning limits on can't fail later (audit M28)", { skip: !enabled }, async (t) => {
+  const { world, context, sent } = await setUp();
+  t.after(() => { litSignerOverride.mode = undefined; });
+  // The server's own amounts (a test signer, so nothing is built on chain), as an account without the cell keeps them.
+  const serverOnly = { ...context, signDigest: async () => "0x" as ccc.Hex };
+  const set = (asset: string, amount: bigint | null) => signingSettings(serverOnly, { operation: "set-daily-amount", asset, amount: amount?.toString() ?? null });
+  const token = (i: number) => `0x${i.toString(16).padStart(2, "0").repeat(32)}`;
+
+  await assert.rejects(set(token(1), 1n << 128n), /too large/);
+  await assert.rejects(set("ckb", (1n << 64n) - 1n), /too large/, "the cell's own 'no limit' value");
+  for (let i = 1; i <= 8; i++) await set(token(i), 1_000n);
+  await assert.rejects(set(token(9), 1_000n), /At most 8 tokens/);
+  await set(token(8), 10n);
+
+  // Turning limits on from these amounts still builds the cell.
+  const asked = await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (100n * CKB).toString() }) as { requiresEmailCode: boolean; confirmationNonce: string };
+  assert.equal(asked.requiresEmailCode, true);
+  await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (100n * CKB).toString(), confirmationNonce: asked.confirmationNonce, emailCode: codeFrom(world) });
+  assert.equal(decodeSendLimitSettings(sent.at(-1)!.outputsData[0]).tokens.size, 8);
+});

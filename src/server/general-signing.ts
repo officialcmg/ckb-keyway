@@ -8,7 +8,16 @@ import { database, type DatabaseSql } from "./database.ts";
 import { createConfirmationEmailTemplate } from "./email-template.ts";
 import { formatCkbSignature, serializeTransaction, signAccountGroups, signingGroups, type SigningGroup } from "./funding-transaction.ts";
 import { accountLocks, secp256k1Lock } from "../sdk/browser/account-lock.ts";
-import { DEFAULT_DAILY_LIMIT_SHANNONS, SEND_LIMIT_OFFER_MINIMUM, settingsFromDailyAmounts, type SendLimitHead } from "../sdk/browser/send-limits.ts";
+import {
+  decodeSendLimitSettings,
+  DEFAULT_DAILY_LIMIT_SHANNONS,
+  MAX_SEND_LIMIT_TOKENS,
+  SEND_LIMIT_OFFER_MINIMUM,
+  SEND_LIMIT_UNLIMITED,
+  settingsFromDailyAmounts,
+  type SendLimitHead,
+  type SendLimitSettings,
+} from "../sdk/browser/send-limits.ts";
 import { loadLitAction } from "./lit-actions.ts";
 import { LIT_ACTION_CIDS } from "./lit-config.ts";
 import { signCkbDigest } from "./lit.ts";
@@ -307,15 +316,19 @@ export async function signingSettings(context: SigningContext, body: Record<stri
   });
   if (body.operation === "get") return view(current);
   if (body.operation !== "set-daily-amount") throw new Error("A valid settings operation is required");
+  // A change can sign and send a send-limit transaction and look up the chain, so it is limited like a signing.
+  await limit(context, "sign", { max: 10, window: 60 });
   const change = { asset: parseAsset(body.asset), amount: parseThreshold(body.amount) };
   const next = new Map(current);
   if (change.amount === null) next.delete(change.asset); else next.set(change.asset, change.amount);
+  refuseUnencodable(current, next, change);
   if (!context.signDigest && litPolicyEnabled()) {
     const onChain = await sendLimitSettings(context, body, current, next, change);
     if (onChain) return { ...view(onChain.amounts), enforcedByLit: true, ...onChain.response };
   }
   // Below: the amounts live on the server only (no policy signer, or the account can't make the cell yet).
   const serverOnly = !context.signDigest && litPolicyEnabled() ? { enforcedByLit: false } : {};
+  if (sameAmounts(current, next)) return { ...view(current), ...serverOnly };
   if (!weakens(current, next)) {
     await writeDailyAmount(context.user, change.asset, change.amount);
     return { ...view(next), ...serverOnly };
@@ -361,6 +374,14 @@ async function sendLimitSettings(
     const head = await sendLimitHead(client, context.wallet, pending);
     // Cells the account's pending sends already spent are never picked again (the same as a client does).
     for (const { transaction, status } of pending) if (status === "pending" || status === "proposed") await client.cache.markTransactions(transaction);
+    // Loosening amounts kept on the server only goes through the server's own code, whose email shows them before
+    // and after; turning send limits on would ask only to "turn on" limits, hiding the stricter amounts it replaces.
+    if (!head && weakens(current, next)) return undefined;
+    // The cell already holds these amounts: nothing to sign. The server's copy follows the chain's.
+    if (head && sameSettings(decodeSendLimitSettings(head.outputData), settings)) {
+      await writeDailyAmount(context.user, change.asset, change.amount);
+      return { amounts: next };
+    }
     let transaction: ccc.Transaction;
     try {
       transaction = head ? await buildSendLimitChange(client, context.wallet, head, settings) : await buildSendLimitGenesis(client, context.wallet, settings);
@@ -372,8 +393,7 @@ async function sendLimitSettings(
     const plan = await planSendLimits(context.wallet, transaction);
     applySendLimitRecord(transaction, plan);
     if (!plan.needsCode) {
-      await signAndSendSettings(context, client, transaction, {});
-      await writeDailyAmount(context.user, change.asset, change.amount);
+      await serverAmountsAround(context.user, current, next, change, () => signAndSendSettings(context, client, transaction, {}));
       return { amounts: next };
     }
     const lines = [
@@ -395,10 +415,24 @@ async function sendLimitSettings(
   if (typeof request.summary.litFingerprint === "string") withFingerprint(transaction, request.summary.litFingerprint);
   const emailCode = parseLitEmailCode(body.emailCode, request.summary.litTicket);
   await countLitCodeAttempt(context.user, "settings", nonce);
-  await signAndSendSettings(context, client, transaction, { email: await context.email(), emailCode });
-  await consumeRequest(context.user, "settings", nonce);
-  await writeDailyAmount(context.user, change.asset, change.amount);
+  await serverAmountsAround(context.user, current, next, change, async () => {
+    await signAndSendSettings(context, client, transaction, { email: await context.email(), emailCode });
+    await consumeRequest(context.user, "settings", nonce);
+  });
   return { amounts: next };
+}
+
+/**
+ * Writes the server's copy of a send-limit change around signing and sending it. The server's amounts alone gate
+ * hosted Fiber payments, so they must never end up looser than the chain: a change that tightens them is written
+ * before the transaction is sent (a crash or a failed write after the broadcast can't lose it), and one that loosens
+ * them only after (a send that fails leaves them stricter). Setting the chain's amounts again brings them in line.
+ */
+async function serverAmountsAround(user: User, current: DailyAmounts, next: DailyAmounts, change: { asset: string; amount: bigint | null }, send: () => Promise<void>): Promise<void> {
+  const tightens = !weakens(current, next);
+  if (tightens) await writeDailyAmount(user, change.asset, change.amount);
+  await send();
+  if (!tightens) await writeDailyAmount(user, change.asset, change.amount);
 }
 
 async function signAndSendSettings(context: SigningContext, client: ccc.Client, transaction: ccc.Transaction, options: { email?: string; emailCode?: LitEmailCode }): Promise<void> {
@@ -421,6 +455,30 @@ async function signAndSendSettings(context: SigningContext, client: ccc.Client, 
  */
 export function dailyAllowance(amounts: DailyAmounts, asset: string): bigint | "unlimited" {
   return amounts.get(asset) ?? "unlimited";
+}
+
+/** Whether two sets of daily amounts are the same. */
+function sameAmounts(a: DailyAmounts, b: DailyAmounts): boolean {
+  return a.size === b.size && [...a].every(([asset, amount]) => b.get(asset) === amount);
+}
+
+/** Whether two send-limit settings hold the same amounts (the bound email aside). */
+function sameSettings(a: Omit<SendLimitSettings, "fingerprint">, b: Omit<SendLimitSettings, "fingerprint">): boolean {
+  return a.ckb === b.ckb && a.tokensUnlimited === b.tokensUnlimited && a.tokens.size === b.tokens.size
+    && [...a.tokens].every(([asset, amount]) => b.tokens.get(asset) === amount);
+}
+
+/**
+ * Daily amounts are written to the account's send-limit cell, so a new one must fit there: at most eight tokens, a
+ * CKB amount below the cell's "no limit" value and a token amount within 16 bytes. Otherwise the cell could never
+ * be made (and every send that has to make it would fail) or would read as a different amount. Removing an amount
+ * is always allowed.
+ */
+function refuseUnencodable(current: DailyAmounts, next: DailyAmounts, change: { asset: string; amount: bigint | null }): void {
+  if (change.amount === null) return;
+  if (change.asset === "ckb" ? change.amount >= SEND_LIMIT_UNLIMITED : change.amount >= 1n << 128n) throw new Error("That amount is too large");
+  const tokens = (amounts: DailyAmounts) => [...amounts.keys()].filter((asset) => asset !== "ckb").length;
+  if (tokens(next) > MAX_SEND_LIMIT_TOKENS && tokens(next) > tokens(current)) throw new Error(`At most ${MAX_SEND_LIMIT_TOKENS} tokens can have their own daily amount`);
 }
 
 /** A change weakens protection if any asset can then send more: an amount raised or removed. */
