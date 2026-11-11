@@ -179,7 +179,9 @@ async function legacyCleanupRequest(request: Request): Promise<Response> {
 
 async function verifyCodeRequest(request: Request): Promise<Response> {
   const { challengeId, code } = await objectBody(request, "Invalid email OTP verification");
-  if (typeof challengeId !== "string" || !challengeId) throw new Error("OTP challenge is required");
+  if (typeof challengeId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(challengeId)) {
+    throw new Error("A valid OTP challenge is required");
+  }
   if (typeof code !== "string" || !/^\d{6}$/.test(code)) throw new Error("Enter the six-digit code");
   return Response.json(await verifyEmailCode(request, challengeId, code));
 }

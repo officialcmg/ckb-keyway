@@ -8,6 +8,7 @@ import { authSchemaOptions } from "../src/server/auth-options.ts";
 import { database, withUserLock } from "../src/server/database.ts";
 import { addApplicationOrigin, createApplication, otpSubject, prepareOtpSend, removeApplicationOrigin } from "../src/server/applications.ts";
 import { closeAuthPool, sendEmailCode, sessionForRequest, setAuthDeliveryForTests, verifyEmailCode } from "../src/server/auth.ts";
+import { handleKeyWayRequest } from "../src/server/http.ts";
 
 // Login codes, their limits, the per-user lock and app sessions, against a database of their own: some of these
 // fill the connection pool or count every login-code event, so other test files must not share it.
@@ -476,4 +477,22 @@ test("sessions without the origin they were issued at are refused", { skip }, as
   // As a session from before sessions recorded their origin.
   await sql`update keyway_auth_sessions set "origin" = null where "scopeId" = ${appId}`;
   await assert.rejects(sessionForRequest(appRequest(appId, origin, "192.0.2.112", sessionToken)), /Session/);
+});
+
+test("expired login challenges are removed, and a challenge ID must be a UUID", { skip }, async () => {
+  const { sql } = await setup();
+  const origin = "https://prune.example";
+  const { appId } = await application([origin]);
+  const old = await sendEmailCode(appRequest(appId, origin, "192.0.2.150"), email());
+  await sql`update keyway_auth_challenges set expires_at = now() - interval '1 second' where id = ${old.challengeId}`;
+  await sendEmailCode(appRequest(appId, origin, "192.0.2.151"), email());
+  assert.equal((await sql`select 1 from keyway_auth_challenges where id = ${old.challengeId}`).length, 0);
+  const response = await handleKeyWayRequest(new Request("http://localhost:3001/api/v1/keyway/auth/verify-code", {
+    method: "POST",
+    headers: { ...Object.fromEntries(appRequest(appId, origin, "192.0.2.152").headers), "Content-Type": "application/json" },
+    body: JSON.stringify({ challengeId: "not-a-challenge", code: "123456" }),
+  }));
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).error, /valid OTP challenge/);
+  await assert.rejects(verifyEmailCode(appRequest(appId, origin, "192.0.2.152"), `${old.challengeId}0`, "123456"), /Incorrect or expired/);
 });

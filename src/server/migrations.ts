@@ -426,6 +426,8 @@ export const migrations: Array<{
       // The source (IP address or IPv6 /64) that asked for each login code and the wrong codes tried on it, so the
       // person who asked can still use a fresh code while wrong codes from others pause the email's checks.
       await sql`alter table keyway_auth_challenges add column ip_hash text, add column wrong_attempts integer not null default 0`;
+      // Expired challenges are removed as new ones are made.
+      await sql`create index keyway_auth_challenges_expiry on keyway_auth_challenges (expires_at)`;
       // The network (IPv4 address or IPv6 /48) of each login-code event, and whether a wrong code was tried while
       // the email's checks were paused.
       await sql`alter table keyway_otp_events add column network_hash text, add column bypass boolean not null default false`;

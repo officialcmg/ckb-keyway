@@ -23,6 +23,7 @@ const requestEmails = new WeakMap<Request, string>();
 let pool: Pool | undefined;
 const instances = new Map<string, Promise<Awaited<ReturnType<typeof createScopedAuth>>>>();
 let delivery: EmailDelivery = sendOtpEmail;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function setAuthDeliveryForTests(callback: EmailDelivery): void {
   if (process.env.NODE_ENV !== "test") throw new Error("Test delivery is unavailable outside tests");
@@ -139,6 +140,8 @@ export async function sendEmailCode(request: Request, emailInput: string): Promi
     // Also applies the 60-second wait between codes, counted per requester so a stranger's request doesn't delay yours.
     const context = await prepareOtpSend({ appId: scope.id === "dashboard" ? undefined : scope.id, email, ipAddress: requestIp(request) });
     const challengeId = randomUUID();
+    // Expired challenges are no use to anyone, and hold the emails people typed.
+    await sql`delete from keyway_auth_challenges where id in (select id from keyway_auth_challenges where expires_at < now() limit 100)`;
     // Earlier challenges for this email stay open: each has its own code, and anyone may ask for one.
     await sql`insert into keyway_auth_challenges (id, scope_id, email, expires_at, status, ip_hash)
       values (${challengeId}, ${scope.id}, ${email}, ${new Date(Date.now() + 600_000)}, 'pending', ${context.ipHash})`;
@@ -161,14 +164,15 @@ export async function sendEmailCode(request: Request, emailInput: string): Promi
 }
 
 export async function verifyEmailCode(request: Request, challengeId: string, code: string) {
+  if (!UUID.test(challengeId)) throw new Error("Incorrect or expired code");
   const scope = await resolveAuthScope(request);
   const sql = await database();
-  const [challenge] = await sql<Array<{ email: string }>>`select email from keyway_auth_challenges where id::text = ${challengeId} and scope_id = ${scope.id}`;
+  const [challenge] = await sql<Array<{ email: string }>>`select email from keyway_auth_challenges where id = ${challengeId}::uuid and scope_id = ${scope.id}`;
   if (!challenge) throw new Error("Incorrect or expired code");
   return withLoginCodeLock(`otp:${scope.id}:${challenge.email}`, async (connection) => {
     const [current] = await connection<Array<{ ip_hash: string | null; wrong_attempts: number }>>`
       select ip_hash, wrong_attempts from keyway_auth_challenges
-      where id::text = ${challengeId} and scope_id = ${scope.id} and status = 'sent' and expires_at > now()`;
+      where id = ${challengeId}::uuid and scope_id = ${scope.id} and status = 'sent' and expires_at > now()`;
     if (!current) throw new Error("Incorrect or expired code");
     const context = otpSubject(scope.id, challenge.email, requestIp(request));
     const { bypass } = await checkOtpFailures(context, { ipHash: current.ip_hash, wrongAttempts: current.wrong_attempts });
@@ -179,7 +183,7 @@ export async function verifyEmailCode(request: Request, challengeId: string, cod
       const identifier = `keyway:${scope.id}:${challengeId}:sign-in-otp-${challenge.email}`;
       const [open] = response.status === 400 ? await connection`select 1 from keyway_auth_verifications where identifier = ${identifier}` : [];
       if (open) {
-        await connection`update keyway_auth_challenges set wrong_attempts = wrong_attempts + 1 where id = ${challengeId}`;
+        await connection`update keyway_auth_challenges set wrong_attempts = wrong_attempts + 1 where id = ${challengeId}::uuid`;
         await recordOtpVerification(context, "verify_failed", bypass);
       }
       throw new Error(response.status === 429 ? "Too many authentication requests" : "Incorrect or expired code");
