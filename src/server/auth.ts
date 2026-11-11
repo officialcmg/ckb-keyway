@@ -207,8 +207,8 @@ export async function sessionForRequest(request: Request) {
     const response = await callAuthEndpoint(request, scope, "/get-session");
     const result = await response.json();
     if (!response.ok || !result?.session || result.session.scopeId !== scope.id) throw new Error("Session is invalid for this application");
-    // A session issued at an origin the app no longer allows ends with it.
-    if (result.session.origin && !scope.origins.includes(result.session.origin)) throw new Error("Session is invalid for this application");
+    // A session issued at an origin the app no longer allows ends with it. Every session has one (migration 23).
+    if (typeof result.session.origin !== "string" || !scope.origins.includes(result.session.origin)) throw new Error("Session is invalid for this application");
     if (typeof result.user.email === "string") requestEmails.set(request, result.user.email);
     return { user: await keywayUser(result.user.id, scope.id), expiresAt: result.session.expiresAt as string, sessionToken: response.headers.get("set-auth-token") ?? undefined };
   })());

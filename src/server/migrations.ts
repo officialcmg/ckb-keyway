@@ -401,4 +401,10 @@ export const migrations: Array<{
     // close reopens it only when it can punish that commitment.
     up: (sql) => sql`alter table keyway_v2_watchtower_channels add column closing_commitment_number numeric(20, 0)`,
   },
+  {
+    version: 23, name: "session-origin-required",
+    // Every session issued since version 21 has the origin it was issued at. The older ones have none, so removing an
+    // origin could never end them; they are signed out, and sessions without an origin are refused.
+    up: (sql) => sql`delete from keyway_auth_sessions where "origin" is null`,
+  },
 ];

@@ -379,3 +379,16 @@ test("removing an origin ends the sessions signed in there", { skip }, async () 
   await assert.rejects(sessionForRequest(appRequest(appId, "https://kept.example", "192.0.2.110", sessionToken)), /Session/);
   assert.ok(await sessionForRequest(appRequest(appId, "https://kept.example", "192.0.2.111", keptLogin.sessionToken)));
 });
+
+test("sessions without the origin they were issued at are refused", { skip }, async () => {
+  const { sql, codes } = await setup();
+  const origin = "https://origin.example";
+  const { appId } = await application([origin]);
+  const user = email();
+  const { challengeId } = await sendEmailCode(appRequest(appId, origin, "192.0.2.112"), user);
+  const { sessionToken } = await verifyEmailCode(appRequest(appId, origin, "192.0.2.112"), challengeId, codes.get(`${appId}:${user}`)!);
+  assert.ok(await sessionForRequest(appRequest(appId, origin, "192.0.2.112", sessionToken)));
+  // As a session from before sessions recorded their origin.
+  await sql`update keyway_auth_sessions set "origin" = null where "scopeId" = ${appId}`;
+  await assert.rejects(sessionForRequest(appRequest(appId, origin, "192.0.2.112", sessionToken)), /Session/);
+});
