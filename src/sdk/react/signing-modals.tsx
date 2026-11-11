@@ -373,7 +373,7 @@ export function KeyWayRecoveryModal({ theme, appName, preview, step, answer }: A
             <Row palette={palette} label="Locked for the recovery list" value={`${preview.adminListCkb} CKB`} />
             {preview.tokenCellsExtraCkb !== "0" && <Row palette={palette} label="Locked in token cells" value={`${preview.tokenCellsExtraCkb} CKB`} />}
             <Row palette={palette} label="Network fee" value={`${preview.feeCkb} CKB`} />
-            <Row palette={palette} label="New address" value={shortAddress(preview.newAddress)} />
+            <Row palette={palette} label="New address" value={preview.newAddress} />
             <Row palette={palette} label="Network" value={preview.network} mono={false} />
           </dl>
           <p role="note" style={errorNote(palette)}>Your address will change because you&apos;re turning on recovery.</p>
@@ -383,7 +383,6 @@ export function KeyWayRecoveryModal({ theme, appName, preview, step, answer }: A
           </p>
           <details style={{ ...details, color: palette.muted }}>
             <summary style={{ cursor: "pointer" }}>Details</summary>
-            <p style={detailLine}>New address {preview.newAddress}</p>
             <p style={detailLine}>Transaction {preview.transactionHash}</p>
           </details>
           <Actions palette={palette} confirm="Turn on recovery" busyLabel="Sending code…" step={step} answer={answer} />

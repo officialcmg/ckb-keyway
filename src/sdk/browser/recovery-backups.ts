@@ -189,10 +189,22 @@ export function parseBackups(value: unknown): RecoveryBackup[] {
   return backups;
 }
 
-/** How a backup is named in previews, dialogs and emails. */
+/**
+ * How a backup is named in messages: by its whole address. A shortened one keeps only the start, which every JoyID
+ * address shares, and the checksum, which someone could grind a look-alike address to match.
+ */
 export function describeBackup(backup: RecoveryBackup): string {
-  const short = (value: string) => value.length <= 20 ? value : `${value.slice(0, 10)}…${value.slice(-6)}`;
-  return backup.kind === "evm" ? `EVM wallet ${short(backup.address)}` : `JoyID ${short(backup.address)}`;
+  return backup.kind === "evm" ? `EVM wallet ${backup.address}` : `JoyID ${backup.address}`;
+}
+
+/**
+ * How a backup is named where the user approves it (previews, dialogs and the emailed code): its whole address,
+ * an EVM wallet's in lowercase hex and a JoyID passkey's as the full CKB address of its main-key lock, the form
+ * JoyID shows and the policy Action's email uses, whatever form the address was given in.
+ */
+export async function backupLabel(client: ccc.Client, backup: RecoveryBackup): Promise<string> {
+  if (backup.kind === "evm") return `EVM wallet ${normalizeEvmAddress(backup.address)}`;
+  return `JoyID ${ccc.Address.fromScript(await joyIdLock(client, backup.address), client).toString()}`;
 }
 
 /** How long a backup has to sign the recovery challenge after KeyWay issues its nonce. */

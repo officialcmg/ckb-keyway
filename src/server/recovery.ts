@@ -1,7 +1,7 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import * as ccc from "@ckb-ccc/core";
 import { adminListLock, adminListTypeScript, keywayOmnilock, omnilockArgsFor, omnilockScript, secp256k1Lock, verifyRecoveryAnchor, OMNILOCK_OWNER_WITNESS_LOCK_LENGTH, type KeyWayRecovery } from "../sdk/browser/account-lock.ts";
-import { BACKUP_CHALLENGE_TTL_MS, backupChallengeExpiry, describeBackup, MAX_RECOVERY_BACKUPS, parseBackup, parseBackups, verifyBackupOwnership, type RecoveryBackup } from "../sdk/browser/recovery-backups.ts";
+import { BACKUP_CHALLENGE_TTL_MS, backupChallengeExpiry, backupLabel, describeBackup, MAX_RECOVERY_BACKUPS, parseBackup, parseBackups, verifyBackupOwnership, type RecoveryBackup } from "../sdk/browser/recovery-backups.ts";
 import { backupAuths, readRecoveryList, recoveryListRecord, recoveryListRecordOf, recoverySalt, setRecoveryListRecord } from "../sdk/browser/recovery-list.ts";
 import { adminListData, whitelistTree } from "../sdk/browser/recovery-smt.ts";
 import { addTokenCellDeps } from "../sdk/browser/settlement-sweep.ts";
@@ -408,7 +408,7 @@ export async function planRecovery(client: ccc.Client, wallet: ReadyWallet, back
       network: "CKB testnet",
       newAddress: ccc.Address.fromScript(omnilock, client).toString(),
       legacyAddress: ccc.Address.fromScript(secp, client).toString(),
-      backups: backups.map((backup) => ({ ...backup, label: describeBackup(backup) })),
+      backups: await Promise.all(backups.map(async (backup) => ({ ...backup, label: await backupLabel(client, backup) }))),
       adminListCkb: formatCkb(adminList.capacity),
       minimumCellCkb: formatCkb(minimum),
       tokenCellsExtraCkb: formatCkb(tokenExtra),
@@ -470,12 +470,12 @@ export async function checkRecoveryTransaction(client: ccc.Client, transaction: 
   if (fee <= 0n || fee > cap) refuse("the fee is outside KeyWay's limit");
 }
 
-/** Lines for the confirmation email, naming the backups. */
+/** Lines for the confirmation email, naming the backups and the new address in full. */
 export function recoveryLines(preview: RecoveryPreview): string[] {
   return [
     "Turn on account recovery",
     ...preview.backups.map(({ label }) => `Backup: ${label}`),
-    `New address: ${preview.newAddress.slice(0, 12)}…${preview.newAddress.slice(-6)}`,
+    `New address: ${preview.newAddress}`,
     "Your address will change because you're turning on recovery.",
     `Locks ${preview.lockedCkb} CKB (${preview.adminListCkb} CKB for the recovery list)`,
     `Network fee ${preview.feeCkb} CKB`,
@@ -683,15 +683,15 @@ export async function planBackupChange(client: ccc.Client, wallet: ReadyWallet, 
   }
   if (funded < minimum + fee) throw new Error(`Your balance can't cover changing backups: it needs ${formatCkb(minimum + fee - funded)} CKB more`);
   transaction.outputs[1].capacity = funded - fee;
-  const label = (backup: RecoveryBackup) => ({ ...backup, label: describeBackup(backup) });
+  const label = async (backup: RecoveryBackup) => ({ ...backup, label: await backupLabel(client, backup) });
   return {
     transaction, omnilock, listLock, adminList, backups, previousBackups: current,
     previousRecord: recoveryListRecord(await backupAuths(client, current, recoverySalt(recovery))),
     preview: {
       network: "CKB testnet",
       change: change.change,
-      backup: label(change.backup),
-      backups: backups.map(label),
+      backup: await label(change.backup),
+      backups: await Promise.all(backups.map(label)),
       feeCkb: formatCkb(fee),
       transactionHash: transaction.hash(),
     },
