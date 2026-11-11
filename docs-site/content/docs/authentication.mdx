@@ -80,6 +80,7 @@ KeyWay limits sign-in codes so one app, inbox or network can't flood the system:
 | Codes per app | 30 a minute, shared by all of the app's users |
 | Code lifetime | 10 minutes |
 | Wrong attempts per code | 5, then request a new code |
+| Wrong codes per email address | Capped per day. Past the cap, a newly requested code still works on its first try |
 
 When a limit is reached, the sign-in modal shows "Too many login codes requested. Try again later". If your app needs more than 30 codes a minute (for a launch, say), open an issue on [GitHub](https://github.com/officialcmg/ckb-keyway/issues) and we'll raise it for your app.
 

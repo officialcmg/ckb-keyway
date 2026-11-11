@@ -140,7 +140,8 @@ export async function sendEmailCode(request: Request, emailInput: string): Promi
     const context = await prepareOtpSend({ appId: scope.id === "dashboard" ? undefined : scope.id, email, ipAddress: requestIp(request) });
     const challengeId = randomUUID();
     // Earlier challenges for this email stay open: each has its own code, and anyone may ask for one.
-    await sql`insert into keyway_auth_challenges (id, scope_id, email, expires_at, status) values (${challengeId}, ${scope.id}, ${email}, ${new Date(Date.now() + 600_000)}, 'pending')`;
+    await sql`insert into keyway_auth_challenges (id, scope_id, email, expires_at, status, ip_hash)
+      values (${challengeId}, ${scope.id}, ${email}, ${new Date(Date.now() + 600_000)}, 'pending', ${context.ipHash})`;
     try {
       const deliveryState = { challengeId, delivered: false };
       const response = await challengeContext.run(deliveryState, () => callAuthEndpoint(request, scope, "/email-otp/send-verification-otp", { email, type: "sign-in" }));
@@ -165,17 +166,22 @@ export async function verifyEmailCode(request: Request, challengeId: string, cod
   const [challenge] = await sql<Array<{ email: string }>>`select email from keyway_auth_challenges where id::text = ${challengeId} and scope_id = ${scope.id}`;
   if (!challenge) throw new Error("Incorrect or expired code");
   return withLoginCodeLock(`otp:${scope.id}:${challenge.email}`, async (connection) => {
-    const [current] = await connection`select 1 from keyway_auth_challenges where id::text = ${challengeId} and scope_id = ${scope.id} and status = 'sent' and expires_at > now()`;
+    const [current] = await connection<Array<{ ip_hash: string | null; wrong_attempts: number }>>`
+      select ip_hash, wrong_attempts from keyway_auth_challenges
+      where id::text = ${challengeId} and scope_id = ${scope.id} and status = 'sent' and expires_at > now()`;
     if (!current) throw new Error("Incorrect or expired code");
     const context = otpSubject(scope.id, challenge.email, requestIp(request));
-    await checkOtpFailures(context);
+    const { bypass } = await checkOtpFailures(context, { ipHash: current.ip_hash, wrongAttempts: current.wrong_attempts });
     const response = await withOtpChallenge(challengeId, () => callAuthEndpoint(request, scope, "/sign-in/email-otp", { email: challenge.email, otp: code }));
     if (!response.ok) {
       // Count a wrong code only when Better Auth compared it. After a wrong code it keeps the record (one more attempt
       // used); a rate-limit refusal, a server error, or a code already used up or expired leaves nothing to guess at.
       const identifier = `keyway:${scope.id}:${challengeId}:sign-in-otp-${challenge.email}`;
       const [open] = response.status === 400 ? await connection`select 1 from keyway_auth_verifications where identifier = ${identifier}` : [];
-      if (open) await recordOtpVerification(context, "verify_failed");
+      if (open) {
+        await connection`update keyway_auth_challenges set wrong_attempts = wrong_attempts + 1 where id = ${challengeId}`;
+        await recordOtpVerification(context, "verify_failed", bypass);
+      }
       throw new Error(response.status === 429 ? "Too many authentication requests" : "Incorrect or expired code");
     }
     const result = await response.json();
