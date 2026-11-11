@@ -338,3 +338,11 @@ test("L5: first-time wallet setup holds no wallet lock while Lit works", { skip 
     assert.equal(busy.headers.get("retry-after"), "5");
   });
 });
+
+test("L16: a database error caused by the request's own input is a 400, not an outage", { skip }, async () => {
+  const { user, call } = await signedIn();
+  await saveWallet(user, readyWallet(DEVICE_A));
+  const response = await call("device-lease", { operation: "heartbeat", deviceIdHash: DEVICE_A, leaseId: "not-a-uuid" });
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: "The request is invalid" });
+});

@@ -96,13 +96,14 @@ test("readiness checks tell anonymous callers only ready or unavailable", async 
 });
 
 test("database and DNS failures inside the API get a fixed message", async (t) => {
-  const saved = process.env.DATABASE_URL;
+  const saved = { database: process.env.DATABASE_URL, dashboard: process.env.KEYWAY_DASHBOARD_ORIGINS };
   const error = console.error;
   const logged: unknown[][] = [];
   console.error = (...args: unknown[]) => { logged.push(args); };
   t.after(() => {
     console.error = error;
-    if (saved === undefined) delete process.env.DATABASE_URL; else process.env.DATABASE_URL = saved;
+    if (saved.database === undefined) delete process.env.DATABASE_URL; else process.env.DATABASE_URL = saved.database;
+    if (saved.dashboard === undefined) delete process.env.KEYWAY_DASHBOARD_ORIGINS; else process.env.KEYWAY_DASHBOARD_ORIGINS = saved.dashboard;
   });
   process.env.KEYWAY_DASHBOARD_ORIGINS = "https://wallet.example";
   process.env.DATABASE_URL = "postgres://keyway:not-a-secret@db.internal.invalid:5432/keyway";

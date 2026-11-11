@@ -89,6 +89,11 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
     return response;
   } catch (error) {
     // Database, network and DNS failures name internal hosts: callers get one plain sentence, operators a code.
+    // A Postgres data or constraint error (SQLSTATE class 22 or 23) comes from the request's own input.
+    if (isInputError(error)) {
+      console.error("[keyway] request failed", { status: 400, cause: "input", code: errorCode(error) });
+      return jsonError("The request is invalid", 400, cors);
+    }
     if (isInternalError(error)) {
       console.error("[keyway] request failed", { status: 503, cause: "internal", code: errorCode(error) });
       return jsonError("KeyWay is temporarily unavailable. Try again in a moment.", 503, cors);
@@ -124,6 +129,12 @@ async function readiness(check: string, probe: () => Promise<unknown>, cors: Hea
 
 const INTERNAL_CODE = /^(CONNECT_TIMEOUT|CONNECTION_[A-Z_]+|E[A-Z]+|[0-9A-Z]{5})$/;
 const INTERNAL_MESSAGE = /CONNECT_TIMEOUT|CONNECTION_(CLOSED|ENDED|DESTROYED)|ECONN|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|getaddrinfo|DATABASE_URL/;
+
+export function isInputError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const { name, code } = error as { name?: unknown; code?: unknown };
+  return name === "PostgresError" && typeof code === "string" && /^2[23][0-9A-Z]{3}$/.test(code);
+}
 
 /**
  * A database, network or DNS error rather than one of KeyWay's own: a Postgres error, a Node system error, a
