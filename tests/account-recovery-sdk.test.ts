@@ -246,7 +246,7 @@ async function recoveryFixture() {
       return JSON.stringify({ alg: -7, signature: Buffer.from(der).toString("base64url"), message: Buffer.from(ccc.bytesConcat(authData, clientData)).toString("base64url") });
     },
   } as unknown as ccc.Signer;
-  const spend = (entry: (typeof list)[number]) => ({ client, lock, omnilock: KEYWAY_OMNILOCK.testnet, auths: list.map(({ auth }) => auth), entry, adminList: { txHash: `0x${"ad".repeat(32)}`, index: 0 }, inputCapacity: 1000n * 100_000_000n });
+  const spend = (entry: (typeof list)[number]) => ({ client, lock, omnilock: KEYWAY_OMNILOCK.testnet, auths: list.map(({ auth }) => auth), entry, adminList: { txHash: `0x${"ad".repeat(32)}`, index: 0 }, inputCells: [input] });
   return { tx, lock, destination, list, evm, joySigner, signs, spend, salt };
 }
 

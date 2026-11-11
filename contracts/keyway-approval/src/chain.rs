@@ -39,7 +39,28 @@ pub fn running_account_salt() -> Result<[u8; 32], ApprovalError> {
     account_salt(parsed.args)
 }
 
+/// The most token cells (outputs with a type script) a rescue may move. KeyWay's rescue moves at most 100 cells
+/// at a time; a larger rescue is refused (111) and can be split.
+pub const MAX_TOKEN_CELLS: usize = 256;
+
+/// A cell's type script hash and data hash, or None when it has no type script.
+fn token_key(index: usize, source: Source) -> Result<Option<[u8; 64]>, ApprovalError> {
+    let mut key = [0u8; 64];
+    match load_cell_by_field(&mut key[..32], 0, index, source, CellField::TypeHash) {
+        Ok(_) => {}
+        Err(SysError::ItemMissing) => return Ok(None),
+        Err(_) => return Err(ApprovalError::Syscall),
+    }
+    load_cell_by_field(&mut key[32..], 0, index, source, CellField::DataHash).map_err(|_| ApprovalError::Syscall)?;
+    Ok(Some(key))
+}
+
 /// Builds the approval text for this transaction into `out`, refusing anything that isn't a rescue.
+///
+/// The text counts token cells rather than naming them, so the token cells must be exactly the account's own,
+/// moved unchanged: each output with a type script has the type script hash and data hash of a distinct input of
+/// the account, and each of the account's inputs with a type script is one of them. Anything else (a token cell
+/// changed, left behind to be burned, or made under a type script the account didn't hold) is refused (111).
 pub fn rescue_text(network: Network, sighash: &[u8; 32], out: &mut [u8]) -> Result<usize, ApprovalError> {
     let mut account = [0u8; 32];
     load_script_hash(&mut account, 0).map_err(|_| ApprovalError::Syscall)?;
@@ -48,7 +69,9 @@ pub fn rescue_text(network: Network, sighash: &[u8; 32], out: &mut [u8]) -> Resu
         return Err(ApprovalError::Shape);
     }
     let mut ckb = 0u128;
-    let mut token_cells = 0u64;
+    let mut tokens = [[0u8; 64]; MAX_TOKEN_CELLS];
+    let mut moved = [false; MAX_TOKEN_CELLS];
+    let mut token_cells = 0;
     let mut index = 0;
     while let Some(value) = capacity(index, Source::Output)? {
         let mut lock_hash = [0u8; 32];
@@ -57,15 +80,19 @@ pub fn rescue_text(network: Network, sighash: &[u8; 32], out: &mut [u8]) -> Resu
             return Err(ApprovalError::Shape);
         }
         ckb += value as u128;
-        let mut type_hash = [0u8; 32];
-        match load_cell_by_field(&mut type_hash, 0, index, Source::Output, CellField::TypeHash) {
-            Ok(_) => token_cells += 1,
-            Err(SysError::ItemMissing) => match load_cell_data(&mut [], 0, index, Source::Output) {
+        match token_key(index, Source::Output)? {
+            Some(key) => {
+                if token_cells == MAX_TOKEN_CELLS {
+                    return Err(ApprovalError::Shape);
+                }
+                tokens[token_cells] = key;
+                token_cells += 1;
+            }
+            None => match load_cell_data(&mut [], 0, index, Source::Output) {
                 Ok(0) => {}
                 Ok(_) | Err(SysError::LengthNotEnough(_)) => return Err(ApprovalError::Shape),
                 Err(_) => return Err(ApprovalError::Syscall),
             },
-            Err(_) => return Err(ApprovalError::Syscall),
         }
         index += 1;
     }
@@ -73,11 +100,22 @@ pub fn rescue_text(network: Network, sighash: &[u8; 32], out: &mut [u8]) -> Resu
     let mut index = 0;
     while let Some(value) = capacity(index, Source::Input)? {
         inputs += value as u128;
+        let mut lock_hash = [0u8; 32];
+        field(&mut lock_hash, index, Source::Input, CellField::LockHash)?;
+        if lock_hash == account {
+            if let Some(key) = token_key(index, Source::Input)? {
+                let found = (0..token_cells).find(|&at| !moved[at] && tokens[at] == key).ok_or(ApprovalError::Shape)?;
+                moved[found] = true;
+            }
+        }
         index += 1;
+    }
+    if moved[..token_cells].iter().any(|&done| !done) {
+        return Err(ApprovalError::Shape);
     }
     let fee = inputs.checked_sub(ckb).ok_or(ApprovalError::Shape)?;
     let mut script = [0u8; MAX_SCRIPT];
     let length = field(&mut script, 0, Source::Output, CellField::Lock)?.ok_or(ApprovalError::Shape)?;
     let destination = parse_script(&script[..length]).ok_or(ApprovalError::Shape)?;
-    approval_text(network, &Rescue { destination, ckb, token_cells, fee }, sighash, out)
+    approval_text(network, &Rescue { destination, ckb, token_cells: token_cells as u64, fee }, sighash, out)
 }

@@ -210,7 +210,7 @@ test("reproduces the testnet proof: two accounts, one EVM and one JoyID-style ba
     const zeroed = transaction.clone();
     zeroed.setWitnessArgsAt(0, ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(witness.length)) }));
     const sighash = (await zeroed.getSignHashInfo(lock, spendClient))!.message;
-    const inputs = recorded.inputCells.reduce((sum, cell) => sum + ccc.CellOutput.from(cell.cellOutput).capacity, 0n);
+    const inputs = recorded.inputCells.map((cell) => ({ cellOutput: cell.cellOutput, outputData: cell.outputData ?? "0x" }));
     return { text: recoveryApprovalText(spendClient, rescueApproval(transaction, lock, inputs), sighash), witness, salt: accountSalt(lock.args) };
   };
   const evmRescue = await approvalOf(fixture.rescueEvmA);

@@ -20,7 +20,9 @@
 //!
 //! On chain, `chain::rescue_text` reads those values from the transaction being verified and refuses any
 //! transaction that isn't a rescue: at least one output, every output locked by the same lock, which isn't the
-//! account's own (the running script), and no output carrying data without a type script.
+//! account's own (the running script), no output carrying data without a type script, and token cells that are
+//! exactly the account's own moved unchanged (each output with a type script has the type script hash and data
+//! hash of a distinct input of the account, and each of the account's inputs with a type script is one of them).
 //!
 //! The same running script gives each account's salt (`account_salt`): a backup's identity on chain is
 //! `blake160(backup id ‖ salt)`, never the backup's own id, so one backup used by two accounts has two unrelated
@@ -43,7 +45,8 @@ pub enum ApprovalError {
     /// The network byte isn't 0 (testnet) or 1 (mainnet).
     Network = 110,
     /// The transaction isn't a rescue: no outputs, outputs to more than one lock or to the account itself,
-    /// data without a type script, or outputs above the inputs.
+    /// data without a type script, token cells that aren't the account's own moved unchanged, more than
+    /// `chain::MAX_TOKEN_CELLS` of them, or outputs above the inputs.
     Shape = 111,
     /// The destination's address doesn't fit the text's limit.
     TooLong = 112,

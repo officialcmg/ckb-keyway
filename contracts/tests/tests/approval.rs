@@ -39,6 +39,9 @@ struct ScriptJson {
 #[derive(Deserialize, Clone)]
 struct InputJson {
     lock: ScriptJson,
+    #[serde(rename = "type")]
+    type_: Option<ScriptJson>,
+    data: String,
     capacity: String,
 }
 
@@ -117,7 +120,8 @@ fn mock_transaction(case: &TransactionCase) -> String {
         let previous = serde_json::json!({ "tx_hash": format!("0x{:064x}", index + 0x100), "index": "0x0" });
         (
             serde_json::json!({ "previous_output": previous, "since": "0x0" }),
-            serde_json::json!({ "capacity": format!("0x{:x}", input.capacity.parse::<u64>().unwrap()), "lock": script_json(&input.lock), "type": null }),
+            serde_json::json!({ "capacity": format!("0x{:x}", input.capacity.parse::<u64>().unwrap()), "lock": script_json(&input.lock), "type": input.type_.as_ref().map(script_json) }),
+            input.data.clone(),
         )
     }).collect();
     let outputs: Vec<_> = case.outputs.iter().map(|output| serde_json::json!({
@@ -127,7 +131,7 @@ fn mock_transaction(case: &TransactionCase) -> String {
     })).collect();
     serde_json::json!({
         "mock_info": {
-            "inputs": inputs.iter().map(|(input, output)| serde_json::json!({ "input": input, "output": output, "data": "0x", "header": null })).collect::<Vec<_>>(),
+            "inputs": inputs.iter().map(|(input, output, data)| serde_json::json!({ "input": input, "output": output, "data": data, "header": null })).collect::<Vec<_>>(),
             "cell_deps": [{ "cell_dep": { "out_point": dep_out_point, "dep_type": "code" }, "output": { "capacity": "0x0", "lock": dead, "type": null }, "data": "0x00", "header": null }],
             "header_deps": [],
         },
@@ -135,7 +139,7 @@ fn mock_transaction(case: &TransactionCase) -> String {
             "version": "0x0",
             "cell_deps": [{ "out_point": dep_out_point, "dep_type": "code" }],
             "header_deps": [],
-            "inputs": inputs.iter().map(|(input, _)| input.clone()).collect::<Vec<_>>(),
+            "inputs": inputs.iter().map(|(input, _, _)| input.clone()).collect::<Vec<_>>(),
             "outputs": outputs,
             "outputs_data": case.outputs.iter().map(|output| output.data.clone()).collect::<Vec<_>>(),
             "witnesses": case.inputs.iter().map(|_| "0x").collect::<Vec<_>>(),
@@ -149,15 +153,17 @@ fn binary(name: &str) -> PathBuf {
     path
 }
 
-/// Exit code and cycles of the verifier run as input 0's lock of `case`, with `argument` as argv[0].
+/// Exit code and cycles of the verifier run as the lock of `case`'s first input of the account, with `argument`
+/// as argv[0].
 fn run(name: &str, case: &TransactionCase, argument: &str) -> (i64, u64) {
+    let account = case.inputs.iter().position(|input| input.lock.code_hash == case.account.code_hash && input.lock.args == case.account.args).expect("an input of the account");
     let directory = std::env::temp_dir().join(format!("keyway-approval-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
     let file = directory.join(format!("{name}-{:x}.json", hash(argument.as_bytes())[0] as u64 * 1_000_003 + case.sighash.len() as u64 + rand_suffix()));
     std::fs::write(&file, mock_transaction(case)).unwrap();
     let debugger = std::env::var("CKB_DEBUGGER").unwrap_or_else(|_| "ckb-debugger".into());
     let output = Command::new(debugger)
-        .args(["--tx-file", file.to_str().unwrap(), "--script", "input.0.lock", "--bin"])
+        .args(["--tx-file", file.to_str().unwrap(), "--script", &format!("input.{account}.lock"), "--bin"])
         .arg(binary(name))
         .arg(argument)
         .output()
@@ -197,6 +203,91 @@ fn evm_blob(network: u8, signature: &[u8]) -> Vec<u8> {
     let mut blob = vec![1u8, network];
     blob.extend(signature);
     blob
+}
+
+/// The rescue text the SDK would build for `case` (which must be one the verifiers accept), with its token count.
+fn sdk_text(case: &TransactionCase, token_cells: u64, ckb: u128, fee: u128) -> String {
+    let lock = &case.outputs[0].lock;
+    let code_hash: [u8; 32] = unhex(&lock.code_hash).try_into().unwrap();
+    let hash_type = match lock.hash_type.as_str() { "data" => 0, "type" => 1, "data1" => 2, _ => 4 };
+    let args = unhex(&lock.args);
+    let rescue = Rescue { destination: Destination { code_hash: &code_hash, hash_type, args: &args }, ckb, token_cells, fee };
+    let mut text = [0u8; keyway_approval::MAX_TEXT];
+    let sighash: [u8; 32] = unhex(&case.sighash).try_into().unwrap();
+    let length = approval_text(network(&case.network), &rescue, &sighash, &mut text).unwrap();
+    String::from_utf8(text[..length].to_vec()).unwrap()
+}
+
+/// The text counts token cells rather than naming them, so both verifiers accept only the account's own token cells
+/// moved unchanged: a token cell changed (its data), put under another type script, left out (burned), moved twice,
+/// taken from someone else's input, or CKB put under a type script the account didn't hold, all behind the same
+/// "N token cells" line the honest rescue shows, are refused (111) before any signature is checked.
+#[test]
+fn token_cells_must_be_the_accounts_own_moved_unchanged() {
+    let cases: Vec<TransactionCase> = fixture("approval-transaction-cases.json");
+    let base = cases.iter().find(|case| case.text.is_some() && case.network == "testnet").unwrap().clone();
+    let account = base.account.clone();
+    let destination = base.outputs[0].lock.clone();
+    let other = ScriptJson { code_hash: format!("0x{}", "ee".repeat(32)), hash_type: "type".into(), args: format!("0x{}", "ee".repeat(20)) };
+    let udt = |byte: &str| ScriptJson { code_hash: format!("0x{}", "5d".repeat(32)), hash_type: "type".into(), args: format!("0x{}", byte.repeat(32)) };
+    let amount = |value: u128| format!("0x{}", hex::encode(value.to_le_bytes()));
+    let input = |lock: &ScriptJson, type_: Option<ScriptJson>, data: String, capacity: u64| InputJson { lock: lock.clone(), type_, data, capacity: capacity.to_string() };
+    let output = |type_: Option<ScriptJson>, data: String, capacity: u64| OutputJson { lock: destination.clone(), type_, data, capacity: capacity.to_string() };
+    const CKB: u64 = 100_000_000;
+    // The account holds two token cells of one token and plain CKB; the honest rescue moves each token cell as it is.
+    let honest = TransactionCase {
+        inputs: vec![
+            input(&account, Some(udt("a1")), amount(1_000), 143 * CKB),
+            input(&account, Some(udt("a1")), amount(25), 143 * CKB),
+            input(&account, None, "0x".into(), 1_000 * CKB),
+        ],
+        outputs: vec![
+            output(Some(udt("a1")), amount(25), 143 * CKB),
+            output(Some(udt("a1")), amount(1_000), 143 * CKB),
+            output(None, "0x".into(), 999 * CKB),
+        ],
+        ..base.clone()
+    };
+    let key = EvmKey::from_slice(&[7u8; 32]).unwrap();
+    let address = evm_address(&key);
+    let code_hash = [0x42u8; 32];
+    let text = sdk_text(&honest, 2, 1_285 * CKB as u128, CKB as u128);
+    assert!(text.contains("\nTokens: 2 token cells\n"));
+    let argument = |case: &TransactionCase| exec_argument(&code_hash, &identity(&address, case), &unhex(&case.sighash), &evm_blob(0, &personal_sign(&key, text.as_bytes())));
+    assert_eq!(run("evm-personal-sign", &honest, &argument(&honest)).0, 0);
+
+    let mut attempts: Vec<(&str, TransactionCase)> = Vec::new();
+    let mut changed = honest.clone();
+    changed.outputs[1].data = amount(1);
+    attempts.push(("a token cell changed, its tokens burned", changed));
+    let mut retyped = honest.clone();
+    retyped.outputs[1].type_ = Some(udt("b2"));
+    attempts.push(("the same data under another type script", retyped));
+    let mut left_out = honest.clone();
+    left_out.outputs.remove(1);
+    left_out.outputs.push(output(Some(udt("c3")), "0x".into(), 143 * CKB));
+    attempts.push(("one token cell burned, CKB under the builder's own type script in its place", left_out));
+    let mut burned = honest.clone();
+    burned.outputs.remove(1);
+    burned.outputs[1].capacity = (1_142 * CKB).to_string();
+    attempts.push(("one token cell burned, its CKB moved as plain CKB", burned));
+    let mut twice = honest.clone();
+    twice.outputs[0].data = amount(1_000);
+    attempts.push(("one token cell moved twice", twice));
+    let mut foreign = honest.clone();
+    foreign.inputs[0].lock = other.clone();
+    attempts.push(("a token cell taken from someone else's input", foreign));
+    let mut planted = honest.clone();
+    planted.outputs[2].type_ = Some(udt("d4"));
+    planted.outputs[2].data = "0x".into();
+    attempts.push(("the plain CKB locked under the builder's own type script", planted));
+    for (what, case) in &attempts {
+        assert_eq!(run("evm-personal-sign", case, &argument(case)).0, 111, "{what}");
+        let passkey = Passkey(SigningKey::from_slice(&[3u8; 32]).unwrap());
+        let pubkey_hash = identity(&joyid_webauthn::blake160(&passkey.public_key()), case);
+        let blob = passkey.blob(0, &text, 1024);
+        assert_eq!(run("joyid-webauthn", case, &exec_argument(&[0x24u8; 32], &pubkey_hash, &unhex(&case.sighash), &blob)).0, 111, "{what}");
+    }
 }
 
 /// The account's salt: the AdminList type hash at args[22..54] of its Omnilock (the case's account lock).

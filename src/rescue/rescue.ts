@@ -382,7 +382,7 @@ async function addRescueTokenCellDeps(client: ccc.Client, transaction: ccc.Trans
 
 /** The backup's spend over the account's movable cells, whose capacities were checked against their creating transactions. */
 function rescueSpend(client: ccc.Client, account: RescueAccount, entry: RecoveryListEntry): RecoverySpend {
-  return { client, lock: account.lock, omnilock: account.omnilock, auths: account.auths, entry, adminList: account.adminList.outPoint, inputCapacity: account.ckb + account.tokenCkb };
+  return { client, lock: account.lock, omnilock: account.omnilock, auths: account.auths, entry, adminList: account.adminList.outPoint, inputCells: account.movable };
 }
 
 /**
