@@ -5,7 +5,7 @@ import { Pool } from "pg";
 import { getMigrations } from "better-auth/db/migration";
 import type { User } from "../src/server/auth-user.ts";
 import { authSchemaOptions } from "../src/server/auth-options.ts";
-import { database, withUserLock } from "../src/server/database.ts";
+import { database, withLoginCodeLock, withUserLock } from "../src/server/database.ts";
 import { addApplicationOrigin, createApplication, otpSubject, prepareOtpSend, removeApplicationOrigin } from "../src/server/applications.ts";
 import { closeAuthPool, sendEmailCode, sessionForRequest, setAuthDeliveryForTests, verifyEmailCode } from "../src/server/auth.ts";
 import { handleKeyWayRequest } from "../src/server/http.ts";
@@ -477,6 +477,38 @@ test("sessions without the origin they were issued at are refused", { skip }, as
   // As a session from before sessions recorded their origin.
   await sql`update keyway_auth_sessions set "origin" = null where "scopeId" = ${appId}`;
   await assert.rejects(sessionForRequest(appRequest(appId, origin, "192.0.2.112", sessionToken)), /Session/);
+});
+
+test("one requester's queued sign-in requests don't refuse anyone else's", { skip, timeout: 30_000 }, async () => {
+  const { codes } = await setup();
+  const origin = "https://queue.example";
+  const { appId } = await application([origin]);
+  const victim = email();
+  const outcome = (promise: Promise<unknown>) => promise.then(() => "done", (error: Error) => error.message);
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  // Holds the lock for the victim's email, as a slow send would, so every request for it queues.
+  const holder = withLoginCodeLock(`otp:${appId}:${victim}`, () => held);
+  await delay(50);
+  try {
+    // One source: four requests in progress, the rest refused at once.
+    const stranger = Array.from({ length: 8 }, () => outcome(sendEmailCode(appRequest(appId, origin, "192.0.2.140"), victim)));
+    const settled = (promises: Array<Promise<string>>) => Promise.race([Promise.all(promises), delay(1_000).then(() => "still waiting")]);
+    assert.deepEqual(await settled(stranger.slice(4)), Array(4).fill("Too many sign-in requests in progress. Try again in a moment"));
+    // One IPv6 /48: sixteen in progress across its /64s, then none.
+    const network = Array.from({ length: 16 }, (_, i) => outcome(sendEmailCode(appRequest(appId, origin, `2001:db8:77:${Math.floor(i / 4) + 1}::1`), victim)));
+    assert.deepEqual(await settled([outcome(sendEmailCode(appRequest(appId, origin, "2001:db8:77:9::1"), victim))]), ["Too many sign-in requests in progress. Try again in a moment"]);
+    // The victim's own request waits its turn instead of being refused.
+    const mine = sendEmailCode(appRequest(appId, origin, "192.0.2.141"), victim);
+    assert.equal(await within(outcome(mine), 200), false, "The victim's request is queued, not refused");
+    release();
+    await holder;
+    const { challengeId } = await mine;
+    assert.ok((await verifyEmailCode(appRequest(appId, origin, "192.0.2.141"), challengeId, codes.get(`${appId}:${victim}`)!)).sessionToken);
+    await Promise.all([...stranger, ...network]);
+  } finally {
+    release();
+  }
 });
 
 test("expired login challenges are removed, and a challenge ID must be a UUID", { skip }, async () => {
