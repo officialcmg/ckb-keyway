@@ -142,28 +142,36 @@ export function lastSweepDecision(status: ccc.TransactionStatus | undefined, sen
 
 /**
  * Sweeps hold a reserved connection across chain and Lit calls, outside the lock budgets in database.ts, so only
- * `MAX_RUNNING_SWEEPS` run at once in a process and the rest wait (holding nothing) for a turn. Past
- * `MAX_WAITING_SWEEPS` waiting, a sweep is skipped as busy; the account's next sign-in tries again.
+ * `MAX_RUNNING_SWEEPS` runs at once in a process and the rest wait (holding nothing) for a turn. An account has at
+ * most one sweep running or waiting here, so one account's sign-ins can't fill the queue; past
+ * `MAX_WAITING_SWEEPS` waiting, a sweep is skipped as busy and the account's next sign-in tries again.
  */
-export const MAX_RUNNING_SWEEPS = 2;
+export const MAX_RUNNING_SWEEPS = 1;
 export const MAX_WAITING_SWEEPS = 32;
 let runningSweeps = 0;
 const waitingSweeps: Array<() => void> = [];
+const sweepingUsers = new Set<string>();
 
-async function withSweepSlot<T>(busy: T, task: () => Promise<T>): Promise<T> {
+async function withSweepSlot<T>(userId: string, busy: T, task: () => Promise<T>): Promise<T> {
+  if (sweepingUsers.has(userId)) return busy;
   if (runningSweeps < MAX_RUNNING_SWEEPS) runningSweeps += 1;
   else if (waitingSweeps.length >= MAX_WAITING_SWEEPS) return busy;
-  else await new Promise<void>((resolve) => waitingSweeps.push(resolve));
+  else {
+    sweepingUsers.add(userId);
+    await new Promise<void>((resolve) => waitingSweeps.push(resolve));
+  }
+  sweepingUsers.add(userId);
   try {
     return await task();
   } finally {
+    sweepingUsers.delete(userId);
     const next = waitingSweeps.shift();
     if (next) next(); else runningSweeps -= 1;
   }
 }
 
 function withSweepLock(userId: string, task: (sql: DatabaseSql) => Promise<LegacySweepResult>): Promise<LegacySweepResult> {
-  return withSweepSlot<LegacySweepResult>({ status: "busy" }, () => withSweepConnection(userId, task));
+  return withSweepSlot<LegacySweepResult>(userId, { status: "busy" }, () => withSweepConnection(userId, task));
 }
 
 async function withSweepConnection(userId: string, task: (sql: DatabaseSql) => Promise<LegacySweepResult>): Promise<LegacySweepResult> {
