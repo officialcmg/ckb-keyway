@@ -344,7 +344,7 @@ test("CKB put under a token script with extension args is what the confirmation 
   assert.equal(preview.heldUnderScriptsCkb, "499.99999");
   const lines = previewSummaryLines(preview);
   assert.equal(lines[0], "Send 499.99999 CKB");
-  assert.match(lines[1], /^Of which 499\.99999 CKB stays in your account under a type script that could keep it$/);
+  assert.match(lines[1], /^Of which 499\.99999 CKB goes to your own address under a type script that could keep it$/);
 
   // A plain transfer reads as before, with no such line.
   const plain = build([{ lock: own, capacity: 500n * CKB }], [{ lock: alice, capacity: 100n * CKB }, { lock: own, capacity: 400n * CKB - fee }]);

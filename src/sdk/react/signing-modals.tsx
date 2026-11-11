@@ -65,7 +65,7 @@ export function KeyWayTransactionModal({ theme, appName, preview, step, answer }
           )}
           <dl style={{ ...fundingDetails, margin: "16px 0" }}>
             {sending && <Row palette={palette} label="You send" value={`${preview.sendingCkb} CKB`} />}
-            {preview.heldUnderScriptsCkb && <Row palette={palette} label="Of which stays in your account, under a script that could keep it" value={`${preview.heldUnderScriptsCkb} CKB`} />}
+            {preview.heldUnderScriptsCkb && <Row palette={palette} label="Of which goes to your own address, under a script that could keep it" value={`${preview.heldUnderScriptsCkb} CKB`} />}
             {preview.receivingCkb !== "0" && <Row palette={palette} label="You receive" value={`${preview.receivingCkb} CKB`} />}
             {preview.tokens.map((token) => <Row key={`t-${token.id}`} palette={palette} label={token.amount.startsWith("-") ? "You send" : "You receive"} value={tokenText(token)} />)}
             {preview.nfts.map((nft) => <Row key={`n-${nft.id}`} palette={palette} label={`${nft.kind} ${nft.change}`} value={nft.id} />)}

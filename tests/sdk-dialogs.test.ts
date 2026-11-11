@@ -39,7 +39,7 @@ test("the dialogs say when CKB counted as sent stays under a script that could k
     recipients: [], unrecognized: [], otherSigners: 0, details: { inputs: [], outputs: [] }, transactionHash: `0x${"ab".repeat(32)}`, requiresEmailCode: false,
   } as unknown as TransactionPreview;
   const html = renderToStaticMarkup(createElement(KeyWayTransactionModal, { theme: "light", appName: "Acme Pay", preview, answer: () => undefined }));
-  assert.match(html, /Of which stays in your account, under a script that could keep it/);
+  assert.match(html, /Of which goes to your own address, under a script that could keep it/);
   const funding = { amountCkb: "200", feeCkb: "0.0001", destination: "0x6c:0xcc", transactionHash: `0x${"ab".repeat(32)}`, heldUnderScriptsCkb: "800" } as FiberChannelOpenPreview;
   const fundingHtml = renderToStaticMarkup(createElement(KeyWayFundingModal, { theme: "light", appName: "Acme Pay", preview: funding, answer: () => undefined }));
   assert.match(fundingHtml, /Also counted as sent: change under the token(&#x27;|')s script, which could keep it/);

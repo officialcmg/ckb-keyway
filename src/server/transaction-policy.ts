@@ -364,7 +364,7 @@ export function describeTransaction(
 export function previewSummaryLines(preview: TransactionPreview): string[] {
   const lines = [
     `Send ${preview.sendingCkb} CKB`,
-    ...(preview.heldUnderScriptsCkb ? [`Of which ${preview.heldUnderScriptsCkb} CKB stays in your account under a type script that could keep it`] : []),
+    ...(preview.heldUnderScriptsCkb ? [`Of which ${preview.heldUnderScriptsCkb} CKB goes to your own address under a type script that could keep it`] : []),
     `Network fee ${preview.feeCkb} CKB`,
     `Network ${preview.network}`,
   ];
