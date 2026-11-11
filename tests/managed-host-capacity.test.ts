@@ -3,10 +3,14 @@ import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
+import { createServer } from "node:http";
+import { once } from "node:events";
+import type { AddressInfo } from "node:net";
 
 // A stand-in for fnn: answers node_info, and list_channels from channels.json in its data directory. It writes
 // its pid there; with a slow-start file it takes a while to answer, and with a slow-stop file it takes a while
 // to exit, writing a stopping file once asked to. With a fail-start file it exits at once, noting it in failed-starts.
+// Each start is logged to starts.log beside the data directories, and slow_call answers after 1.5s.
 const FAKE_FNN = `#!${process.execPath}
 const { createServer } = require("node:http");
 const { appendFileSync, existsSync, readFileSync, writeFileSync } = require("node:fs");
@@ -17,6 +21,7 @@ if (existsSync(join(dir, "fail-start"))) { appendFileSync(join(dir, "failed-star
 const port = Number(args.find((arg) => arg.startsWith("--rpc-listening-addr=")).split(":").pop());
 const parent = process.ppid;
 writeFileSync(join(dir, "pid"), String(process.pid));
+appendFileSync(join(dir, "..", "starts.log"), dir.split("/").pop() + "\\n");
 setInterval(() => { try { process.kill(parent, 0); } catch { process.exit(0); } }, 500);
 process.on("SIGTERM", () => {
   if (!existsSync(join(dir, "slow-stop"))) process.exit(0);
@@ -29,13 +34,13 @@ const server = createServer((request, response) => {
   request.on("end", () => {
     const { id, method } = JSON.parse(body);
     let result = null;
-    if (method === "node_info") result = { pubkey: "02" + "11".repeat(32), version: "fake" };
+    if (method === "node_info") result = { pubkey: "02" + "11".repeat(32), version: "fake", default_funding_lock_script: { code_hash: "0x" + "22".repeat(32), hash_type: "type", args: "0x" } };
     if (method === "list_channels") {
       try { result = { channels: JSON.parse(readFileSync(join(dir, "channels.json"), "utf8")) }; } catch { result = { channels: [] }; }
     }
     if (method === "open_channel_with_external_funding") result = { channel_id: "0x" + "33".repeat(32) };
     response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({ jsonrpc: "2.0", id, result }));
+    setTimeout(() => response.end(JSON.stringify({ jsonrpc: "2.0", id, result })), method === "slow_call" ? 1_500 : 0);
   });
 });
 setTimeout(() => server.listen(port, "127.0.0.1"), existsSync(join(dir, "slow-start")) ? 1_500 : 0);
@@ -43,9 +48,15 @@ setTimeout(() => server.listen(port, "127.0.0.1"), existsSync(join(dir, "slow-st
 
 const OPEN_CHANNEL = [{ state: { state_name: "ChannelReady" } }];
 const CLOSED_CHANNEL = [{ state: { state_name: "CLOSED", state_flags: "COOPERATIVE" } }];
-const SETTLED_FORCE_CLOSE = [{ state: { state_name: "CLOSED", state_flags: "UNCOOPERATIVE_LOCAL | WAITING_ONCHAIN_SETTLEMENT | ONCHAIN_SETTLEMENT_CONFIRMED" } }];
-const UNFUNDED_CHANNEL = [{ state: { state_name: "NEGOTIATING_FUNDING", state_flags: "OUR_INIT_SENT | THEIR_INIT_SENT | AWAITING_EXTERNAL_FUNDING" } }];
+// As Fiber 0.9.1's list_channels reports them.
+const SETTLING_FORCE_CLOSE = [{ state: { state_name: "CLOSED", state_flags: "UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT" } }];
+const SETTLED_FORCE_CLOSE = [{ state: { state_name: "CLOSED", state_flags: "UNCOOPERATIVE_LOCAL" } }];
+const SETTLED_REMOTE_CLOSE = [{ state: { state_name: "CLOSED", state_flags: "UNCOOPERATIVE_REMOTE" } }];
+const UNFUNDED_CHANNEL = [{ state: { state_name: "NEGOTIATING_FUNDING", state_flags: "OUR_INIT_SENT|THEIR_INIT_SENT|AWAITING_EXTERNAL_FUNDING" } }];
 const ABORTED_FUNDING = [{ state: { state_name: "CLOSED", state_flags: "FUNDING_ABORTED" } }];
+// Signed on our side, with funding that may or may not have reached the chain.
+const FUNDING_TX = `0x${"77".repeat(32)}`;
+const SIGNED_CHANNEL = [{ state: { state_name: "AWAITING_TX_SIGNATURES", state_flags: "OUR_TX_SIGNATURES_SENT" }, channel_outpoint: `${FUNDING_TX}00000000` }];
 const exists = (path: string) => stat(path).then(() => true, () => false);
 
 async function until(check: () => Promise<boolean>) {
@@ -59,9 +70,35 @@ const [A, B, C, F] = ["a", "b", "c", "f"].map((letter) => letter.repeat(64));
 const FEW_MINUTES = 5 * 60_000;
 let instances = 0;
 
+/**
+ * A stand-in for the CKB node: transactions it knows by hash, live cells by "hash:index", and the CKB at the
+ * hosted nodes' own lock.
+ */
+async function fakeCkb(context: TestContext) {
+  const chain = { transactions: new Map<string, string>(), live: new Set<string>(), capacity: 0n, down: false };
+  const server = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      const { id, method, params } = JSON.parse(body);
+      let result: unknown = null;
+      if (method === "get_transaction") result = { tx_status: { status: chain.transactions.get(params[0]) ?? "unknown" } };
+      if (method === "get_cells_capacity") result = { capacity: `0x${chain.capacity.toString(16)}` };
+      if (method === "get_live_cell") result = { status: chain.live.has(`${params[0].tx_hash}:${params[0].index}`) ? "live" : "unknown" };
+      response.writeHead(chain.down ? 503 : 200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ jsonrpc: "2.0", id, result }));
+    });
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  context.after(() => server.close());
+  return { chain, url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/` };
+}
+
 /** A host of at most two nodes on a fresh volume, as its own module instance so tests don't share nodes. */
 async function host(context: TestContext) {
   const root = await mkdtemp(join(tmpdir(), "keyway-host-capacity-"));
+  const ckb = await fakeCkb(context);
   const fnn = join(root, "fnn.cjs");
   await writeFile(fnn, FAKE_FNN);
   await chmod(fnn, 0o755);
@@ -72,6 +109,7 @@ async function host(context: TestContext) {
     KEYWAY_MANAGED_BACKUP_DIR: join(root, "backups"),
     KEYWAY_MANAGED_RETIRED_DIR: join(root, "retired"),
     KEYWAY_MANAGED_MAX_NODES: "2",
+    CKB_NODE_RPC_URL: ckb.url,
   });
   const path = `../managed-host/index.mjs?instance=${++instances}`;
   const module = await import(path) as typeof import("../managed-host/index.mjs");
@@ -94,7 +132,8 @@ async function host(context: TestContext) {
     await writeFile(join(root, "users", user, "keyway-channels-checked"), "");
     await writeFile(join(root, "users", user, "keyway-channels"), "");
   };
-  return { module, root, request, running, marked, withChannels, markedNode };
+  const starts = async () => (await readFile(join(root, "users", "starts.log"), "utf8").catch(() => "")).split("\n").filter(Boolean);
+  return { module, root, chain: ckb.chain, request, running, marked, withChannels, markedNode, starts };
 }
 
 test("at capacity, a node idle for a few minutes makes room for a new user; one with channels or just used is never stopped", async (context) => {
@@ -219,7 +258,7 @@ test("a node still starting when the host shuts down stops with it", async (cont
 
 test("a read never creates a hosted node; connecting one or setting up a channel does", async (context) => {
   const { root, request, running } = await host(context);
-  for (const method of ["list_channels", "list_peers", "graph_nodes", "get_invoice"]) assert.equal(await request(A, method), 502, method);
+  for (const method of ["list_channels", "list_peers", "graph_nodes", "get_invoice", "submit_signed_funding_tx"]) assert.equal(await request(A, method), 502, method);
   assert.equal(await exists(join(root, "users", A)), false);
   assert.deepEqual(running(), []);
   assert.equal(await request(A, "node_info"), 200);
@@ -248,6 +287,26 @@ test("reads don't keep a node from making room; the steps of a channel setup do,
   assert.deepEqual(running(), [A, B]);
 });
 
+test("repeating setup steps holds a node at most 15 minutes after it starts, and holds at most half the host", async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const { request, running } = await host(context);
+  assert.equal(await request(A, "connect_peer"), 200);
+  // With A held, B's setup step doesn't hold B: half of this host is one node.
+  assert.equal(await request(B, "connect_peer"), 200);
+  context.mock.timers.tick(61_000);
+  assert.equal(await request(C), 200);
+  assert.deepEqual(running(), [A, C]);
+  // A keeps repeating a setup step, while C is read after it each time.
+  for (let minute = 4; minute < 16; minute += 4) {
+    context.mock.timers.tick(4 * 60_000);
+    assert.equal(await request(A, "connect_peer"), 200);
+    assert.equal(await request(C, "list_channels"), 200);
+  }
+  context.mock.timers.tick(3 * 60_000);
+  assert.equal(await request(B), 200);
+  assert.deepEqual(running(), [B, C]);
+});
+
 test("a node started on demand is recorded as checked, so a restart starts it only if it has channels", async (context) => {
   const { root, request, marked } = await host(context);
   assert.equal(await request(A), 200);
@@ -256,13 +315,16 @@ test("a node started on demand is recorded as checked, so a restart starts it on
 });
 
 test("after a restart, nodes with channels start before nodes never checked", async (context) => {
-  const { module, root, running, markedNode } = await host(context);
+  const { module, root, running, markedNode, starts } = await host(context);
   const unchecked = ["1", "2"].map((digit) => digit.repeat(64));
   for (const user of unchecked) await mkdir(join(root, "users", user), { recursive: true });
   await markedNode(F);
 
   await module.startKnownNodes([...unchecked, F]);
   assert.ok(running().includes(F));
+  // F is in the first batch, before the second node never checked.
+  const order = await starts();
+  assert.ok(order.indexOf(F) < order.indexOf(unchecked[1]), order.join(","));
   assert.deepEqual(module.readiness().status, "ready");
 });
 
@@ -276,25 +338,75 @@ test("a node with channels takes the place of a just-used node without channels"
   assert.ok(running().includes(F));
 });
 
+test("a node with channels takes the place of a node without channels even while that one serves requests", async (context) => {
+  const { module, request, running, markedNode } = await host(context);
+  assert.equal(await request(A), 200);
+  assert.equal(await request(B), 200);
+  const busy = [request(A, "slow_call"), request(B, "slow_call")];
+  await markedNode(F);
+  await module.startKnownNodes([F]);
+  assert.ok(running().includes(F), running().join(","));
+  await Promise.all(busy);
+});
+
 test("a node with channels that crashes is restarted until it runs, and /readyz reports it offline meanwhile", async (context) => {
   const { module, root, request, running, withChannels } = await host(context);
   await withChannels(F);
   assert.equal(await request(F), 200);
-  assert.deepEqual(module.readiness(), { status: "ready", nodes: 1, maxNodes: 2, offline: 0 });
+  assert.deepEqual(module.readiness?.(), { status: "ready", nodes: 1, maxNodes: 2, offline: 0 });
   // It crashes, and its first restarts fail.
   await writeFile(join(root, "users", F, "fail-start"), "");
   process.kill(Number(await readFile(join(root, "users", F, "pid"), "utf8")), "SIGKILL");
   await until(() => exists(join(root, "users", F, "failed-starts")));
   assert.deepEqual(running(), []);
-  assert.deepEqual(module.readiness(), { status: "degraded", nodes: 0, maxNodes: 2, offline: 1 });
+  const whileOffline = module.readiness?.();
   await rm(join(root, "users", F, "fail-start"));
   await until(async () => running().includes(F));
+  assert.deepEqual(whileOffline, { status: "degraded", nodes: 0, maxNodes: 2, offline: 1 });
   assert.deepEqual(module.readiness(), { status: "ready", nodes: 1, maxNodes: 2, offline: 0 });
 });
 
+test("a node with channels that keeps crashing right after it starts is restarted with growing delays", async (context) => {
+  const { root, request, running, withChannels } = await host(context);
+  await withChannels(F);
+  assert.equal(await request(F), 200);
+  const crash = async () => {
+    const pid = Number(await readFile(join(root, "users", F, "pid"), "utf8"));
+    const crashedAt = Date.now();
+    process.kill(pid, "SIGKILL");
+    await until(async () => running().includes(F) && Number(await readFile(join(root, "users", F, "pid"), "utf8")) !== pid);
+    return Date.now() - crashedAt;
+  };
+  assert.ok(await crash() >= 900);
+  assert.ok(await crash() >= 1_900);
+});
+
+test("an offline node with channels is tried again whatever stopped its last attempt", async (context) => {
+  const { module, root, running, markedNode } = await host(context);
+  await markedNode(F);
+  // The retired list can't be read, so the attempt fails before the node starts.
+  await writeFile(join(root, "retired"), "");
+  await module.startKnownNodes([F]);
+  assert.deepEqual(running(), []);
+  assert.equal(module.readiness().offline, 1);
+  await rm(join(root, "retired"));
+  await until(async () => running().includes(F));
+  assert.equal(module.readiness().offline, 0);
+});
+
+test("a channel a peer opened to the node marks it once the node's channels show it", async (context) => {
+  const { request, marked, withChannels } = await host(context);
+  assert.equal(await request(A), 200);
+  assert.equal(await marked(A), false);
+  await withChannels(A);
+  assert.equal(await request(A, "list_channels"), 200);
+  assert.equal(await marked(A), true);
+});
+
 test("a node whose channels can hold nothing more makes room once its user has stopped, and loses its marker", async (context) => {
-  // Force-closed and settled on-chain, opened but never funded, and funding aborted by Fiber.
-  for (const channels of [SETTLED_FORCE_CLOSE, UNFUNDED_CHANNEL, ABORTED_FUNDING]) {
+  // Force-closed and settled on-chain (by either side), opened but never funded, signed but with funding CKB has
+  // never seen, and funding aborted by Fiber.
+  for (const channels of [SETTLED_FORCE_CLOSE, SETTLED_REMOTE_CLOSE, UNFUNDED_CHANNEL, SIGNED_CHANNEL, ABORTED_FUNDING]) {
     context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
     const { request, running, marked, markedNode } = await host(context);
     await markedNode(F, channels);
@@ -308,6 +420,23 @@ test("a node whose channels can hold nothing more makes room once its user has s
   }
 });
 
+test("a node whose channel is settling, or whose funding has reached the chain, keeps running", async (context) => {
+  for (const [channels, status] of [[SETTLING_FORCE_CLOSE, undefined], [SIGNED_CHANNEL, "pending"], [SIGNED_CHANNEL, "committed"], [SIGNED_CHANNEL, "down"]] as const) {
+    context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+    const { chain, request, running, marked, markedNode } = await host(context);
+    if (status === "down") chain.down = true;
+    else if (status) chain.transactions.set(FUNDING_TX, status);
+    await markedNode(F, channels);
+    assert.equal(await request(F), 200);
+    assert.equal(await request(A), 200);
+    context.mock.timers.tick(FEW_MINUTES);
+    assert.equal(await request(B), 200);
+    assert.deepEqual(running(), [B, F], `${JSON.stringify(channels)} ${status}`);
+    assert.equal(await marked(F), true);
+    context.mock.timers.reset();
+  }
+});
+
 test("a node waiting for its channel's funding keeps its node while its user is signing", async (context) => {
   context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const { request, running, withChannels } = await host(context);
@@ -317,4 +446,23 @@ test("a node waiting for its channel's funding keeps its node while its user is 
   context.mock.timers.tick(FEW_MINUTES - 60_000);
   assert.equal(await request(B), 200);
   assert.deepEqual(running(), [B, F]);
+});
+
+test("a node can be retired once its channels are finished and nothing of it is left on chain", async (context) => {
+  const { module, root, chain, request, withChannels } = await host(context);
+  const retire = () => module.withUserOperation(F, () => module.retireUser(F));
+  await withChannels(F, [...SETTLED_FORCE_CLOSE, { ...CLOSED_CHANNEL[0], channel_outpoint: `${FUNDING_TX}01000000` }]);
+  assert.equal(await request(F), 200);
+  // The settlement, or the fee reserve, is still at the node's own key.
+  chain.capacity = 62n * 100_000_000n;
+  await assert.rejects(retire(), /still holds funds/);
+  chain.capacity = 0n;
+  chain.live.add(`${FUNDING_TX}:0x1`);
+  await assert.rejects(retire(), /still on chain/);
+  chain.live.clear();
+  await withChannels(F, SETTLING_FORCE_CLOSE);
+  await assert.rejects(retire(), /closure is incomplete/);
+  await withChannels(F, SETTLED_REMOTE_CLOSE);
+  assert.deepEqual(await retire(), { retired: true, databasePreserved: true });
+  assert.equal(await exists(join(root, "retired", F)), true);
 });

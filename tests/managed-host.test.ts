@@ -52,7 +52,7 @@ test("retired node purge is exact, preserves other users and keeps the tombstone
 test("node retirement rejects active, settling, or unknown channel states", () => {
   requireClosedChannels([]);
   requireClosedChannels([{ state: { state_name: "Closed", state_flags: "COOPERATIVE" } }]);
-  assert.throws(() => requireClosedChannels([{ state: { state_name: "Closed", state_flags: "FORCE" } }]), /preserve/);
+  assert.throws(() => requireClosedChannels([{ state: { state_name: "Closed", state_flags: "UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT" } }]), /preserve/);
   for (const state_name of ["ChannelReady", "ShuttingDown", "AwaitingTxSignatures", "Unknown"]) {
     assert.throws(() => requireClosedChannels([{ state: { state_name } }]), /preserve/);
   }
@@ -60,13 +60,12 @@ test("node retirement rejects active, settling, or unknown channel states", () =
 });
 
 test("a force-closed channel counts as finished once it has settled on-chain, read by flag, not by string", () => {
+  // As Fiber 0.9.1's list_channels reports them: WAITING_ONCHAIN_SETTLEMENT goes once the close has settled.
   const closed = (state_flags: unknown) => [{ state: { state_name: "CLOSED", state_flags } }];
-  requireClosedChannels(closed("UNCOOPERATIVE_LOCAL | WAITING_ONCHAIN_SETTLEMENT | ONCHAIN_SETTLEMENT_CONFIRMED"));
-  requireClosedChannels(closed("UNCOOPERATIVE_REMOTE|WAITING_ONCHAIN_SETTLEMENT|ONCHAIN_SETTLEMENT_CONFIRMED"));
-  // Closed before anything was funded.
-  requireClosedChannels(closed("FUNDING_ABORTED"));
-  requireClosedChannels(closed("ABANDONED"));
-  for (const flags of ["UNCOOPERATIVE_LOCAL | WAITING_ONCHAIN_SETTLEMENT", "UNCOOPERATIVE_REMOTE", "NOT_COOPERATIVE", "ONCHAIN_SETTLEMENT_CONFIRMED_LATER", undefined, 9]) {
+  for (const flags of ["UNCOOPERATIVE_LOCAL", "UNCOOPERATIVE_REMOTE", "FUNDING_ABORTED", "ABANDONED", "COOPERATIVE", "UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT|ONCHAIN_SETTLEMENT_CONFIRMED"]) {
+    requireClosedChannels(closed(flags));
+  }
+  for (const flags of ["UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT", "UNCOOPERATIVE_REMOTE | WAITING_ONCHAIN_SETTLEMENT", ["WAITING_ONCHAIN_SETTLEMENT"]]) {
     assert.throws(() => requireClosedChannels(closed(flags)), /preserve/, String(flags));
   }
   // A channel still negotiating its funding isn't closed, so it still blocks retirement.
@@ -76,18 +75,18 @@ test("a force-closed channel counts as finished once it has settled on-chain, re
 test("the hosted node and the settlement sweep agree on which channels are finished", () => {
   const states = [
     ["CHANNEL_READY", undefined], ["ChannelReady", undefined], ["NEGOTIATING_FUNDING", "AWAITING_EXTERNAL_FUNDING"],
-    ["SHUTTING_DOWN", "WAITING_COMMITMENT_CONFIRMATION"], ["CLOSED", "COOPERATIVE"], ["Closed", "COOPERATIVE"],
-    ["CLOSED", "UNCOOPERATIVE_LOCAL | WAITING_ONCHAIN_SETTLEMENT"],
-    ["CLOSED", "UNCOOPERATIVE_LOCAL | WAITING_ONCHAIN_SETTLEMENT | ONCHAIN_SETTLEMENT_CONFIRMED"],
-    ["CLOSED", "UNCOOPERATIVE_REMOTE"], ["CLOSED", "FUNDING_ABORTED"], ["CLOSED", "ABANDONED"], ["CLOSED", "FORCE"],
-    ["CLOSED", undefined], ["CLOSED", ["COOPERATIVE"]], ["CLOSED", 1],
+    ["AWAITING_TX_SIGNATURES", "OUR_TX_SIGNATURES_SENT"], ["SHUTTING_DOWN", "WAITING_COMMITMENT_CONFIRMATION"],
+    ["CLOSED", "COOPERATIVE"], ["Closed", "COOPERATIVE"], ["CLOSED", "UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT"],
+    ["CLOSED", "UNCOOPERATIVE_LOCAL"], ["CLOSED", "UNCOOPERATIVE_REMOTE"], ["CLOSED", "UNCOOPERATIVE_REMOTE|WAITING_ONCHAIN_SETTLEMENT"],
+    ["CLOSED", "UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT|ONCHAIN_SETTLEMENT_CONFIRMED"], ["CLOSED", "FUNDING_ABORTED"],
+    ["CLOSED", "ABANDONED"], ["CLOSED", undefined], ["CLOSED", ["WAITING_ONCHAIN_SETTLEMENT"]], ["CLOSED", "NOT_WAITING_ONCHAIN_SETTLEMENT_YET"],
   ] as const;
   for (const [state_name, state_flags] of states) {
     const channel = { state: { state_name, state_flags } };
     assert.equal(hostChannelFinished(channel), sweepChannelFinished(channel as never), `${state_name} ${String(state_flags)}`);
   }
-  assert.equal(hostChannelFinished({ state: { state_name: "CLOSED", state_flags: "UNCOOPERATIVE_LOCAL | WAITING_ONCHAIN_SETTLEMENT | ONCHAIN_SETTLEMENT_CONFIRMED" } }), true);
-  assert.equal(hostChannelFinished({ state: { state_name: "CLOSED", state_flags: "UNCOOPERATIVE_REMOTE" } }), false);
+  assert.equal(hostChannelFinished({ state: { state_name: "CLOSED", state_flags: "UNCOOPERATIVE_LOCAL" } }), true);
+  assert.equal(hostChannelFinished({ state: { state_name: "CLOSED", state_flags: "UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT" } }), false);
 });
 
 test("managed database operations report success only after the node resumes", async () => {

@@ -13,6 +13,10 @@ test("the reserve stays while any channel is open, closing or waiting to settle 
   assert.equal(needsFeeReserve([channel("CLOSED", "COOPERATIVE")]), false);
   assert.equal(needsFeeReserve([channel("CLOSED", "UNCOOPERATIVE_LOCAL | WAITING_ONCHAIN_SETTLEMENT | ONCHAIN_SETTLEMENT_CONFIRMED")]), false);
   assert.equal(needsFeeReserve([channel("CLOSED", "COOPERATIVE"), channel("CHANNEL_READY")]), true);
+  // As Fiber 0.9.1 reports a force close once it has settled: the reserve comes back.
+  assert.equal(needsFeeReserve([channel("CLOSED", "UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT")]), true);
+  assert.equal(needsFeeReserve([channel("CLOSED", "UNCOOPERATIVE_LOCAL")]), false);
+  assert.equal(needsFeeReserve([channel("CLOSED", "UNCOOPERATIVE_REMOTE")]), false);
 });
 
 test("a sweep keeps the reserve and sends the rest of a settlement to the user", () => {
