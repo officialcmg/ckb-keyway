@@ -5,7 +5,7 @@ import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { formatCkbSignature, type ValidatedFunding } from "../src/server/funding-transaction.ts";
 import { fundingSigning, type FundingContext } from "../src/server/funding-signing.ts";
 import { database } from "../src/server/database.ts";
-import { countLitCodeAttempt, issueRequest, loadRequest, messageSigning, outflowNeedsEmailCode, recordLitCode, reserveOutflow, signingSettings, transactionSigning, type SigningContext } from "../src/server/general-signing.ts";
+import { countLitCodeAttempt, issueRequest, loadRequest, messageSigning, outflowNeedsEmailCode, recordLitCode, reserveOutflow, sendCode, signingSettings, transactionSigning, verifyCode, type SigningContext } from "../src/server/general-signing.ts";
 import type { ValidatedTransaction } from "../src/server/transaction-policy.ts";
 import type { ReadyWallet } from "../src/server/user-wallet.ts";
 
@@ -385,5 +385,56 @@ test("general signing binds approvals, email codes and threshold changes", { ski
     await countLitCodeAttempt(user, "recovery", nonce);
     assert.equal((await loadRequest(user, "recovery", nonce, "digest")).summary.litTicket, "v1.2.ticket");
     await assert.rejects(() => recordLitCode(user, "recovery", crypto.randomUUID(), {}), /expired/);
+  });
+});
+
+test("wrong step-up codes add up across codes, to 20 a day per user", { skip: !enabled }, async (t) => {
+  process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
+  delete process.env.KEYWAY_SECURITY_ALERT_WEBHOOK_URL;
+  const sql = await database();
+  const alerts: string[] = [];
+  const warn = console.warn;
+  console.warn = (...args: unknown[]) => { if (args[0] === "[keyway-security]") alerts.push(String(args[1])); else warn(...args); };
+  t.after(() => { console.warn = warn; });
+  const wrong = (code: string) => code === "000000" ? "111111" : "000000";
+  const limitAlerts = () => alerts.filter((alert) => JSON.parse(alert).kind === "step_up_failure_limit").length;
+
+  await t.test("each code allows five tries, but codes sent again don't bring more", async () => {
+    const { context, codeFrom } = harness(0n);
+    const nonce = await issueRequest(context.user, "message", "digest", {}, true);
+    for (let round = 0; round < 3; round++) {
+      await sendCode(context, "message", nonce, "Sign a message", []);
+      const code = codeFrom();
+      for (let i = 0; i < 5; i++) await assert.rejects(() => verifyCode(context.user, "message", nonce, wrong(code)), /isn't right/);
+    }
+    await sendCode(context, "message", nonce, "Sign a message", []);
+    const kept = codeFrom();
+    for (let i = 0; i < 4; i++) await assert.rejects(() => verifyCode(context.user, "message", nonce, wrong(kept)), /isn't right/);
+    // The twentieth wrong code, on another approval: one alert, and then no code is checked or sent for the day.
+    const other = await issueRequest(context.user, "settings", "digest", {}, true);
+    await sendCode(context, "settings", other, "Confirm a security change", []);
+    await assert.rejects(() => verifyCode(context.user, "settings", other, wrong(codeFrom())), /isn't right/);
+    assert.equal(limitAlerts(), 1);
+    await assert.rejects(() => verifyCode(context.user, "message", nonce, kept), /Too many wrong email codes today/);
+    await assert.rejects(() => sendCode(context, "message", nonce, "Sign a message", []), /Too many wrong email codes today/);
+    assert.equal(limitAlerts(), 1);
+    // A day later they count for nothing.
+    await sql`update keyway_v2_step_up_failures set created_at = created_at - interval '1 day' where user_id = ${context.user.id}`;
+    await sendCode(context, "message", nonce, "Sign a message", []);
+    await verifyCode(context.user, "message", nonce, codeFrom());
+  });
+
+  await t.test("wrong codes tried at once still stop at 20", async () => {
+    const { context, codeFrom } = harness(0n);
+    const nonces: Array<{ nonce: string; code: string }> = [];
+    for (let i = 0; i < 6; i++) {
+      const nonce = await issueRequest(context.user, "payment", `digest-${i}`, {}, true);
+      await sendCode(context, "payment", nonce, "Confirm a payment", []);
+      nonces.push({ nonce, code: codeFrom() });
+    }
+    const outcomes = await Promise.all(nonces.flatMap(({ nonce, code }) => Array.from({ length: 5 }, () =>
+      verifyCode(context.user, "payment", nonce, wrong(code)).then(() => "ok", (error: Error) => error.message))));
+    assert.equal(outcomes.filter((message) => /isn't right/.test(message)).length, 20);
+    assert.equal(outcomes.filter((message) => /today/.test(message)).length, 10);
   });
 });

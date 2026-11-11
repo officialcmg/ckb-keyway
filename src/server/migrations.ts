@@ -407,4 +407,17 @@ export const migrations: Array<{
     // origin could never end them; they are signed out, and sessions without an origin are refused.
     up: (sql) => sql`delete from keyway_auth_sessions where "origin" is null`,
   },
+  {
+    version: 24, name: "step-up-code-failures",
+    up: async (sql) => {
+      // Wrong step-up codes per user, kept for a day: each code allows five tries, and codes can be sent again.
+      await sql`create table keyway_v2_step_up_failures (
+        id bigint generated always as identity primary key,
+        user_id uuid not null,
+        created_at timestamptz not null default now()
+      )`;
+      await sql`create index keyway_v2_step_up_failures_user on keyway_v2_step_up_failures (user_id, created_at)`;
+      await sql`create index keyway_v2_step_up_failures_age on keyway_v2_step_up_failures (created_at)`;
+    },
+  },
 ];
