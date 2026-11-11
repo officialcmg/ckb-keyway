@@ -200,16 +200,22 @@ test("the most urgent payment goes first: one claimable with a preimage before o
   assert.equal(decision.claim.unlockType, 1);
 });
 
-test("the user's share isn't held back by payments in flight, and a successor keeps them", () => {
+test("the user's share waits while a payment may still be the user's, since whoever settles second may take the cell", () => {
   // Neither payment is the node's to claim yet: no preimage, and the outgoing one hasn't expired.
   const f = tlcFixture({ offeredExpiry: NOW + HOUR });
-  const decision = planClaim({ channel: f.channel, cell: f.cell, now: NOW });
+  // With the user's slot emptied first, the peer (settling second) could sweep the cell, payments and all.
+  assert.deepEqual(planClaim({ channel: f.channel, cell: f.cell, now: NOW }), { skip: "waiting for a pending payment to resolve" });
+  // Once nothing remains that can become the user's (the outgoing one taken back, the incoming one expired without
+  // its preimage), the share goes, and a successor keeps what is the peer's to take back.
+  const resolved = tlcFixture({ receivedExpiry: NOW - HOUR, offeredExpiry: NOW + HOUR });
+  const outgoingBack = ccc.bytesConcat(new Uint8Array([1]), resolved.theirs, new Uint8Array([0, 0]), new Uint8Array(65));
+  const decision = planClaim({ channel: resolved.channel, cell: { capacity: resolved.capacity - 180n * CKB, args: "0x" + "00".repeat(57) }, previousWitness: outgoingBack, now: NOW });
   assert.ok("claim" in decision);
   assert.equal(decision.claim.unlockType, 0xff, "the user's slot on the peer's commitment");
-  assert.equal(decision.claim.since, 0xa000010000000001n);
-  assert.equal(decision.claim.successor?.capacity, f.capacity - 500n * CKB);
-  const after = applyUnlocks({ ...parseSettlementWitness(f.theirs, false)!, unlocks: [{ type: 0xff, withPreimage: false }] })!;
-  assert.equal(after.pendingTlcs.length, 2);
+  assert.equal(decision.claim.since, 0n);
+  assert.equal(decision.claim.successor?.capacity, resolved.capacity - 180n * CKB - 500n * CKB);
+  const after = applyUnlocks({ ...parseSettlementWitness(outgoingBack)!, unlocks: [{ type: 0, withPreimage: false }, { type: 0xff, withPreimage: false }] })!;
+  assert.equal(after.pendingTlcs.length, 1);
   assert.equal(hex(ccc.bytesFrom(decision.claim.successor!.args).slice(36, 56)), hex(blake160(encodeWitnessState(after))));
 
   // Once the peer has settled its share too, the TLCs' amounts still stay locked for them rather than going to the

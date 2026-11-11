@@ -248,7 +248,8 @@ type ClaimChannel = Pick<WatchedChannel, "localSettlementKey" | "remoteSettlemen
  *
  * Pending TLCs come first, the most urgent first: one the node can unlock with a payment preimage it holds (the
  * peer can take it back once it expires), soonest expiry first, then one that has expired and is the node's to take
- * back. Then the user's own share, leaving a successor cell for whatever TLCs remain. On the first settlement each
+ * back. Then the user's own share: while the peer's is unsettled, only once no TLC may still become the user's (the
+ * party that settles second can take the whole cell), leaving a successor cell for what remains. On the first settlement each
  * unlock also waits for its share of the commitment's delay (`delayPassed`, given the input `since` it needs).
  */
 export function planClaim(options: {
@@ -349,6 +350,10 @@ export function planClaim(options: {
     if (left < occupied(successorArgs)) return { claim: base };
     return { claim: { ...base, successor: { capacity: left, args: successorArgs } } };
   }
+  // The peer's share is unsettled: whoever settles second may take the whole cell, TLCs included (the lock checks no
+  // output once both slots are empty), and Fiber's watchtower does. So, as Fiber, the user's share waits while any
+  // TLC may still become the user's; until then the peer, settling first, leaves them in a successor.
+  if (waitingTlcs) return { skip: "waiting for a pending payment to resolve" };
   if (cell.capacity <= mine) return { skip: "the commitment cell holds less than the user's share" };
   // The peer's part (and any TLCs) stays in a successor cell, which must hold at least its own occupied capacity.
   if (left < occupied(successorArgs)) return { skip: "the peer's remaining part is too small for a commitment cell" };
