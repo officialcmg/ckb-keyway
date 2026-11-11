@@ -55,6 +55,12 @@ const CATCH_UP_BUDGET_MS = 120_000;
 const PAGE_TIMEOUT_MS = 15_000;
 /** Channels never seen funded that are checked per pass (see `runWatchtowerPass`). */
 const UNFUNDED_PER_PASS = 500;
+/**
+ * Check time one account's channels may take in a pass before its remaining ones wait for the next (each account's
+ * first check always runs). A channel's check is a page or two of its funding lock, so an honest account's 64
+ * channels take a few seconds; this keeps an account whose locks are padded or slow from lengthening every pass.
+ */
+const ACCOUNT_BUDGET_MS = 30_000;
 /** How long a close or penalty must stay on-chain before it is final (24 blocks are about 4 minutes). */
 const REORG_RECHECK_MINUTES = 30;
 /** Channels whose recent history is checked at the same time in a pass. */
@@ -697,6 +703,8 @@ export type PassDependencies = {
   catchUpBudgetMs?: number;
   /** Channels never seen funded checked per pass (default `UNFUNDED_PER_PASS`). */
   unfundedPerPass?: number;
+  /** Check time per account per pass (default `ACCOUNT_BUDGET_MS`). */
+  accountBudgetMs?: number;
 };
 
 /**
@@ -716,12 +724,17 @@ export async function runWatchtowerPass(passDeps: PassDependencies): Promise<voi
       -- A close or penalty is kept until it is confirmed, however long the watchtower was down.
       and (resolution_confirmed or state in ('missed', 'invalid'))
   `;
-  // Channels whose funding is on-chain are all checked, every pass, first. Ones never seen funded can't have been
-  // closed yet; at most UNFUNDED_PER_PASS of them are checked per pass, so registrations can't slow down the funded
-  // channels' checks.
+  // Channels whose funding is on-chain are checked first, from each account in turn (every account's least recently
+  // checked first), each account within its share of the pass (ACCOUNT_BUDGET_MS): what one account's channels
+  // don't get to waits for the next pass, ahead of its others. Ones never seen funded can't have been closed yet; at
+  // most UNFUNDED_PER_PASS of them are checked per pass, so registrations can't slow down the funded channels' checks.
   const funded = await sql<Row[]>`
-    select * from keyway_v2_watchtower_channels where state in ('watching', 'penalty-sent') and (funding_seen or funding_spend is not null)
-    order by checked_at asc nulls first
+    select * from (
+      select *, row_number() over (partition by user_id order by checked_at asc nulls first, created_at asc) as turn
+      from keyway_v2_watchtower_channels
+      where state in ('watching', 'penalty-sent') and (funding_seen or funding_spend is not null)
+    ) funded_rows
+    order by turn, checked_at asc nulls first, created_at asc
   `;
   // Taken from each account in turn (every account's least recently checked first), so one account's
   // registrations only delay its own channels.
@@ -762,8 +775,19 @@ export async function runWatchtowerPass(passDeps: PassDependencies): Promise<voi
 
   const behind: Row[] = [];
   const queue = [...rows];
+  const accountBudget = deps.accountBudgetMs ?? ACCOUNT_BUDGET_MS;
+  const spent = new Map<string, number>();
   await Promise.all(Array.from({ length: Math.min(deps.concurrency ?? CHECK_CONCURRENCY, queue.length) }, async () => {
-    for (let row = queue.shift(); row; row = queue.shift()) if (await check(row, 0)) behind.push(row);
+    for (let row = queue.shift(); row; row = queue.shift()) {
+      // Past its share: left unchecked (so least recently checked, and first in its account's turn next pass).
+      if ((spent.get(row.user_id) ?? 0) >= accountBudget) continue;
+      const started = Date.now();
+      try {
+        if (await check(row, 0)) behind.push(row);
+      } finally {
+        spent.set(row.user_id, (spent.get(row.user_id) ?? 0) + Date.now() - started);
+      }
+    }
   }));
   // Several at a time too, so a long list of closes doesn't hold up the next pass.
   const confirming = [...recent];

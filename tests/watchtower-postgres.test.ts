@@ -368,6 +368,43 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     assert.equal((await sql<Array<{ state: string }>>`select state from keyway_v2_watchtower_channels where channel_id = ${id}`)[0].state, "missed");
   });
 
+  await t.test("funded channels are checked from each account in turn, each account within its share of the pass", async () => {
+    await sql`delete from keyway_v2_watchtower_channels`;
+    const flooder = { id: crypto.randomUUID() };
+    const honest = { id: crypto.randomUUID() };
+    // The flooder's channels sit on locks that are slow to read (padded); the honest account's on a quick one.
+    const flooderIds = Array.from({ length: 5 }, channelId);
+    for (const id of flooderIds) await watchtowerRequest(flooder, watch(id));
+    const honestId = channelId();
+    await watchtowerRequest(honest, parseWatchtowerRequest({ operation: "watch", channelId: honestId, localFundingPubkey: K3, remoteFundingPubkey: K2, fundingUdtTypeScript: null }));
+    // The honest channel was checked more recently than every one of the flooder's.
+    await sql`update keyway_v2_watchtower_channels set funding_seen = true, checked_at = now() - interval '1 hour' where user_id = ${flooder.id}`;
+    await sql`update keyway_v2_watchtower_channels set funding_seen = true, checked_at = now() - interval '1 minute' where user_id = ${honest.id}`;
+    // Distinct scan positions, so no two channels share a read.
+    await sql`update keyway_v2_watchtower_channels set history_cursor = channel_id`;
+    const honestLock = fundingLockArgs(K3, K2);
+    const order: string[] = [];
+    const chain: ChainView = {
+      async fundingHistory(lock, scan) {
+        order.push(scan.cursor!);
+        if (lock.args !== honestLock) await new Promise((resolve) => setTimeout(resolve, 60));
+        return { sawOutput: true, cursor: scan.cursor };
+      },
+      transaction: async () => undefined,
+      isLive: async () => true,
+    };
+    await runWatchtowerPass({ sql, chain, concurrency: 1, accountBudgetMs: 100, punish: async () => { throw new Error("no"); }, log: () => undefined });
+    assert.ok(order.indexOf(honestId) <= 1, `the honest account's channel is checked in the first turn: ${order.indexOf(honestId)}`);
+    const flooderChecks = order.filter((id) => id !== honestId).length;
+    assert.ok(flooderChecks >= 1 && flooderChecks < flooderIds.length, `the flooder's checks stop at its share: ${flooderChecks}`);
+    // The ones left over go first next pass.
+    const unchecked: string[] = flooderIds.filter((id) => !order.includes(id));
+    order.length = 0;
+    await runWatchtowerPass({ sql, chain, concurrency: 1, accountBudgetMs: 100, punish: async () => { throw new Error("no"); }, log: () => undefined });
+    assert.ok(unchecked.includes(order.filter((id) => id !== honestId)[0]));
+    await sql`delete from keyway_v2_watchtower_channels`;
+  });
+
   await t.test("closed channels count toward the cap until confirmed, and a pass reads each lock and transaction once", async () => {
     await sql`delete from keyway_v2_watchtower_channels`;
     const flooder = { id: crypto.randomUUID() };
