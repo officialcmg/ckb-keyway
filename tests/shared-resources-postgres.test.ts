@@ -14,7 +14,7 @@ import { acquireLease } from "../src/server/device-lease.ts";
 import { handleKeyWayRequest } from "../src/server/http.ts";
 import { runIdempotentMutation } from "../src/server/idempotency.ts";
 import { prepareBackupForDevice, saveNodeBackup } from "../src/server/node-backup.ts";
-import { recordSigningEvent } from "../src/server/security-alerts.ts";
+import { alertRetry, recordSigningEvent } from "../src/server/security-alerts.ts";
 import { readWallet, saveWallet, type ReadyWallet } from "../src/server/user-wallet.ts";
 
 // Shared resources (the Lit credit, the database, the lock budget, alerts) against a database of their own: these
@@ -180,6 +180,8 @@ test("L3: the unusual-signing alert survives concurrent signings and failed deli
   process.env.KEYWAY_SECURITY_ALERT_WEBHOOK_URL = "https://alerts.example/hook";
   const warn = console.warn;
   console.warn = (...args: unknown[]) => { if (args[0] !== "[keyway-security]") warn(...args); };
+  const retryDelay = alertRetry.delayMs;
+  alertRetry.delayMs = 20;
   let failures = 0;
   let attempts = 0;
   let delivered = 0;
@@ -201,6 +203,7 @@ test("L3: the unusual-signing alert survives concurrent signings and failed deli
   };
   const signers = () => Array.from({ length: 2 * threshold }, () => crypto.randomUUID());
   t.after(() => {
+    alertRetry.delayMs = retryDelay;
     console.warn = warn;
     globalThis.fetch = realFetch;
     delete process.env.KEYWAY_SECURITY_ALERT_WEBHOOK_URL;

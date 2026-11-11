@@ -35,6 +35,12 @@ export async function recordSigningEvent(userId: string, connection?: DatabaseSq
   `;
   const threshold = positiveInteger(process.env.KEYWAY_SIGNING_ALERT_THRESHOLD, 20);
   if (row.count < threshold) return;
+  // Read first, so signings in a burst that already alerted don't all queue on the claim's row lock.
+  const [recent] = await sql`
+    select 1 from keyway_security_alert_state
+    where kind = 'unusual_signing_volume' and alerted_at >= now() - make_interval(mins => ${SIGNING_WINDOW_MINUTES})
+  `;
+  if (recent) return;
   const claimId = crypto.randomUUID();
   const [claimed] = await sql`
     insert into keyway_security_alert_state (kind, alerted_at, claim_id) values ('unusual_signing_volume', now(), ${claimId})
