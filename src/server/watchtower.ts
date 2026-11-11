@@ -973,12 +973,22 @@ function storedRevocation(row: Row): Revocation | undefined {
  * The penalty, built from a stored row and sent with the watchtower's fee key. Make one per pass: ccc's client cache
  * marks a sent penalty's fee cells spent and its change cell live, which lets the penalties of one pass (sent one at
  * a time) chain on each other, but a penalty the chain dropped would leave that change cell in the cache for good, and
- * every later penalty would spend a cell that doesn't exist. So the first penalty of each sender clears the cache.
+ * every later penalty would spend a cell that doesn't exist. So the first penalty of each sender clears the cache,
+ * then marks again the penalties (`inFlight`) the node still has in its mempool.
  */
-export function penaltySender(client: ccc.Client, feeSigner: ccc.Signer) {
+export function penaltySender(client: ccc.Client, feeSigner: ccc.Signer, inFlight: () => Promise<string[]> = async () => []) {
   let cleared: Promise<void> | undefined;
+  // Penalties from earlier passes still in the mempool keep their fee cells spent (the indexer only shows committed
+  // cells), so a new penalty chains on them instead of conflicting with them.
+  const refresh = async () => {
+    await client.cache.clear();
+    for (const hash of await inFlight()) {
+      const found = await client.getTransactionNoCache(hash).catch(() => undefined);
+      if (found && (found.status === "pending" || found.status === "proposed")) await client.cache.markTransactions(found.transaction);
+    }
+  };
   return async (row: Row, commitment: Commitment) => {
-    await (cleared ??= client.cache.clear());
+    await (cleared ??= refresh());
     const revocation = storedRevocation(row);
     if (!revocation) throw new Error("No revocation data");
     const tx = await buildPenaltyTransaction({ client, commitment, revocation, peerKey: row.peer_commitment_key, feeSigner });
@@ -1022,7 +1032,10 @@ export function startWatchtower(env: NodeJS.ProcessEnv = process.env): () => Pro
     if (!locked) return;
     if (!lock) console.info(`[watchtower] running; fee address ${await feeSigner.getRecommendedAddress()}`);
     lock = connection;
-    await runWatchtowerPass({ sql, chain: chainView(client), punish: penaltySender(client, feeSigner) });
+    const inFlight = async () => (await sql<Array<{ penalty_tx: string }>>`
+      select penalty_tx from keyway_v2_watchtower_channels where state = 'penalty-sent' and penalty_tx is not null
+    `).map((row) => row.penalty_tx);
+    await runWatchtowerPass({ sql, chain: chainView(client), punish: penaltySender(client, feeSigner, inFlight) });
   };
   const loop = () => {
     if (stopped) return;
