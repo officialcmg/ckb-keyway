@@ -92,6 +92,29 @@ test("a node that runs again after its logout saved a backup retires that backup
     assert.equal((await readClaimedNodeBackup(user, A)).status, "claimed");
   });
 
+  await t.test("a device that lost the wallet while its key was being wrapped gets no key and retires nothing", async () => {
+    const { user, lease } = await device();
+    await saveNodeBackup(user, A, payload("state at logout"));
+    // While Lit wraps the key, the lease runs out, and another device signs in, claims the backup and is bound.
+    await assert.rejects(access(user, A, lease.leaseId, async (wallet) => {
+      await lapse(user.id);
+      assert.equal((await prepareBackupForDevice(user, A, B, undefined, sql)).restoreRequired, true);
+      await saveWallet(user, { ...wallet, primaryDeviceIdHash: B });
+      return "wrapped key";
+    }), /bound to another device/);
+    assert.equal((await readClaimedNodeBackup(user, B)).status, "claimed", "the other device can still restore it");
+  });
+
+  await t.test("a lease that ran out while the key was being wrapped retires nothing", async () => {
+    const { user, lease } = await device();
+    await saveNodeBackup(user, A, payload("state at logout"));
+    await assert.rejects(access(user, A, lease.leaseId, async () => {
+      await lapse(user.id);
+      return "wrapped key";
+    }), /active device lease/);
+    assert.equal((await prepareBackupForDevice(user, A, B, undefined, sql)).restoreRequired, true);
+  });
+
   await t.test("only a device holding the lease gets its key, and nothing is retired otherwise", async () => {
     const { user, lease } = await device();
     await saveNodeBackup(user, A, payload("state at logout"));

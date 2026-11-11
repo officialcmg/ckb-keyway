@@ -20,7 +20,7 @@ import { loadLitAction } from "./lit-actions.ts";
 import { LIT_ACTION_CIDS } from "./lit-config.ts";
 import { wrapFiberKey } from "./lit.ts";
 import { serializeTransaction } from "./funding-transaction.ts";
-import { database } from "./database.ts";
+import { database, withUserLock } from "./database.ts";
 import { confirmNodeBackupRestored, readClaimedNodeBackup, retireOwnBackups, saveNodeBackup } from "./node-backup.ts";
 import {
   addApplicationOrigin,
@@ -247,7 +247,20 @@ export async function fiberKeyAccess<T>(user: User, deviceIdHash: string, leaseI
   if (wallet.primaryDeviceIdHash !== deviceIdHash) throw new Error("Fiber wallet is bound to another device");
   await requireLease(user, deviceIdHash, leaseId);
   const delivered = await deliver(wallet);
-  await retireOwnBackups(user, deviceIdHash);
+  // Wrapping takes a while: the lease may have run out and another device claimed the backups and been bound
+  // meanwhile. Under the lock bootstrap claims and rebinds with, this device must still be the wallet's and hold the
+  // lease (its row locked until the retire commits); otherwise it gets no key and nothing is retired.
+  await withUserLock(user.id, async (sql) => {
+    const current = await readWallet(user, sql);
+    if (!current || current.status !== "ready" || current.primaryDeviceIdHash !== deviceIdHash) throw new Error("Fiber wallet is bound to another device");
+    const [lease] = await sql`
+      select 1 from keyway_v2_device_leases
+      where user_id = ${user.id} and device_id_hash = ${deviceIdHash} and lease_id = ${leaseId} and expires_at > now()
+      for update
+    `;
+    if (!lease) throw new Error("An active device lease is required");
+    await retireOwnBackups(user, deviceIdHash, sql);
+  });
   return delivered;
 }
 
