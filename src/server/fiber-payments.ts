@@ -108,8 +108,8 @@ async function payOnce(context: PaymentContext, node: FiberCaller, body: Record<
   const params = paymentFiberParams(method, body.params, "testnet");
   if (params.dry_run === true) throw new Error("Use the node call for dry runs");
   // The fee a payment may pay is capped at the one counted toward the daily amount (max_fee_amount, when sending).
-  // A fee rate would be a second, separate cap, so the dry run and the send both leave it to the node's default.
-  delete params.max_fee_rate;
+  // A fee rate would be a second, separate cap that the estimate and the send could apply differently.
+  if (params.max_fee_rate !== undefined) throw new Error("Hosted payments take max_fee_amount, not max_fee_rate, to limit the fee");
   const digest = hashText(JSON.stringify({ method, params }));
 
   if (body.stage === "preview") {

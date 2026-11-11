@@ -521,14 +521,14 @@ test("a hosted payment can't pay a higher fee than the one counted toward the da
   const fee = 5_000n;
   const h = harness(40n * CKB, { fee });
   // The caller's own fee limits are far above the dry run's estimate.
-  const params = { invoice: "fibt1test", max_fee_amount: `0x${(10n * CKB).toString(16)}`, max_fee_rate: "0x3e8" };
+  const params = { invoice: "fibt1test", max_fee_amount: `0x${(10n * CKB).toString(16)}` };
+  // A fee rate is refused rather than left out: the counted fee is the one cap.
+  await assert.rejects(fiberPayment(h.context, h.node, { method: "sendPayment", params: { ...params, max_fee_rate: "0x3e8" }, stage: "preview" }), /max_fee_amount, not max_fee_rate/);
   const preview = await fiberPayment(h.context, h.node, { method: "sendPayment", params, stage: "preview" }) as Record<string, unknown>;
   assert.equal((preview.preview as { fee: string }).fee, fee.toString());
   await fiberPayment(h.context, h.node, { method: "sendPayment", params, stage: "send", confirmationNonce: preview.confirmationNonce });
   const sent = h.sent.at(-1) as Record<string, unknown>;
   assert.equal(sent.max_fee_amount, `0x${fee.toString(16)}`, "capped at the counted fee");
-  assert.equal(sent.max_fee_rate, undefined, "the counted fee is the one cap");
-  assert.equal(h.dryRuns.at(-1)!.max_fee_rate, undefined, "the estimate is made under the same rules the send runs under");
 
   // A caller's own lower cap still holds.
   const lower = { invoice: "fibt1test", max_fee_amount: "0x3e8" };
