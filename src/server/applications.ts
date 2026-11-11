@@ -167,7 +167,10 @@ export async function applicationAllowsOrigin(appId: string, origin: string): Pr
 // shared with other people refuse only a source that already asked in the last minute.
 const OTP_EMAIL_APP_LIMIT = 5; // codes for one email in one app from one source
 const OTP_SOURCE_LIMIT = 60; // codes asked for from one source
-const OTP_NETWORK_LIMIT = 60; // codes asked for from one network, so a /48 can't act as 65,536 sources
+// Codes asked for from one network. Many people can share a /48 (an ISP's customers, a carrier, a host), so a source
+// that hasn't asked in the window still gets its first code up to the hard limit, and known networks are exempt.
+const OTP_NETWORK_LIMIT = 60;
+const OTP_NETWORK_HARD_LIMIT = 600;
 const OTP_EMAIL_LIMIT = 15; // codes to one email across all apps, shared
 // A known network is one that signed in to this email's account in the app in the last OTP_KNOWN_NETWORK_DAYS days.
 // Strangers can't make one, so the owner's usual networks get through the limits below that strangers can fill.
@@ -190,9 +193,9 @@ const OTP_FAILURE_ALERT = 20; // from anyone: one alert
 const OTP_FAILURE_PAUSE = 30; // from anyone: checks pause until it drops back, except a fresh code's first try (below)
 // While paused, a code's first try still goes ahead, so strangers' wrong codes can't lock the owner out. Each such
 // try needs a newly sent code, and an unknown network gets it while it has fewer than OTP_BYPASS_NETWORK_LIMIT wrong
-// codes, until OTP_BYPASS_LIMIT wrong first tries from anyone. Known networks keep it, within OTP_FAILURE_LIMIT per
-// source. So at most OTP_FAILURE_PAUSE + OTP_BYPASS_LIMIT wrong codes (90 of a million) reach Better Auth a day,
-// plus up to OTP_FAILURE_LIMIT from each source inside one of the owner's own known networks.
+// codes, until OTP_BYPASS_LIMIT wrong first tries from anyone. A known network keeps it while it has fewer than
+// OTP_FAILURE_LIMIT. So at most OTP_FAILURE_PAUSE + OTP_BYPASS_LIMIT wrong codes (90 of a million) reach Better Auth
+// a day, plus up to OTP_FAILURE_LIMIT from each network the owner signed in from.
 const OTP_BYPASS_NETWORK_LIMIT = 3;
 const OTP_BYPASS_LIMIT = 60;
 const OTP_PLATFORM_FAILURE_ALERT = 500; // wrong codes in an hour across every app and email: one alert an hour
@@ -214,7 +217,7 @@ export async function prepareOtpSend(input: {
   const appLimit = app?.otp_limit_per_minute ?? DASHBOARD_OTP_LIMIT_PER_MINUTE;
   type Ceiling = "global" | "owner" | "inbox";
   const result = await sql.begin(async (transaction): Promise<"failures" | "cooldown" | "limited" | "limited-first" | { ceilings: Ceiling[] }> => {
-    const keys = [`otp:app:${appId}`, `otp:email:${emailHash}`, `otp:ip:${ipHash}`, ...owner ? [`otp:owner:${owner}`] : []];
+    const keys = [`otp:app:${appId}`, `otp:email:${emailHash}`, `otp:ip:${ipHash}`, `otp:network:${networkHash}`, ...owner ? [`otp:owner:${owner}`] : []];
     for (const key of keys.sort()) {
       await transaction`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`;
     }
@@ -250,18 +253,22 @@ export async function prepareOtpSend(input: {
     // One code a minute for one email in one app from one source.
     if (limits.cooldown > 0) return "cooldown";
     // Budgets shared with other people (the app's, the developer's, everyone's, the inbox's across apps) refuse only a
-    // source or network that already asked in the last minute, so strangers filling them can't block anyone else's
-    // first request. The inbox's hard limit refuses a network that already had a code for this email in the window,
-    // unless the owner signed in from it recently. Past the inbox's absolute limit in this app or everyone's hard
-    // limit, only such a known network gets a code.
+    // source that already asked in the last minute, so strangers filling them can't block anyone else's first request;
+    // past everyone's per-minute budget, a network that asked in the last minute is refused too, so one /48 can't fill
+    // it alone. The inbox's hard limit refuses a network that already had a code for this email in the window. Past the
+    // inbox's absolute limit in this app or everyone's hard limit, only a known network gets a code. Known networks,
+    // which strangers can't make, are exempt from every limit counted per network.
     let known: boolean | undefined;
     const isKnown = async () => known ??= await knownNetwork(transaction as unknown as DatabaseSql, context);
     const shared = limits.app_count >= appLimit || limits.owner_count >= OWNER_OTP_LIMIT_PER_MINUTE
       || limits.global_count >= GLOBAL_OTP_LIMIT_PER_MINUTE || limits.email_count >= OTP_EMAIL_LIMIT;
     const knownOnly = limits.email_app_total >= OTP_EMAIL_ABSOLUTE_LIMIT || limits.global_count >= GLOBAL_OTP_HARD_LIMIT_PER_MINUTE;
-    if (limits.email_app_count >= OTP_EMAIL_APP_LIMIT || limits.source_count >= OTP_SOURCE_LIMIT || limits.network_count >= OTP_NETWORK_LIMIT
-      || (shared && (limits.source_minute_count > 0 || limits.network_minute_count > 0))
-      || (limits.email_count >= OTP_EMAIL_HARD_LIMIT && limits.network_email_count > 0 && !await isKnown())
+    const busyNetwork = (limits.network_count >= OTP_NETWORK_LIMIT && limits.source_count > 0)
+      || limits.network_count >= OTP_NETWORK_HARD_LIMIT
+      || (limits.global_count >= GLOBAL_OTP_LIMIT_PER_MINUTE && limits.network_minute_count > 0)
+      || (limits.email_count >= OTP_EMAIL_HARD_LIMIT && limits.network_email_count > 0);
+    if (limits.email_app_count >= OTP_EMAIL_APP_LIMIT || limits.source_count >= OTP_SOURCE_LIMIT
+      || (shared && limits.source_minute_count > 0) || (busyNetwork && !await isKnown())
       || (knownOnly && !await isKnown())) {
       // At most one record a minute per source and app, and one alert per app every 10 minutes, however many are refused.
       if (limits.source_limited === 0) await insertOtpEvent(transaction as unknown as DatabaseSql, context, "rate_limited");
@@ -350,8 +357,8 @@ export async function checkOtpFailures(context: OtpContext, challenge: { wrongAt
   const failures = await otpFailures(sql, context);
   if (failures.source >= OTP_FAILURE_LIMIT) throw new Error(OTP_FAILURE_MESSAGE);
   if (failures.day < OTP_FAILURE_PAUSE) return { bypass: false };
-  if (challenge.wrongAttempts === 0 && (await knownNetwork(sql, context)
-    || (failures.network < OTP_BYPASS_NETWORK_LIMIT && failures.bypass < OTP_BYPASS_LIMIT))) return { bypass: true };
+  if (challenge.wrongAttempts === 0 && (failures.network < OTP_BYPASS_NETWORK_LIMIT && failures.bypass < OTP_BYPASS_LIMIT
+    || failures.network < OTP_FAILURE_LIMIT && await knownNetwork(sql, context))) return { bypass: true };
   throw new Error("Too many incorrect codes for this email. Try again later");
 }
 

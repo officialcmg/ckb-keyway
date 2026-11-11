@@ -77,7 +77,9 @@ KeyWay limits sign-in codes so one app, inbox or network can't flood the system:
 | --- | --- |
 | Codes per email address | 5 every 10 minutes |
 | Codes per IP address | 60 every 10 minutes |
+| Codes per network (IPv6 /48) | 60 every 10 minutes for addresses that already asked; each other address still gets its first code |
 | Codes per app | 30 a minute, shared by all of the app's users |
+| Codes to one email address in one app | 50 every 10 minutes from new networks; networks the user signed in from in the last 90 days are exempt |
 | Code lifetime | 10 minutes |
 | Wrong attempts per code | 5, then request a new code |
 | Wrong codes per email address | 30 a day in each app. After that, each newly requested code gets one try: a few per network and a limited number a day, and always from a network the user signed in from in the last 90 days |

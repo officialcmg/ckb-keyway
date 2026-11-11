@@ -388,7 +388,7 @@ test("general signing binds approvals, email codes and threshold changes", { ski
   });
 });
 
-test("wrong step-up codes add up across codes, to 20 a day per user", { skip: !enabled }, async (t) => {
+test("wrong step-up codes add up across codes, to 20 a day per session", { skip: !enabled }, async (t) => {
   process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
   delete process.env.KEYWAY_SECURITY_ALERT_WEBHOOK_URL;
   const sql = await database();
