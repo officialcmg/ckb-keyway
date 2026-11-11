@@ -39,7 +39,7 @@ const address = (byte: number) => ccc.Address.fromScript(ccc.Script.from({
 function preview(recipients: number): TransactionPreview {
   return {
     network: "CKB testnet", sendingCkb: "1100", receivingCkb: "0", feeCkb: "0.0001",
-    tokens: [{ id: "0x55555555…5555", asset: `0x${"55".repeat(32)}`, standard: "xUDT", amount: "-1000", amountText: "-1000 of token 0x55555555…5555" }],
+    tokens: [{ id: "0x55555555…5555", asset: `0x${"55".repeat(32)}`, standard: "xUDT", amount: "-1000", amountText: `-1000 of token 0x${"55".repeat(32)}` }],
     nfts: [], dao: [],
     recipients: Array.from({ length: recipients }, (_, index) => ({ address: address(index + 1), kind: "wallet" as const, walletType: "standard", ckb: "100", tokens: [], nfts: [] })),
     unrecognized: [{ codeHash: "0x9f9f9f9f…9f9f", cells: 1 }],
@@ -51,7 +51,7 @@ test("the confirmation email never drops what a transaction does to the account'
   const lines = previewSummaryLines(preview(11));
   const email = createConfirmationEmailTemplate("Acme Pay", "123456", "Confirm a transaction", lines);
   for (const body of [email.plaintext, email.html]) {
-    assert.match(body, /Token -1000 of token 0x55555555…5555/);
+    assert.ok(body.includes(`Token -1000 of token 0x${"55".repeat(32)} (xUDT 0x${"55".repeat(32)})`));
     assert.match(body, /Unrecognized script 0x9f9f9f9f…9f9f/);
     // Whatever doesn't fit is said to be missing, not silently left out.
     assert.match(body, /and \d+ more/);

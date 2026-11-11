@@ -38,12 +38,11 @@ const escape = (_step: ApprovalStep | undefined, answer: (approved: boolean) => 
 
 type ApprovalProps<P> = { theme: Theme; appName: string; preview: P; step?: ApprovalStep; answer: (approved: boolean) => void };
 
-/** A token's change for people: "25 RUSD", or the raw amount with a short ID when KeyWay can't name it. */
+/** A token's change for people: "25 RUSD", or the raw amount with the token's whole ID when KeyWay can't name it. */
 function tokenText(token: TransactionPreview["tokens"][number]): string {
   const raw = BigInt(token.amount.replace(/^\+/, ""));
   const size = raw < 0n ? -raw : raw;
-  if (token.amountText) return token.amountText.replace(/^[+-]/, "");
-  return token.asset ? formatAsset(size, token.asset) : `${size} of token ${token.id}`;
+  return formatAsset(size, token.asset);
 }
 
 /** The built-in approval dialog for a transaction, drawn from the backend's decoding of its effects. */
@@ -66,8 +65,8 @@ export function KeyWayTransactionModal({ theme, appName, preview, step, answer }
           <dl style={{ ...fundingDetails, margin: "16px 0" }}>
             {sending && <Row palette={palette} label="You send" value={`${preview.sendingCkb} CKB`} />}
             {preview.receivingCkb !== "0" && <Row palette={palette} label="You receive" value={`${preview.receivingCkb} CKB`} />}
-            {preview.tokens.map((token) => <Row key={`t-${token.id}`} palette={palette} label={token.amount.startsWith("-") ? "You send" : "You receive"} value={tokenText(token)} />)}
-            {preview.nfts.map((nft) => <Row key={`n-${nft.id}`} palette={palette} label={`${nft.kind} ${nft.change}`} value={nft.id} />)}
+            {preview.tokens.map((token) => <Row key={`t-${token.asset}`} palette={palette} label={token.amount.startsWith("-") ? "You send" : "You receive"} value={tokenText(token)} />)}
+            {preview.nfts.map((nft, index) => <Row key={`n-${index}`} palette={palette} label={`${nft.kind} ${nft.change}`} value={nft.id} />)}
             {preview.dao.map((action, index) => <Row key={`d-${index}`} palette={palette} label={`Nervos DAO ${action.action}`} value={`${action.amountCkb} CKB`} />)}
             {preview.recipients.map((recipient) => (
               <Row
@@ -78,7 +77,7 @@ export function KeyWayTransactionModal({ theme, appName, preview, step, answer }
                   {/* The whole address: two look-alike addresses can share their start and their checksum. */}
                   {recipient.address}
                   <span style={{ display: "block", color: palette.muted }}>
-                    {[`${recipient.ckb} CKB`, ...recipient.tokens.map((token) => token.amountText ?? `${token.amount} of token ${token.id}`), ...recipient.nfts].join(" · ")}
+                    {[`${recipient.ckb} CKB`, ...recipient.tokens.map((token) => formatAsset(BigInt(token.amount), token.asset)), ...recipient.nfts].join(" · ")}
                   </span>
                 </>}
               />
@@ -90,7 +89,7 @@ export function KeyWayTransactionModal({ theme, appName, preview, step, answer }
           {preview.requiresEmailCode && !step?.failure && <p style={note(palette)}>This reaches your email confirmation amount, so we&apos;ll email you a code next.</p>}
           <details style={{ ...details, color: palette.muted }}>
             <summary style={{ cursor: "pointer" }}>Details</summary>
-            {preview.tokens.map((token) => <p key={`d-${token.id}`} style={detailLine}>Token {token.asset ?? token.id} ({token.standard}) {token.amount}</p>)}
+            {preview.tokens.map((token) => <p key={`d-${token.asset}`} style={detailLine}>Token {token.asset} ({token.standard}) {token.amount}</p>)}
             {preview.recipients.map((recipient) => <p key={`r-${recipient.address}`} style={detailLine}>To {recipient.address}</p>)}
             <CellList title="Inputs" cells={preview.details.inputs} />
             <CellList title="Outputs" cells={preview.details.outputs} />

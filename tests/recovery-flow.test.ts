@@ -146,7 +146,7 @@ test("builds the one recovery transaction from the account's own cells", async (
   const fee = 2_443n * CKB - transaction.getOutputsCapacity();
   assert.equal(preview.feeCkb, (Number(fee) / 1e8).toString());
   assert.ok(fee > 0n && fee < CKB / 1000n);
-  assert.deepEqual(preview.tokens, [{ asset: token.hash(), amount: "2500", amountText: `2500 of token ${token.hash().slice(0, 10)}…${token.hash().slice(-6)}` }]);
+  assert.deepEqual(preview.tokens, [{ asset: token.hash(), amount: "2500", amountText: `2500 of token ${token.hash()}` }]);
   assert.equal(preview.transactionHash, transaction.hash());
 
   // Deterministic: the same cells give the same transaction, so enable can rebuild and compare it.

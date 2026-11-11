@@ -26,9 +26,13 @@ const CLUSTER_CODE_HASHES = new Set([
 
 /**
  * A token's net change for the account: `amount` is signed raw units, `amountText` is for people ("-25 RUSD"),
- * `id` is a short form of `asset`, the token's type script hash.
+ * `id` is a short form of `asset`, the token's type script hash, for keys only: people are shown `asset` whole.
  */
 export type TokenEffect = { id: string; asset: string; standard: "xUDT" | "sUDT"; amount: string; amountText: string };
+/**
+ * A Spore or Cluster cell's change for the account. `id` is its whole type args, the NFT's ID: a shortened one could
+ * be ground to match another NFT's.
+ */
 export type NftEffect = { kind: "Spore" | "Cluster"; id: string; change: "sent" | "received" | "minted" | "burned" };
 export type DaoEffect = { action: "deposit" | "withdrawal request" | "withdrawal"; amountCkb: string };
 export type Recipient = {
@@ -36,7 +40,9 @@ export type Recipient = {
   kind: "wallet" | "contract" | "Fiber channel";
   walletType?: string;
   ckb: string;
-  tokens: Array<{ id: string; amount: string; amountText: string }>;
+  /** Per token, by `asset`, its whole type script hash (`id` is a short form of it, for keys only). */
+  tokens: Array<{ id: string; asset: string; amount: string; amountText: string }>;
+  /** "Spore <whole type args>" or "Cluster <whole type args>". */
   nfts: string[];
 };
 export type CellSummary = { lock: string; type?: string; capacityCkb: string; dataBytes: number };
@@ -253,13 +259,13 @@ export function describeTransaction(
   const nfts: NftEffect[] = [];
   for (const { key } of inputNfts.filter((item) => item.own)) {
     const after = outputNfts.find((item) => item.key!.id === key!.id);
-    if (!after) nfts.push({ kind: key!.kind, id: shortHash(key!.id), change: "burned" });
-    else if (!after.own) nfts.push({ kind: key!.kind, id: shortHash(key!.id), change: "sent" });
+    if (!after) nfts.push({ kind: key!.kind, id: key!.id, change: "burned" });
+    else if (!after.own) nfts.push({ kind: key!.kind, id: key!.id, change: "sent" });
   }
   for (const { key } of outputNfts.filter((item) => item.own)) {
     if (inputNfts.some((item) => item.own && item.key!.id === key!.id)) continue;
     const existed = inputNfts.some((item) => item.key!.id === key!.id);
-    nfts.push({ kind: key!.kind, id: shortHash(key!.id), change: existed ? "received" : "minted" });
+    nfts.push({ kind: key!.kind, id: key!.id, change: existed ? "received" : "minted" });
   }
 
   // Nervos DAO: deposit cells hold 8 zero bytes; withdrawal requests hold the deposit block number.
@@ -301,15 +307,15 @@ export function describeTransaction(
     recipient.ckb = formatCkb(parseCkb(recipient.ckb) + cell.cellOutput.capacity);
     const kind = typeKind(cell.cellOutput.type);
     if (kind === "xUDT" || kind === "sUDT") {
+      // One row per token by its whole type script hash: two tokens can share a short form.
       const asset = cell.cellOutput.type!.hash();
-      const id = shortHash(asset);
-      const existing = recipient.tokens.find((token) => token.id === id);
+      const existing = recipient.tokens.find((token) => token.asset === asset);
       const amount = udtAmount(cell.outputData) + BigInt(existing?.amount ?? 0);
-      const entry = { id, amount: amount.toString(), amountText: formatAsset(amount, asset) };
+      const entry = { id: shortHash(asset), asset, amount: amount.toString(), amountText: formatAsset(amount, asset) };
       if (existing) Object.assign(existing, entry);
       else recipient.tokens.push(entry);
     }
-    if (kind === "Spore" || kind === "Cluster") recipient.nfts.push(`${kind} ${shortHash(cell.cellOutput.type!.args)}`);
+    if (kind === "Spore" || kind === "Cluster") recipient.nfts.push(`${kind} ${cell.cellOutput.type!.args}`);
     recipients.set(key, recipient);
   }
 
@@ -360,7 +366,8 @@ export function describeTransaction(
  */
 export function previewSummaryLines(preview: TransactionPreview): string[] {
   const lines = [`Send ${preview.sendingCkb} CKB`, `Network fee ${preview.feeCkb} CKB`, `Network ${preview.network}`];
-  for (const token of preview.tokens) lines.push(`Token ${token.amountText} (${token.standard} ${token.id})`);
+  // Tokens and NFTs are named by their whole ID: a shortened one could be ground to match another's.
+  for (const token of preview.tokens) lines.push(`Token ${token.amountText} (${token.standard} ${token.asset})`);
   for (const nft of preview.nfts) lines.push(`${nft.kind} ${nft.id}: ${nft.change}`);
   for (const action of preview.dao) lines.push(`Nervos DAO ${action.action}: ${action.amountCkb} CKB`);
   for (const script of preview.unrecognized) lines.push(`Unrecognized script ${script.codeHash} (${script.cells} cells)`);

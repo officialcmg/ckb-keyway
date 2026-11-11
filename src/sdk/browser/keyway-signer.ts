@@ -18,9 +18,10 @@ export type TransactionPreview = {
   feeCkb: string;
   /**
    * Net change per token: `amount` in raw units with a sign, `amountText` for people, such as "-25 RUSD".
-   * `id` is a short form of `asset`, the token's type script hash.
+   * `asset` is the token's type script hash; `id` is a short form of it, for keys only.
    */
-  tokens: Array<{ id: string; asset?: string; standard: "xUDT" | "sUDT"; amount: string; amountText?: string }>;
+  tokens: Array<{ id: string; asset: string; standard: "xUDT" | "sUDT"; amount: string; amountText?: string }>;
+  /** `id` is the NFT's whole type args. */
   nfts: Array<{ kind: "Spore" | "Cluster"; id: string; change: "sent" | "received" | "minted" | "burned" }>;
   dao: Array<{ action: "deposit" | "withdrawal request" | "withdrawal"; amountCkb: string }>;
   recipients: Array<{
@@ -28,8 +29,9 @@ export type TransactionPreview = {
     kind: "wallet" | "contract" | "Fiber channel";
     walletType?: string;
     ckb: string;
-    /** Raw units per token; `amountText` for people, such as "25 RUSD". */
-    tokens: Array<{ id: string; amount: string; amountText?: string }>;
+    /** Raw units per token, by `asset` (its type script hash); `amountText` for people, such as "25 RUSD". */
+    tokens: Array<{ id: string; asset: string; amount: string; amountText?: string }>;
+    /** "Spore <whole type args>" or "Cluster <whole type args>". */
     nfts: string[];
   }>;
   /** Type scripts the backend couldn't explain. Always shown, never hidden. */

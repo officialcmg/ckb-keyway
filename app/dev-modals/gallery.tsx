@@ -41,7 +41,7 @@ const TRANSACTION: TransactionPreview = {
   tokens: [{ id: "0x45b32a…df52", asset: RUSD, standard: "xUDT", amount: "-2500000000", amountText: "-25 RUSD" }],
   nfts: [],
   dao: [],
-  recipients: [{ address: ADDRESS.replace("zda0", "zdb1"), kind: "wallet", walletType: "standard", ckb: "143", tokens: [{ id: "0x45b32a…df52", amount: "2500000000", amountText: "25 RUSD" }], nfts: [] }],
+  recipients: [{ address: ADDRESS.replace("zda0", "zdb1"), kind: "wallet", walletType: "standard", ckb: "143", tokens: [{ id: "0x45b32a…df52", asset: RUSD, amount: "2500000000", amountText: "25 RUSD" }], nfts: [] }],
   unrecognized: [],
   otherSigners: 0,
   details: {
@@ -54,8 +54,8 @@ const TRANSACTION: TransactionPreview = {
 
 const UNKNOWN_TOKEN: TransactionPreview = {
   ...TRANSACTION,
-  tokens: [{ id: "0x9a1f03…77c2", asset: `0x9a1f03${"5".repeat(52)}c0de77c2`, standard: "xUDT", amount: "-1000", amountText: "-1000 of token 0x9a1f0355…de77c2" }],
-  recipients: [{ ...TRANSACTION.recipients[0], tokens: [{ id: "0x9a1f03…77c2", amount: "1000", amountText: "1000 of token 0x9a1f0355…de77c2" }] }],
+  tokens: [{ id: "0x9a1f03…77c2", asset: `0x9a1f03${"5".repeat(52)}c0de77c2`, standard: "xUDT", amount: "-1000", amountText: `-1000 of token 0x9a1f03${"5".repeat(52)}c0de77c2` }],
+  recipients: [{ ...TRANSACTION.recipients[0], tokens: [{ id: "0x9a1f03…77c2", asset: `0x9a1f03${"5".repeat(52)}c0de77c2`, amount: "1000", amountText: `1000 of token 0x9a1f03${"5".repeat(52)}c0de77c2` }] }],
 };
 
 const CKB_TRANSACTION: TransactionPreview = {

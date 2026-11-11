@@ -72,6 +72,8 @@ export const modalTitle: CSSProperties = {
   fontWeight: 700,
   lineHeight: 1.15,
   letterSpacing: "-0.025em",
+  // A token KeyWay can't name is shown by its whole ID, which mustn't widen the dialog.
+  overflowWrap: "anywhere",
 };
 
 export const modalCopy: CSSProperties = {
