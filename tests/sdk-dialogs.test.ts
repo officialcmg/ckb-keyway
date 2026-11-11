@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { formatDuration, KeyWayTransactionModal, settingText } from "../src/sdk/react/signing-modals.tsx";
+import { formatDuration, KeyWayFundingModal, KeyWayTransactionModal, settingText } from "../src/sdk/react/signing-modals.tsx";
+import type { FiberChannelOpenPreview } from "../src/sdk/browser/remote-ckb-signer.ts";
 import type { TransactionPreview } from "../src/sdk/browser/keyway-signer.ts";
 
 const RUSD = "0x45b32a2bc4285d0a09678eb11960ddc8707bc2779887a09d482e9bfe9a2cdf52";
@@ -30,4 +31,17 @@ test("the transaction dialog shows each recipient's whole address, not just its 
   // The main rows, before the collapsed details.
   const rows = html.slice(0, html.indexOf("<details"));
   assert.ok(rows.includes(address));
+});
+
+test("the dialogs say when CKB counted as sent stays under a script that could keep it (audit M7, M8)", () => {
+  const preview = {
+    network: "CKB testnet", sendingCkb: "499.99999", heldUnderScriptsCkb: "499.99999", receivingCkb: "0", feeCkb: "0.00001", tokens: [], nfts: [], dao: [],
+    recipients: [], unrecognized: [], otherSigners: 0, details: { inputs: [], outputs: [] }, transactionHash: `0x${"ab".repeat(32)}`, requiresEmailCode: false,
+  } as unknown as TransactionPreview;
+  const html = renderToStaticMarkup(createElement(KeyWayTransactionModal, { theme: "light", appName: "Acme Pay", preview, answer: () => undefined }));
+  assert.match(html, /Of which stays in your account, under a script that could keep it/);
+  const funding = { amountCkb: "200", feeCkb: "0.0001", destination: "0x6c:0xcc", transactionHash: `0x${"ab".repeat(32)}`, heldUnderScriptsCkb: "800" } as FiberChannelOpenPreview;
+  const fundingHtml = renderToStaticMarkup(createElement(KeyWayFundingModal, { theme: "light", appName: "Acme Pay", preview: funding, answer: () => undefined }));
+  assert.match(fundingHtml, /Also counted as sent: change under the token(&#x27;|')s script, which could keep it/);
+  assert.match(fundingHtml, /800 CKB/);
 });
