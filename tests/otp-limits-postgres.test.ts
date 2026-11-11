@@ -428,13 +428,49 @@ test("past an inbox's 30 codes in 10 minutes, only a network that had none for i
   await prepareOtpSend({ appId, email: victim, ipAddress: "100.66.3.2" });
 });
 
-test("one network gets at most 10 codes for an inbox in 10 minutes, even the owner's own", { skip }, async () => {
+test("one network gets at most 10 codes for an inbox in 10 minutes, the owner's own 100", { skip }, async () => {
   const { sql } = await setup();
   const { appId } = await application([], 120);
+  const { appId: other } = await application([], 120);
   const victim = email();
+  for (let i = 1; i <= 10; i++) await prepareOtpSend({ appId, email: victim, ipAddress: `2001:db8:64:${i}::1` });
+  await assert.rejects(prepareOtpSend({ appId, email: victim, ipAddress: "2001:db8:64:11::1" }), /Too many login codes/);
+  // A neighbour in the owner's own /48 asking for codes in two apps doesn't shut the owner out at home...
   await knownNetworkFor(sql, appId, victim, "2001:db8:65:1::1");
-  for (let i = 1; i <= 10; i++) await prepareOtpSend({ appId, email: victim, ipAddress: `2001:db8:65:${i}::1` });
-  await assert.rejects(prepareOtpSend({ appId, email: victim, ipAddress: "2001:db8:65:11::1" }), /Too many login codes/);
+  for (let i = 2; i <= 11; i++) await prepareOtpSend({ appId: i % 2 ? appId : other, email: victim, ipAddress: `2001:db8:65:${i}::1` });
+  await prepareOtpSend({ appId, email: victim, ipAddress: "2001:db8:65:1::1" });
+  // ...and even from there, flooding the inbox stops at 100.
+  for (let i = 12; i <= 100; i++) await prepareOtpSend({ appId, email: victim, ipAddress: `2001:db8:65:${i}::1` });
+  await assert.rejects(prepareOtpSend({ appId, email: victim, ipAddress: "2001:db8:65:ffff::1" }), /Too many login codes/);
+});
+
+test("checks at the edge of the paused first tries are counted one at a time", { skip }, async () => {
+  const { sql, codes } = await setup();
+  const origin = "https://edge.example";
+  const { appId } = await application([origin]);
+  const victim = email();
+  await pastFailures(sql, appId, victim, [1, 2, 3, 4, 5, 6].map((i) => `198.18.6.${i}`), 5, 10);
+  await pastFailures(sql, appId, victim, ["198.18.6.200"], 59, 10, true);
+  // One paused first try is left. Two strangers with fresh codes check at once.
+  const first = appRequest(appId, origin, "198.18.6.21");
+  const second = appRequest(appId, origin, "198.18.6.22");
+  const a = await sendEmailCode(first, victim);
+  const codeA = codes.get(`${appId}:${victim}`)!;
+  const b = await sendEmailCode(second, victim);
+  const codeB = codes.get(`${appId}:${victim}`)!;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const holder = withLoginCodeLock(`otp:${appId}:${victim}`, () => held);
+  await delay(50);
+  // Both pass the early check and wait for the email's lock; under it, only one is compared.
+  const outcomes = [
+    verifyEmailCode(first, a.challengeId, wrong(codeA)).then(() => "signed in", (error: Error) => error.message),
+    verifyEmailCode(second, b.challengeId, wrong(codeB)).then(() => "signed in", (error: Error) => error.message),
+  ];
+  await delay(300);
+  release();
+  await holder;
+  assert.deepEqual((await Promise.all(outcomes)).sort(), ["Incorrect or expired code", "Too many incorrect codes for this email. Try again later"]);
 });
 
 test("codes asked for in another app don't stop an inbox's first code in this one", { skip }, async () => {

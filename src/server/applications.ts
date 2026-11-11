@@ -171,8 +171,10 @@ const OTP_SOURCE_LIMIT = 60; // codes asked for from one source
 // that hasn't asked in the window still gets its first code up to the hard limit, and known networks are exempt.
 const OTP_NETWORK_LIMIT = 60;
 const OTP_NETWORK_HARD_LIMIT = 600;
-// Codes to one email from one network, known or not, so even someone sharing the owner's network can't flood the inbox.
+// Codes to one email from one network, across apps. A network the owner signed in from gets far more, so a neighbour
+// sharing it can't cheaply use the cap to shut the owner out, while flooding the inbox from it stays bounded.
 const OTP_NETWORK_EMAIL_LIMIT = 10;
+const OTP_KNOWN_NETWORK_EMAIL_LIMIT = 100;
 const OTP_EMAIL_LIMIT = 15; // codes to one email across all apps, shared
 // A known network is one that signed in to this email's account in the app in the last OTP_KNOWN_NETWORK_DAYS days.
 // Strangers can't make one, so the owner's usual networks get through the limits below that strangers can fill.
@@ -193,7 +195,8 @@ const OTP_CEILING_ALERT_MINUTES = 10; // one alert per shared ceiling (and inbox
 const OTP_FAILURE_LIMIT = 20; // from one source: that source is refused
 const OTP_FAILURE_ALERT = 20; // from anyone: one alert
 const OTP_FAILURE_PAUSE = 30; // from anyone: checks pause until it drops back, except a fresh code's first try (below)
-// While paused, a code's first try still goes ahead, so strangers' wrong codes can't lock the owner out. Each such
+// While paused, a code's first try still goes ahead, so strangers' wrong codes can't lock the owner out of a network
+// they signed in from (from other networks, only within the limits that follow). Each such
 // try needs a newly sent code, and an unknown network gets it while it has fewer than OTP_BYPASS_NETWORK_LIMIT wrong
 // codes, until OTP_BYPASS_LIMIT wrong first tries from anyone. A known network keeps it while it has fewer than
 // OTP_FAILURE_LIMIT. So at most OTP_FAILURE_PAUSE + OTP_BYPASS_LIMIT wrong codes (90 of a million) reach Better Auth
@@ -270,7 +273,7 @@ export async function prepareOtpSend(input: {
       || (limits.global_count >= GLOBAL_OTP_LIMIT_PER_MINUTE && limits.network_minute_count > 0)
       || (limits.email_count >= OTP_EMAIL_HARD_LIMIT && limits.network_email_count > 0);
     if (limits.email_app_count >= OTP_EMAIL_APP_LIMIT || limits.source_count >= OTP_SOURCE_LIMIT
-      || limits.network_email_count >= OTP_NETWORK_EMAIL_LIMIT
+      || (limits.network_email_count >= OTP_NETWORK_EMAIL_LIMIT && (limits.network_email_count >= OTP_KNOWN_NETWORK_EMAIL_LIMIT || !await isKnown()))
       || (shared && limits.source_minute_count > 0) || (busyNetwork && !await isKnown())
       || (knownOnly && !await isKnown())) {
       // At most one record a minute per source and app, and one alert per app every 10 minutes, however many are refused.
