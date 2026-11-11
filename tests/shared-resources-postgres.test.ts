@@ -305,5 +305,36 @@ test("L5: first-time wallet setup holds no wallet lock while Lit works", { skip 
     assert.equal((await bootstrap(raced, DEVICE_A, "browser", late)).provisioned, false);
     const kept = await readWallet(raced);
     assert.equal(kept?.status === "ready" && kept.encryptedFiberKey, "fiber-key-in-use");
+
+    // A setup whose claim another request took over (it expired meanwhile) stops before the next paid step.
+    const overtaken = { id: crypto.randomUUID() } as User;
+    let completed = 0;
+    const slow: Provisioning = {
+      createPkp: async () => {
+        await sql`update keyway_v2_provisioning_claims set claim_id = ${crypto.randomUUID()} where user_id = ${overtaken.id}`;
+        return `0x${"12".repeat(20)}`;
+      },
+      complete: async () => { completed += 1; return { litPublicKey: `0x02${"cd".repeat(32)}`, ckbAddress: "ckt1", encryptedFiberKey: "key" }; },
+    };
+    await assert.rejects(bootstrap(overtaken, DEVICE_A, "browser", slow), /still being set up/);
+    assert.equal(completed, 0);
+    assert.equal(await readWallet(overtaken), undefined);
+  });
+
+  await t.test("sign-in bootstraps are rate limited per user, and a setup in progress answers 409", async () => {
+    const { user, call } = await signedIn();
+    await saveWallet(user, readyWallet(DEVICE_A));
+    const statuses: number[] = [];
+    for (let index = 0; index < 31; index++) {
+      const response = await call("bootstrap", { deviceIdHash: DEVICE_A, keyCustody: "lit" }, { "Idempotency-Key": `bootstrap-rate-${String(index).padStart(4, "0")}` });
+      statuses.push(response.status);
+    }
+    assert.deepEqual(statuses, [...Array.from({ length: 30 }, () => 200), 429]);
+
+    const fresh = await signedIn();
+    await sql`insert into keyway_v2_provisioning_claims (user_id, claim_id) values (${fresh.user.id}, ${crypto.randomUUID()})`;
+    const busy = await fresh.call("bootstrap", { deviceIdHash: DEVICE_A, keyCustody: "lit" }, { "Idempotency-Key": "bootstrap-busy-0001" });
+    assert.equal(busy.status, 409);
+    assert.equal(busy.headers.get("retry-after"), "5");
   });
 });

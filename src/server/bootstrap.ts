@@ -19,10 +19,11 @@ import {
 
 const DEVICE_ID_HASH = /^[0-9a-f]{64}$/;
 /**
- * How long one request's claim on a new account's setup keeps others from starting it. Longer than the Lit and
- * Chipotle calls can take (each has its own timeout); a claim left by a process that stopped expires after it.
+ * How long one request's claim on a new account's setup keeps others from starting it. The claim is renewed before
+ * each paid step (creating the PKP, then completing it), so this only has to outlast the longer step, about five
+ * minutes at worst with every timeout and Lit retry; a claim left by a process that stopped expires after it.
  */
-const PROVISIONING_CLAIM = "5 minutes";
+const PROVISIONING_CLAIM = "10 minutes";
 
 export type BootstrapResult = {
   provisioned: boolean;
@@ -98,6 +99,8 @@ export async function bootstrap(
         // Only the claim holder creates a wallet; one is here already only if this claim expired meanwhile.
         const current = await readWallet(user, sql);
         if (current?.status === "ready") return { result: await readyResult(user, current, deviceIdHash, nodeMode, sql) };
+        // Renewed before completing the PKP, the second paid step; refused if another request took the claim over.
+        await renewProvisioning(user, start.claimId, sql);
         if (current) return { litPkpId: current.litPkpId };
         const wallet: ProvisioningWallet = {
           version: 1,
@@ -168,6 +171,16 @@ async function claimProvisioning(user: User, sql: DatabaseSql): Promise<string |
     returning claim_id
   `;
   return row ? claimId : undefined;
+}
+
+/** Renews this request's claim before a paid step; refuses when another request has taken it over meanwhile. */
+async function renewProvisioning(user: User, claimId: string, sql: DatabaseSql): Promise<void> {
+  const [row] = await sql`
+    update keyway_v2_provisioning_claims set claimed_at = now()
+    where user_id = ${user.id} and claim_id = ${claimId}
+    returning 1
+  `;
+  if (!row) throw new Error("Your KeyWay wallet is still being set up. Try again in a moment");
 }
 
 async function releaseProvisioning(user: User, claimId: string, connection?: DatabaseSql): Promise<void> {

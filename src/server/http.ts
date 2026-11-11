@@ -96,11 +96,15 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
     const message = error instanceof Error ? error.message : "KeyWay request failed";
     const unauthorized = /session|bearer/i.test(message);
     const rateLimited = /too many/i.test(message);
-    const status = unauthorized ? 401 : rateLimited ? 429 : 400;
+    // Another request is setting this account's wallet up; the client can try again shortly.
+    const busy = /still being set up/i.test(message);
+    const status = unauthorized ? 401 : rateLimited ? 429 : busy ? 409 : 400;
     // A sanitized cause for operators: Lit refuses everything once the account's credit runs out.
     const cause = /payment_required|HTTP 402/i.test(message) ? "lit-out-of-credit" : PROVIDER_ERROR.test(message) ? "provider" : undefined;
     console.error("[keyway] request failed", { status, ...(cause ? { cause } : {}) });
-    return jsonError(publicErrorMessage(message), status, cors);
+    const response = jsonError(publicErrorMessage(message), status, cors);
+    if (busy) response.headers.set("Retry-After", "5");
+    return response;
   }
 }
 
@@ -234,6 +238,9 @@ async function logoutRequest(request: Request): Promise<Response> {
 
 async function bootstrapRequest(request: Request): Promise<Response> {
   const user = await authenticateUser(request);
+  // Every sign-in bootstraps; this bounds what one account can queue (old-address sweeps, idempotency records).
+  const limit = await consumeRateLimit(`bootstrap:${user.id}`, { max: 30, window: 60 });
+  if (!limit.allowed) throw new Error(`Too many sign-in requests. Try again in ${limit.retryAfter ?? 60} seconds`);
   const body = await objectBody(request, "Invalid bootstrap request");
   const { deviceIdHash, nodeMode, keyCustody } = body;
   if (typeof deviceIdHash !== "string") throw new Error("Device ID hash is required");
