@@ -37,6 +37,9 @@ pub mod chain;
 /// Omnilock's 1024-byte signature with the rest of the assertion, so the destination's address is limited.
 pub const MAX_TEXT: usize = 480;
 pub const HEADER: &[u8] = b"KeyWay recovery\nMove everything to ";
+/// The most token cells (outputs with a type script) a rescue may move. KeyWay's rescue page moves at most 100
+/// cells at a time; a larger rescue is refused (111) and can be split.
+pub const MAX_TOKEN_CELLS: usize = 256;
 
 /// Exit codes shared by the verifiers, after their own (100–109).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,7 +49,7 @@ pub enum ApprovalError {
     Network = 110,
     /// The transaction isn't a rescue: no outputs, outputs to more than one lock or to the account itself,
     /// data without a type script, token cells that aren't the account's own moved unchanged, more than
-    /// `chain::MAX_TOKEN_CELLS` of them, or outputs above the inputs.
+    /// `MAX_TOKEN_CELLS` of them, or outputs above the inputs.
     Shape = 111,
     /// The destination's address doesn't fit the text's limit.
     TooLong = 112,

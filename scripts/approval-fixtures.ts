@@ -5,7 +5,7 @@
 // - tests/fixtures/approval-transaction-cases.json: random transactions spending an account's cells (plain and
 //   token cells, some of them someone else's), with the text the SDK's `rescueApproval` reads from them, or null
 //   when it refuses them as not a rescue: among them token cells changed, left out, moved twice, taken from
-//   someone else, or made under a type script the account didn't hold.
+//   someone else, made under a type script the account didn't hold, or given more CKB than they held.
 import { writeFileSync } from "node:fs";
 import * as ccc from "@ckb-ccc/core";
 import { recoveryApprovalText, rescueApproval } from "../src/sdk/browser/recovery-approval.ts";
@@ -66,6 +66,7 @@ for (let index = 0; index < 160; index++) {
   else if (roll < 0.18) moved.push({ lock: destination, type: randomScript(32), data: ccc.hexFrom(bytes(8)), capacity: 20_000_000_000n }); // CKB under a type script the account didn't hold
   else if (roll < 0.22 && moved.length > 0) moved[0] = { ...moved[0], type: randomScript(32) }; // the same data under another type script
   else if (roll < 0.26 && moved.length > 0) moved.push({ ...moved[0] }); // one token cell moved twice
+  else if (roll < 0.30 && moved.length > 0) moved[0] = { ...moved[0], capacity: moved[0].capacity + 100_000_000n }; // a token cell given more CKB than it held
   const plain = Array.from({ length: Math.floor(random() * 3) }, (): Cell => {
     const other = random();
     return { lock: other < 0.04 ? account : other < 0.08 ? randomScript() : destination, data: random() < 0.05 ? ccc.hexFrom(bytes(4)) : "0x", capacity: 6_100_000_000n + bigRandom(10n ** 13n) };

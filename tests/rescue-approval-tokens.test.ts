@@ -59,6 +59,23 @@ test("refuses token cells that aren't the account's own, moved unchanged, behind
   }
 });
 
+test("refuses a token cell given more CKB than it held, which its type script could keep", () => {
+  // Anyone can send the account a cell under their own type script. The honest rescue leaves it out; a phishing one
+  // moves it with the rescued CKB inside, leaves one of the account's token cells unspent, and shows the same text.
+  const trap = { type: udt("e5"), data: "0x" as ccc.Hex, capacity: 143n * CKB };
+  const inputs = [held[0], trap, held[2]];
+  assert.throws(rescue(inputs, [honest[1], { ...trap, capacity: 1_142n * CKB }]), /holds more CKB than the account's did/);
+  // Moving it with no more than it held is a plain move of that cell, and the rest arrives as plain CKB.
+  const approval = rescue(inputs, [honest[1], trap, { capacity: 999n * CKB }])();
+  assert.equal(approval.tokenCells, 2);
+  // Less than it held is fine: the rest arrives as plain CKB.
+  assert.equal(rescue(held, [{ ...honest[0], capacity: 142n * CKB }, honest[1], { capacity: 1_000n * CKB }])().tokenCells, 2);
+  // Among identical cells, only their total counts.
+  const twin = { type: udt("a1"), data: amount(7n), capacity: 160n * CKB };
+  assert.equal(rescue([twin, { ...twin, capacity: 150n * CKB }, held[2]], [{ ...twin, capacity: 150n * CKB }, twin, { capacity: 999n * CKB }])().tokenCells, 2);
+  assert.throws(rescue([twin, { ...twin, capacity: 150n * CKB }, held[2]], [twin, twin, { capacity: 989n * CKB }]), /holds more CKB/);
+});
+
 test("someone else's token cell may be spent beside the rescue, and isn't counted", () => {
   const approval = rescue([...held, { lock: stranger, type: udt("f6"), data: amount(5n), capacity: 143n * CKB }], [...honest, { capacity: 143n * CKB }])();
   assert.equal(approval.tokenCells, 2);

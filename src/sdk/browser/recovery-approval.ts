@@ -57,7 +57,7 @@ export function recoveryApprovalText(client: ccc.Client, approval: RescueApprova
   return text;
 }
 
-/** The most token cells a rescue may move (`keyway_approval::chain::MAX_TOKEN_CELLS`). */
+/** The most token cells a rescue may move (`keyway_approval::MAX_TOKEN_CELLS`). */
 export const MAX_RESCUE_TOKEN_CELLS = 256;
 
 /** An input cell of the transaction, checked against the transaction that created it. */
@@ -68,9 +68,11 @@ export type RescueInputCell = { cellOutput: ccc.CellOutputLike; outputData: ccc.
  * are the transaction's input cells in order, checked against the transactions that created them.
  *
  * The text counts token cells rather than naming them, so they must be exactly the account's own, moved
- * unchanged: each output with a type script has the type script and data of a distinct input of the account, and
- * each of the account's inputs with a type script is one of them. A token cell changed, left behind (burned), or
- * made under a type script the account didn't hold is refused.
+ * unchanged: each output with a type script has the type script and data of a distinct input of the account, each
+ * of the account's inputs with a type script is one of them, and the outputs of each kind (same type script and
+ * data) hold no more CKB than the account's inputs of that kind did. A token cell changed, left behind (burned),
+ * made under a type script the account didn't hold, or given more CKB than it held (which its type script could
+ * then keep) is refused.
  */
 export function rescueApproval(transaction: ccc.Transaction, account: ccc.ScriptLike, inputCells: readonly RescueInputCell[]): RescueApproval {
   const refuse = (reason: string): never => { throw new Error(`This transaction can't be approved by a backup: ${reason}`); };
@@ -82,26 +84,37 @@ export function rescueApproval(transaction: ccc.Transaction, account: ccc.Script
   if (destination.eq(accountLock)) refuse("it sends to the account itself");
   const tokenKey = (type: ccc.Script, data: ccc.HexLike) => `${type.hash()}:${ccc.hashCkb(data)}`;
   let ckb = 0n;
-  const tokens: string[] = [];
+  let tokenCells = 0;
+  // Per kind of token cell: how many outputs are still unmatched, and the CKB the outputs and the inputs hold.
+  const kinds = new Map<string, { unmatched: number; put: bigint; held: bigint }>();
   transaction.outputs.forEach((output, index) => {
     if (!output.lock.eq(destination)) refuse("its outputs go to more than one address");
     ckb += output.capacity;
     const data = ccc.hexFrom(transaction.outputsData[index] ?? "0x");
-    if (output.type) tokens.push(tokenKey(output.type, data));
-    else if (data !== "0x") refuse("an output carries data without a type script");
+    if (output.type) {
+      tokenCells += 1;
+      const key = tokenKey(output.type, data);
+      const kind = kinds.get(key) ?? { unmatched: 0, put: 0n, held: 0n };
+      kind.unmatched += 1;
+      kind.put += output.capacity;
+      kinds.set(key, kind);
+    } else if (data !== "0x") refuse("an output carries data without a type script");
   });
-  if (tokens.length > MAX_RESCUE_TOKEN_CELLS) refuse(`it moves more than ${MAX_RESCUE_TOKEN_CELLS} token cells`);
-  const unmoved = [...tokens];
+  if (tokenCells > MAX_RESCUE_TOKEN_CELLS) refuse(`it moves more than ${MAX_RESCUE_TOKEN_CELLS} token cells`);
   let inputCapacity = 0n;
   for (const cell of inputCells) {
     const cellOutput = ccc.CellOutput.from(cell.cellOutput);
     inputCapacity += cellOutput.capacity;
     if (!cellOutput.lock.eq(accountLock) || !cellOutput.type) continue;
-    const at = unmoved.indexOf(tokenKey(cellOutput.type, cell.outputData));
-    if (at < 0) refuse("one of the account's token cells isn't moved unchanged");
-    unmoved.splice(at, 1);
+    const kind = kinds.get(tokenKey(cellOutput.type, cell.outputData));
+    if (!kind || kind.unmatched === 0) refuse("one of the account's token cells isn't moved unchanged");
+    kind!.unmatched -= 1;
+    kind!.held += cellOutput.capacity;
   }
-  if (unmoved.length > 0) refuse("a token cell it creates isn't one of the account's, moved unchanged");
+  for (const kind of kinds.values()) {
+    if (kind.unmatched > 0) refuse("a token cell it creates isn't one of the account's, moved unchanged");
+    if (kind.put > kind.held) refuse("a token cell it creates holds more CKB than the account's did");
+  }
   if (inputCapacity < ckb) refuse("its outputs exceed its inputs");
-  return { destination, ckb, tokenCells: tokens.length, fee: inputCapacity - ckb };
+  return { destination, ckb, tokenCells, fee: inputCapacity - ckb };
 }

@@ -281,12 +281,60 @@ fn token_cells_must_be_the_accounts_own_moved_unchanged() {
     planted.outputs[2].type_ = Some(udt("d4"));
     planted.outputs[2].data = "0x".into();
     attempts.push(("the plain CKB locked under the builder's own type script", planted));
+    // Anyone can send the account a cell under their own type script. Moving it with the rescued CKB inside, and
+    // leaving one of the account's token cells unspent, would show exactly the honest rescue's text.
+    let mut trap = honest.clone();
+    trap.inputs[1] = input(&account, Some(udt("e5")), "0x".into(), 143 * CKB);
+    trap.outputs = vec![output(Some(udt("a1")), amount(1_000), 143 * CKB), output(Some(udt("e5")), "0x".into(), 1_142 * CKB)];
+    attempts.push(("the rescued CKB put in a typed cell someone sent the account", trap));
+    let mut richer = honest.clone();
+    richer.outputs[0].capacity = (144 * CKB).to_string();
+    richer.outputs[2].capacity = (998 * CKB).to_string();
+    attempts.push(("a token cell given 1 CKB more than it held", richer));
     for (what, case) in &attempts {
         assert_eq!(run("evm-personal-sign", case, &argument(case)).0, 111, "{what}");
         let passkey = Passkey(SigningKey::from_slice(&[3u8; 32]).unwrap());
         let pubkey_hash = identity(&joyid_webauthn::blake160(&passkey.public_key()), case);
         let blob = passkey.blob(0, &text, 1024);
         assert_eq!(run("joyid-webauthn", case, &exec_argument(&[0x24u8; 32], &pubkey_hash, &unhex(&case.sighash), &blob)).0, 111, "{what}");
+    }
+
+    // Less CKB than a token cell held is fine (the rest arrives as plain CKB), and identical cells count together.
+    let mut leaner = honest.clone();
+    leaner.outputs[0].capacity = (142 * CKB).to_string();
+    leaner.outputs[2].capacity = (1_000 * CKB).to_string();
+    let mut swapped = honest.clone();
+    swapped.inputs[1].data = amount(1_000);
+    swapped.inputs[1].capacity = (150 * CKB).to_string();
+    swapped.inputs[2].capacity = (993 * CKB).to_string();
+    swapped.outputs[0] = output(Some(udt("a1")), amount(1_000), 150 * CKB);
+    swapped.outputs[2].capacity = (992 * CKB).to_string();
+    for case in [leaner, swapped] {
+        let text = sdk_text(&case, 2, 1_285 * CKB as u128, CKB as u128);
+        let signed = exec_argument(&code_hash, &identity(&address, &case), &unhex(&case.sighash), &evm_blob(0, &personal_sign(&key, text.as_bytes())));
+        assert_eq!(run("evm-personal-sign", &case, &signed).0, 0);
+    }
+}
+
+/// At most `MAX_TOKEN_CELLS` (256) token cells: 256 of the account's own are moved, 257 are refused (111).
+#[test]
+fn moves_at_most_256_token_cells() {
+    let cases: Vec<TransactionCase> = fixture("approval-transaction-cases.json");
+    let base = cases.iter().find(|case| case.text.is_some() && case.network == "testnet").unwrap().clone();
+    let key = EvmKey::from_slice(&[7u8; 32]).unwrap();
+    let address = evm_address(&key);
+    const CKB: u64 = 100_000_000;
+    for (count, expected) in [(100, 0), (keyway_approval::MAX_TOKEN_CELLS, 0), (keyway_approval::MAX_TOKEN_CELLS + 1, 111)] {
+        let type_ = |at: usize| ScriptJson { code_hash: format!("0x{}", "5d".repeat(32)), hash_type: "type".into(), args: format!("0x{:064x}", at) };
+        let mut case = base.clone();
+        case.inputs = (0..count).map(|at| InputJson { lock: base.account.clone(), type_: Some(type_(at)), data: "0x".into(), capacity: (150 * CKB).to_string() }).collect();
+        case.inputs.push(InputJson { lock: base.account.clone(), type_: None, data: "0x".into(), capacity: CKB.to_string() });
+        case.outputs = (0..count).map(|at| OutputJson { lock: base.outputs[0].lock.clone(), type_: Some(type_(at)), data: "0x".into(), capacity: (150 * CKB).to_string() }).collect();
+        let text = sdk_text(&case, count as u64, (count as u128) * 150 * CKB as u128, CKB as u128);
+        let argument = exec_argument(&[0x42u8; 32], &identity(&address, &case), &unhex(&case.sighash), &evm_blob(0, &personal_sign(&key, text.as_bytes())));
+        let (code, cycles) = run("evm-personal-sign", &case, &argument);
+        assert_eq!(code, expected, "{count} token cells");
+        println!("{count} token cells: exit {code}, {cycles} cycles");
     }
 }
 

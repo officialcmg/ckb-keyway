@@ -277,13 +277,19 @@ export type RescuePlan = {
   /** Token cells that arrive at the destination, with the CKB each holds. */
   tokens: Array<RescueToken & { capacity: bigint }>;
   fee: bigint;
+  /**
+   * Plain CKB left at the account: only when it is too little for a plain cell at the destination and more than
+   * the token cells may take (a token cell can't hold more CKB than it did), so a later rescue can move it.
+   */
+  plainLeft: bigint;
 };
 
 /**
  * Builds the rescue: every movable cell (up to MAX_RESCUE_CELLS) to `destination`. Token cells move one to one
  * with their data, each at exactly the capacity it needs at the destination's lock; the rest of the CKB, less
- * the fee, goes into one plain cell. When that would be smaller than a plain cell can be, it joins the first
- * token cell instead. The AdminList is only a cell dep and stays where it is. The fee is sized with the
+ * the fee, goes into one plain cell. When that would be smaller than a plain cell can be, it goes back into the
+ * token cells instead, each up to the CKB it held (the verifier refuses a token cell given more, since its type
+ * script could keep it); plain CKB that still doesn't fit stays at the account (`plainLeft`). The AdminList is only a cell dep and stays where it is. The fee is sized with the
  * backup's witness at its final length, so the backup signs once.
  */
 export async function planRescue(client: ccc.Client, account: RescueAccount, entry: RecoveryListEntry, destinationInput: string): Promise<RescuePlan> {
@@ -303,41 +309,67 @@ export async function planRescue(client: ccc.Client, account: RescueAccount, ent
   if (!account.auths.includes(entry.auth)) throw new RescueError("not-backup", "This backup isn't on the account's recovery list");
 
   const tokenCells = account.movable.filter((cell) => cell.cellOutput.type);
-  const attempt = async (withPlain: boolean) => {
-    const tokenOutputs = tokenCells.map((cell) => {
-      const output = ccc.CellOutput.from({ lock, type: cell.cellOutput.type, capacity: 0n });
-      output.capacity = occupied(output, cell.outputData);
-      return output;
-    });
+  const plainCells = account.movable.filter((cell) => !cell.cellOutput.type);
+  // A token cell may not hold more CKB at the destination than it did here (the verifier refuses it: its type
+  // script could keep that CKB), so each needs no more than it has.
+  const tokenOutputs = tokenCells.map((cell) => {
+    const output = ccc.CellOutput.from({ lock, type: cell.cellOutput.type, capacity: 0n });
+    output.capacity = occupied(output, cell.outputData);
+    if (output.capacity > cell.cellOutput.capacity) {
+      throw new RescueError("destination", "That address needs more CKB to hold a token cell than the cell has, so the token cells can't move there unchanged. Send to a standard CKB address, such as one from another wallet");
+    }
+    return output;
+  });
+  const attempt = async (withPlain: boolean, inputs: ccc.Cell[]) => {
     const plain = withPlain ? [ccc.CellOutput.from({ lock, capacity: 0n })] : [];
     const transaction = ccc.Transaction.from({
-      inputs: account.movable.map((cell) => ({ previousOutput: cell.outPoint })),
-      outputs: [...tokenOutputs, ...plain],
+      inputs: inputs.map((cell) => ({ previousOutput: cell.outPoint })),
+      outputs: [...tokenOutputs.map((output) => output.clone()), ...plain],
       outputsData: [...tokenCells.map((cell) => cell.outputData), ...plain.map(() => "0x")],
     });
     await addRescueTokenCellDeps(client, transaction, tokenCells);
     // The deps and the zeroed admin witness at its final length; the fee covers the signed size.
-    const prepared = await prepareRecoveryWitness(transaction, rescueSpend(client, account, entry));
+    const prepared = await prepareRecoveryWitness(transaction, rescueSpend(client, account, entry, transaction));
     transaction.cellDeps = prepared.cellDeps;
     transaction.witnesses = prepared.witnesses;
     const fee = (BigInt(transaction.toBytes().length + 4) * FEE_RATE + 999n) / 1000n;
     const tokenCapacity = tokenOutputs.reduce((total, output) => total + output.capacity, 0n);
-    const spare = account.ckb + account.tokenCkb - tokenCapacity - fee;
+    const spare = inputs.reduce((total, cell) => total + cell.cellOutput.capacity, 0n) - tokenCapacity - fee;
     return { transaction, spare, fee };
+  };
+  // Without a plain cell, the spare CKB goes back into the token cells, each up to the CKB it held here.
+  const intoTokenCells = (built: { transaction: ccc.Transaction; spare: bigint }) => {
+    let rest = built.spare;
+    tokenCells.forEach((cell, index) => {
+      const add = ccc.numMin(rest, cell.cellOutput.capacity - built.transaction.outputs[index].capacity);
+      built.transaction.outputs[index].capacity += add;
+      rest -= add;
+    });
+    return rest;
   };
 
   const minimumPlain = occupied(ccc.CellOutput.from({ lock, capacity: 0n }), "0x");
-  let built = await attempt(true);
+  let built = await attempt(true, account.movable);
   if (built.spare >= minimumPlain) {
     built.transaction.outputs[built.transaction.outputs.length - 1].capacity = built.spare;
   } else {
     if (tokenCells.length === 0) throw short(minimumPlain - built.spare);
-    const tokensOnly = await attempt(false);
+    const tokensOnly = await attempt(false, account.movable);
     if (tokensOnly.spare < 0n) throw short(-tokensOnly.spare);
-    tokensOnly.transaction.outputs[0].capacity += tokensOnly.spare;
-    built = tokensOnly;
+    if (intoTokenCells(tokensOnly) === 0n) {
+      built = tokensOnly;
+    } else {
+      // The plain CKB is too little for a cell of its own and more than the token cells held: it stays here, and
+      // the page says so. Only the token cells move.
+      const tokensAlone = await attempt(false, tokenCells);
+      if (tokensAlone.spare < 0n) throw short(-tokensAlone.spare);
+      intoTokenCells(tokensAlone);
+      built = tokensAlone;
+    }
   }
   const { transaction, fee } = built;
+  const spent = new Set(transaction.inputs.map(({ previousOutput }) => outPointKey({ outPoint: previousOutput })));
+  const plainLeft = plainCells.filter((cell) => !spent.has(outPointKey(cell))).reduce((total, cell) => total + cell.cellOutput.capacity, 0n);
   const tokens = tokenCells.map((cell, index) => {
     const typeHash = cell.cellOutput.type!.hash();
     const amount = ccc.numLeFromBytes(ccc.bytesFrom(cell.outputData).slice(0, 16));
@@ -345,8 +377,8 @@ export async function planRescue(client: ccc.Client, account: RescueAccount, ent
   });
   const ckb = transaction.outputs.length > tokenCells.length ? transaction.outputs[transaction.outputs.length - 1].capacity : 0n;
   checkRescueTransaction(transaction, account, lock);
-  const { text } = await prepareRecoverySpend(transaction, rescueSpend(client, account, entry));
-  return { transaction, entry, destination, approvalText: text, ckb, tokens, fee };
+  const { text } = await prepareRecoverySpend(transaction, rescueSpend(client, account, entry, transaction));
+  return { transaction, entry, destination, approvalText: text, ckb, tokens, fee, plainLeft };
 }
 
 /**
@@ -380,9 +412,18 @@ async function addRescueTokenCellDeps(client: ccc.Client, transaction: ccc.Trans
   if (tokenCells.some(isSudt)) await transaction.addCellDepsOfKnownScripts(client, ccc.KnownScript.SUdt);
 }
 
-/** The backup's spend over the account's movable cells, whose capacities were checked against their creating transactions. */
-function rescueSpend(client: ccc.Client, account: RescueAccount, entry: RecoveryListEntry): RecoverySpend {
-  return { client, lock: account.lock, omnilock: account.omnilock, auths: account.auths, entry, adminList: account.adminList.outPoint, inputCells: account.movable };
+/**
+ * The backup's spend of `transaction`, whose inputs are the account's movable cells (checked against their
+ * creating transactions).
+ */
+function rescueSpend(client: ccc.Client, account: RescueAccount, entry: RecoveryListEntry, transaction: ccc.Transaction): RecoverySpend {
+  const movable = new Map(account.movable.map((cell) => [outPointKey(cell), cell]));
+  const inputCells = transaction.inputs.map(({ previousOutput }) => {
+    const cell = movable.get(outPointKey({ outPoint: previousOutput }));
+    if (!cell) throw new Error("The rescue spends a cell that isn't one of the account's movable cells");
+    return cell;
+  });
+  return { client, lock: account.lock, omnilock: account.omnilock, auths: account.auths, entry, adminList: account.adminList.outPoint, inputCells };
 }
 
 /**
@@ -411,14 +452,14 @@ export function checkRescueTransaction(transaction: ccc.Transaction, account: Re
 /** Signs the rescue once with an EVM backup: its wallet shows the plan's approval text. */
 export async function signRescueWithEvm(client: ccc.Client, account: RescueAccount, plan: RescuePlan, ethereum: EthereumProvider): Promise<ccc.Transaction> {
   if (plan.entry.backup.kind !== "evm") throw new RescueError("not-backup", "This backup isn't an EVM wallet");
-  const signed = await signRecoverySpendWithEvm(plan.transaction, rescueSpend(client, account, plan.entry), ethereum);
+  const signed = await signRecoverySpendWithEvm(plan.transaction, rescueSpend(client, account, plan.entry, plan.transaction), ethereum);
   return sameRescue(signed, plan);
 }
 
 /** Signs the rescue once with a JoyID backup through CCC's JoyID signer. */
 export async function signRescueWithJoyId(client: ccc.Client, account: RescueAccount, plan: RescuePlan, signer: ccc.Signer): Promise<ccc.Transaction> {
   if (plan.entry.backup.kind !== "joyid") throw new RescueError("not-backup", "This backup isn't a JoyID passkey");
-  const signed = await signRecoverySpendWithJoyId(plan.transaction, rescueSpend(client, account, plan.entry), signer);
+  const signed = await signRecoverySpendWithJoyId(plan.transaction, rescueSpend(client, account, plan.entry, plan.transaction), signer);
   return sameRescue(signed, plan);
 }
 
@@ -456,6 +497,6 @@ export async function sendRescue(client: ccc.Client, transaction: ccc.Transactio
   return client.sendTransaction(transaction, "passthrough");
 }
 
-function outPointKey(cell: ccc.Cell): string {
+function outPointKey(cell: { outPoint: ccc.OutPoint }): string {
   return `${cell.outPoint.txHash}:${cell.outPoint.index.toString().padStart(10, "0")}`;
 }

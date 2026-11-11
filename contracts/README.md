@@ -64,10 +64,14 @@ refuses, with exit code 111, any transaction that isn't a rescue:
 - outputs to the account itself (the running script, which is the account's Omnilock in exec);
 - an output with data but no type script;
 - token cells that aren't exactly the account's own, moved unchanged: each output with a type script must have the
-  type script hash and data hash of a distinct input of the account, and each of the account's inputs with a type
-  script must be one of them. A token cell changed (tokens burned), left out (burned), moved twice, taken from
-  someone else's input, or CKB put under a type script the account didn't hold, is refused;
-- more than 256 token cells (`chain::MAX_TOKEN_CELLS`; the rescue page moves at most 100 cells at a time);
+  type script hash and data hash of a distinct input of the account, each of the account's inputs with a type
+  script must be one of them, and the outputs of each kind (same type script hash and data hash) may hold no more
+  CKB than the account's inputs of that kind did. A token cell changed (tokens burned), left out (burned), moved
+  twice, taken from someone else's input, made under a type script the account didn't hold, or given more CKB
+  than it held, is refused. The last one matters because anyone can send the account a cell under their own type
+  script, and that script could keep any CKB put in it: the rescued CKB beyond what token cells held must arrive
+  in plain cells;
+- more than 256 token cells (`MAX_TOKEN_CELLS`; the rescue page moves at most 100 cells at a time);
 - outputs above inputs.
 
 The text is at most 480 bytes (exit code 112 beyond). A JoyID assertion carries it base64url-encoded in
@@ -167,12 +171,14 @@ Deployed by `research/backup-unlinking/deploy-verifiers.ts` (version 3, salted i
 | `build/joyid-webauthn` | `0x01ac20c4c1a7e5e073a9369b452382970d7d493ad98169dbfa017df1351e2957` | `0x2b25815f1a4e130878880b079530646887560fcec104fb09e3fdfdec26be58c6:0` | 41,392 bytes |
 
 The source here is version 4, which also checks that the token cells are the account's own, moved unchanged
-(audit run 3, M19). Built from it, `evm-personal-sign` is 100,536 bytes with code hash
-`0x386072fa03d1ba1ba129b937bc4951d3c5e20b5cb88f977d627a266a6b155b72` and `joyid-webauthn` is 42,056 bytes with code
-hash `0x854652a420ca2a7357e3625caf84e116d99ee14fff450b350e4a4bcb7221c694`. They aren't deployed yet: a backup's
+(audit run 3, M19). Built from it, `evm-personal-sign` is 100,976 bytes with code hash
+`0x17c0015351a676c893110dab13dfbf5e7db1bd80678a7cd6934d593e969cc863` and `joyid-webauthn` is 42,456 bytes with code
+hash `0x82ac814afad69575b760902a3bd6b56ee432181d9efc67cf83bce6246f472866`. They aren't deployed yet: a backup's
 identity names its verifier's code hash, which the policy Lit Action pins too, so switching to them takes the
 deployment, a new Action CID and new pins in the SDK together. Until then `build/` holds the version 3 binaries
-above, which the SDK and the Action use, and which don't make that check.
+above, which the SDK and the Action use, and which don't make that check. An account's recovery list names its
+backups' identities, so an account whose list was written before the switch keeps version 3 identities, and the
+old check, until its list is written again.
 
 The version 2 verifiers (unsalted: `0x33bd1c69…3c88` EVM, `0xf1185da2…cd89` WebAuthn) and the version 1 WebAuthn
 verifier (`0x24306cbe…9720`) are still on chain but no longer used.
@@ -195,7 +201,8 @@ cargo test --release -- --nocapture                # runs the binaries in CKB-VM
 The builds are reproducible: a fresh copy of `contracts/` built in another directory gives the same bytes.
 `tests/tests/verifier.rs` runs the WebAuthn verifier against `tests/tests/rescue.json` (a mock rescue transaction
 for ckb-debugger); `approval.rs` runs both verifiers on the random transactions and 40,000 signature mutations, and checks the salt (an identity from one account refused in another, 114 for a lock that isn't a KeyWay account's);
-`approval.rs` also runs both verifiers on the token-cell attempts above;
+`approval.rs` also runs both verifiers on the token-cell attempts above, and the EVM verifier on 100, 256 and 257
+token cells;
 `audit_fable51_parity.rs` checks the clientDataJSON rules against the server's. `p256-check` is a test-only binary
 that runs the P-256 code on `public_key:rs:message`.
 
@@ -205,5 +212,7 @@ that runs the P-256 code on `public_key:rs:message`.
 |---|---|
 | EVM verifier, random rescue transactions | up to 7.9M |
 | WebAuthn verifier, random rescue transactions | up to 7.2M |
+| EVM verifier, 100 token cells (the most the rescue page moves at once) | 9.3M |
+| EVM verifier, 256 token cells (the most it accepts) | 13.2M |
 | Whole administrator-path spend on testnet, EVM backup | 8.05M |
 | Whole administrator-path spend on testnet, JoyID-style backup | 7.34M |
