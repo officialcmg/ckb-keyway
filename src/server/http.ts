@@ -240,6 +240,9 @@ async function bootstrapRequest(request: Request): Promise<Response> {
 
 async function fiberKeyRequest(request: Request): Promise<Response> {
   const user = await authenticateUser(request);
+  // Each request runs a paid Lit Action on the operator's shared credit; a node needs its key once per start.
+  const limit = await consumeRateLimit(`fiber-key:${user.id}`, { max: 5, window: 60 });
+  if (!limit.allowed) throw new Error(`Too many Fiber key requests. Try again in ${limit.retryAfter ?? 60} seconds`);
   const { deviceIdHash, leaseId, recipientPublicKey } = await objectBody(request, "Invalid Fiber key request");
   if (typeof deviceIdHash !== "string") throw new Error("Device ID hash is required");
   if (typeof leaseId !== "string") throw new Error("Device lease is required");
