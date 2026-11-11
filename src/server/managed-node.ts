@@ -118,8 +118,12 @@ export async function managedNodeRequest(
   if (body.operation === "open-channel") {
     const params = openChannelParams(body.params);
     if (!ownLock) throw new Error("The account's own lock is required to open a channel");
+    const own = await ownLock();
     // Fiber pays the channel out to the shutdown script when it closes, so it must be the user's own lock.
-    params.shutdown_script = ownShutdownScript(body.params, await ownLock());
+    params.shutdown_script = ownShutdownScript(body.params, own);
+    // And the account funds it: a lock nobody signs for would leave the channel waiting for funding forever.
+    if (!sameScript(params.funding_lock_script, own)) throw new Error("Channels can only be funded from your own KeyWay address");
+    params.funding_lock_script = own;
     await connectManagedPeer(node, params.pubkey);
     return serializeMutation(userId, () => node.openChannelWithExternalFunding(params));
   }
@@ -284,11 +288,13 @@ function openChannelParams(value: unknown): OpenChannelWithExternalFundingParams
 function ownShutdownScript(value: unknown, own: RpcScript): RpcScript {
   const requested = (value as { shutdown_script?: unknown } | undefined)?.shutdown_script;
   if (requested === undefined) return own;
-  const candidate = script(requested);
-  const same = candidate.code_hash.toLowerCase() === own.code_hash.toLowerCase() &&
-    candidate.hash_type === own.hash_type && candidate.args.toLowerCase() === own.args.toLowerCase();
-  if (!same) throw new Error("Channels can only close to your own KeyWay address");
+  if (!sameScript(script(requested), own)) throw new Error("Channels can only close to your own KeyWay address");
   return own;
+}
+
+function sameScript(candidate: RpcScript, own: RpcScript): boolean {
+  return candidate.code_hash.toLowerCase() === own.code_hash.toLowerCase() &&
+    candidate.hash_type === own.hash_type && candidate.args.toLowerCase() === own.args.toLowerCase();
 }
 
 function submitFundingParams(value: unknown): SubmitSignedFundingTxParams {

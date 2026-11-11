@@ -216,6 +216,24 @@ test("hosted channels from an Omnilock account fund at 1500 shannons/KB; others 
   await managedNodeRequest("fee-rate-test", { operation: "open-channel", params }, recording as never, ownLock);
   await managedNodeRequest("fee-rate-test", { operation: "open-channel", params: { ...params, funding_fee_rate: "0x7d0" } }, recording as never, ownLock);
   const omnilock = { code_hash: "0xf329effd1c475a2978453c8600e1eaf0bc2087ee093c3ee64cc96ec6847752cb", hash_type: "type", args: `0x00${"11".repeat(20)}01${"22".repeat(32)}` };
-  await managedNodeRequest("fee-rate-test", { operation: "open-channel", params: { ...params, funding_lock_script: omnilock } }, recording as never, ownLock);
+  await managedNodeRequest("fee-rate-test", { operation: "open-channel", params: { ...params, funding_lock_script: omnilock } }, recording as never, async () => omnilock as never);
   assert.deepEqual(rates, [undefined, "0x7d0", "0x5dc"]);
+});
+
+test("a hosted channel is funded only from the account's own lock", async () => {
+  const opened: Array<{ funding_lock_script: unknown }> = [];
+  const recording = { ...node, openChannelWithExternalFunding: async (params: { funding_lock_script: unknown }) => { opened.push(params); return node.openChannelWithExternalFunding(); } };
+  const open = (funding_lock_script: unknown) => managedNodeRequest("funding-lock-test", {
+    operation: "open-channel",
+    params: { pubkey: "0x02b6d4e3ab86a2ca2fad6fae0ecb2e1e559e0b911939872a90abdda6d20302be71", funding_amount: "0x5f5e100", funding_lock_script },
+  }, recording as never, ownLock);
+  // A lock nobody will sign for would leave the channel waiting for funding that never comes.
+  for (const other of [
+    { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x99" },
+    { code_hash: `0x${"22".repeat(32)}`, hash_type: "type", args: "0x" },
+    { code_hash: `0x${"11".repeat(32)}`, hash_type: "data1", args: "0x" },
+  ]) await assert.rejects(open(other), /funded from your own KeyWay address/);
+  assert.equal(opened.length, 0);
+  await open({ code_hash: `0x${"11".repeat(32)}`.toUpperCase().replace("0X", "0x"), hash_type: "type", args: "0x" });
+  assert.deepEqual(opened.map(({ funding_lock_script }) => funding_lock_script), [await ownLock()]);
 });
