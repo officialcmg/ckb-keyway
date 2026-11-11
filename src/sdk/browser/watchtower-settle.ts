@@ -338,10 +338,11 @@ export function planClaim(options: {
   else if (equal(current.second.pubkeyHash, ours)) { unlockType = UNLOCK_LOCAL_SLOT; mine = current.second.amount; otherSettled = equal(current.first.pubkeyHash, ZERO20); }
   else return waiting("the user's share is already claimed");
   // Whoever settles second may take the whole cell, TLCs included (the lock checks no output once both slots are
-  // empty), and Fiber's watchtower does. So, as Fiber, the user's share waits while any TLC may still become the
-  // user's: settled first, it would let the peer sweep them; settled second, it would take them before their time.
-  // Once the peer has settled, a TLC that could only be claimed alone by leaving a successor too small to exist
-  // never could be, so then the whole cell is taken rather than holding it forever.
+  // empty), and Fiber's watchtower does. While the peer's share is unsettled the user's waits, as Fiber's does, until
+  // no TLC may still become the user's: settled first, it would let the peer sweep them. Once the peer has settled,
+  // this differs from Fiber, which takes the whole cell at once: the user's TLCs are claimed one by one first (as
+  // they become claimable), so the peer's still-pending ones aren't taken before their time. A TLC that could only
+  // be claimed alone by leaving a successor too small to exist never could be, so then the whole cell is taken.
   const stranded = (tlc: PendingTlc) => {
     const left = cell.capacity - tlc.amount;
     return left > 0n && left < occupied(successorFor(tlc.index).args);
