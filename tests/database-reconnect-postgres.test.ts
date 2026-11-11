@@ -41,7 +41,10 @@ test("a failed first database connection is tried again on the next call", { ski
   });
   await new Promise<void>((resolve) => proxy!.listen(port, "127.0.0.1", resolve));
   const sql = await database();
-  const [row] = await sql<Array<{ one: number }>>`select 1 as one`;
-  assert.equal(row.one, 1);
-  await sql.end({ timeout: 0 });
+  try {
+    const [row] = await sql<Array<{ one: number }>>`select 1 as one`;
+    assert.equal(row.one, 1);
+  } finally {
+    await sql.end({ timeout: 0 });
+  }
 });
