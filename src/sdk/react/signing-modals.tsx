@@ -55,7 +55,7 @@ export function KeyWayTransactionModal({ theme, appName, preview, step, answer }
           <h2 id="keyway-transaction-title" style={modalTitle}>{title}</h2>
           {preview.unrecognized.length > 0 && (
             <p role="alert" style={errorNote(palette)}>
-              This transaction uses {preview.unrecognized.length === 1 ? "a script" : "scripts"} KeyWay doesn&apos;t recognize ({preview.unrecognized.map((item) => `${item.codeHash}, ${item.cells} cell${item.cells === 1 ? "" : "s"}`).join("; ")}). Only approve it if you trust {appName}.
+              This transaction uses {preview.unrecognized.length === 1 ? "a script" : "scripts"} KeyWay doesn&apos;t recognize ({preview.unrecognized.map((item) => `${item.codeHash} (${item.hashType}), ${item.cells} cell${item.cells === 1 ? "" : "s"}`).join("; ")}). Only approve it if you trust {appName}.
             </p>
           )}
           <dl style={{ ...fundingDetails, margin: "16px 0" }}>

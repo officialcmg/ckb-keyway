@@ -109,7 +109,16 @@ test("shows an NFT leaving the account and flags unrecognized scripts", () => {
   assert.equal(preview.unrecognized[0].cells, 2);
   // By its whole code hash.
   assert.equal(preview.unrecognized[0].codeHash, mystery.codeHash);
-  assert.ok(previewSummaryLines(preview).includes(`Unrecognized script ${mystery.codeHash} (2 cells)`));
+  assert.ok(previewSummaryLines(preview).includes(`Unrecognized script ${mystery.codeHash} (type, 2 cells)`));
+  // The same code hash run another way is another program, and is listed apart.
+  const other = ccc.Script.from({ ...mystery, hashType: "data1" });
+  const both = build(
+    [{ lock: own, capacity: 500n * CKB, type: mystery }, { lock: own, capacity: 500n * CKB, type: other }],
+    [{ lock: contract, capacity: 500n * CKB, type: mystery }, { lock: own, capacity: 500n * CKB - 4_000n, type: other }],
+  ).preview;
+  assert.deepEqual(both.unrecognized, [{ codeHash: mystery.codeHash, hashType: "type", cells: 2 }, { codeHash: mystery.codeHash, hashType: "data1", cells: 2 }]);
+  assert.ok(both.details.outputs.every(({ type }) => !type?.includes("…")));
+  assert.equal(both.details.outputs[0].lock, contract.hash());
   assert.equal(preview.recipients.find((recipient) => recipient.kind === "contract")?.ckb, "499.99996");
 });
 

@@ -58,7 +58,8 @@ export type TransactionPreview = {
   nfts: NftEffect[];
   dao: DaoEffect[];
   recipients: Recipient[];
-  unrecognized: Array<{ codeHash: string; cells: number }>;
+  /** By whole code hash and hash type: the same code hash with another hash type is another program. */
+  unrecognized: Array<{ codeHash: string; hashType: string; cells: number }>;
   otherSigners: number;
   details: { inputs: CellSummary[]; outputs: CellSummary[] };
   transactionHash: string;
@@ -283,13 +284,15 @@ export function describeTransaction(
 
   // Anything carrying a type script we can't explain, on the account's cells or on any output, by its whole code
   // hash: two scripts can share a short form.
-  const unrecognizedCounts = new Map<string, number>();
+  const unrecognizedCounts = new Map<string, { codeHash: string; hashType: string; cells: number }>();
   for (const cell of [...ownInputs, ...outputs]) {
     if (typeKind(cell.cellOutput.type) !== "unknown") continue;
-    const codeHash = cell.cellOutput.type!.codeHash;
-    unrecognizedCounts.set(codeHash, (unrecognizedCounts.get(codeHash) ?? 0) + 1);
+    const { codeHash, hashType } = cell.cellOutput.type!;
+    const entry = unrecognizedCounts.get(`${codeHash}:${hashType}`) ?? { codeHash, hashType, cells: 0 };
+    entry.cells += 1;
+    unrecognizedCounts.set(`${codeHash}:${hashType}`, entry);
   }
-  const unrecognized = [...unrecognizedCounts].map(([codeHash, cells]) => ({ codeHash, cells }));
+  const unrecognized = [...unrecognizedCounts.values()];
 
   // Recipients: every other lock that receives an output.
   const recipients = new Map<string, Recipient>();
@@ -323,10 +326,10 @@ export function describeTransaction(
   const summarize = (cell: { cellOutput: ccc.CellOutput; outputData: ccc.Hex }): CellSummary => {
     const kind = typeKind(cell.cellOutput.type);
     return {
-      lock: isOwn(cell) ? "you" : shortHash(cell.cellOutput.lock.hash()),
+      lock: isOwn(cell) ? "you" : cell.cellOutput.lock.hash(),
       ...(cell.cellOutput.type ? {
         type: isRecoveryList(cell.cellOutput.type) ? RECOVERY_LIST
-          : kind === "unknown" || kind === "quiet" ? shortHash(cell.cellOutput.type.codeHash) : kind === "dao" ? "Nervos DAO" : kind,
+          : kind === "unknown" || kind === "quiet" ? `${cell.cellOutput.type.codeHash} (${cell.cellOutput.type.hashType})` : kind === "dao" ? "Nervos DAO" : kind,
       } : {}),
       capacityCkb: formatCkb(cell.cellOutput.capacity),
       dataBytes: (cell.outputData.length - 2) / 2,
@@ -371,7 +374,7 @@ export function previewSummaryLines(preview: TransactionPreview): string[] {
   for (const token of preview.tokens) lines.push(`Token ${token.amountText} (${token.standard} ${token.asset})`);
   for (const nft of preview.nfts) lines.push(`${nft.kind} ${nft.id}: ${nft.change}`);
   for (const action of preview.dao) lines.push(`Nervos DAO ${action.action}: ${action.amountCkb} CKB`);
-  for (const script of preview.unrecognized) lines.push(`Unrecognized script ${script.codeHash} (${script.cells} cells)`);
+  for (const script of preview.unrecognized) lines.push(`Unrecognized script ${script.codeHash} (${script.hashType}, ${script.cells} cells)`);
   if (preview.details.outputs.some(({ type }) => type === RECOVERY_LIST)) lines.push("Writes the account's recovery list");
   // The amount comes before the address, so an address too long for the email's line can't push it out.
   for (const recipient of preview.recipients) lines.push(`${recipient.ckb} CKB to ${recipient.address} (${recipient.kind})`);

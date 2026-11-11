@@ -35,7 +35,7 @@ export type TransactionPreview = {
     nfts: string[];
   }>;
   /** Type scripts the backend couldn't explain. Always shown, never hidden. */
-  unrecognized: Array<{ codeHash: string; cells: number }>;
+  unrecognized: Array<{ codeHash: string; hashType: string; cells: number }>;
   /** Inputs owned by other locks, which their owners must sign. */
   otherSigners: number;
   details: { inputs: CellSummary[]; outputs: CellSummary[] };
