@@ -50,13 +50,10 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
     return Response.json({ status: "ok" }, { headers: cors });
   }
   if (request.method === "GET" && new URL(request.url).pathname === "/readyz") {
-    const sql = await database();
-    await sql`select 1`;
-    return Response.json({ status: "ready" }, { headers: cors });
+    return readiness("database", async () => { const sql = await database(); await sql`select 1`; }, cors);
   }
   if (request.method === "GET" && new URL(request.url).pathname === "/managed-readyz") {
-    await managedNodeReady();
-    return Response.json({ status: "ready" }, { headers: cors });
+    return readiness("managed-fiber", managedNodeReady, cors);
   }
   if (request.method !== "POST") return jsonError("Not found", 404, cors);
 
@@ -99,6 +96,26 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
     console.error("[keyway] request failed", { status: unauthorized ? 401 : rateLimited ? 429 : 400, ...(cause ? { cause } : {}) });
     return jsonError(publicErrorMessage(message), unauthorized ? 401 : rateLimited ? 429 : 400, cors);
   }
+}
+
+/**
+ * A readiness check for anonymous callers: ready or unavailable, never why. The cause goes to the operator's log
+ * as an error code only, since database, DNS and hosted-node errors name internal hosts.
+ */
+async function readiness(check: string, probe: () => Promise<unknown>, cors: Headers): Promise<Response> {
+  try {
+    await probe();
+    return Response.json({ status: "ready" }, { headers: cors });
+  } catch (error) {
+    console.error("[keyway] readiness check failed", { check, code: errorCode(error) });
+    return Response.json({ status: "unavailable" }, { status: 503, headers: cors });
+  }
+}
+
+/** A short code for an error (ECONNREFUSED, 28P01, ...) that names no host, address or account. */
+export function errorCode(error: unknown): string {
+  const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+  return typeof code === "string" && /^[A-Za-z0-9_]{1,40}$/.test(code) ? code : "unknown";
 }
 
 async function managedNodeHttpRequest(request: Request): Promise<Response> {
