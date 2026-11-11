@@ -377,9 +377,11 @@ async function sendLimitSettings(
     // Loosening amounts kept on the server only goes through the server's own code, whose email shows them before
     // and after; turning send limits on would ask only to "turn on" limits, hiding the stricter amounts it replaces.
     if (!head && weakens(current, next)) return undefined;
-    // The cell already holds these amounts: nothing to sign. The server's copy follows the chain's.
-    if (head && sameSettings(decodeSendLimitSettings(head.outputData), settings)) {
-      await writeDailyAmount(context.user, change.asset, change.amount);
+    // The cell already holds these amounts and the server's copy isn't loosened: nothing to sign. A change that
+    // loosens the server's copy is still signed as a change on the cell, so it can't land alongside a tightening
+    // made meanwhile (whose amount is written before it is sent) and undo it on the server.
+    if (head && !weakens(current, next) && sameSettings(decodeSendLimitSettings(head.outputData), settings)) {
+      await writeDailyAmount(context.user, change.asset, change.amount, { onlyLower: true });
       return { amounts: next };
     }
     let transaction: ccc.Transaction;

@@ -387,3 +387,36 @@ test("daily amounts the send-limit cell can't hold are refused, so turning limit
   await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (100n * CKB).toString(), confirmationNonce: asked.confirmationNonce, emailCode: codeFrom(world) });
   assert.equal(decodeSendLimitSettings(sent.at(-1)!.outputsData[0]).tokens.size, 8);
 });
+
+test("setting the old amount again while a tightening is being signed can't leave the server looser than the chain", { skip: !enabled }, async (t) => {
+  const { world, secp, user, context, sent } = await setUp();
+  t.after(() => { litSignerOverride.mode = undefined; });
+  const { set, amounts } = await limitsOn(world, context, sent, 150n * CKB);
+  // A node: a transaction spending a cell an accepted one already spent is refused.
+  const accepted = new Set<string>();
+  const broadcast = context.broadcast!;
+  context.broadcast = async (tx) => {
+    const spends = tx.inputs.map((input) => `${input.previousOutput.txHash}:${input.previousOutput.index}`);
+    if (spends.some((outPoint) => accepted.has(outPoint))) throw new Error("PoolRejectedRBF: conflicting transaction");
+    spends.forEach((outPoint) => accepted.add(outPoint));
+    return broadcast(tx);
+  };
+  // While the user's lowering to 10 CKB is being signed, the same session asks for 150 CKB again.
+  let raced: Promise<unknown> | undefined;
+  context.recordSigning = async () => {
+    if (raced) return;
+    raced = set(150n * CKB).catch((error: Error) => error);
+    await raced;
+  };
+  const lowered = await set(10n * CKB).catch((error: Error) => error);
+  await raced;
+  // Whichever change reached the node, the server's amount is no looser than the cell's.
+  const onChain = decodeSendLimitSettings(sent.at(-1)!.outputsData[sent.at(-1)!.outputs.findIndex((output, i) => isSendLimitCell(output, sent.at(-1)!.outputsData[i], secp))]).ckb!;
+  const server = BigInt((await amounts()).ckb);
+  assert.ok(server <= onChain, `server ${server} looser than chain ${onChain} (lowering: ${lowered instanceof Error ? lowered.message : "sent"})`);
+
+  t.after(async () => {
+    const sql = await database();
+    await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
+  });
+});
