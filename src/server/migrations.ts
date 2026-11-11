@@ -433,6 +433,8 @@ export const migrations: Array<{
       // The network (IPv4 address or IPv6 /48) of each login-code event, and whether a wrong code was tried while
       // the email's checks were paused.
       await sql`alter table keyway_otp_events add column network_hash text, add column bypass boolean not null default false`;
+      // Every code check counts one email's wrong codes over a day; this keeps that from reading everyone's.
+      await sql`create index keyway_otp_events_failures on keyway_otp_events (app_id, email_hash, created_at) where outcome = 'verify_failed'`;
       // Networks that signed in to an email's account in an app, kept 90 days: the owner's own, which strangers can't add.
       await sql`create table keyway_otp_known_networks (
         app_id text not null, email_hash text not null, network_hash text not null, verified_at timestamptz not null,

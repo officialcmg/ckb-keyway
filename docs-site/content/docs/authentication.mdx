@@ -77,12 +77,15 @@ KeyWay limits sign-in codes so one app, inbox or network can't flood the system:
 | --- | --- |
 | Codes per email address | 5 every 10 minutes |
 | Codes per IP address | 60 every 10 minutes |
-| Codes per network (IPv6 /48) | 60 every 10 minutes for addresses that already asked; each other address still gets its first code |
+| Codes per network (IPv6 /48) | 60 every 10 minutes for addresses that already asked; each other address still gets its first code, up to 600 |
+| Codes to one email address from one network | 10 every 10 minutes |
 | Codes per app | 30 a minute, shared by all of the app's users |
+| Codes across all apps | Past 1,000 a minute, only networks people signed in from in the last 90 days get codes |
 | Codes to one email address in one app | 50 every 10 minutes from new networks; networks the user signed in from in the last 90 days are exempt |
 | Code lifetime | 10 minutes |
+| Sign-in requests in progress per address | 16, and 2 for one email address or code |
 | Wrong attempts per code | 5, then request a new code |
-| Wrong codes per email address | 30 a day in each app. After that, each newly requested code gets one try: a few per network and a limited number a day, and always from a network the user signed in from in the last 90 days |
+| Wrong codes per email address | 30 a day in each app. After that, each newly requested code gets one try: a few per network and a limited number a day, and up to 20 a day from each network the user signed in from in the last 90 days |
 
 When a limit is reached, the sign-in modal shows "Too many login codes requested. Try again later". If your app needs more than 30 codes a minute (for a launch, say), open an issue on [GitHub](https://github.com/officialcmg/ckb-keyway/issues) and we'll raise it for your app.
 

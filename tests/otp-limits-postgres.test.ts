@@ -290,6 +290,9 @@ test("while checks are paused, fresh codes' first tries are limited per network 
   const sameNetwork = appRequest(appId, origin, "2001:db8:5:4::1");
   const refused = await sendEmailCode(sameNetwork, victim);
   await assert.rejects(verifyEmailCode(sameNetwork, refused.challengeId, code()), /Try again later/);
+  // A challenge refused while paused is retired, so later checks of it don't wait for the email's lock.
+  const [retired] = await sql<Array<{ status: string }>>`select status from keyway_auth_challenges where id = ${refused.challengeId}`;
+  assert.equal(retired.status, "failed");
   // At most 60 wrong first tries a day for the email, from anyone. Reaching it raises one alert.
   await pastFailures(sql, appId, victim, ["198.18.4.200"], 56, 10, true);
   const before = count(alerts, "otp_failure_bypass_limit");
@@ -423,6 +426,15 @@ test("past an inbox's 30 codes in 10 minutes, only a network that had none for i
   await assert.rejects(prepareOtpSend({ appId, email: victim, ipAddress: "100.66.3.1" }), /Too many login codes/);
   await knownNetworkFor(sql, appId, victim, "100.66.3.2");
   await prepareOtpSend({ appId, email: victim, ipAddress: "100.66.3.2" });
+});
+
+test("one network gets at most 10 codes for an inbox in 10 minutes, even the owner's own", { skip }, async () => {
+  const { sql } = await setup();
+  const { appId } = await application([], 120);
+  const victim = email();
+  await knownNetworkFor(sql, appId, victim, "2001:db8:65:1::1");
+  for (let i = 1; i <= 10; i++) await prepareOtpSend({ appId, email: victim, ipAddress: `2001:db8:65:${i}::1` });
+  await assert.rejects(prepareOtpSend({ appId, email: victim, ipAddress: "2001:db8:65:11::1" }), /Too many login codes/);
 });
 
 test("codes asked for in another app don't stop an inbox's first code in this one", { skip }, async () => {
@@ -618,10 +630,14 @@ test("one requester's queued sign-in requests don't refuse anyone else's", { ski
     assert.deepEqual(await settled(stranger.slice(2)), Array(3).fill(refusal));
     // Someone else behind the same address (a shared NAT) still gets their own code.
     await sendEmailCode(appRequest(appId, origin, "192.0.2.140"), email());
-    // One IPv6 /48: 64 in progress across its /64s, then none.
+    // One IPv6 /48 with 64 in progress: a /64 that already has some gets no more...
     const network = Array.from({ length: 64 }, (_, i) =>
       outcome(verifyEmailCode(appRequest(appId, origin, `2001:db8:77:${Math.floor(i / 2) + 1}::1`), theirs.challengeId, guess)));
-    assert.deepEqual(await settled([outcome(verifyEmailCode(appRequest(appId, origin, "2001:db8:77:99::1"), theirs.challengeId, guess))]), [refusal]);
+    assert.deepEqual(await settled([outcome(sendEmailCode(appRequest(appId, origin, "2001:db8:77:1::1"), email()))]), [refusal]);
+    // ...but someone else in that /48 isn't shut out.
+    const neighbour = outcome(verifyEmailCode(appRequest(appId, origin, "2001:db8:77:99::1"), theirs.challengeId, guess));
+    assert.equal(await within(neighbour, 200), false, "A neighbour's request is queued, not refused");
+    network.push(neighbour);
     // The victim's own request waits its turn instead of being refused.
     const mine = sendEmailCode(appRequest(appId, origin, "192.0.2.141"), victim);
     assert.equal(await within(outcome(mine), 200), false, "The victim's request is queued, not refused");

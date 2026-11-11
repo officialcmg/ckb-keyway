@@ -171,6 +171,8 @@ const OTP_SOURCE_LIMIT = 60; // codes asked for from one source
 // that hasn't asked in the window still gets its first code up to the hard limit, and known networks are exempt.
 const OTP_NETWORK_LIMIT = 60;
 const OTP_NETWORK_HARD_LIMIT = 600;
+// Codes to one email from one network, known or not, so even someone sharing the owner's network can't flood the inbox.
+const OTP_NETWORK_EMAIL_LIMIT = 10;
 const OTP_EMAIL_LIMIT = 15; // codes to one email across all apps, shared
 // A known network is one that signed in to this email's account in the app in the last OTP_KNOWN_NETWORK_DAYS days.
 // Strangers can't make one, so the owner's usual networks get through the limits below that strangers can fill.
@@ -268,6 +270,7 @@ export async function prepareOtpSend(input: {
       || (limits.global_count >= GLOBAL_OTP_LIMIT_PER_MINUTE && limits.network_minute_count > 0)
       || (limits.email_count >= OTP_EMAIL_HARD_LIMIT && limits.network_email_count > 0);
     if (limits.email_app_count >= OTP_EMAIL_APP_LIMIT || limits.source_count >= OTP_SOURCE_LIMIT
+      || limits.network_email_count >= OTP_NETWORK_EMAIL_LIMIT
       || (shared && limits.source_minute_count > 0) || (busyNetwork && !await isKnown())
       || (knownOnly && !await isKnown())) {
       // At most one record a minute per source and app, and one alert per app every 10 minutes, however many are refused.
@@ -340,18 +343,18 @@ function addressPrefix(address: string, prefixGroups: number): string {
   return `${words.slice(0, prefixGroups).map((word) => word.toString(16)).join(":")}::/${prefixGroups * 16}`;
 }
 
+/** A code check refused while the email's checks are paused: the challenge it was for can't be checked again. */
+export class OtpPausedError extends Error {
+  constructor() { super("Too many incorrect codes for this email. Try again later"); }
+}
+
 /**
  * Whether this code check may go ahead. Refuses one once this source has had too many wrong codes for this email in
  * the app, and pauses checks once anyone has: that keeps guessing from many addresses slow. While paused, a code's
  * first try still goes ahead (`bypass`), within the limits above, so strangers can't lock the owner out. The challenge
- * ID is the requester's own secret, so only they can try their code. Run under the email's login-code lock, so checks
- * for one email are counted one at a time.
+ * ID is the requester's own secret, so only they can try their code. Run before the email's login-code lock to turn
+ * refusals away early, and again under it, where checks for one email are counted one at a time.
  */
-/** Refuses a code check from a source that has had too many wrong codes for this email in the app today. */
-export async function checkOtpSource(context: OtpContext): Promise<void> {
-  if ((await otpFailures(await database(), context)).source >= OTP_FAILURE_LIMIT) throw new Error(OTP_FAILURE_MESSAGE);
-}
-
 export async function checkOtpFailures(context: OtpContext, challenge: { wrongAttempts: number }): Promise<{ bypass: boolean }> {
   const sql = await database();
   const failures = await otpFailures(sql, context);
@@ -359,7 +362,7 @@ export async function checkOtpFailures(context: OtpContext, challenge: { wrongAt
   if (failures.day < OTP_FAILURE_PAUSE) return { bypass: false };
   if (challenge.wrongAttempts === 0 && (failures.network < OTP_BYPASS_NETWORK_LIMIT && failures.bypass < OTP_BYPASS_LIMIT
     || failures.network < OTP_FAILURE_LIMIT && await knownNetwork(sql, context))) return { bypass: true };
-  throw new Error("Too many incorrect codes for this email. Try again later");
+  throw new OtpPausedError();
 }
 
 export async function recordOtpResult(context: OtpContext, outcome: "sent" | "send_failed"): Promise<void> {

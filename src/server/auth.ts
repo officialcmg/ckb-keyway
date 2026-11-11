@@ -7,7 +7,7 @@ import { bearer, emailOTP } from "better-auth/plugins";
 import { Pool } from "pg";
 import { Resend } from "resend";
 import { database, withLoginCodeLock, withLoginCodeSlot } from "./database.ts";
-import { applicationAllowsOrigin, checkOtpFailures, checkOtpSource, otpNetwork, otpSource, otpSubject, prepareOtpSend, recordOtpResult, recordOtpVerification } from "./applications.ts";
+import { applicationAllowsOrigin, checkOtpFailures, OtpPausedError, otpNetwork, otpSource, otpSubject, prepareOtpSend, recordOtpResult, recordOtpVerification } from "./applications.ts";
 import { authSchemaOptions } from "./auth-options.ts";
 import { scopedAuthAdapter } from "./scoped-auth-adapter.ts";
 import { createOtpEmailTemplate } from "./email-template.ts";
@@ -30,9 +30,11 @@ export const CHALLENGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0
 // Login-code requests in progress in this process: per source (IPv6 /64) for one email or challenge, per source, and
 // per network (IPv6 /48). The lock for one email is open to anyone, so the cap is on who is asking: one requester
 // can't queue without end, and people sharing an address (a NAT, a carrier) don't share the tightest cap.
+// Past the network's soft cap, only a source with nothing in progress gets in, so one /64 can't shut out a shared /48.
 const LOGIN_REQUESTS_PER_TARGET = 2;
 const LOGIN_REQUESTS_PER_SOURCE = 16;
 const LOGIN_REQUESTS_PER_NETWORK = 64;
+const LOGIN_REQUESTS_PER_NETWORK_HARD = 512;
 const loginRequests = new Map<string, number>();
 
 export function setAuthDeliveryForTests(callback: EmailDelivery): void {
@@ -150,9 +152,11 @@ async function withLoginRequest<T>(request: Request, target: string, task: () =>
   const slots = [
     [`target:${source}:${target}`, LOGIN_REQUESTS_PER_TARGET],
     [`source:${source}`, LOGIN_REQUESTS_PER_SOURCE],
-    [`network:${otpNetwork(ip)}`, LOGIN_REQUESTS_PER_NETWORK],
+    [`network:${otpNetwork(ip)}`, LOGIN_REQUESTS_PER_NETWORK_HARD],
   ] as const;
-  if (slots.some(([key, max]) => (loginRequests.get(key) ?? 0) >= max)) {
+  const inProgress = (key: string) => loginRequests.get(key) ?? 0;
+  if (slots.some(([key, max]) => inProgress(key) >= max)
+    || (inProgress(slots[2][0]) >= LOGIN_REQUESTS_PER_NETWORK && inProgress(slots[1][0]) > 0)) {
     throw new Error("Too many sign-in requests in progress. Try again in a moment");
   }
   for (const [key] of slots) loginRequests.set(key, (loginRequests.get(key) ?? 0) + 1);
@@ -199,17 +203,23 @@ export function sendEmailCode(request: Request, emailInput: string): Promise<{ c
   });
 }
 
-export function verifyEmailCode(request: Request, challengeId: string, code: string) {
+export function verifyEmailCode(request: Request, challengeIdInput: string, code: string) {
+  const challengeId = challengeIdInput.toLowerCase();
   return withLoginRequest(request, `challenge:${challengeId}`, async () => {
     if (!CHALLENGE_ID.test(challengeId)) throw new Error("Incorrect or expired code");
     const scope = await resolveAuthScope(request);
     const sql = await database();
     // A challenge that is used up or expired is refused here, before it takes the email's lock.
-    const [challenge] = await sql<Array<{ email: string }>>`select email from keyway_auth_challenges
+    const [challenge] = await sql<Array<{ email: string; wrong_attempts: number }>>`select email, wrong_attempts from keyway_auth_challenges
       where id = ${challengeId}::uuid and scope_id = ${scope.id} and status = 'sent' and expires_at > now()`;
     if (!challenge) throw new Error("Incorrect or expired code");
-    // A source past its own limit is refused before the lock too (and checked again under it).
-    await checkOtpSource(otpSubject(scope.id, challenge.email, requestIp(request)));
+    // A check the limits refuse is turned away before the lock too (and the limits are checked again under it). One
+    // refused while checks are paused retires its challenge: it can't become checkable again within its life.
+    const retire = async (error: unknown) => {
+      if (error instanceof OtpPausedError) await sql`update keyway_auth_challenges set status = 'failed' where id = ${challengeId}::uuid`;
+      throw error;
+    };
+    await checkOtpFailures(otpSubject(scope.id, challenge.email, requestIp(request)), { wrongAttempts: challenge.wrong_attempts }).catch(retire);
     return withLoginCodeLock(`otp:${scope.id}:${challenge.email}`, async (connection) => {
       const [current] = await connection<Array<{ wrong_attempts: number }>>`
         select wrong_attempts from keyway_auth_challenges
@@ -223,12 +233,7 @@ export function verifyEmailCode(request: Request, challengeId: string, code: str
         throw new Error("Incorrect or expired code");
       }
       const context = otpSubject(scope.id, challenge.email, requestIp(request));
-      const { bypass } = await checkOtpFailures(context, { wrongAttempts: current.wrong_attempts }).catch(async (error: unknown) => {
-        // A challenge already tried and now refused stays refused while checks are paused, so it is retired and later
-        // checks of it are turned away before the lock.
-        if (current.wrong_attempts > 0) await connection`update keyway_auth_challenges set status = 'failed' where id = ${challengeId}::uuid`;
-        throw error;
-      });
+      const { bypass } = await checkOtpFailures(context, { wrongAttempts: current.wrong_attempts }).catch(retire);
       const response = await withOtpChallenge(challengeId, () => callAuthEndpoint(request, scope, "/sign-in/email-otp", { email: challenge.email, otp: code }));
       if (!response.ok) {
         // Count a wrong code only when Better Auth compared it. After a wrong code it keeps the record (one more attempt
