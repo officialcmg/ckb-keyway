@@ -10,7 +10,9 @@ export async function database() {
   const url = process.env.DATABASE_URL;
   if (!url) throw new Error("DATABASE_URL is required");
   client ??= postgres(url, { max: 10, idle_timeout: 20 });
-  migration ??= process.env.NODE_ENV === "production" ? verifySchema(client) : migrateDatabase(client);
+  // A failed first connection (the database not up yet) isn't kept, so the next call tries again.
+  migration ??= (process.env.NODE_ENV === "production" ? verifySchema(client) : migrateDatabase(client))
+    .catch((error: unknown) => { migration = undefined; throw error; });
   await migration;
   return client;
 }
