@@ -8,7 +8,7 @@ import { keccak_256 } from "@noble/hashes/sha3.js";
 import { secp256k1Lock } from "../src/sdk/browser/account-lock.ts";
 import { chainOnSendLimit, decodeSendLimitSettings, DEFAULT_DAILY_LIMIT_SHANNONS, isSendLimitCell, type SendLimitHead } from "../src/sdk/browser/send-limits.ts";
 import { database } from "../src/server/database.ts";
-import { fundingCode, fundingNeedsLitCode, issueFundingCodeRequest, sendFundingCode, sendLimitOffer, signingSettings, transactionSigning, type SigningContext } from "../src/server/general-signing.ts";
+import { fundingCode, fundingNeedsLitCode, hashText, issueFundingCodeRequest, issueRequest, sendCode, sendFundingCode, sendLimitOffer, signingSettings, transactionSigning, type SigningContext } from "../src/server/general-signing.ts";
 import { litSignerOverride } from "../src/server/lit-config.ts";
 import { litPolicyRunner } from "../src/server/lit-policy.ts";
 import { listPendingTransactions } from "../src/server/pending-transactions.ts";
@@ -463,4 +463,54 @@ test("two token amounts added at once can't take the account past the eight the 
   assert.match(String((results.find(({ status }) => status === "rejected") as PromiseRejectedResult).reason), /At most 8 tokens/);
   const stored = (await signingSettings(context, { operation: "get" }) as { dailyAmounts: Record<string, string> }).dailyAmounts;
   assert.equal(Object.keys(stored).length, 8);
+});
+
+test("raising the server's amount back to the cell's takes the server's code, even when the cell needs no change", { skip: !enabled }, async (t) => {
+  const { world, user, context, sent } = await setUp();
+  t.after(() => { litSignerOverride.mode = undefined; });
+  const { set, amounts } = await limitsOn(world, context, sent, 150n * CKB);
+  const emails: string[] = [];
+  context.sendEmail = async (_to, message) => { emails.push(message.plaintext); };
+  // A lowering that never reached the node: the server holds 10 CKB, the cell still 150.
+  const broadcast = context.broadcast!;
+  context.broadcast = async () => { throw new Error("connection reset"); };
+  await assert.rejects(set(10n * CKB), /connection reset/);
+  context.broadcast = broadcast;
+  assert.deepEqual(await amounts(), { ckb: (10n * CKB).toString() });
+
+  const litEmails = world.lit.emails.length;
+  const asked = await set(150n * CKB);
+  assert.equal(asked.requiresEmailCode, true, "loosening the server's amount needs a code");
+  assert.equal(world.lit.emails.length, litEmails, "the cell allows it already, so the code is the server's");
+  assert.deepEqual(await amounts(), { ckb: (10n * CKB).toString() });
+  assert.match(emails.at(-1)!, /CKB: once 10 CKB is sent in 24 hours → once 150 CKB is sent in 24 hours/);
+  await assert.rejects(set(150n * CKB, { confirmationNonce: asked.confirmationNonce, emailCode: "000000" }), /isn't right/);
+  const code = /code is (\d{6})/.exec(emails.at(-1)!)![1];
+  const done = await set(150n * CKB, { confirmationNonce: asked.confirmationNonce, emailCode: code });
+  assert.deepEqual(done.dailyAmounts, { ckb: (150n * CKB).toString() });
+
+  t.after(async () => {
+    const sql = await database();
+    await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
+  });
+});
+
+test("a change asked for while the account had no send-limit cell can't be confirmed once limits are on", { skip: !enabled }, async (t) => {
+  const { world, user, context, sent } = await setUp();
+  t.after(() => { litSignerOverride.mode = undefined; });
+  const emails: string[] = [];
+  // A server-only raise to 1,000 CKB, asked for before limits were on, then limits turned on at 150 CKB.
+  const lines = ["Email confirmation for CKB: once 150 CKB is sent in 24 hours", "Change: once 1000 CKB is sent in 24 hours"];
+  await limitsOn(world, context, sent, 150n * CKB);
+  const nonce = await issueRequest(user, "settings", hashText(`daily-amount:ckb:${(1_000n * CKB).toString()}`), { lines }, true);
+  await sendCode({ ...context, sendEmail: async (_to, message) => { emails.push(message.plaintext); } }, "settings", nonce, "Confirm a security change", lines, { limited: true });
+  const code = /code is (\d{6})/.exec(emails.at(-1)!)![1];
+  await assert.rejects(signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (1_000n * CKB).toString(), confirmationNonce: nonce, emailCode: code }), /turned on since/);
+  const stored = (await signingSettings(context, { operation: "get" }) as { dailyAmounts: Record<string, string> }).dailyAmounts;
+  assert.deepEqual(stored, { ckb: (150n * CKB).toString() });
+
+  t.after(async () => {
+    const sql = await database();
+    await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
+  });
 });

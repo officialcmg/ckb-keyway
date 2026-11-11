@@ -4,7 +4,7 @@ import * as ccc from "@ckb-ccc/core";
 import { sha256 } from "@noble/hashes/sha2.js";
 import type { User } from "./auth-user.ts";
 import type { TransactionSql } from "postgres";
-import { database, withUserLock, type DatabaseSql } from "./database.ts";
+import { database, withDailyAmountLock, type DatabaseSql } from "./database.ts";
 import { createConfirmationEmailTemplate } from "./email-template.ts";
 import { formatCkbSignature, serializeTransaction, signAccountGroups, signingGroups, type SigningGroup } from "./funding-transaction.ts";
 import { accountLocks, secp256k1Lock } from "../sdk/browser/account-lock.ts";
@@ -316,7 +316,7 @@ export async function signingSettings(context: SigningContext, body: Record<stri
   await limit(context, "sign", { max: 10, window: 60 });
   // One change at a time per user, from reading the amounts to writing them: each change is checked against, and
   // written over, the amounts the one before it left, so overlapping changes can't undo each other.
-  return withUserLock(`daily-amounts:${context.user.id}`, () => setDailyAmount(context, body));
+  return withDailyAmountLock(context.user.id, () => setDailyAmount(context, body));
 }
 
 function dailyAmountsView(amounts: DailyAmounts) {
@@ -402,15 +402,23 @@ async function sendLimitSettings(
     }
     const plan = await planSendLimits(context.wallet, transaction);
     applySendLimitRecord(transaction, plan);
-    if (!plan.needsCode) {
-      await serverAmountsAround(context.user, current, next, change, () => signAndSendSettings(context, client, transaction, {}));
-      return { amounts: next };
-    }
     const lines = [
       head ? "Change your daily send limits" : "Turn on daily send limits, enforced by KeyWay's Lit Action",
       `CKB: ${describeAmount(current, "ckb")} → ${describeAmount(next, "ckb")}`,
       ...(change.asset === "ckb" ? [] : [`${assetName(change.asset)}: ${describeAmount(current, change.asset)} → ${describeAmount(next, change.asset)}`]),
     ];
+    if (!plan.needsCode && !weakens(current, next)) {
+      await serverAmountsAround(context.user, current, next, change, () => signAndSendSettings(context, client, transaction, {}));
+      return { amounts: next };
+    }
+    if (!plan.needsCode) {
+      // The cell's change needs no Lit code (the cell already allows as much), but it loosens the server's own
+      // amounts, which alone gate hosted Fiber payments: that takes the server's code, as for amounts it keeps alone.
+      await codeLimit(context);
+      const confirmationNonce = await issueRequest(context.user, "settings", digest, { lines, settingsTransaction: serializeTransaction(transaction), serverCode: true }, true);
+      const sentTo = await sendCode(context, "settings", confirmationNonce, "Confirm a security change", lines, { limited: true });
+      return { amounts: current, response: { requiresEmailCode: true, confirmationNonce, sentTo } };
+    }
     await codeLimit(context);
     const confirmationNonce = await issueRequest(context.user, "settings", digest, { lines, settingsTransaction: serializeTransaction(transaction) }, true);
     const sent = await policySendCode(transaction, context.wallet, { email: await context.email(), appName: context.appName });
@@ -419,9 +427,23 @@ async function sendLimitSettings(
   }
   const nonce = requiredNonce(body.confirmationNonce);
   const request = await loadRequest(context.user, "settings", nonce, digest);
-  // A request made while the account couldn't afford the cell carries no transaction; the server's code applies.
-  if (!request.summary.settingsTransaction) return undefined;
+  // A request made while the account had no send-limit cell carries no transaction; the server's code applies, unless
+  // limits were turned on since: then the change would apply to the server alone and leave it looser than the cell.
+  if (!request.summary.settingsTransaction) {
+    if (await sendLimitHead(client, context.wallet, await listPendingTransactions(context.user.id, nodeStatus(client)))) {
+      throw new Error("Send limits were turned on since this change was asked for. Start again");
+    }
+    return undefined;
+  }
   const transaction = ccc.Transaction.from(request.summary.settingsTransaction as ccc.TransactionLike);
+  if (request.summary.serverCode === true) {
+    await verifyCode(context.user, "settings", nonce, body.emailCode);
+    await serverAmountsAround(context.user, current, next, change, async () => {
+      await signAndSendSettings(context, client, transaction, {});
+      await consumeRequest(context.user, "settings", nonce);
+    });
+    return { amounts: next };
+  }
   if (typeof request.summary.litFingerprint === "string") withFingerprint(transaction, request.summary.litFingerprint);
   const emailCode = parseLitEmailCode(body.emailCode, request.summary.litTicket);
   await countLitCodeAttempt(context.user, "settings", nonce);
