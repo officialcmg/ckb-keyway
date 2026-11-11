@@ -606,6 +606,8 @@ function waitText(seconds: number): string {
 export async function verifyCode(user: User, purpose: Purpose, nonce: string, code: unknown): Promise<void> {
   if (typeof code !== "string" || !/^\d{6}$/.test(code)) throw new Error("Enter the six-digit code from your email");
   const sql = await database();
+  // A session past its limit is refused before it competes for the lock below.
+  if (overFailureLimit(await codeFailures(sql, user))) throw new Error(CODE_FAILURES_MESSAGE);
   // One check at a time per user, so the day's wrong codes are counted before the next one is compared. Another
   // check already running is refused rather than waited for, so checks never queue on pool connections.
   const outcome = await sql.begin(async (tx) => {

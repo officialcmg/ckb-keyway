@@ -4,6 +4,7 @@ import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { formatCkbSignature, type ValidatedFunding } from "../src/server/funding-transaction.ts";
 import { fundingSigning, type FundingContext } from "../src/server/funding-signing.ts";
+import postgres from "postgres";
 import { database } from "../src/server/database.ts";
 import { countLitCodeAttempt, issueRequest, loadRequest, messageSigning, outflowNeedsEmailCode, recordLitCode, reserveOutflow, sendCode, signingSettings, transactionSigning, verifyCode, type SigningContext } from "../src/server/general-signing.ts";
 import type { ValidatedTransaction } from "../src/server/transaction-policy.ts";
@@ -438,6 +439,16 @@ test("wrong step-up codes add up across codes, to 20 a day per session", { skip:
     const stolen = session("stolen");
     await twenty(stolen);
     await assert.rejects(() => sendCode(stolen, "message", nonce, "Sign a message", []), /today/);
+    // Past its limit, it is refused without competing for the check lock the owner's own checks use.
+    const holder = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      await holder.begin(async (tx) => {
+        await tx`select pg_advisory_xact_lock(hashtextextended(${`step-up-failures:${context.user.id}`}, 0))`;
+        await assert.rejects(() => verifyCode(stolen.user, "message", nonce, "123456"), /today/);
+      });
+    } finally {
+      await holder.end({ timeout: 0 });
+    }
     // The owner's own sign-in, a session of its own, isn't held back by it.
     const owner = session("owner");
     await sendCode(owner, "message", nonce, "Sign a message", []);
