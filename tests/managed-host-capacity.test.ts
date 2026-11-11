@@ -6,13 +6,14 @@ import test, { type TestContext } from "node:test";
 
 // A stand-in for fnn: answers node_info, and list_channels from channels.json in its data directory. It writes
 // its pid there; with a slow-start file it takes a while to answer, and with a slow-stop file it takes a while
-// to exit, writing a stopping file once asked to.
+// to exit, writing a stopping file once asked to. With a fail-start file it exits at once, noting it in failed-starts.
 const FAKE_FNN = `#!${process.execPath}
 const { createServer } = require("node:http");
-const { existsSync, readFileSync, writeFileSync } = require("node:fs");
+const { appendFileSync, existsSync, readFileSync, writeFileSync } = require("node:fs");
 const { join } = require("node:path");
 const args = process.argv.slice(2);
 const dir = args[args.indexOf("-d") + 1];
+if (existsSync(join(dir, "fail-start"))) { appendFileSync(join(dir, "failed-starts"), "x"); process.exit(1); }
 const port = Number(args.find((arg) => arg.startsWith("--rpc-listening-addr=")).split(":").pop());
 const parent = process.ppid;
 writeFileSync(join(dir, "pid"), String(process.pid));
@@ -42,6 +43,9 @@ setTimeout(() => server.listen(port, "127.0.0.1"), existsSync(join(dir, "slow-st
 
 const OPEN_CHANNEL = [{ state: { state_name: "ChannelReady" } }];
 const CLOSED_CHANNEL = [{ state: { state_name: "CLOSED", state_flags: "COOPERATIVE" } }];
+const SETTLED_FORCE_CLOSE = [{ state: { state_name: "CLOSED", state_flags: "UNCOOPERATIVE_LOCAL | WAITING_ONCHAIN_SETTLEMENT | ONCHAIN_SETTLEMENT_CONFIRMED" } }];
+const UNFUNDED_CHANNEL = [{ state: { state_name: "NEGOTIATING_FUNDING", state_flags: "OUR_INIT_SENT | THEIR_INIT_SENT | AWAITING_EXTERNAL_FUNDING" } }];
+const ABORTED_FUNDING = [{ state: { state_name: "CLOSED", state_flags: "FUNDING_ABORTED" } }];
 const exists = (path: string) => stat(path).then(() => true, () => false);
 
 async function until(check: () => Promise<boolean>) {
@@ -80,11 +84,17 @@ async function host(context: TestContext) {
     .then(({ status }) => status, () => 502);
   const running = () => module.runningUsers().sort();
   const marked = (user: string) => stat(join(root, "users", user, "keyway-channels")).then(() => true, () => false);
-  const withChannels = async (user: string) => {
+  const withChannels = async (user: string, channels: unknown[] = OPEN_CHANNEL) => {
     await mkdir(join(root, "users", user), { recursive: true });
-    await writeFile(join(root, "users", user, "channels.json"), JSON.stringify(OPEN_CHANNEL));
+    await writeFile(join(root, "users", user, "channels.json"), JSON.stringify(channels));
   };
-  return { module, root, request, running, marked, withChannels };
+  /** A node from before this restart, marked as holding channels. */
+  const markedNode = async (user: string, channels: unknown[] = OPEN_CHANNEL) => {
+    await withChannels(user, channels);
+    await writeFile(join(root, "users", user, "keyway-channels-checked"), "");
+    await writeFile(join(root, "users", user, "keyway-channels"), "");
+  };
+  return { module, root, request, running, marked, withChannels, markedNode };
 }
 
 test("at capacity, a node idle for a few minutes makes room for a new user; one with channels or just used is never stopped", async (context) => {
@@ -205,4 +215,106 @@ test("a node still starting when the host shuts down stops with it", async (cont
   assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
   assert.equal(await admission, 502);
   assert.deepEqual(running(), []);
+});
+
+test("a read never creates a hosted node; connecting one or setting up a channel does", async (context) => {
+  const { root, request, running } = await host(context);
+  for (const method of ["list_channels", "list_peers", "graph_nodes", "get_invoice"]) assert.equal(await request(A, method), 502, method);
+  assert.equal(await exists(join(root, "users", A)), false);
+  assert.deepEqual(running(), []);
+  assert.equal(await request(A, "node_info"), 200);
+  assert.equal(await request(A, "list_channels"), 200);
+  assert.equal(await request(B, "connect_peer"), 200);
+  assert.deepEqual(running(), [A, B]);
+});
+
+test("reads don't keep a node from making room; the steps of a channel setup do, for a few minutes", async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const later = () => context.mock.timers.tick(FEW_MINUTES);
+  const { request, running } = await host(context);
+  assert.equal(await request(A), 200);
+  assert.equal(await request(B), 200);
+  later();
+  // Both keep reading, as a page polling its node does, yet a new user still gets a node.
+  assert.equal(await request(A, "list_channels"), 200);
+  assert.equal(await request(B, "list_peers"), 200);
+  assert.equal(await request(C), 200);
+  assert.deepEqual(running(), [B, C]);
+  later();
+  // B connects to a peer to open a channel, so it keeps its node even though C was used after it.
+  assert.equal(await request(B, "connect_peer"), 200);
+  assert.equal(await request(C, "list_channels"), 200);
+  assert.equal(await request(A), 200);
+  assert.deepEqual(running(), [A, B]);
+});
+
+test("a node started on demand is recorded as checked, so a restart starts it only if it has channels", async (context) => {
+  const { root, request, marked } = await host(context);
+  assert.equal(await request(A), 200);
+  assert.equal(await exists(join(root, "users", A, "keyway-channels-checked")), true);
+  assert.equal(await marked(A), false);
+});
+
+test("after a restart, nodes with channels start before nodes never checked", async (context) => {
+  const { module, root, running, markedNode } = await host(context);
+  const unchecked = ["1", "2"].map((digit) => digit.repeat(64));
+  for (const user of unchecked) await mkdir(join(root, "users", user), { recursive: true });
+  await markedNode(F);
+
+  await module.startKnownNodes([...unchecked, F]);
+  assert.ok(running().includes(F));
+  assert.deepEqual(module.readiness().status, "ready");
+});
+
+test("a node with channels takes the place of a just-used node without channels", async (context) => {
+  const { module, request, running, markedNode } = await host(context);
+  assert.equal(await request(A), 200);
+  assert.equal(await request(B), 200);
+  await markedNode(F);
+  await module.startKnownNodes([F]);
+  assert.equal(running().length, 2);
+  assert.ok(running().includes(F));
+});
+
+test("a node with channels that crashes is restarted until it runs, and /readyz reports it offline meanwhile", async (context) => {
+  const { module, root, request, running, withChannels } = await host(context);
+  await withChannels(F);
+  assert.equal(await request(F), 200);
+  assert.deepEqual(module.readiness(), { status: "ready", nodes: 1, maxNodes: 2, offline: 0 });
+  // It crashes, and its first restarts fail.
+  await writeFile(join(root, "users", F, "fail-start"), "");
+  process.kill(Number(await readFile(join(root, "users", F, "pid"), "utf8")), "SIGKILL");
+  await until(() => exists(join(root, "users", F, "failed-starts")));
+  assert.deepEqual(running(), []);
+  assert.deepEqual(module.readiness(), { status: "degraded", nodes: 0, maxNodes: 2, offline: 1 });
+  await rm(join(root, "users", F, "fail-start"));
+  await until(async () => running().includes(F));
+  assert.deepEqual(module.readiness(), { status: "ready", nodes: 1, maxNodes: 2, offline: 0 });
+});
+
+test("a node whose channels can hold nothing more makes room once its user has stopped, and loses its marker", async (context) => {
+  // Force-closed and settled on-chain, opened but never funded, and funding aborted by Fiber.
+  for (const channels of [SETTLED_FORCE_CLOSE, UNFUNDED_CHANNEL, ABORTED_FUNDING]) {
+    context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+    const { request, running, marked, markedNode } = await host(context);
+    await markedNode(F, channels);
+    assert.equal(await request(F), 200);
+    assert.equal(await request(A), 200);
+    context.mock.timers.tick(FEW_MINUTES);
+    assert.equal(await request(B), 200, JSON.stringify(channels));
+    assert.deepEqual(running(), [A, B], JSON.stringify(channels));
+    assert.equal(await marked(F), false);
+    context.mock.timers.reset();
+  }
+});
+
+test("a node waiting for its channel's funding keeps its node while its user is signing", async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const { request, running, withChannels } = await host(context);
+  await withChannels(F, UNFUNDED_CHANNEL);
+  assert.equal(await request(F, "open_channel_with_external_funding"), 200);
+  assert.equal(await request(A), 200);
+  context.mock.timers.tick(FEW_MINUTES - 60_000);
+  assert.equal(await request(B), 200);
+  assert.deepEqual(running(), [B, F]);
 });

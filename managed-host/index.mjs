@@ -14,12 +14,26 @@ const CHANNELS_MARKER = "keyway-channels";
 // Written once a node's channels have been checked under the marker scheme. A node without it (one from before
 // markers existed) starts after a restart like a marked one, so its channels are found and marked.
 const CHECKED_MARKER = "keyway-channels-checked";
-// A node used this recently is never stopped to make room, so a user's steps that span several requests,
-// such as connecting to a peer and then opening a channel with it, can't lose the node in between.
+// A node is never stopped to make room for this long after a step of a channel setup, so a user's steps that
+// span several requests, such as connecting to a peer, opening a channel and signing its funding, can't lose
+// the node in between. Reads, such as a page polling its node, don't hold a node.
 const RECENT_USE_MS = 5 * 60_000;
+// Nor for this long after it starts, so the request that started it is served, and no node can be made to stop
+// and start more than once in this time.
+const START_GRACE_MS = 60_000;
+// Only these calls may create a node for a user who has none: connecting a hosted node (the SDK's start and its
+// fee reserve read node_info) and setting up a channel. Any other read of a user without a node is refused.
+const PROVISIONING = new Set(["node_info", "connect_peer", "open_channel", "open_channel_with_external_funding"]);
+// The steps of a channel setup, which hold the node for RECENT_USE_MS.
+const CHANNEL_SETUP = new Set(["connect_peer", "open_channel", "open_channel_with_external_funding", "submit_signed_funding_tx"]);
+// A node that may hold channels and isn't running is started again after 1s, then 2s, 4s, ... up to every minute.
+const RESTART_BASE_MS = 1_000;
+const RESTART_MAX_MS = 60_000;
 const nodes = new Map();
 const starting = new Map();
 const operations = new Map();
+// Nodes that may hold channels but aren't running, with their restart attempts and the pending retry.
+const offline = new Map();
 let shuttingDown = false;
 let uses = 0;
 
@@ -57,7 +71,8 @@ async function handleRequest(request, response) {
       return send(response, 401, { error: "Unauthorized" });
     }
     if (request.method === "GET" && request.url === "/readyz") {
-      return send(response, 200, { status: "ready", nodes: nodes.size, maxNodes: maxNodes() });
+      const ready = readiness();
+      return send(response, ready.status === "ready" ? 200 : 503, ready);
     }
     if (request.method === "GET" && request.url === "/inventory") {
       return send(response, 200, { users: await existingUsers(), running: runningUsers() });
@@ -101,10 +116,22 @@ async function handleRequest(request, response) {
   }
 }
 
-/** Passes one JSON-RPC request to the user's node, starting it if needed. */
+/**
+ * Ready only while every node that may hold channels is running: one that is offline can't watch its channels.
+ * Counts only, as the API may show this to anyone.
+ */
+export function readiness() {
+  return { status: offline.size === 0 ? "ready" : "degraded", nodes: nodes.size, maxNodes: maxNodes(), offline: offline.size };
+}
+
+/**
+ * Passes one JSON-RPC request to the user's node, starting it if needed. Only connecting a node or setting up a
+ * channel may create one, and only a channel setup step holds it (see PROVISIONING and CHANNEL_SETUP).
+ */
 export function proxyUserRequest(userId, body) {
+  const method = rpcMethod(body);
   return withUserOperation(userId, async () => {
-    const node = await ensureNode(userId);
+    const node = await ensureNode(userId, { provision: PROVISIONING.has(method), setup: CHANNEL_SETUP.has(method) });
     const upstream = await fetch(`http://127.0.0.1:${node.port}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -121,10 +148,19 @@ export function proxyUserRequest(userId, body) {
   });
 }
 
+function rpcMethod(body) {
+  try {
+    const { method } = JSON.parse(body.toString("utf8"));
+    return typeof method === "string" ? method : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** A channel opened, or its funding handed to the node: the node may hold channels from now on. */
 function opensChannel(request, response) {
   try {
-    const { method } = JSON.parse(request.toString("utf8"));
-    return (method === "open_channel" || method === "open_channel_with_external_funding") && !JSON.parse(response.toString("utf8")).error;
+    return ["open_channel", "open_channel_with_external_funding", "submit_signed_funding_tx"].includes(rpcMethod(request)) && !JSON.parse(response.toString("utf8")).error;
   } catch {
     return false;
   }
@@ -148,6 +184,19 @@ async function channelsChecked(userId) {
   return fileExists(join(managedDataDir(userId), CHECKED_MARKER));
 }
 
+/**
+ * A marked node, or one never checked under the marker scheme (it may hold channels from before it). A user
+ * without a node has none, and a node is recorded as checked when it is created (see startNode).
+ */
+async function mayHoldChannels(userId) {
+  if (!(await fileExists(managedDataDir(userId)).catch(() => true))) return false;
+  const [marked, checked] = await Promise.all([
+    hasChannelsMarker(userId).catch(() => true),
+    channelsChecked(userId).catch(() => false),
+  ]);
+  return marked || !checked;
+}
+
 async function fileExists(path) {
   try { await stat(path); return true; }
   catch (error) { if (error?.code === "ENOENT") return false; throw error; }
@@ -155,8 +204,8 @@ async function fileExists(path) {
 
 /** Marks a node by its current channels and records that it has been checked. */
 async function checkChannels(userId, node) {
-  let open = false;
-  try { requireClosedChannels(await nodeChannels(node)); } catch { open = true; }
+  let open = true;
+  try { open = holdsChannels(await nodeChannels(node)); } catch {}
   await markChannels(userId, open);
   await writeFile(join(managedDataDir(userId), CHECKED_MARKER), "", { mode: 0o600 });
 }
@@ -172,40 +221,68 @@ export async function withUserOperation(userId, operation) {
   }
 }
 
-async function ensureNode(userId) {
+/**
+ * The user's node, started if it isn't running. `provision: false` refuses to create a node for a user who has
+ * none; `setup: true` holds the node for a few minutes (see RECENT_USE_MS). Every start checks the node's
+ * channels and marks it by them, so a node started on demand is never taken for one from before markers.
+ */
+async function ensureNode(userId, { provision = true, setup = false } = {}) {
   if (!USER_ID.test(userId)) throw new Error("Managed user ID is invalid");
   if (shuttingDown) throw new Error("Managed host is shutting down");
   if (await isRetired(userId)) throw new Error("Legacy Fiber node has been retired");
-  const running = nodes.get(userId);
-  if (running?.stopping) throw new Error("Fiber process is still stopping");
-  if (running) {
-    running.lastUsed = ++uses;
-    running.lastUsedAt = Date.now();
-    return running;
-  }
-  const pending = starting.get(userId);
-  if (pending) return pending;
+  const current = () => {
+    const running = nodes.get(userId);
+    if (running?.stopping) throw new Error("Fiber process is still stopping");
+    if (running) return use(running, setup);
+    return starting.get(userId)?.then((node) => use(node, setup));
+  };
+  const existing = current();
+  if (existing) return existing;
+  if (!provision && !(await fileExists(managedDataDir(userId)))) throw new Error("This account has no hosted Fiber node yet");
+  const priority = await mayHoldChannels(userId);
+  // Looked up again after the waits above.
+  const again = current();
+  if (again) return again;
+  if (shuttingDown) throw new Error("Managed host is shutting down");
   const full = new Set([...nodes.keys(), ...starting.keys()]).size >= maxNodes();
-  const promise = (full ? makeRoom(userId) : Promise.resolve()).then(() => startNode(userId)).finally(() => starting.delete(userId));
+  const promise = (full ? makeRoom(userId, priority) : Promise.resolve())
+    .then(() => startNode(userId))
+    .then(async (node) => {
+      forgetOffline(userId);
+      await checkChannels(userId, node).catch(logError);
+      return node;
+    }, async (error) => {
+      // A node that may hold channels keeps being started until it runs.
+      if (!shuttingDown && await mayHoldChannels(userId).catch(() => true)) superviseNode(userId);
+      throw error;
+    })
+    .finally(() => starting.delete(userId));
   starting.set(userId, promise);
-  return promise;
+  return promise.then((node) => use(node, setup));
+}
+
+function use(node, setup) {
+  node.lastUsed = ++uses;
+  if (setup) node.heldUntil = Math.max(node.heldUntil, Date.now() + RECENT_USE_MS);
+  return node;
 }
 
 /**
- * When the host is full, a new node takes the place of the least recently used one that has no channels,
- * so accounts that never opened a channel can't hold the host's capacity. A node with channels is never
- * stopped this way, nor is one serving a request or used in the last few minutes.
+ * When the host is full, a new node takes the place of the least recently used one that holds no channels, so
+ * accounts that never funded a channel can't hold the host's capacity. A node with channels is never stopped
+ * this way, nor is one serving a request, nor one held (just started, or in a channel setup) unless the new
+ * node may hold channels itself: it must run to watch them.
  */
-async function makeRoom(userId) {
-  const reusable = (id, node) => id !== userId && !node.stopping && !operations.has(id) && Date.now() - node.lastUsedAt >= RECENT_USE_MS;
+async function makeRoom(userId, priority = false) {
+  const reusable = (id, node) => id !== userId && !node.stopping && !operations.has(id) && (priority || Date.now() >= node.heldUntil);
   const candidates = [...nodes.entries()]
     .filter(([id, node]) => reusable(id, node))
     .sort(([, left], [, right]) => left.lastUsed - right.lastUsed);
   for (const [id, node] of candidates) {
     let channels;
     try { channels = await nodeChannels(node); } catch { continue; }
-    let idle = true;
-    try { requireClosedChannels(channels); } catch { idle = false; await markChannels(id, true).catch(logError); }
+    const idle = !holdsChannels(channels);
+    if (!idle) await markChannels(id, true).catch(logError);
     // Checked again after the wait, in case the node was stopped or picked up a request meanwhile.
     if (!idle || nodes.get(id) !== node || !reusable(id, node)) continue;
     // Stopping marks the node at once, so no request can pick it up in between; its marker goes only once
@@ -218,23 +295,53 @@ async function makeRoom(userId) {
 }
 
 /**
- * Starts the nodes that may hold channels after a restart: as many as fit together, then the rest one at a
- * time, in case one has closed its channels since and can make room. Every other node starts on its user's
- * next request, so leftover nodes can't hold up the ones with channels.
+ * Starts the nodes that may hold channels after a restart, marked ones first: as many as fit together, then
+ * the rest one at a time, each taking the place of a node found to hold none. Every other node starts on its
+ * user's next request, so leftover nodes can't hold up the ones with channels. A node that fails to start is
+ * retried until it runs (see superviseNode), and counts as offline meanwhile.
  */
 export async function startKnownNodes(users) {
   const states = await Promise.all(users.map(async (userId) => ({
     marked: await hasChannelsMarker(userId).catch(() => true),
     checked: await channelsChecked(userId).catch(() => false),
   })));
-  // Marked nodes, and nodes never checked under the marker scheme (they may hold channels from before it).
-  const withChannels = users.filter((_, index) => states[index].marked || !states[index].checked);
-  const start = (userId) => withUserOperation(userId, async () => {
-    const node = await ensureNode(userId);
-    if (!(await channelsChecked(userId))) await checkChannels(userId, node);
+  // Marked nodes, then nodes never checked under the marker scheme (they may hold channels from before it).
+  const withChannels = [
+    ...users.filter((_, index) => states[index].marked),
+    ...users.filter((_, index) => !states[index].marked && !states[index].checked),
+  ];
+  for (const userId of withChannels) if (!offline.has(userId)) offline.set(userId, { attempts: 0 });
+  await Promise.all(withChannels.slice(0, maxNodes()).map(restartNode));
+  for (const userId of withChannels.slice(maxNodes())) await restartNode(userId);
+}
+
+/** Schedules the next start of an offline node that may hold channels, backing off after each failure. */
+function superviseNode(userId) {
+  if (shuttingDown) return;
+  const entry = offline.get(userId) ?? { attempts: 0 };
+  offline.set(userId, entry);
+  if (entry.timer) return;
+  const delay = Math.min(RESTART_MAX_MS, RESTART_BASE_MS * 2 ** entry.attempts);
+  entry.attempts++;
+  entry.timer = setTimeout(() => {
+    entry.timer = undefined;
+    void restartNode(userId);
+  }, delay);
+  entry.timer.unref?.();
+}
+
+/** Starts an offline node unless it no longer needs to run: retired, or found to hold no channels. */
+async function restartNode(userId) {
+  await withUserOperation(userId, async () => {
+    if (shuttingDown) return;
+    if (nodes.has(userId) || await isRetired(userId) || !(await mayHoldChannels(userId))) return forgetOffline(userId);
+    await ensureNode(userId);
   }).catch(logError);
-  await Promise.all(withChannels.slice(0, maxNodes()).map(start));
-  for (const userId of withChannels.slice(maxNodes())) await start(userId);
+}
+
+function forgetOffline(userId) {
+  clearTimeout(offline.get(userId)?.timer);
+  offline.delete(userId);
 }
 
 export function runningUsers() {
@@ -243,6 +350,7 @@ export function runningUsers() {
 
 export async function shutdown() {
   shuttingDown = true;
+  for (const entry of offline.values()) clearTimeout(entry.timer);
   // A node still starting either stops before it spawns or stops itself once it is up (see startNode).
   await Promise.all([
     ...[...nodes.values()].map((node) => waitForExit(node.child).catch(logError)),
@@ -254,8 +362,11 @@ async function startNode(userId) {
   const port = await availablePort();
   const baseDir = managedDataDir(userId);
   await requireCleanRestore(baseDir);
+  const created = !(await fileExists(baseDir));
   const ckbDir = join(baseDir, "ckb");
   await mkdir(ckbDir, { recursive: true });
+  // A new node holds no channels, so it is checked from the start, even if its first start fails.
+  if (created) await writeFile(join(baseDir, CHECKED_MARKER), "", { mode: 0o600 });
   await createCkbKey(join(ckbDir, "key"));
   // The host may have begun shutting down while this admission waited, for room or for the steps above.
   if (shuttingDown) throw new Error("Managed host is shutting down");
@@ -269,12 +380,15 @@ async function startNode(userId) {
   ], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
   child.stdout.on("data", (chunk) => process.stdout.write(`[fnn:${userId.slice(0, 8)}] ${chunk}`));
   child.stderr.on("data", (chunk) => process.stderr.write(`[fnn:${userId.slice(0, 8)}] ${chunk}`));
-  const node = { child, port, lastUsed: 0, lastUsedAt: 0 };
+  const node = { child, port, lastUsed: 0, heldUntil: 0 };
   child.once("exit", (code, signal) => {
     const wasRunning = nodes.get(userId)?.child === child;
     if (wasRunning) nodes.delete(userId);
     console.error(`[managed-host] fnn ${userId.slice(0, 8)} exited code=${code} signal=${signal}`);
-    if (wasRunning && !node.stopping && !shuttingDown) setTimeout(() => void withUserOperation(userId, () => ensureNode(userId)).catch(logError), 1_000);
+    // A node that may hold channels is started again until it runs; any other starts on its user's next request.
+    if (wasRunning && !node.stopping && !shuttingDown) {
+      void mayHoldChannels(userId).catch(() => true).then((may) => { if (may) superviseNode(userId); });
+    }
   });
   await waitForRpc(port, child);
   if (shuttingDown) {
@@ -282,7 +396,7 @@ async function startNode(userId) {
     throw new Error("Managed host is shutting down");
   }
   node.lastUsed = ++uses;
-  node.lastUsedAt = Date.now();
+  node.heldUntil = Date.now() + START_GRACE_MS;
   nodes.set(userId, node);
   return node;
 }
@@ -414,8 +528,35 @@ async function nodeChannels(node) {
   return result.result?.channels;
 }
 
+/**
+ * Closes after which a channel holds nothing: closed cooperatively, force-closed and settled on-chain, or closed
+ * before it was funded (Fiber aborts or abandons a channel only until its funding signature has been sent).
+ * Kept equal to channelFinished in src/sdk/browser/settlement-sweep.ts by a test.
+ */
+const FINISHED_CLOSES = ["COOPERATIVE", "ONCHAIN_SETTLEMENT_CONFIRMED", "FUNDING_ABORTED", "ABANDONED"];
+
+function stateName(channel) {
+  return String(channel?.state?.state_name).replaceAll("_", "").toLowerCase();
+}
+
+/** True once a channel is closed and can hold nothing more, matched by whole flag, never by substring. */
+export function channelFinished(channel) {
+  if (stateName(channel) !== "closed") return false;
+  const flags = new Set(JSON.stringify(channel?.state?.state_flags ?? "").match(/\b[A-Z][A-Z0-9_]*\b/g) ?? []);
+  return FINISHED_CLOSES.some((flag) => flags.has(flag));
+}
+
+/**
+ * Whether a node must keep running for its channels. A channel still negotiating its funding holds nothing:
+ * the node has no signed funding for it yet, so it doesn't keep the node running.
+ */
+function holdsChannels(channels) {
+  return !Array.isArray(channels) || channels.some((channel) => !channelFinished(channel) && stateName(channel) !== "negotiatingfunding");
+}
+
+/** Retirement needs every channel finished, including ones still negotiating their funding. */
 export function requireClosedChannels(channels) {
-  if (!Array.isArray(channels) || channels.some((channel) => String(channel?.state?.state_name).replaceAll("_", "").toLowerCase() !== "closed" || channel?.state?.state_flags !== "COOPERATIVE")) {
+  if (!Array.isArray(channels) || !channels.every(channelFinished)) {
     throw new Error("Channel closure is incomplete; preserve the node database");
   }
 }

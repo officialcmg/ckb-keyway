@@ -15,13 +15,28 @@ export const MIN_PLAIN_CELL = 61n * 100_000_000n;
 
 type ChannelState = { state: { state_name: string; state_flags?: unknown } };
 
+/**
+ * Closes after which a channel holds nothing: closed cooperatively, force-closed and settled on-chain, or closed
+ * before it was funded (Fiber aborts or abandons a channel only until its funding signature has been sent).
+ * The hosted node server (managed-host/index.mjs) keeps its own copy of this check; a test holds the two equal.
+ */
+const FINISHED_CLOSES = ["COOPERATIVE", "ONCHAIN_SETTLEMENT_CONFIRMED", "FUNDING_ABORTED", "ABANDONED"];
+
+/** A channel's state flags, which Fiber sends as one string such as "UNCOOPERATIVE_LOCAL | WAITING_ONCHAIN_SETTLEMENT". */
+function stateFlags(flags: unknown): Set<string> {
+  return new Set(JSON.stringify(flags ?? "").match(/\b[A-Z][A-Z0-9_]*\b/g) ?? []);
+}
+
+/** True once a channel is closed and can hold nothing more, matched by whole flag, never by substring. */
+export function channelFinished({ state }: ChannelState): boolean {
+  if (String(state?.state_name).replaceAll("_", "").toLowerCase() !== "closed") return false;
+  const flags = stateFlags(state.state_flags);
+  return FINISHED_CLOSES.some((flag) => flags.has(flag));
+}
+
 /** True while any channel is open, closing, or closed but not yet settled on-chain. */
 export function needsFeeReserve(channels: ChannelState[]): boolean {
-  return channels.some(({ state }) => {
-    if (String(state.state_name) !== "CLOSED") return true;
-    const flags = JSON.stringify(state.state_flags ?? "");
-    return flags.includes("WAITING_ONCHAIN_SETTLEMENT") && !flags.includes("ONCHAIN_SETTLEMENT_CONFIRMED");
-  });
+  return channels.some((channel) => !channelFinished(channel));
 }
 
 /**

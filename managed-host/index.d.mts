@@ -1,5 +1,7 @@
 export function managedUserId(userId: string): string;
 export function requireClosedChannels(channels: unknown): void;
+export function channelFinished(channel: unknown): boolean;
+export function readiness(): { status: "ready" | "degraded"; nodes: number; maxNodes: number; offline: number };
 export function purgeRetiredUser(userId: string, roots?: { dataRoot?: string; backupRoot?: string; retiredRoot?: string }): Promise<{ purged: boolean; userId: string }>;
 export function authorizationMatches(header: string | undefined, token: string): boolean;
 export function createCkbKey(path: string): Promise<void>;

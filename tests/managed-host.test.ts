@@ -20,7 +20,9 @@ import {
   withUserOperation,
   requireClosedChannels,
   purgeRetiredUser,
+  channelFinished as hostChannelFinished,
 } from "../managed-host/index.mjs";
+import { channelFinished as sweepChannelFinished } from "../src/sdk/browser/settlement-sweep.ts";
 
 const USER = "a".repeat(64);
 const ENCRYPTION_KEY = randomBytes(32);
@@ -55,6 +57,37 @@ test("node retirement rejects active, settling, or unknown channel states", () =
     assert.throws(() => requireClosedChannels([{ state: { state_name } }]), /preserve/);
   }
   assert.throws(() => requireClosedChannels(undefined), /preserve/);
+});
+
+test("a force-closed channel counts as finished once it has settled on-chain, read by flag, not by string", () => {
+  const closed = (state_flags: unknown) => [{ state: { state_name: "CLOSED", state_flags } }];
+  requireClosedChannels(closed("UNCOOPERATIVE_LOCAL | WAITING_ONCHAIN_SETTLEMENT | ONCHAIN_SETTLEMENT_CONFIRMED"));
+  requireClosedChannels(closed("UNCOOPERATIVE_REMOTE|WAITING_ONCHAIN_SETTLEMENT|ONCHAIN_SETTLEMENT_CONFIRMED"));
+  // Closed before anything was funded.
+  requireClosedChannels(closed("FUNDING_ABORTED"));
+  requireClosedChannels(closed("ABANDONED"));
+  for (const flags of ["UNCOOPERATIVE_LOCAL | WAITING_ONCHAIN_SETTLEMENT", "UNCOOPERATIVE_REMOTE", "NOT_COOPERATIVE", "ONCHAIN_SETTLEMENT_CONFIRMED_LATER", undefined, 9]) {
+    assert.throws(() => requireClosedChannels(closed(flags)), /preserve/, String(flags));
+  }
+  // A channel still negotiating its funding isn't closed, so it still blocks retirement.
+  assert.throws(() => requireClosedChannels([{ state: { state_name: "NEGOTIATING_FUNDING", state_flags: "AWAITING_EXTERNAL_FUNDING" } }]), /preserve/);
+});
+
+test("the hosted node and the settlement sweep agree on which channels are finished", () => {
+  const states = [
+    ["CHANNEL_READY", undefined], ["ChannelReady", undefined], ["NEGOTIATING_FUNDING", "AWAITING_EXTERNAL_FUNDING"],
+    ["SHUTTING_DOWN", "WAITING_COMMITMENT_CONFIRMATION"], ["CLOSED", "COOPERATIVE"], ["Closed", "COOPERATIVE"],
+    ["CLOSED", "UNCOOPERATIVE_LOCAL | WAITING_ONCHAIN_SETTLEMENT"],
+    ["CLOSED", "UNCOOPERATIVE_LOCAL | WAITING_ONCHAIN_SETTLEMENT | ONCHAIN_SETTLEMENT_CONFIRMED"],
+    ["CLOSED", "UNCOOPERATIVE_REMOTE"], ["CLOSED", "FUNDING_ABORTED"], ["CLOSED", "ABANDONED"], ["CLOSED", "FORCE"],
+    ["CLOSED", undefined], ["CLOSED", ["COOPERATIVE"]], ["CLOSED", 1],
+  ] as const;
+  for (const [state_name, state_flags] of states) {
+    const channel = { state: { state_name, state_flags } };
+    assert.equal(hostChannelFinished(channel), sweepChannelFinished(channel as never), `${state_name} ${String(state_flags)}`);
+  }
+  assert.equal(hostChannelFinished({ state: { state_name: "CLOSED", state_flags: "UNCOOPERATIVE_LOCAL | WAITING_ONCHAIN_SETTLEMENT | ONCHAIN_SETTLEMENT_CONFIRMED" } }), true);
+  assert.equal(hostChannelFinished({ state: { state_name: "CLOSED", state_flags: "UNCOOPERATIVE_REMOTE" } }), false);
 });
 
 test("managed database operations report success only after the node resumes", async () => {
