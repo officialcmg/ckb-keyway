@@ -381,6 +381,41 @@ test("a recovery change whose send fails stays pending until the chain settles i
     await recoverySetup(h.context(dropped), { operation: "preview", backups: [h.sign(evmWallet())] });
   });
 
+  await t.test("past the grace period, one whose input reads spent while the node has it pending again (a reorg) is kept, not dropped", async () => {
+    const h = await harness();
+    const result = await enable(h, { before: TIMEOUT() });
+    const input = ccc.Transaction.from(result.transaction).inputs[0].previousOutput;
+    const getCellLive = h.client.getCellLive.bind(h.client);
+    // The change's block is rolled back between reads: unknown first, its input spent, then back in the pool.
+    const statuses: ccc.TransactionStatus[] = ["unknown", "pending"];
+    const reorged = Object.assign(Object.create(h.client) as ccc.Client, {
+      getTransaction: async () => ({ transaction: ccc.Transaction.from(result.transaction), status: statuses.shift() ?? "pending" }),
+      getCellLive: async (outPoint: ccc.OutPointLike, withData?: boolean) => ccc.OutPoint.from(outPoint).eq(input) ? undefined : getCellLive(outPoint, withData),
+    });
+    const kept = await settleRecoveryChange({ ...(await current(h)), client: reorged }, later(11));
+    assert.equal(kept.recoveryPending?.transactionHash, result.transactionHash);
+    assert.equal(kept.ckbAddress, h.legacyAddress);
+    h.chain.set(result.transactionHash, { transaction: ccc.Transaction.from(result.transaction), status: "committed" });
+    const settled = await settleRecoveryChange(await current(h), later(12));
+    assert.equal(settled.ckbAddress, result.ckbAddress);
+    assert.equal(settled.recovery?.enableTransactionHash, result.transactionHash);
+  });
+
+  await t.test("past the grace period, one whose AdminList output is live is applied even when the transaction reads unknown", async () => {
+    const h = await harness();
+    const result = await enable(h, { before: TIMEOUT() });
+    // Committed: its input is spent and its AdminList output live. The transaction lookup still answers as a node
+    // that hasn't caught up would.
+    h.chain.set(result.transactionHash, { transaction: ccc.Transaction.from(result.transaction), status: "committed" });
+    const lagging = Object.assign(Object.create(h.client) as ccc.Client, { getTransaction: async () => undefined });
+    const settled = await settleRecoveryChange({ ...(await current(h)), client: lagging }, later(11));
+    assert.equal(settled.recoveryPending, undefined);
+    assert.equal(settled.ckbAddress, result.ckbAddress);
+    assert.equal(settled.recovery?.enableTransactionHash, result.transactionHash);
+    assert.equal(h.emails.filter(({ subject }) => /Account recovery is on/.test(subject)).length, 1);
+    assert.equal(h.broadcasts.length, 0, "not sent again");
+  });
+
   await t.test("one the node reports rejected while its inputs are unspent stays pending, is sent again, and is applied once committed", async () => {
     const h = await harness();
     const result = await enable(h, {});
