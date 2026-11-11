@@ -58,6 +58,8 @@ const roomStarts = new Map();
 // When each user's queue of requests last went from idle to busy.
 const busySince = new Map();
 let noRoomAt = 0;
+// Set from launch until the nodes to start after a restart are known, so /readyz isn't ready before then.
+let booting = false;
 let shuttingDown = false;
 let uses = 0;
 
@@ -76,11 +78,12 @@ async function main() {
   required("FIBER_SECRET_KEY_PASSWORD");
   required("KEYWAY_MANAGED_HOST_TOKEN");
   backupKey();
+  booting = true;
   const server = createServer(handleRequest);
   server.listen(Number(process.env.PORT ?? 8080), "0.0.0.0", () => {
     console.log(`[managed-host] listening on ${process.env.PORT ?? 8080}`);
   });
-  void startKnownNodes(await existingUsers()).catch(logError);
+  void existingUsers().then(startKnownNodes).catch(logError).finally(() => { booting = false; });
   const stop = () => {
     server.close();
     void shutdown();
@@ -148,7 +151,7 @@ async function handleRequest(request, response) {
  * Counts only, as the API may show this to anyone.
  */
 export function readiness() {
-  return { status: offline.size === 0 ? "ready" : "degraded", nodes: nodes.size, maxNodes: maxNodes(), offline: offline.size };
+  return { status: offline.size === 0 && !booting ? "ready" : "degraded", nodes: nodes.size, maxNodes: maxNodes(), offline: offline.size };
 }
 
 /**
@@ -183,7 +186,9 @@ export function proxyUserRequest(userId, body, signal) {
     const answer = result.ok ? rpcResult(result.body) : undefined;
     delete result.ok;
     if (answer && setup) hold(userId, node);
-    if (answer && ["open_channel", "open_channel_with_external_funding", "submit_signed_funding_tx"].includes(method)) await markChannels(userId, true);
+    // A channel holds funds once they are handed to Fiber: the user's signed funding, or the node's own for
+    // open_channel. An external-funding open alone holds nothing, and Fiber keeps it only in memory.
+    if (answer && ["open_channel", "submit_signed_funding_tx"].includes(method)) await markChannels(userId, true);
     // A channel can also be opened to the node by a peer: it is marked once the node's channels show it.
     if (answer && method === "list_channels" && Array.isArray(answer.result?.channels) && answer.result.channels.some((channel) => channelClass(channel) === "open")) {
       await markChannels(userId, true);
@@ -247,14 +252,11 @@ async function fileExists(path) {
   catch (error) { if (error?.code === "ENOENT") return false; throw error; }
 }
 
-/**
- * Marks a node by its current channels and records that it has been checked. If the channels can't be read, the
- * node is marked; if only CKB can't be asked about a channel's funding, its marker stays as it was.
- */
+/** Marks a node by its current channels (marked if they can't be read) and records that it has been checked. */
 async function checkChannels(userId, node) {
-  let holds = "yes";
-  try { holds = await holdsChannels(await nodeChannels(node)); } catch {}
-  if (holds !== "unknown") await markChannels(userId, holds === "yes");
+  let holds = true;
+  try { holds = holdsChannels(await nodeChannels(node)); } catch {}
+  await markChannels(userId, holds);
   await writeFile(join(managedDataDir(userId), CHECKED_MARKER), "", { mode: 0o600 });
 }
 
@@ -388,14 +390,14 @@ async function makeRoom(userId, priority = false) {
   for (const [id, node] of candidates) {
     let channels;
     try { channels = await nodeChannels(node); } catch { continue; }
-    const holds = await holdsChannels(channels);
-    const idle = holds === "no";
-    if (holds === "yes") await markChannels(id, true).catch(logError);
+    const idle = !holdsChannels(channels);
+    if (!idle) await markChannels(id, true).catch(logError);
     // Checked again after the wait, in case the node was stopped or picked up a request meanwhile.
     if (!idle || nodes.get(id) !== node || !reusable(id, node)) continue;
     // Stopping marks the node at once, so no request can pick it up in between; its marker goes only once
     // it has stopped.
-    await stopNode(id);
+    // A node that won't stop leaves no room; that is no failure of the node being admitted.
+    try { await stopNode(id); } catch (error) { logError(error); continue; }
     await markChannels(id, false);
     return;
   }
@@ -420,6 +422,7 @@ export async function startKnownNodes(users) {
     ...users.filter((_, index) => !states[index].marked && !states[index].checked),
   ];
   for (const userId of withChannels) if (!offline.has(userId)) offline.set(userId, {});
+  booting = false;
   await Promise.all(withChannels.slice(0, maxNodes()).map(restartNode));
   for (const userId of withChannels.slice(maxNodes())) await restartNode(userId);
 }
@@ -692,55 +695,27 @@ function stateName(channel) {
   return String(channel?.state?.state_name).replaceAll("_", "").toLowerCase();
 }
 
-// States before a channel's funding is on chain: it holds funds only once its funding transaction is.
-const BEFORE_FUNDING = ["negotiatingfunding", "collaboratingfundingtx", "signingcommitment", "awaitingtxsignatures", "awaitingchannelready"];
-
-/** "finished", "unfunded" (before its funding is on chain, see BEFORE_FUNDING), or "open". */
+/**
+ * "finished"; "unfunded" while Fiber could still abort its funding, before our funding signatures were sent
+ * (Fiber's can_abort_funding_on_timeout); or "open". An unfunded channel holds nothing of the user's on chain,
+ * and Fiber aborts it if it stalls. Once our signatures are sent, the peer may broadcast the funding at any time,
+ * so the channel counts as open.
+ */
 function channelClass(channel) {
   if (channelFinished(channel)) return "finished";
-  return BEFORE_FUNDING.includes(stateName(channel)) ? "unfunded" : "open";
+  const name = stateName(channel);
+  if (["negotiatingfunding", "collaboratingfundingtx", "signingcommitment"].includes(name)) return "unfunded";
+  if (name === "awaitingtxsignatures") {
+    const flags = new Set(JSON.stringify(channel?.state?.state_flags ?? "").match(/\b[A-Z][A-Z0-9_]*\b/g) ?? []);
+    // TX_SIGNATURES_SENT is Fiber's name for both sides having sent them.
+    return flags.has("OUR_TX_SIGNATURES_SENT") || flags.has("TX_SIGNATURES_SENT") ? "open" : "unfunded";
+  }
+  return "open";
 }
 
-/**
- * Whether a node must keep running for its channels: "yes", "no", or "unknown" when only CKB couldn't be asked
- * whether a channel's funding exists (such a node isn't stopped, and its marker isn't changed). A channel that
- * hasn't reached ready counts only once CKB knows its funding transaction: before that the funding may never
- * come, and nothing of the user's is in the channel.
- */
-async function holdsChannels(channels) {
-  if (!Array.isArray(channels)) return "yes";
-  if (channels.some((channel) => channelClass(channel) === "open")) return "yes";
-  const outpoints = [...new Set(channels.filter((channel) => channelClass(channel) === "unfunded")
-    .map((channel) => String(channel?.channel_outpoint ?? ""))
-    .filter((outpoint) => /^0x[0-9a-f]{72}$/i.test(outpoint)))];
-  let unknown = false;
-  // A few lookups at a time, each answered from a short cache when it can be.
-  for (let index = 0; index < outpoints.length; index += 8) {
-    const seen = await Promise.all(outpoints.slice(index, index + 8).map(fundingSeen));
-    if (seen.includes(true)) return "yes";
-    if (seen.includes(undefined)) unknown = true;
-  }
-  return unknown ? "unknown" : "no";
-}
-
-const fundingLookups = new Map();
-// A funding transaction CKB knows stays known; one it doesn't is asked about again after a minute.
-const UNSEEN_FUNDING_TTL_MS = 60_000;
-
-/** True if CKB knows the channel's funding transaction, false if not, undefined if CKB couldn't be asked. */
-async function fundingSeen(outpoint) {
-  const hash = outpoint.slice(0, 66).toLowerCase();
-  const cached = fundingLookups.get(hash);
-  if (cached && (cached.seen || Date.now() - cached.at < UNSEEN_FUNDING_TTL_MS)) return cached.seen;
-  try {
-    const status = (await ckbRpc("get_transaction", [hash]))?.tx_status?.status;
-    const seen = status !== "unknown" && status !== "rejected";
-    if (fundingLookups.size >= 10_000) fundingLookups.clear();
-    fundingLookups.set(hash, { seen, at: Date.now() });
-    return seen;
-  } catch {
-    return undefined;
-  }
+/** Whether a node must keep running for its channels: any channel that isn't finished or unfunded. */
+function holdsChannels(channels) {
+  return !Array.isArray(channels) || channels.some((channel) => channelClass(channel) === "open");
 }
 
 /** Retirement needs every channel finished. */

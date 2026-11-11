@@ -14,7 +14,7 @@ import { serializeCccTransactionForRpc } from "../sdk/browser/ccc-transaction.ts
 import { approveFiberParams, FIBER_METHODS, fundingFeeRate, freeFiberParams, paymentFiberParams, type FiberMethod } from "../sdk/browser/fiber-methods.ts";
 import { pinPublicPeerAddress } from "./peer-address.ts";
 import * as ccc from "@ckb-ccc/core";
-import { FEE_RESERVE, needsFeeReserve, sweepSettlement } from "../sdk/browser/settlement-sweep.ts";
+import { channelFinished, FEE_RESERVE, needsFeeReserve, sweepSettlement } from "../sdk/browser/settlement-sweep.ts";
 
 type ManagedNodeClient = Pick<
   FiberRpcClient,
@@ -85,7 +85,8 @@ export async function managedNodeRequest(
         return { done: true };
       }
       await serializeMutation(userId, async () => {
-        await assertPeerRoom(node, typeof params.pubkey === "string" ? params.pubkey : undefined);
+        // Only a dial by key to a peer already connected takes no room: a new address can reach another node.
+        await assertPeerRoom(node, typeof params.pubkey === "string" && params.address === undefined ? params.pubkey : undefined);
         await node.call(FIBER_METHODS[method as FiberMethod].rpc, [dial]);
       });
       return { done: true };
@@ -131,6 +132,7 @@ export async function managedNodeRequest(
     // And the account funds it: a lock nobody signs for would leave the channel waiting for funding forever.
     if (!sameScript(params.funding_lock_script, own)) throw new Error("Channels can only be funded from your own KeyWay address");
     params.funding_lock_script = own;
+    await serializeMutation(userId, () => assertChannelRoom(node));
     await serializeMutation(userId, () => connectManagedPeer(node, params.pubkey));
     return serializeMutation(userId, () => node.openChannelWithExternalFunding(params));
   }
@@ -314,6 +316,18 @@ function submitFundingParams(value: unknown): SubmitSignedFundingTxParams {
 }
 
 const MAX_PEERS = 32;
+// Fiber keeps every channel record, aborted ones included, and each unfinished channel keeps a hosted node
+// running; so a hosted node opens no more once it has this many unfinished channels or records in all.
+const MAX_UNFINISHED_CHANNELS = 32;
+const MAX_CHANNEL_RECORDS = 200;
+
+async function assertChannelRoom(node: ManagedNodeClient): Promise<void> {
+  const { channels } = await node.listChannels({ include_closed: true });
+  if (channels.length >= MAX_CHANNEL_RECORDS) throw new Error(`A hosted node can hold at most ${MAX_CHANNEL_RECORDS} channel records`);
+  if (channels.filter((channel) => !channelFinished(channel as never)).length >= MAX_UNFINISHED_CHANNELS) {
+    throw new Error(`A hosted node can have at most ${MAX_UNFINISHED_CHANNELS} channels open or being set up`);
+  }
+}
 // A peer's announced addresses are checked and dialed; only this many, however many it announces.
 const MAX_PEER_ADDRESSES = 4;
 

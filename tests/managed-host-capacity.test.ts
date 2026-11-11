@@ -56,9 +56,13 @@ const SETTLED_FORCE_CLOSE = [{ state: { state_name: "Closed", state_flags: "UNCO
 const SETTLED_REMOTE_CLOSE = [{ state: { state_name: "Closed", state_flags: "UNCOOPERATIVE_REMOTE" } }];
 const UNFUNDED_CHANNEL = [{ state: { state_name: "NegotiatingFunding", state_flags: "OUR_INIT_SENT|THEIR_INIT_SENT|AWAITING_EXTERNAL_FUNDING" } }];
 const ABORTED_FUNDING = [{ state: { state_name: "Closed", state_flags: "FUNDING_ABORTED" } }];
-// Signed on our side, with funding that may or may not have reached the chain.
+// Signed on our side: the peer may broadcast the funding at any time.
 const FUNDING_TX = `0x${"77".repeat(32)}`;
 const SIGNED_CHANNEL = [{ state: { state_name: "AwaitingTxSignatures", state_flags: "OUR_TX_SIGNATURES_SENT" }, channel_outpoint: `${FUNDING_TX}00000000` }];
+const BOTH_SIGNED_CHANNEL = [{ state: { state_name: "AwaitingTxSignatures", state_flags: "TX_SIGNATURES_SENT" }, channel_outpoint: `${FUNDING_TX}00000000` }];
+// Before our funding signatures are sent, Fiber can still abort the funding.
+const UNSIGNED_CHANNEL = [{ state: { state_name: "AwaitingTxSignatures", state_flags: "THEIR_TX_SIGNATURES_SENT" }, channel_outpoint: `${FUNDING_TX}00000000` }];
+const COMMITTING_CHANNEL = [{ state: { state_name: "SigningCommitment", state_flags: "COMMITMENT_SIGNED_SENT" } }];
 const BROADCAST_CHANNEL = [{ state: { state_name: "AwaitingChannelReady", state_flags: "OUR_CHANNEL_READY" }, channel_outpoint: `${FUNDING_TX}00000000` }];
 const exists = (path: string) => stat(path).then(() => true, () => false);
 
@@ -73,22 +77,20 @@ const [A, B, C, F] = ["a", "b", "c", "f"].map((letter) => letter.repeat(64));
 const FEW_MINUTES = 5 * 60_000;
 let instances = 0;
 
-/**
- * A stand-in for the CKB node: transactions it knows by hash, live cells by "hash:index", and the CKB at the
- * hosted nodes' own lock.
- */
+/** A stand-in for the CKB node: live cells by "hash:index", and the CKB at the hosted nodes' own lock. */
 async function fakeCkb(context: TestContext) {
-  const chain = { transactions: new Map<string, string>(), live: new Set<string>(), capacity: 0n, down: false };
+  const chain = { live: new Set<string>(), capacity: 0n };
   const server = createServer((request, response) => {
     let body = "";
     request.on("data", (chunk) => { body += chunk; });
     request.on("end", () => {
       const { id, method, params } = JSON.parse(body);
       let result: unknown = null;
-      if (method === "get_transaction") result = { tx_status: { status: chain.transactions.get(params[0]) ?? "unknown" } };
+      // It has never seen any funding transaction: a node must not take that to mean a channel holds nothing.
+      if (method === "get_transaction") result = { tx_status: { status: "unknown" } };
       if (method === "get_cells_capacity") result = { capacity: `0x${chain.capacity.toString(16)}` };
       if (method === "get_live_cell") result = { status: chain.live.has(`${params[0].tx_hash}:${params[0].index}`) ? "live" : "unknown" };
-      response.writeHead(chain.down ? 503 : 200, { "content-type": "application/json" });
+      response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({ jsonrpc: "2.0", id, result }));
     });
   });
@@ -170,11 +172,13 @@ test("at capacity, a node idle for a few minutes makes room for a new user; one 
   assert.deepEqual(running(), [A, F]);
 });
 
-test("opening a channel marks the node to start first after a restart", async (context) => {
+test("handing a channel's funding to the node marks it to start first after a restart; opening alone doesn't", async (context) => {
   const { request, marked } = await host(context);
   assert.equal(await request(A), 200);
   assert.equal(await marked(A), false);
   assert.equal(await request(A, "open_channel_with_external_funding"), 200);
+  assert.equal(await marked(A), false);
+  assert.equal(await request(A, "submit_signed_funding_tx"), 200);
   assert.equal(await marked(A), true);
 });
 
@@ -213,7 +217,7 @@ test("a node making room keeps its channel marker until it has stopped", async (
   const { root, request, running, marked } = await host(context);
   // A once opened a channel, since closed cooperatively, so it may make room but is still marked.
   assert.equal(await request(A), 200);
-  assert.equal(await request(A, "open_channel_with_external_funding"), 200);
+  assert.equal(await request(A, "submit_signed_funding_tx"), 200);
   await writeFile(join(root, "users", A, "channels.json"), JSON.stringify(CLOSED_CHANNEL));
   await writeFile(join(root, "users", A, "slow-stop"), "");
   assert.equal(await request(B), 200);
@@ -439,9 +443,8 @@ test("a channel a peer opened to the node marks it once the node's channels show
 });
 
 test("a node whose channels can hold nothing more makes room once its user has stopped, and loses its marker", async (context) => {
-  // Force-closed and settled on-chain (by either side), opened but never funded, signed but with funding CKB has
-  // never seen, and funding aborted by Fiber.
-  for (const channels of [SETTLED_FORCE_CLOSE, SETTLED_REMOTE_CLOSE, UNFUNDED_CHANNEL, SIGNED_CHANNEL, BROADCAST_CHANNEL, ABORTED_FUNDING]) {
+  // Force-closed and settled on-chain (by either side), opened but not yet signed by us, and funding aborted by Fiber.
+  for (const channels of [SETTLED_FORCE_CLOSE, SETTLED_REMOTE_CLOSE, UNFUNDED_CHANNEL, COMMITTING_CHANNEL, UNSIGNED_CHANNEL, ABORTED_FUNDING]) {
     context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
     const { request, running, marked, markedNode } = await host(context);
     await markedNode(F, channels);
@@ -455,18 +458,17 @@ test("a node whose channels can hold nothing more makes room once its user has s
   }
 });
 
-test("a node whose channel is settling, or whose funding has reached the chain, keeps running", async (context) => {
-  for (const [channels, status] of [[SETTLING_FORCE_CLOSE, undefined], [SIGNED_CHANNEL, "pending"], [SIGNED_CHANNEL, "committed"], [SIGNED_CHANNEL, "down"], [BROADCAST_CHANNEL, "committed"]] as const) {
+test("a node whose channel is settling, or whose funding we have signed, keeps running whatever CKB shows", async (context) => {
+  // Once our signatures are sent, the peer may broadcast the funding at any time.
+  for (const channels of [SETTLING_FORCE_CLOSE, SIGNED_CHANNEL, BOTH_SIGNED_CHANNEL, BROADCAST_CHANNEL]) {
     context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
-    const { chain, request, running, marked, markedNode } = await host(context);
-    if (status === "down") chain.down = true;
-    else if (status) chain.transactions.set(FUNDING_TX, status);
+    const { request, running, marked, markedNode } = await host(context);
     await markedNode(F, channels);
     assert.equal(await request(F), 200);
     assert.equal(await request(A), 200);
     context.mock.timers.tick(FEW_MINUTES);
     assert.equal(await request(B), 200);
-    assert.deepEqual(running(), [B, F], `${JSON.stringify(channels)} ${status}`);
+    assert.deepEqual(running(), [B, F], JSON.stringify(channels));
     assert.equal(await marked(F), true);
     context.mock.timers.reset();
   }

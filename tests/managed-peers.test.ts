@@ -18,6 +18,7 @@ function hostedNode(announced: string[]) {
     listPeers: async () => ({ peers: connected ? [{ pubkey: PEER }] : [] }),
     connectPeer: async (params: Record<string, unknown>) => { dialed.push(params); connected = true; },
     openChannelWithExternalFunding: async () => ({ channel_id: `0x${"33".repeat(32)}` }),
+    listChannels: async () => ({ channels: [] as unknown[] }),
     call: async (method: string, [params]: [Record<string, unknown>]) => {
       if (method === "graph_nodes") return { nodes: [{ pubkey: PEER.slice(2), addresses: announced }], last_cursor: "0x" };
       if (method === "connect_peer") dialed.push(params);
@@ -178,6 +179,36 @@ test("connecting a peer by key needs room for every address it dials, and reconn
   full.node.listPeers = async () => ({ peers: [...others, { pubkey: `0x02${"ff".repeat(32)}` }, { pubkey: OFFICIAL }] });
   await managedNodeRequest("room-user", { operation: "act", method: "connectPeer", params: { pubkey: OFFICIAL } }, full.node as never);
   assert.deepEqual(full.dialed, [{ pubkey: OFFICIAL, addr_type: "tcp", save: false }]);
+});
+
+test("a new address for a peer that is already connected still needs room", async () => {
+  const others = Array.from({ length: 31 }, (_, index) => ({ pubkey: `0x02${index.toString(16).padStart(64, "0")}` }));
+  const { node, dialed } = hostedNode([]);
+  node.listPeers = async () => ({ peers: [...others, { pubkey: PEER }] });
+  await assert.rejects(
+    managedNodeRequest("bypass-user", { operation: "act", method: "connectPeer", params: { pubkey: PEER, address: "/ip4/203.0.113.7/tcp/8228" } }, node as never),
+    /at most 32 peers/,
+  );
+  assert.deepEqual(dialed, []);
+});
+
+test("a hosted node opens no more channels once it has many unfinished channels or channel records", async () => {
+  const open = (channels: unknown[]) => {
+    const { node } = hostedNode([]);
+    node.listChannels = async () => ({ channels });
+    let opened = 0;
+    node.openChannelWithExternalFunding = async () => { opened++; return { channel_id: `0x${"33".repeat(32)}` }; };
+    (node as { connectPeer: unknown }).connectPeer = async () => undefined;
+    node.listPeers = async () => ({ peers: [{ pubkey: OFFICIAL }] });
+    return managedNodeRequest("records-user", {
+      operation: "open-channel", params: { pubkey: OFFICIAL, funding_amount: "0x5f5e100", funding_lock_script: lock },
+    }, node as never, async () => lock as never).then(() => opened);
+  };
+  const pending = { state: { state_name: "NEGOTIATING_FUNDING", state_flags: "AWAITING_EXTERNAL_FUNDING" } };
+  const aborted = { state: { state_name: "CLOSED", state_flags: "FUNDING_ABORTED" } };
+  await assert.rejects(open(Array(32).fill(pending)), /at most 32 channels/);
+  await assert.rejects(open(Array(200).fill(aborted)), /at most 200 channel records/);
+  assert.equal(await open([...Array(31).fill(pending), ...Array(100).fill(aborted)]), 1);
 });
 
 test("a hosted node dials only the first few addresses a peer announces", async () => {
