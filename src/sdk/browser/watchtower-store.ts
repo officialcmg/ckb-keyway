@@ -36,6 +36,8 @@ export type WatchtowerStore = {
   list(): Promise<WatchedChannel[]>;
   get(channelId: string): Promise<WatchedChannel | undefined>;
   remove(channelId: string): Promise<void>;
+  /** The preimage the node handed over for a payment hash (`create_preimage`), if it still has one. */
+  preimage(paymentHash: string): Promise<string | undefined>;
   close(): void;
 };
 
@@ -149,6 +151,11 @@ export function openWatchtowerStore(databasePrefix: string): WatchtowerStore {
       const tx = (await db()).transaction(STORE, "readwrite");
       tx.objectStore(STORE).delete(channelId.toLowerCase());
       await new Promise<void>((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); });
+    },
+    async preimage(paymentHash) {
+      const tx = (await db()).transaction(PREIMAGES, "readonly");
+      const found = await request(tx.objectStore(PREIMAGES).get(hex32(paymentHash, "payment hash"))) as { preimage: string } | undefined;
+      return found?.preimage;
     },
     close() {
       void opened?.then((database) => database.close(), () => undefined);

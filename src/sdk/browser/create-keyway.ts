@@ -343,6 +343,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
             const result = await settleChannel({
               client: fundingSigner.client, network, channel, nodeKey: ccc.hexFrom(key),
               ref: { channelId: channel.channelId, fundingOutPoint: ccc.OutPoint.decode(outpoint) },
+              preimage: (paymentHash) => watchtower.preimage(paymentHash),
             });
             if (watchStatus.get(channel.channelId) !== result.status) {
               watchStatus.set(channel.channelId, result.status);
