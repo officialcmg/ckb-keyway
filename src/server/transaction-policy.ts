@@ -281,11 +281,12 @@ export function describeTransaction(
     }
   }
 
-  // Anything carrying a type script we can't explain, on the account's cells or on any output.
+  // Anything carrying a type script we can't explain, on the account's cells or on any output, by its whole code
+  // hash: two scripts can share a short form.
   const unrecognizedCounts = new Map<string, number>();
   for (const cell of [...ownInputs, ...outputs]) {
     if (typeKind(cell.cellOutput.type) !== "unknown") continue;
-    const codeHash = shortHash(cell.cellOutput.type!.codeHash);
+    const codeHash = cell.cellOutput.type!.codeHash;
     unrecognizedCounts.set(codeHash, (unrecognizedCounts.get(codeHash) ?? 0) + 1);
   }
   const unrecognized = [...unrecognizedCounts].map(([codeHash, cells]) => ({ codeHash, cells }));

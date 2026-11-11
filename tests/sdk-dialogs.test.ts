@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { formatDuration, KeyWayTransactionModal, settingText } from "../src/sdk/react/signing-modals.tsx";
+import { formatDuration, KeyWayPeerModal, KeyWayTransactionModal, settingText } from "../src/sdk/react/signing-modals.tsx";
 import type { TransactionPreview } from "../src/sdk/browser/keyway-signer.ts";
 
 const RUSD = "0x45b32a2bc4285d0a09678eb11960ddc8707bc2779887a09d482e9bfe9a2cdf52";
@@ -49,4 +49,11 @@ test("the transaction dialog names NFTs and tokens KeyWay can't name by their wh
   for (const id of [twinA, twinB, sporeId]) assert.ok(rows.includes(id), id);
   assert.ok(rows.includes(`1000 of token ${twinA} · 7 of token ${twinB} · Spore ${sporeId}`), rows);
   assert.doesNotMatch(rows, /…/);
+});
+
+test("the peer dialog shows the whole node ID", () => {
+  const pubkey = `0x03${"4c".repeat(16)}${"00".repeat(16)}`;
+  const html = renderToStaticMarkup(createElement(KeyWayPeerModal, { theme: "light", appName: "Acme Pay", preview: { action: "connect", pubkey, openChannels: 0 }, answer: () => undefined }));
+  assert.ok(html.includes(pubkey), html);
+  assert.doesNotMatch(html, /…/);
 });

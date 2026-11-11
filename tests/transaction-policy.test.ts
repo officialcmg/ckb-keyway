@@ -107,6 +107,9 @@ test("shows an NFT leaving the account and flags unrecognized scripts", () => {
   assert.equal(preview.nfts[0].change, "sent");
   assert.equal(preview.unrecognized.length, 1);
   assert.equal(preview.unrecognized[0].cells, 2);
+  // By its whole code hash.
+  assert.equal(preview.unrecognized[0].codeHash, mystery.codeHash);
+  assert.ok(previewSummaryLines(preview).includes(`Unrecognized script ${mystery.codeHash} (2 cells)`));
   assert.equal(preview.recipients.find((recipient) => recipient.kind === "contract")?.ckb, "499.99996");
 });
 

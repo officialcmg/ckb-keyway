@@ -29,10 +29,6 @@ const note = (palette: ModalPalette): CSSProperties => ({ ...modalCopy, margin: 
 const details: CSSProperties = { textAlign: "left", fontSize: 12, margin: "8px 0 0" };
 const detailLine: CSSProperties = { margin: "8px 0 0", fontFamily: "ui-monospace, monospace", overflowWrap: "anywhere" };
 
-function shortAddress(value: string): string {
-  return value.length <= 24 ? value : `${value.slice(0, 12)}…${value.slice(-6)}`;
-}
-
 /** Escape cancels; while the approved step runs it only hides the dialog, like Close. */
 const escape = (_step: ApprovalStep | undefined, answer: (approved: boolean) => void) => () => answer(false);
 
@@ -256,7 +252,7 @@ export function KeyWayChannelCloseModal({ theme, appName, preview, step, answer,
           <h2 id="keyway-close-title" style={modalTitle}>{preview.force ? "Force-close this channel?" : "Close this channel?"}</h2>
           <dl style={{ ...fundingDetails, margin: "16px 0" }}>
             <Row palette={palette} label="Returns to you, before the closing fee" value={preview.returningText} />
-            <Row palette={palette} label="Peer" value={shortAddress(preview.peer)} />
+            <Row palette={palette} label="Peer" value={preview.peer} />
             <Row palette={palette} label="Network" value={preview.network} mono={false} />
           </dl>
           <p style={note(palette)}>
@@ -283,7 +279,7 @@ export function KeyWayPeerModal({ theme, appName, preview, step, answer }: Appro
           <p style={{ ...modalEyebrow, color: palette.muted }}>{appName} · FIBER PEER</p>
           <h2 id="keyway-peer-title" style={modalTitle}>{connect ? "Connect to this peer?" : "Disconnect this peer?"}</h2>
           <dl style={{ ...fundingDetails, margin: "16px 0" }}>
-            {preview.pubkey && <Row palette={palette} label="Node ID" value={shortAddress(preview.pubkey)} />}
+            {preview.pubkey && <Row palette={palette} label="Node ID" value={preview.pubkey} />}
             {preview.address && <Row palette={palette} label="Address" value={preview.address} />}
           </dl>
           <p style={note(palette)}>
@@ -346,7 +342,7 @@ export function KeyWayChannelSettingsModal({ theme, appName, preview, step, answ
             {preview.changes.map((change) => (
               <Row key={change.setting} palette={palette} label={SETTING_LABELS[change.setting]} value={`${settingText(change.setting, change.from, preview.asset)} → ${settingText(change.setting, change.to, preview.asset)}`} />
             ))}
-            <Row palette={palette} label="Peer" value={shortAddress(preview.peer)} />
+            <Row palette={palette} label="Peer" value={preview.peer} />
           </dl>
           <p style={note(palette)}>These settings apply to payments other people route through this channel. No funds move.</p>
           <Actions palette={palette} confirm="Save settings" busyLabel="Saving…" step={step} answer={answer} />
@@ -433,7 +429,7 @@ export function KeyWayFundingModal({ theme, appName, preview, step, answer }: Ap
           <dl style={{ ...fundingDetails, margin: "16px 0" }}>
             {preview.token && <Row palette={palette} label="Channel funding" value={preview.token.amountText} />}
             <Row palette={palette} label={preview.token ? "CKB reserve" : "Channel funding"} value={`${preview.amountCkb} CKB`} />
-            {preview.peer && <Row palette={palette} label="Peer" value={shortAddress(preview.peer)} />}
+            {preview.peer && <Row palette={palette} label="Peer" value={preview.peer} />}
             {preview.feeReserveCkb && <Row palette={palette} label="Fee reserve" value={`${preview.feeReserveCkb} CKB`} />}
             <Row palette={palette} label="Network fee" value={`${preview.feeCkb} CKB`} />
             <Row palette={palette} label="Network" value="CKB testnet" mono={false} />
