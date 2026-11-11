@@ -354,9 +354,10 @@ async function setDailyAmount(context: SigningContext, body: Record<string, unkn
   }
   const nonce = requiredNonce(body.confirmationNonce);
   const request = await loadRequest(context.user, "settings", nonce, digest);
+  const from = approvedFrom(request);
   await verifyCode(context.user, "settings", nonce, body.emailCode);
   await consumeRequest(context.user, "settings", nonce);
-  if (!await writeDailyAmount(context.user, change.asset, change.amount, { from: approvedFrom(request) })) throw new Error(AMOUNTS_CHANGED);
+  if (!await writeDailyAmount(context.user, change.asset, change.amount, { from })) throw new Error(AMOUNTS_CHANGED);
   return { ...view(next), ...serverOnly };
 }
 
@@ -451,9 +452,10 @@ async function sendLimitSettings(
     return undefined;
   }
   const transaction = ccc.Transaction.from(request.summary.settingsTransaction as ccc.TransactionLike);
+  const from = approvedFrom(request);
   if (request.summary.serverCode === true) {
     await verifyCode(context.user, "settings", nonce, body.emailCode);
-    return { amounts: await serverAmountsAround(context.user, current, next, change, approvedFrom(request), async () => {
+    return { amounts: await serverAmountsAround(context.user, current, next, change, from, async () => {
       await signAndSendSettings(context, client, transaction, {});
       await consumeRequest(context.user, "settings", nonce);
     }) };
@@ -461,7 +463,7 @@ async function sendLimitSettings(
   if (typeof request.summary.litFingerprint === "string") withFingerprint(transaction, request.summary.litFingerprint);
   const emailCode = parseLitEmailCode(body.emailCode, request.summary.litTicket);
   await countLitCodeAttempt(context.user, "settings", nonce);
-  return { amounts: await serverAmountsAround(context.user, current, next, change, approvedFrom(request), async () => {
+  return { amounts: await serverAmountsAround(context.user, current, next, change, from, async () => {
     await signAndSendSettings(context, client, transaction, { email: await context.email(), emailCode });
     await consumeRequest(context.user, "settings", nonce);
   }) };
