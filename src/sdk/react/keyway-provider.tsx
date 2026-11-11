@@ -280,6 +280,8 @@ export function KeyWayProvider({
   const [tabId] = useState(newTabId);
   const handoffRef = useRef<{ release(): void } | undefined>(undefined);
   const handoffHandlerRef = useRef<() => Promise<void>>(async () => undefined);
+  /** Logouts in progress here (this tab's own, or one handed from another tab). */
+  const loggingOutRef = useRef(0);
   const operationRef = useRef<Promise<void>>(Promise.resolve());
   const runRef = useRef(0);
   const callbacksRef = useRef({ approveFiberChannelOpen, approveFiberPayment, approveFiberChannelClose, approveFiberPeerConnect, approveFiberChannelSettings, approveCkbTransaction, approveCkbMessage, approveDailyLimit, approveRecovery, approveBackupChange, onError, onFiberStartup });
@@ -410,8 +412,15 @@ export function KeyWayProvider({
           },
         });
         if (run !== runRef.current) {
-          // A logout (here or handed from another tab) may be what overtook it: it delivers this node's channel
-          // updates and backs it up along with the other stopped nodes.
+          if (loggingOutRef.current > 0 && !connectionRef.current) {
+            // A logout overtook it and is waiting for this connect: it takes this node as the connection, so the
+            // node is stopped, delivers to KeyWay's watchtower and is backed up before the session ends.
+            connectionRef.current = next;
+            connectionRunRef.current = run;
+            setConnection(next);
+            throw new Error("KeyWay connection was superseded");
+          }
+          // Otherwise it stops; any channel updates it still owes KeyWay's watchtower go with the stopped nodes.
           stoppedNodes.add(next.keyway);
           await next.keyway.stop();
           throw new Error("KeyWay connection was superseded");
@@ -463,6 +472,15 @@ export function KeyWayProvider({
   }
 
   async function logout() {
+    loggingOutRef.current += 1;
+    try {
+      await logoutNow();
+    } finally {
+      loggingOutRef.current -= 1;
+    }
+  }
+
+  async function logoutNow() {
     const token = authToken;
     const logoutRun = ++runRef.current;
     funding.dismiss();
@@ -514,6 +532,14 @@ export function KeyWayProvider({
    * fails that logout, and a node that kept the device runs again, as after a failed logout here.
    */
   handoffHandlerRef.current = async () => {
+    loggingOutRef.current += 1;
+    try {
+      await logOutNodesHere();
+    } finally {
+      loggingOutRef.current -= 1;
+    }
+  };
+  async function logOutNodesHere() {
     const handoffRun = ++runRef.current;
     for (const approval of [funding, channelClose, peer, channelSettings]) approval.dismiss();
     await operationRef.current;
@@ -535,7 +561,7 @@ export function KeyWayProvider({
     setConnection(undefined);
     setStatus("idle");
     setFiberStartupStage(undefined);
-  };
+  }
   useEffect(() => () => {
     handoffRef.current?.release();
     handoffRef.current = undefined;

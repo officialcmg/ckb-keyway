@@ -101,8 +101,13 @@ test("the provider hands a logout to the session's other tabs, and checks no nod
   assert.ok(end > 0);
   assert.ok(logout.indexOf("await handOffLogout(") > 0 && logout.indexOf("await handOffLogout(") < end);
   assert.ok(logout.indexOf("await refuseWhileFiberRuns(") > 0 && logout.indexOf("await refuseWhileFiberRuns(") < end);
-  // A node whose start a logout overtook is stopped as one of the stopped nodes, so the logout delivers and backs it up.
+  // A node whose start a logout overtook becomes the connection that logout stops, delivers and backs up; one
+  // overtaken otherwise is stopped as one of the stopped nodes.
+  assert.match(source, /if \(loggingOutRef\.current > 0 && !connectionRef\.current\) \{[^}]*connectionRef\.current = next;/);
   assert.match(source, /stoppedNodes\.add\(next\.keyway\);\s*await next\.keyway\.stop\(\);\s*throw new Error\("KeyWay connection was superseded"\)/);
+  for (const handler of ["async function logout() {", "handoffHandlerRef.current = async () => {"]) {
+    assert.match(source.slice(source.indexOf(handler)), /^[^]{0,80}loggingOutRef\.current \+= 1;/);
+  }
   // A tab that ever ran a node answers other tabs' logouts.
   assert.match(source.slice(source.indexOf("  async function connect() {")), /^[^]*?serveLogoutHandoff\(/);
 });
