@@ -2,7 +2,7 @@ import { createHmac, randomBytes } from "node:crypto";
 import { isIP } from "node:net";
 import type { User } from "./auth-user.ts";
 import { database, type DatabaseSql } from "./database";
-import { sendSecurityAlert, sendSecurityAlertOnce } from "./security-alerts";
+import { securityAlertSentWithin, sendSecurityAlert, sendSecurityAlertOnce } from "./security-alerts";
 
 const APP_ID = /^keyway_[A-Za-z0-9_-]{24}$/;
 const LEGACY_APP_ID = "dashboard";
@@ -196,6 +196,7 @@ const OTP_FAILURE_PAUSE = 30; // from anyone: checks pause until it drops back, 
 const OTP_BYPASS_NETWORK_LIMIT = 3;
 const OTP_BYPASS_LIMIT = 60;
 const OTP_PLATFORM_FAILURE_ALERT = 500; // wrong codes in an hour across every app and email: one alert an hour
+const OTP_PLATFORM_ALERT_MINUTES = 60;
 const OTP_FAILURE_MESSAGE = "Too many incorrect codes for this email. Try again tomorrow";
 
 export type OtpContext = { appId: string; emailHash: string; ipHash: string; networkHash: string };
@@ -339,6 +340,11 @@ function addressPrefix(address: string, prefixGroups: number): string {
  * ID is the requester's own secret, so only they can try their code. Run under the email's login-code lock, so checks
  * for one email are counted one at a time.
  */
+/** Refuses a code check from a source that has had too many wrong codes for this email in the app today. */
+export async function checkOtpSource(context: OtpContext): Promise<void> {
+  if ((await otpFailures(await database(), context)).source >= OTP_FAILURE_LIMIT) throw new Error(OTP_FAILURE_MESSAGE);
+}
+
 export async function checkOtpFailures(context: OtpContext, challenge: { wrongAttempts: number }): Promise<{ bypass: boolean }> {
   const sql = await database();
   const failures = await otpFailures(sql, context);
@@ -377,12 +383,13 @@ export async function recordOtpVerification(context: OtpContext, outcome: "verif
   const failures = await otpFailures(sql, context);
   if (failures.day === OTP_FAILURE_ALERT) void sendSecurityAlert("otp_failure_limit", { appId: context.appId });
   if (bypass && failures.bypass === OTP_BYPASS_LIMIT) void sendSecurityAlert("otp_failure_bypass_limit", { appId: context.appId });
-  // Limits per email don't slow guessing spread over many emails, so watch the total too.
+  // Limits per email don't slow guessing spread over many emails, so watch the total too, until the hour's alert is out.
+  if (await securityAlertSentWithin("otp_platform_failures", "all", OTP_PLATFORM_ALERT_MINUTES)) return;
   const [total] = await sql<Array<{ count: number }>>`
     select count(*)::int as count from keyway_otp_events where outcome = 'verify_failed' and created_at >= now() - interval '1 hour'
   `;
   if (total.count >= OTP_PLATFORM_FAILURE_ALERT) {
-    await sendSecurityAlertOnce("otp_platform_failures", "all", 60, { count: total.count }).catch(() => undefined);
+    await sendSecurityAlertOnce("otp_platform_failures", "all", OTP_PLATFORM_ALERT_MINUTES, { count: total.count }).catch(() => undefined);
   }
 }
 

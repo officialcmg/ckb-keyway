@@ -6,8 +6,8 @@ import { getAdapter } from "better-auth/db/adapter";
 import { bearer, emailOTP } from "better-auth/plugins";
 import { Pool } from "pg";
 import { Resend } from "resend";
-import { database, withLoginCodeLock } from "./database.ts";
-import { applicationAllowsOrigin, checkOtpFailures, otpNetwork, otpSource, otpSubject, prepareOtpSend, recordOtpResult, recordOtpVerification } from "./applications.ts";
+import { database, withLoginCodeLock, withLoginCodeSlot } from "./database.ts";
+import { applicationAllowsOrigin, checkOtpFailures, checkOtpSource, otpNetwork, otpSource, otpSubject, prepareOtpSend, recordOtpResult, recordOtpVerification } from "./applications.ts";
 import { authSchemaOptions } from "./auth-options.ts";
 import { scopedAuthAdapter } from "./scoped-auth-adapter.ts";
 import { createOtpEmailTemplate } from "./email-template.ts";
@@ -25,7 +25,8 @@ const instances = new Map<string, Promise<Awaited<ReturnType<typeof createScoped
 let delivery: EmailDelivery = sendOtpEmail;
 // Tries per login code. Wrong ones are counted on the challenge too, so a used-up challenge is refused before its lock.
 const LOGIN_CODE_ATTEMPTS = 5;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** A login challenge ID: the UUID `sendEmailCode` returned. */
+export const CHALLENGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Login-code requests in progress in this process: per source (IPv6 /64) for one email or challenge, per source, and
 // per network (IPv6 /48). The lock for one email is open to anyone, so the cap is on who is asking: one requester
 // can't queue without end, and people sharing an address (a NAT, a carrier) don't share the tightest cap.
@@ -169,9 +170,10 @@ export function sendEmailCode(request: Request, emailInput: string): Promise<{ c
   const email = emailInput.trim().toLowerCase();
   return withLoginRequest(request, `email:${email}`, async () => {
     const scope = await resolveAuthScope(request);
-    // Decided before the email's lock (the limits take their own locks), so refused requests never queue on it. Also
-    // applies the 60-second wait between codes, counted per requester so a stranger's request doesn't delay yours.
-    const context = await prepareOtpSend({ appId: scope.id === "dashboard" ? undefined : scope.id, email, ipAddress: requestIp(request) });
+    // Decided before the email's lock (the limits take their own locks), so refused requests never queue on it, but in
+    // a login-code slot, so a flood waits here rather than on pool connections. Also applies the 60-second wait between
+    // codes, counted per requester so a stranger's request doesn't delay yours.
+    const context = await withLoginCodeSlot(() => prepareOtpSend({ appId: scope.id === "dashboard" ? undefined : scope.id, email, ipAddress: requestIp(request) }));
     return withLoginCodeLock(`otp:${scope.id}:${email}`, async (sql) => {
       const challengeId = randomUUID();
       // Expired challenges are no use to anyone, and hold the emails people typed.
@@ -199,13 +201,15 @@ export function sendEmailCode(request: Request, emailInput: string): Promise<{ c
 
 export function verifyEmailCode(request: Request, challengeId: string, code: string) {
   return withLoginRequest(request, `challenge:${challengeId}`, async () => {
-    if (!UUID.test(challengeId)) throw new Error("Incorrect or expired code");
+    if (!CHALLENGE_ID.test(challengeId)) throw new Error("Incorrect or expired code");
     const scope = await resolveAuthScope(request);
     const sql = await database();
     // A challenge that is used up or expired is refused here, before it takes the email's lock.
     const [challenge] = await sql<Array<{ email: string }>>`select email from keyway_auth_challenges
       where id = ${challengeId}::uuid and scope_id = ${scope.id} and status = 'sent' and expires_at > now()`;
     if (!challenge) throw new Error("Incorrect or expired code");
+    // A source past its own limit is refused before the lock too (and checked again under it).
+    await checkOtpSource(otpSubject(scope.id, challenge.email, requestIp(request)));
     return withLoginCodeLock(`otp:${scope.id}:${challenge.email}`, async (connection) => {
       const [current] = await connection<Array<{ wrong_attempts: number }>>`
         select wrong_attempts from keyway_auth_challenges
@@ -219,7 +223,12 @@ export function verifyEmailCode(request: Request, challengeId: string, code: str
         throw new Error("Incorrect or expired code");
       }
       const context = otpSubject(scope.id, challenge.email, requestIp(request));
-      const { bypass } = await checkOtpFailures(context, { wrongAttempts: current.wrong_attempts });
+      const { bypass } = await checkOtpFailures(context, { wrongAttempts: current.wrong_attempts }).catch(async (error: unknown) => {
+        // A challenge already tried and now refused stays refused while checks are paused, so it is retired and later
+        // checks of it are turned away before the lock.
+        if (current.wrong_attempts > 0) await connection`update keyway_auth_challenges set status = 'failed' where id = ${challengeId}::uuid`;
+        throw error;
+      });
       const response = await withOtpChallenge(challengeId, () => callAuthEndpoint(request, scope, "/sign-in/email-otp", { email: challenge.email, otp: code }));
       if (!response.ok) {
         // Count a wrong code only when Better Auth compared it. After a wrong code it keeps the record (one more attempt

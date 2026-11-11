@@ -242,6 +242,9 @@ test("strangers' wrong codes pause other checks but not the owner's fresh code",
   const theirCode = codes.get(`${appId}:${victim}`)!;
   await assert.rejects(verifyEmailCode(stranger, theirs.challengeId, wrong(theirCode)), /Incorrect/);
   await assert.rejects(verifyEmailCode(stranger, theirs.challengeId, theirCode), /Try again later/);
+  // A tried challenge refused while paused is retired, so later checks of it don't wait for the email's lock.
+  const [retired] = await sql<Array<{ status: string }>>`select status from keyway_auth_challenges where id = ${theirs.challengeId}`;
+  assert.equal(retired.status, "failed");
   // The owner, from somewhere else, asks for a code and signs in with it, even if the browser checks it from another
   // address than it asked from (IPv6 to ask, IPv4 to check).
   const mine = await sendEmailCode(appRequest(appId, origin, "2001:db8:2:7::1"), victim);
@@ -442,6 +445,27 @@ test("one network's sources share a budget for login codes", { skip }, async () 
   await prepareOtpSend({ appId: busy, email: email(), ipAddress: "2001:db8:89:1::1" });
   await assert.rejects(prepareOtpSend({ appId: busy, email: email(), ipAddress: "2001:db8:89:2::1" }), /Too many login codes/);
   await prepareOtpSend({ appId: busy, email: email(), ipAddress: "2001:db8:90:1::1" });
+});
+
+test("deciding whether to send a code never takes every pool connection", { skip, timeout: 30_000 }, async () => {
+  const { sql } = await setup();
+  const origin = "https://flood.example";
+  const { appId } = await application([origin]);
+  const observer = postgres(process.env.DATABASE_URL!, { max: 1 });
+  try {
+    // Holds the app's send-limit lock, so every decision for the app waits on it.
+    const gate = await observer.reserve();
+    await gate`select pg_advisory_lock(hashtextextended(${`otp:app:${appId}`}, 0))`;
+    const sends = Array.from({ length: 12 }, (_, i) =>
+      sendEmailCode(appRequest(appId, origin, `192.0.2.${170 + i}`), email()).then(() => "sent", (error: Error) => error.message));
+    await delay(300);
+    assert.ok(await within(sql`select 1`, 500), "The shared pool still answers");
+    await gate`select pg_advisory_unlock(hashtextextended(${`otp:app:${appId}`}, 0))`;
+    gate.release();
+    assert.deepEqual(await Promise.all(sends), Array(12).fill("sent"));
+  } finally {
+    await observer.end({ timeout: 0 });
+  }
 });
 
 test("past 1,000 codes a minute from everyone, only networks people signed in from recently get one", { skip, timeout: 120_000 }, async () => {

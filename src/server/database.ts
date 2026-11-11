@@ -37,6 +37,29 @@ export function withLoginCodeLock<T>(key: string, task: (sql: DatabaseSql) => Pr
   return withLock(key, loginCodeLocks, task);
 }
 
+/**
+ * Runs login-code work that needs no email lock (deciding whether to send a code) in one of the login-code slots, so
+ * a flood of sign-in requests waits in this process instead of on pool connections.
+ */
+export async function withLoginCodeSlot<T>(task: () => Promise<T>): Promise<T> {
+  await acquire(loginCodeLocks);
+  try {
+    return await task();
+  } finally {
+    release(loginCodeLocks);
+  }
+}
+
+async function acquire(budget: LockBudget): Promise<void> {
+  if (budget.held < MAX_RESERVED_LOCKS) budget.held += 1;
+  else await new Promise<void>((resolve) => budget.waiting.push(resolve));
+}
+
+function release(budget: LockBudget): void {
+  const next = budget.waiting.shift();
+  if (next) next(); else budget.held -= 1;
+}
+
 async function withLock<T>(key: string, budget: LockBudget, task: (sql: DatabaseSql) => Promise<T>, maxCalls = Infinity): Promise<T> {
   const sql = await database();
   // Callers for the same key wait here, in this process, rather than on a pool connection blocked in Postgres.
@@ -49,13 +72,11 @@ async function withLock<T>(key: string, budget: LockBudget, task: (sql: Database
   queue.tail = new Promise<void>((resolve) => { finished = resolve; });
   try {
     await previous;
-    if (budget.held < MAX_RESERVED_LOCKS) budget.held += 1;
-    else await new Promise<void>((resolve) => budget.waiting.push(resolve));
+    await acquire(budget);
     try {
       return await withReservedLock(sql, key, task);
     } finally {
-      const next = budget.waiting.shift();
-      if (next) next(); else budget.held -= 1;
+      release(budget);
     }
   } finally {
     queue.calls -= 1;
