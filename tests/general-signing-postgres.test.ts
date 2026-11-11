@@ -430,3 +430,17 @@ test("a channel funding's email names the change its token's script could keep (
   assert.match(emails.at(-1)!.plaintext, /Also counted as sent: 800 CKB your change puts under the token's script, which could keep it/);
   assert.ok(codeFrom());
 });
+
+test("a raise confirmed after a stricter amount was set can't replace it", { skip: !enabled }, async () => {
+  process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
+  const { context, codeFrom } = harness(0n);
+  const set = (amount: bigint, extra: Record<string, unknown> = {}) => signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: amount.toString(), ...extra }) as Promise<Record<string, unknown>>;
+  await set(10n * CKB);
+  // The email for this raise shows "10 CKB → 100 CKB"; before it is confirmed, the user lowers the amount to 5.
+  const raise = await set(100n * CKB);
+  assert.equal(raise.requiresEmailCode, true);
+  const code = codeFrom();
+  await set(5n * CKB);
+  await assert.rejects(set(100n * CKB, { confirmationNonce: raise.confirmationNonce, emailCode: code }), /changed while this was waiting/);
+  assert.deepEqual(await signingSettings(context, { operation: "get" }), { dailyAmounts: { ckb: (5n * CKB).toString() } });
+});

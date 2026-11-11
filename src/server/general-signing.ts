@@ -348,19 +348,32 @@ async function setDailyAmount(context: SigningContext, body: Record<string, unkn
     ];
     // Checked before the new request replaces the old one, so a refused resend leaves the last code usable.
     await codeLimit(context);
-    const confirmationNonce = await issueRequest(context.user, "settings", digest, { lines }, true);
+    const confirmationNonce = await issueRequest(context.user, "settings", digest, { lines, basedOn: basedOn(current, change.asset) }, true);
     const sentTo = await sendCode(context, "settings", confirmationNonce, "Confirm a security change", lines, { limited: true });
     return { requiresEmailCode: true, confirmationNonce, sentTo, ...serverOnly };
   }
   const nonce = requiredNonce(body.confirmationNonce);
-  await loadRequest(context.user, "settings", nonce, digest);
+  const request = await loadRequest(context.user, "settings", nonce, digest);
   await verifyCode(context.user, "settings", nonce, body.emailCode);
   await consumeRequest(context.user, "settings", nonce);
-  if (!await writeDailyAmount(context.user, change.asset, change.amount, { from: current.get(change.asset) })) throw new Error(AMOUNTS_CHANGED);
+  if (!await writeDailyAmount(context.user, change.asset, change.amount, { from: approvedFrom(request) })) throw new Error(AMOUNTS_CHANGED);
   return { ...view(next), ...serverOnly };
 }
 
 const AMOUNTS_CHANGED = "Your daily amounts changed while this was waiting. Check them and try again";
+
+/** The asset's amount a change was asked for from, kept in its request: what the email showed as "before". */
+function basedOn(amounts: DailyAmounts, asset: string): string | null {
+  return amounts.get(asset)?.toString() ?? null;
+}
+
+/** The amount a confirmed change may replace: only the one the user saw when they approved it. */
+function approvedFrom(request: RequestRow): bigint | undefined {
+  const value = request.summary.basedOn;
+  if (value === null) return undefined;
+  if (typeof value !== "string" || !/^\d+$/.test(value)) throw new Error(REQUEST_EXPIRED);
+  return BigInt(value);
+}
 
 /**
  * The daily amounts as the account's send-limit cell, which Lit enforces. Turning limits on creates the cell (always
@@ -409,20 +422,20 @@ async function sendLimitSettings(
       ...(change.asset === "ckb" ? [] : [`${assetName(change.asset)}: ${describeAmount(current, change.asset)} → ${describeAmount(next, change.asset)}`]),
     ];
     if (!plan.needsCode && !weakens(current, next)) {
-      return { amounts: await serverAmountsAround(context.user, current, next, change, () => signAndSendSettings(context, client, transaction, {})) };
+      return { amounts: await serverAmountsAround(context.user, current, next, change, current.get(change.asset), () => signAndSendSettings(context, client, transaction, {})) };
     }
     if (!plan.needsCode) {
       // The cell's change needs no Lit code (the cell already allows as much), but it loosens the server's own
       // amounts, which alone gate hosted Fiber payments: that takes the server's code, as for amounts it keeps alone.
       await codeLimit(context);
-      const confirmationNonce = await issueRequest(context.user, "settings", digest, { lines, settingsTransaction: serializeTransaction(transaction), serverCode: true }, true);
+      const confirmationNonce = await issueRequest(context.user, "settings", digest, { lines, settingsTransaction: serializeTransaction(transaction), serverCode: true, basedOn: basedOn(current, change.asset) }, true);
       const sentTo = await sendCode(context, "settings", confirmationNonce, "Confirm a security change", lines, { limited: true });
       return { amounts: current, response: { requiresEmailCode: true, confirmationNonce, sentTo } };
     }
     // Stricter amounts apply on the server at once, even while turning limits on waits for the Lit code.
     if (!weakens(current, next)) await writeDailyAmount(context.user, change.asset, change.amount, "lower");
     await codeLimit(context);
-    const confirmationNonce = await issueRequest(context.user, "settings", digest, { lines, settingsTransaction: serializeTransaction(transaction) }, true);
+    const confirmationNonce = await issueRequest(context.user, "settings", digest, { lines, settingsTransaction: serializeTransaction(transaction), basedOn: basedOn(current, change.asset) }, true);
     const sent = await policySendCode(transaction, context.wallet, { email: await context.email(), appName: context.appName });
     await recordLitCode(context.user, "settings", confirmationNonce, { litTicket: sent.ticket, ...(sent.fingerprint ? { litFingerprint: sent.fingerprint } : {}) });
     return { amounts: await readDailyAmounts(context.user), response: { requiresEmailCode: true, confirmationNonce, sentTo: sent.sentTo, codeLength: 8 } };
@@ -440,7 +453,7 @@ async function sendLimitSettings(
   const transaction = ccc.Transaction.from(request.summary.settingsTransaction as ccc.TransactionLike);
   if (request.summary.serverCode === true) {
     await verifyCode(context.user, "settings", nonce, body.emailCode);
-    return { amounts: await serverAmountsAround(context.user, current, next, change, async () => {
+    return { amounts: await serverAmountsAround(context.user, current, next, change, approvedFrom(request), async () => {
       await signAndSendSettings(context, client, transaction, {});
       await consumeRequest(context.user, "settings", nonce);
     }) };
@@ -448,7 +461,7 @@ async function sendLimitSettings(
   if (typeof request.summary.litFingerprint === "string") withFingerprint(transaction, request.summary.litFingerprint);
   const emailCode = parseLitEmailCode(body.emailCode, request.summary.litTicket);
   await countLitCodeAttempt(context.user, "settings", nonce);
-  return { amounts: await serverAmountsAround(context.user, current, next, change, async () => {
+  return { amounts: await serverAmountsAround(context.user, current, next, change, approvedFrom(request), async () => {
     await signAndSendSettings(context, client, transaction, { email: await context.email(), emailCode });
     await consumeRequest(context.user, "settings", nonce);
   }) };
@@ -459,13 +472,13 @@ async function sendLimitSettings(
  * holds. The server's amounts alone gate hosted Fiber payments, so they must never end up looser than the chain: a
  * change that tightens them is written before the transaction is sent (a crash or a failed write after the broadcast
  * can't lose it), and only ever lowers what is stored; one that loosens them is written only after it was sent, and
- * only over the amount it was based on, so a tightening made meanwhile stands.
+ * only over `from`, the amount the user approved it from, so a tightening made meanwhile stands.
  */
-async function serverAmountsAround(user: User, current: DailyAmounts, next: DailyAmounts, change: { asset: string; amount: bigint | null }, send: () => Promise<void>): Promise<DailyAmounts> {
+async function serverAmountsAround(user: User, current: DailyAmounts, next: DailyAmounts, change: { asset: string; amount: bigint | null }, from: bigint | undefined, send: () => Promise<void>): Promise<DailyAmounts> {
   const tightens = !weakens(current, next);
   if (tightens) await writeDailyAmount(user, change.asset, change.amount, "lower");
   await send();
-  if (!tightens) await writeDailyAmount(user, change.asset, change.amount, { from: current.get(change.asset) });
+  if (!tightens) await writeDailyAmount(user, change.asset, change.amount, { from });
   return readDailyAmounts(user);
 }
 
