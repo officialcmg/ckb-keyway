@@ -536,3 +536,15 @@ test("a hosted payment can't pay a higher fee than the one counted toward the da
   await fiberPayment(h.context, h.node, { method: "sendPayment", params: { invoice: "fibt1test" }, stage: "send", confirmationNonce: bare.confirmationNonce });
   assert.equal((h.sent.at(-1) as Record<string, unknown>).max_fee_amount, `0x${fee.toString(16)}`);
 });
+
+test("a payment request without a counted fee is refused before anything is counted", { skip: !enabled }, async () => {
+  process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
+  const h = harness(40n * CKB, { fee: 5_000n });
+  const preview = await pay(h, { stage: "preview" });
+  const sql = await database();
+  await sql`update keyway_v2_signature_requests set summary = summary - 'fee' where nonce = ${String(preview.confirmationNonce)}`;
+  await assert.rejects(pay(h, { stage: "send", confirmationNonce: preview.confirmationNonce }), /expired/);
+  const counted = await sql`select 1 from keyway_v2_signed_outflows where user_id = ${h.context.user.id}`;
+  assert.equal(counted.length, 0, "nothing stays counted for a payment that was never sent");
+  assert.equal(h.sent.length, 0);
+});

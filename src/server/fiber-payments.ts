@@ -141,6 +141,8 @@ async function payOnce(context: PaymentContext, node: FiberCaller, body: Record<
   if (request.requires_email_code) await verifyCode(context.user, "payment", nonce, body.emailCode);
   await consumeRequest(context.user, "payment", nonce);
   const outflow = { id: `payment:${nonce}`, ...paymentOutflow(String(request.summary.asset ?? "ckb"), BigInt(String(request.summary.outflow ?? "0"))) };
+  // Built before the amount is counted, so a request it can't send is refused without leaving anything counted.
+  const sending = withCountedFee(method, params, request.summary.fee);
   const release = await reserveOutflow(context.user, outflow, request.requires_email_code);
   let handle: PaymentHandle | undefined;
   try {
@@ -156,7 +158,7 @@ async function payOnce(context: PaymentContext, node: FiberCaller, body: Record<
     throw error;
   }
   try {
-    return await node.call(FIBER_METHODS[method].rpc, [withCountedFee(method, params, request.summary.fee)]);
+    return await node.call(FIBER_METHODS[method].rpc, [sending]);
   } catch (error) {
     // A timeout or dropped connection looks like a rejection, but the node may have taken the payment, or still be
     // making it. With its hash recorded, ask the node: a payment it made is this send's result. Otherwise only
