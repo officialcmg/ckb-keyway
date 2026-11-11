@@ -154,7 +154,7 @@ test("an incoming payment in flight is claimed with its preimage once a third of
   const third = 0xa000030001000000n; // a third of the one-epoch delay, as the lock works it out
   const passed = new Set<bigint>();
   const plan = (now = NOW) => planClaim({ channel: f.channel, cell: f.cell, preimages, now, delayPassed: (since) => passed.has(since) });
-  assert.deepEqual(plan(), { skip: "waiting for the commitment delay" });
+  assert.deepEqual(plan(), { skip: "waiting for a pending payment to resolve" });
   passed.add(third);
   const decision = plan();
   assert.ok("claim" in decision);
@@ -181,8 +181,8 @@ test("an outgoing payment in flight is taken back once it expires, with its expi
   const twoThirds = 0xa000030002000000n;
   const passed = new Set<bigint>([twoThirds]);
   const plan = (now: number) => planClaim({ channel: f.channel, cell: f.cell, now, delayPassed: (since) => passed.has(since) });
-  // Not expired yet: nothing of the user's can go, the share waits for the full delay.
-  assert.deepEqual(plan(NOW), { skip: "waiting for the commitment delay" });
+  // Not expired yet: nothing can go, and the user's share waits for its payments.
+  assert.deepEqual(plan(NOW), { skip: "waiting for a pending payment to resolve" });
   const decision = plan(NOW + 2 * HOUR);
   assert.ok("claim" in decision);
   assert.equal(decision.claim.unlockType, 0);
@@ -218,27 +218,44 @@ test("the user's share waits while a payment may still be the user's, since whoe
   assert.equal(after.pendingTlcs.length, 1);
   assert.equal(hex(ccc.bytesFrom(decision.claim.successor!.args).slice(36, 56)), hex(blake160(encodeWitnessState(after))));
 
-  // Once the peer has settled its share too, the TLCs' amounts still stay locked for them rather than going to the
-  // user with the rest of the cell, and the node keeps the channel until its own payment can be taken back.
+  // The peer settles its share first. Settling second, the user's claim could take the whole cell, so it still waits
+  // while a payment may become the user's.
   const peerSettled = ccc.bytesConcat(new Uint8Array([1]), f.theirs, new Uint8Array([0xfe, 0]), new Uint8Array(65));
   const remaining = f.capacity - 250n * CKB;
-  const next = planClaim({ channel: f.channel, cell: { capacity: remaining, args: "0x" + "00".repeat(57) }, previousWitness: peerSettled, now: NOW });
-  assert.ok("claim" in next);
-  assert.equal(next.claim.since, 0n);
-  assert.equal(next.claim.successor?.capacity, remaining - 500n * CKB);
-  const userSettled = ccc.bytesConcat(new Uint8Array([1]), encodeWitnessState(applyUnlocks(parseSettlementWitness(peerSettled)!)!), new Uint8Array([0xff, 0]), new Uint8Array(65));
-  assert.deepEqual(
-    planClaim({ channel: f.channel, cell: { capacity: 350n * CKB, args: "0x" + "00".repeat(57) }, previousWitness: userSettled, now: NOW }),
-    { skip: "waiting for a pending payment to resolve" },
-  );
-  // After expiry the outgoing payment comes back on that last cell, and nothing then remains for the user.
-  const back = planClaim({ channel: f.channel, cell: { capacity: 350n * CKB, args: "0x" + "00".repeat(57) }, previousWitness: userSettled, now: NOW + 2 * HOUR });
+  const afterPeer = { capacity: remaining, args: "0x" + "00".repeat(57) };
+  assert.deepEqual(planClaim({ channel: f.channel, cell: afterPeer, previousWitness: peerSettled, now: NOW }), { skip: "waiting for a pending payment to resolve" });
+  // After expiry the outgoing payment comes back first, leaving the rest in a successor.
+  const back = planClaim({ channel: f.channel, cell: afterPeer, previousWitness: peerSettled, now: NOW + 2 * HOUR });
   assert.ok("claim" in back && back.claim.unlockType === 0 && back.claim.since === 0n);
-  assert.equal(back.claim.successor?.capacity, 170n * CKB);
-  // The incoming payment, without its preimage and past its expiry, is the peer's to take back.
-  const lost = tlcFixture({ receivedExpiry: NOW - HOUR, offeredExpiry: NOW + HOUR });
-  const lostAfter = ccc.bytesConcat(new Uint8Array([1]), encodeWitnessState(applyUnlocks({ ...parseSettlementWitness(lost.theirs, false)!, unlocks: [{ type: 0, withPreimage: false }, { type: 0xff, withPreimage: false }] })!), new Uint8Array([0xfe, 0]), new Uint8Array(65));
-  assert.deepEqual(planClaim({ channel: lost.channel, cell: { capacity: 170n * CKB, args: "0x" + "00".repeat(57) }, previousWitness: lostAfter, now: NOW }), { skip: "the user's share is already claimed" });
+  assert.equal(back.claim.successor?.capacity, remaining - 180n * CKB);
+  // Then, with the incoming one past its expiry and no preimage (the peer's to take back), the user's claim empties
+  // the cell, as Fiber's does: Fiber claims nothing once its own slot is empty, so a successor would hold it for good.
+  const thenBack = ccc.bytesConcat(new Uint8Array([1]), encodeWitnessState(applyUnlocks(parseSettlementWitness(peerSettled)!)!), new Uint8Array([0, 0]), new Uint8Array(65));
+  const last = planClaim({ channel: f.channel, cell: { capacity: remaining - 180n * CKB, args: "0x" + "00".repeat(57) }, previousWitness: thenBack, now: NOW + 2 * HOUR });
+  assert.ok("claim" in last && last.claim.unlockType === 0xff);
+  assert.equal(last.claim.successor, undefined);
+});
+
+test("a payment that could never be claimed alone doesn't hold the cell once the peer has settled", () => {
+  // The peer's commitment: the user's 60 CKB, the peer's 250, and two outgoing payments of 60 CKB, not yet expired.
+  const { channel } = channelFixture();
+  const small = (id: string, fill: number) => ({
+    tlc_id: { Offered: id }, hash_algorithm: "CkbHash", payment_amount: `0x${(60n * CKB).toString(16)}`, payment_hash: hex(new Uint8Array(32).fill(fill)),
+    expiry: `0x${(NOW + HOUR).toString(16)}`, local_key: hex(secp256k1.utils.randomSecretKey()).slice(2), remote_key: hex(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true)).slice(2),
+  });
+  const remoteSettlement = { ...channel.remoteSettlement!, local_amount: `0x${(60n * CKB).toString(16)}`, tlcs: [small("0x0", 1), small("0x1", 2)] };
+  const withTlcs = { ...channel, remoteSettlement };
+  const theirs = encodeSettlementWitness(remoteSettlement, true, channel.localSettlementKey, channel.remoteSettlementKey);
+  const peerSettled = ccc.bytesConcat(new Uint8Array([1]), theirs, new Uint8Array([0xfe, 0]), new Uint8Array(65));
+  const plan = (capacity: bigint) => planClaim({ channel: withTlcs, cell: { capacity, args: "0x" + "00".repeat(57) }, previousWitness: peerSettled, now: NOW });
+  // With room for a successor after either payment, the cell waits for them...
+  assert.deepEqual(plan(500n * CKB), { skip: "waiting for a pending payment to resolve" });
+  // ...but in a cell of 150 CKB, taking back either one would leave 90 CKB, below a commitment cell's 98: neither
+  // could ever go alone, so the user's claim takes the cell as a whole.
+  const decision = plan(150n * CKB);
+  assert.ok("claim" in decision);
+  assert.equal(decision.claim.unlockType, 0xff);
+  assert.equal(decision.claim.successor, undefined);
 });
 
 test("the delay's shares are worked out as the commitment lock does", () => {
@@ -300,6 +317,8 @@ function fakeChain(options: {
   peerSettledFirst?: boolean; settlementWitness?: (ours: Uint8Array) => Uint8Array; peerTookEverything?: boolean;
   /** The peer's commitment with payments in flight (tlcFixture) instead of the node's own. */
   tlcs?: ReturnType<typeof tlcFixture>; preimages?: Map<string, string>; now?: number;
+  /** The chain's median block time (ms), answered to `get_block_median_time`. */
+  medianTime?: () => number;
 } = {}) {
   const { channel, argsFor } = options.tlcs ?? channelFixture();
   const ours = options.tlcs?.theirs ?? encodeSettlementWitness(channel.localSettlement, false, channel.localSettlementKey, channel.remoteSettlementKey);
@@ -376,6 +395,12 @@ function fakeChain(options: {
           yield ccc.Cell.from({ outPoint: { txHash, index }, cellOutput: tx.outputs[index], outputData: "0x" });
         }
       }
+    },
+    requestor: {
+      async request(method: string) {
+        if (method !== "get_block_median_time" || !options.medianTime) throw new Error(`unexpected ${method}`);
+        return `0x${options.medianTime().toString(16)}`;
+      },
     },
     async sendTransaction(tx: ccc.TransactionLike) {
       const signed = ccc.Transaction.from(tx);
@@ -509,4 +534,18 @@ test("the in-page store hands back a preimage the node gave it, until the node r
   await store.apply({ method: "remove_preimage", params: { payment_hash: paymentHash } } as never);
   assert.equal(await store.preimage(paymentHash), undefined);
   store.close();
+});
+
+test("payment expiries are judged by the chain's median time, not the browser's clock", async () => {
+  // Expired an hour ago by this machine's clock, but the chain's median time hasn't reached it yet.
+  const expiry = Date.now() - HOUR;
+  let median = expiry - HOUR;
+  const tlcs = tlcFixture({ offeredExpiry: expiry });
+  const chain = fakeChain({ tlcs, medianTime: () => median });
+  chain.setTip([101, 0, 1]);
+  assert.equal((await chain.settle()).status, "waiting for a pending payment to resolve");
+  assert.equal(chain.sent.length, 0, "a claim the chain would refuse as immature isn't sent");
+  median = expiry + 1_000;
+  assert.equal((await chain.settle()).status, "claimed");
+  assert.equal(chain.sent[0].inputs[1].since, (0x40n << 56n) | BigInt(Math.floor(expiry / 1000)));
 });
