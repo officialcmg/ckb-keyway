@@ -297,7 +297,9 @@ test("while checks are paused, fresh codes' first tries are limited per network 
   const next = appRequest(appId, origin, "198.18.4.21");
   const nextChallenge = await sendEmailCode(next, victim);
   await assert.rejects(verifyEmailCode(next, nextChallenge.challengeId, code()), /Try again later/);
-  // Strangers can use those up, but not the owner's own: a network that signed in recently keeps its first tries.
+  // Strangers can use those up, but not the owner's own: a network that signed in recently keeps its first tries, even
+  // after the owner's own typos.
+  await pastFailures(sql, appId, victim, ["198.18.4.30"], 3, 5, true);
   await later(sql, 61);
   const again = await sendEmailCode(home, victim);
   assert.ok((await verifyEmailCode(home, again.challengeId, code())).sessionToken);
@@ -405,11 +407,41 @@ test("past an inbox's 30 codes in 10 minutes, only a network that had none for i
   await prepareOtpSend({ appId, email: victim, ipAddress: "2001:db8:66:1::1" });
   await assert.rejects(prepareOtpSend({ appId, email: victim, ipAddress: "2001:db8:66:2::1" }), /Too many login codes/);
   assert.equal(count(alerts, "otp_inbox_ceiling"), before + 1, "One alert while the inbox is past its limit");
-  // At 100 codes, a new network gets none either; one the owner signed in from recently still does.
-  for (let i = 1; i <= 68; i++) await prepareOtpSend({ appId, email: victim, ipAddress: `100.66.2.${i}` });
+  // The owner's own network, where they signed in recently, can ask again.
+  await knownNetworkFor(sql, appId, victim, "100.66.0.5");
+  await prepareOtpSend({ appId, email: victim, ipAddress: "100.66.0.5" });
+  // At 50 codes in this app, a new network gets none either; one the owner signed in from recently still does.
+  for (let i = 1; i <= 17; i++) await prepareOtpSend({ appId, email: victim, ipAddress: `100.66.2.${i}` });
   await assert.rejects(prepareOtpSend({ appId, email: victim, ipAddress: "100.66.3.1" }), /Too many login codes/);
   await knownNetworkFor(sql, appId, victim, "100.66.3.2");
   await prepareOtpSend({ appId, email: victim, ipAddress: "100.66.3.2" });
+});
+
+test("codes asked for in another app don't stop an inbox's first code in this one", { skip }, async () => {
+  await setup();
+  // A stranger's own two apps take the inbox to 100 codes, 50 in each (where their own apps stop).
+  const stranger = { id: crypto.randomUUID() } as User;
+  const theirs = [(await application([], 120, stranger)).appId, (await application([], 120, stranger)).appId];
+  const { appId: mine } = await application([], 120);
+  const victim = email();
+  for (let i = 1; i <= 100; i++) await prepareOtpSend({ appId: theirs[i % 2], email: victim, ipAddress: `100.67.0.${i}` });
+  await assert.rejects(prepareOtpSend({ appId: theirs[0], email: victim, ipAddress: "100.67.1.1" }), /Too many login codes/);
+  await prepareOtpSend({ appId: mine, email: victim, ipAddress: "100.67.9.1" });
+});
+
+test("one network's sources share a budget for login codes", { skip }, async () => {
+  await setup();
+  const { appId } = await application([], 120);
+  const outcomes = [];
+  for (let i = 1; i <= 100; i++) {
+    outcomes.push(await prepareOtpSend({ appId, email: email(), ipAddress: `2001:db8:88:${i.toString(16)}::1` }).then(() => "sent", () => "refused"));
+  }
+  assert.equal(outcomes.filter((outcome) => outcome === "sent").length, 60);
+  // When a shared budget is full, a network gets one code a minute, not one per /64.
+  const { appId: busy } = await application([], 1);
+  await prepareOtpSend({ appId: busy, email: email(), ipAddress: "2001:db8:89:1::1" });
+  await assert.rejects(prepareOtpSend({ appId: busy, email: email(), ipAddress: "2001:db8:89:2::1" }), /Too many login codes/);
+  await prepareOtpSend({ appId: busy, email: email(), ipAddress: "2001:db8:90:1::1" });
 });
 
 test("past 1,000 codes a minute from everyone, only networks people signed in from recently get one", { skip, timeout: 120_000 }, async () => {
