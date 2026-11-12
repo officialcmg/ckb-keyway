@@ -5,7 +5,7 @@ import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { secp256k1Lock, type KeyWayRecovery } from "../src/sdk/browser/account-lock.ts";
 import { database } from "../src/server/database.ts";
 import { formatCkbSignature } from "../src/server/funding-transaction.ts";
-import { sweepLegacyAddress, type LegacySweepContext } from "../src/server/legacy-sweep.ts";
+import { MAX_RUNNING_SWEEPS, sweepLegacyAddress, type LegacySweepContext } from "../src/server/legacy-sweep.ts";
 import { saveWallet, type ReadyWallet } from "../src/server/user-wallet.ts";
 import { anchoredRecovery } from "./recovery-fixture.ts";
 
@@ -173,5 +173,55 @@ test("the sign-in sweep never double-sends", { skip: !enabled }, async (t) => {
     h.pool.get(h.broadcasts[0].hash())!.status = "committed";
     assert.deepEqual(await sweepLegacyAddress(h.context), { status: "empty" });
     assert.equal(h.broadcasts.length, 1);
+  });
+
+  await t.test("sweeps for many accounts at once never deadlock the connection pool", async () => {
+    // Every sweep holds a reserved connection; one that then waited on the pool for its other writes would, with ten
+    // sweeps holding all ten connections, wait forever. A barrier holds sweeps inside their lock until ten are in
+    // (or a second has passed), the point where they'd have filled the pool.
+    const sweeps = await Promise.all(Array.from({ length: 12 }, () => harness()));
+    let arrived = 0;
+    let open!: () => void;
+    const barrier = new Promise<void>((resolve) => { open = resolve; });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let inside = 0;
+    let mostInside = 0;
+    let withoutConnection = 0;
+    for (const h of sweeps) {
+      const find = h.client.findCellsByLock.bind(h.client);
+      let first = true;
+      Object.assign(h.client, { findCellsByLock: async function* (...args: Parameters<typeof find>) {
+        if (first) {
+          first = false;
+          inside += 1;
+          mostInside = Math.max(mostInside, inside);
+          arrived += 1;
+          timer ??= setTimeout(open, 1_000);
+          if (arrived >= 10) open();
+          await barrier;
+        }
+        yield* find(...args);
+      } });
+      // The real signing record's write, on the connection the sweep passes, or on the pool without one.
+      h.context.recordSigning = async (userId, connection) => {
+        h.signings.push(userId);
+        if (!connection) withoutConnection += 1;
+        await (connection ?? await database())`select 1`;
+      };
+      h.context.broadcast = async (transaction) => { inside -= 1; h.broadcasts.push(transaction); return transaction.hash(); };
+    }
+    const runs = Promise.all(sweeps.map((h) => sweepLegacyAddress(h.context)));
+    const finished = await Promise.race([runs.then(() => true), new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 20_000))]);
+    clearTimeout(timer);
+    if (!finished) await sql.end({ timeout: 0 });
+    assert.ok(finished, "every sweep finishes");
+    const results = await runs;
+    assert.deepEqual(results.map(({ status }) => status), sweeps.map(() => "swept"));
+    assert.equal(withoutConnection, 0, "a sweep writes on its own connection");
+    assert.ok(mostInside <= MAX_RUNNING_SWEEPS, `at most ${MAX_RUNNING_SWEEPS} sweeps hold a connection at once`);
+    for (const h of sweeps) {
+      const [{ count }] = await sql<Array<{ count: number }>>`select count(*)::int as count from keyway_v2_pending_transactions where user_id = ${h.user.id}`;
+      assert.equal(count, 1, "the sweep's pending transaction is recorded");
+    }
   });
 });

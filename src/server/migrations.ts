@@ -401,4 +401,28 @@ export const migrations: Array<{
     // close reopens it only when it can punish that commitment.
     up: (sql) => sql`alter table keyway_v2_watchtower_channels add column closing_commitment_number numeric(20, 0)`,
   },
+  {
+    version: 23, name: "security-alert-state",
+    // When each kind of alert last went out, so concurrent signings raise one alert per window between them.
+    up: (sql) => sql`create table keyway_security_alert_state (kind text primary key, alerted_at timestamptz not null, claim_id uuid not null)`,
+  },
+  {
+    version: 24, name: "wallet-provisioning-claims",
+    // The one request setting up a new account's wallet, so its Lit calls run without holding the wallet lock.
+    up: (sql) => sql`create table keyway_v2_provisioning_claims (
+      user_id text primary key,
+      claim_id uuid not null,
+      claimed_at timestamptz not null default now()
+    )`,
+  },
+  {
+    version: 25, name: "idempotency-pruning",
+    up: async (sql) => {
+      // Node-backup loads are plain reads now, so their stored copies (up to 16 MB each) go; expired records keep
+      // only a tombstone. The partial index lets each new record find expired responses to drop.
+      await sql`delete from keyway_v2_idempotency_keys where operation = 'node-backup:claim'`;
+      await sql`update keyway_v2_idempotency_keys set response = null where expires_at <= now() and response is not null`;
+      await sql`create index keyway_v2_idempotency_keys_unpruned on keyway_v2_idempotency_keys (expires_at) where response is not null`;
+    },
+  },
 ];

@@ -10,14 +10,19 @@ export async function database() {
   const url = process.env.DATABASE_URL;
   if (!url) throw new Error("DATABASE_URL is required");
   client ??= postgres(url, { max: 10, idle_timeout: 20 });
-  migration ??= process.env.NODE_ENV === "production" ? verifySchema(client) : migrateDatabase(client);
+  // A failed first connection (the database not up yet) isn't kept, so the next call tries again.
+  migration ??= (process.env.NODE_ENV === "production" ? verifySchema(client) : migrateDatabase(client))
+    .catch((error: unknown) => { migration = undefined; throw error; });
   await migration;
   return client;
 }
 
 // Lock holders keep a pool connection each, and work done inside a lock still takes more from the pool, so holders
-// never get more than 6 of its 10. Login-code locks and wallet locks each have their own 3: slow first-time wallet
-// setup (Lit and CKB calls) can't hold up anyone's sign-in, and a flood of sign-in requests can't hold up wallets.
+// never get more than 6 of its 10. Login-code locks and wallet locks each have their own 3: a flood of sign-in
+// requests can't hold up wallets, and slow Lit and CKB calls run outside wallet locks where they can.
+// Outside these budgets, the watchtower keeps 1 connection and old-address sweeps at most 1 (legacy-sweep.ts); sweeps
+// run every query on their own connection and never wait on the pool while holding one. That leaves at least two
+// connections for the work inside locks and everything else, so the pool can't deadlock.
 type LockBudget = { held: number; waiting: Array<() => void> };
 const MAX_RESERVED_LOCKS = 3;
 const walletLocks: LockBudget = { held: 0, waiting: [] };

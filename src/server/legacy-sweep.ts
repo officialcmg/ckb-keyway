@@ -18,7 +18,8 @@ import { readWallet, type ReadyWallet } from "./user-wallet.ts";
  * account's Omnilock address, built and signed here with the account's own Lit key and no approval dialog.
  */
 export type LegacySweepContext = Pick<SigningContext, "user" | "signDigest"> & {
-  recordSigning?: (userId: string) => Promise<void>;
+  /** Gets the sweep's own reserved connection, which it must use rather than wait on the pool. */
+  recordSigning?: (userId: string, sql: DatabaseSql) => Promise<void>;
   client?: ccc.Client;
   broadcast?: (transaction: ccc.Transaction) => Promise<ccc.Hex>;
 };
@@ -85,7 +86,7 @@ export async function sweepLegacyAddress(context: LegacySweepContext): Promise<L
       if (plan.status === "short") return { status: "short", shortCkb: formatCkb(plan.shortBy) };
 
       await checkLegacySweepTransaction(client, plan.transaction, wallet.litPublicKey, wallet.recovery);
-      await (context.recordSigning ?? recordSigningEvent)(context.user.id);
+      await (context.recordSigning ?? recordSigningEvent)(context.user.id, sql);
       const signed = await signGroups({ wallet, signDigest: context.signDigest }, plan.transaction, plan.groups, client);
       const blamed = attempt < MAX_BLAMED ? await blamedTokenCell(client, signed) : undefined;
       if (blamed) {
@@ -95,7 +96,7 @@ export async function sweepLegacyAddress(context: LegacySweepContext): Promise<L
       }
       const transactionHash = signed.hash();
       // Recorded before sending, so a crash in between can't lead to a second, conflicting transaction.
-      await recordPendingTransaction(context.user.id, signed);
+      await recordPendingTransaction(context.user.id, signed, sql);
       await sql`
         insert into keyway_v2_legacy_sweeps (user_id, transaction_hash, sent_at) values (${context.user.id}, ${transactionHash}, now())
         on conflict (user_id) do update set transaction_hash = excluded.transaction_hash, sent_at = excluded.sent_at
@@ -139,7 +140,41 @@ export function lastSweepDecision(status: ccc.TransactionStatus | undefined, sen
   return now.getTime() - sentAt.getTime() < UNKNOWN_GRACE_MS ? "wait" : "gone";
 }
 
-async function withSweepLock(userId: string, task: (sql: DatabaseSql) => Promise<LegacySweepResult>): Promise<LegacySweepResult> {
+/**
+ * Sweeps hold a reserved connection across chain and Lit calls, outside the lock budgets in database.ts, so only
+ * `MAX_RUNNING_SWEEPS` runs at once in a process and the rest wait (holding nothing) for a turn. An account has at
+ * most one sweep running or waiting here, so one account's sign-ins can't fill the queue; past
+ * `MAX_WAITING_SWEEPS` waiting, a sweep is skipped as busy and the account's next sign-in tries again.
+ */
+export const MAX_RUNNING_SWEEPS = 1;
+export const MAX_WAITING_SWEEPS = 32;
+let runningSweeps = 0;
+const waitingSweeps: Array<() => void> = [];
+const sweepingUsers = new Set<string>();
+
+async function withSweepSlot<T>(userId: string, busy: T, task: () => Promise<T>): Promise<T> {
+  if (sweepingUsers.has(userId)) return busy;
+  if (runningSweeps < MAX_RUNNING_SWEEPS) runningSweeps += 1;
+  else if (waitingSweeps.length >= MAX_WAITING_SWEEPS) return busy;
+  else {
+    sweepingUsers.add(userId);
+    await new Promise<void>((resolve) => waitingSweeps.push(resolve));
+  }
+  sweepingUsers.add(userId);
+  try {
+    return await task();
+  } finally {
+    sweepingUsers.delete(userId);
+    const next = waitingSweeps.shift();
+    if (next) next(); else runningSweeps -= 1;
+  }
+}
+
+function withSweepLock(userId: string, task: (sql: DatabaseSql) => Promise<LegacySweepResult>): Promise<LegacySweepResult> {
+  return withSweepSlot<LegacySweepResult>(userId, { status: "busy" }, () => withSweepConnection(userId, task));
+}
+
+async function withSweepConnection(userId: string, task: (sql: DatabaseSql) => Promise<LegacySweepResult>): Promise<LegacySweepResult> {
   const sql = await database();
   const connection = await sql.reserve();
   const key = `keyway-legacy-sweep:${userId}`;
