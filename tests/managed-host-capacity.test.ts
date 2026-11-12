@@ -919,3 +919,19 @@ test("back-to-back requests can't keep renewing a node's protection while it ser
   assert.deepEqual(running(), [B, C]);
   await another;
 });
+
+test("a node that exits unexpectedly and loses its slot meanwhile stays counted offline and is tried again", async (context) => {
+  const { module, root, request, running } = await host(context);
+  assert.equal(await request(A), 200);
+  assert.equal(await request(B), 200);
+  const pid = Number(await readFile(join(root, "users", A, "pid"), "utf8"));
+  process.kill(pid, "SIGKILL");
+  await until(async () => !running().includes(A));
+  // Another user takes A's slot before A's restart: A may hold a channel nothing has listed yet.
+  assert.equal(await request(C), 200);
+  await until(async () => module.readiness().offline === 1);
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+  assert.deepEqual(running(), [B, C]);
+  assert.equal(module.readiness().offline, 1);
+  assert.equal(await exists(join(root, "users", A, "keyway-channels-checked")), false);
+});

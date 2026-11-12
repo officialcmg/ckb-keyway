@@ -51,8 +51,6 @@ const CHANNEL_SETUP = new Set(["connect_peer", "open_channel", "open_channel_wit
 const RESTART_BASE_MS = 1_000;
 const RESTART_MAX_MS = 60_000;
 const RESTART_STABLE_MS = 60_000;
-// How many times in a row a crashed node without a marker is started again.
-const RESTARTS_WITHOUT_MARKER = 3;
 const nodes = new Map();
 const starting = new Map();
 const operations = new Map();
@@ -656,22 +654,6 @@ async function restartNode(userId) {
   }
 }
 
-/**
- * Starts a crashed node without channel markers again, after the restart backoff, where there is room; at most
- * RESTARTS_WITHOUT_MARKER times until it stays up a minute.
- */
-function restartUnmarked(userId) {
-  const attempts = restarts.get(userId) ?? 0;
-  // A node without a marker that keeps dying soon after it starts is left for its user's next request.
-  if (attempts >= RESTARTS_WITHOUT_MARKER) return;
-  restarts.set(userId, attempts + 1);
-  const timer = setTimeout(() => {
-    if (shuttingDown || nodes.has(userId)) return;
-    void withUserOperation(userId, () => ensureNode(userId, { provision: false })).catch(logError);
-  }, Math.min(RESTART_MAX_MS, RESTART_BASE_MS * 2 ** attempts));
-  timer.unref?.();
-}
-
 function forgetOffline(userId) {
   clearTimeout(offline.get(userId)?.timer);
   offline.delete(userId);
@@ -735,10 +717,10 @@ async function startNode(userId) {
       failedStarts.delete(userId);
     // Dying soon after starting counts as a failed start, so a node that keeps doing it loses its priority.
     } else if (wasRunning && !node.stopping) failedStart(userId);
-    // A node that exits unexpectedly is started again, as it may hold a channel it was never marked for; one that
-    // may hold channels keeps being started until it runs (see superviseNode).
+    // A node that exits unexpectedly may hold a channel it was never marked for, so it counts as unchecked again:
+    // it is started again until it runs (see superviseNode), and counts as offline meanwhile.
     if (wasRunning && !node.stopping && !shuttingDown) {
-      void mayHoldChannels(userId).catch(() => true).then((may) => may ? superviseNode(userId) : restartUnmarked(userId));
+      void rm(join(managedDataDir(userId), CHECKED_MARKER), { force: true }).catch(logError).then(() => superviseNode(userId));
     }
   });
   await waitForRpc(port, child);
@@ -809,9 +791,12 @@ async function resumeNode(userId, wasRunning) {
     if (wasRunning) return void await ensureNode(userId, { provision: false });
   } catch (error) {
     if (!shuttingDown && await mayHoldChannels(userId).catch(() => true)) superviseNode(userId);
+    // A node restored without channels isn't offline, whatever stopped its start.
+    else forgetOffline(userId);
     throw error;
   }
   if (!shuttingDown && await mayHoldChannels(userId).catch(() => true)) superviseNode(userId);
+  else forgetOffline(userId);
 }
 
 export async function completeDatabaseOperation(operation, resume) {
