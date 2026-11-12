@@ -30,14 +30,12 @@ const SECP256K1_CODE_HASH = "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637
 const OMNILOCK_CODE_HASH = "0x6b29b6f10346b43c540e53806ba88ba0fe3a0c3a29d7448ef555840c8f8318fa";
 // The official testnet Omnilock (CCC's KnownScript.OmniLock), by type: the same lock, so the same rules apply.
 const OFFICIAL_OMNILOCK_CODE_HASH = "0xf329effd1c475a2978453c8600e1eaf0bc2087ee093c3ee64cc96ec6847752cb";
-// Anyone-can-pay (testnet, mainnet): its args start with a key's blake160, which that key's signature unlocks.
-const ACP_CODE_HASHES = ["0x3419a1c09eb2567f6552ee7a8ecffd64155cffe0f1796e6e61ec088d740c1356", "0xd369597ff47f29fbc0d47d2e3775370d1250b85140c670e4718af712983a2354"];
 const JOYID_CODE_HASH = "0xd23761b364210735c19c60561d213fb3beae2fd6172743719eff6920e020baac";
 // An indexer more than this many blocks behind its node's tip could miss a send-limit cell, so it isn't believed; nor is
 // a node whose tip is older than this (its whole chain may have stalled behind the network's).
 const MAX_INDEXER_LAG = 3n;
 const MAX_TIP_AGE_MS = 10 * 60_000;
-// Pages of one block's history read for one lock: past this many entries, outsiders have given the key a lot of CKB.
+// Pages of one block's history (1024 transactions each) read for one lock; a block can't hold this many.
 const MAX_HISTORY_PAGES = 4;
 const TYPE_ID_CODE_HASH = "0x00000000000000000000000000000000000000000000000000545950455f4944";
 // KeyWay's backup verifiers, version 3 with salted identities (src/sdk/browser/recovery-backups.ts).
@@ -450,22 +448,24 @@ async function madeByKey(account, candidates, urls, options = {}) {
   const locks = options.locks ?? [account.secp, account.listLock];
   let pending = blocks.flatMap((block) => locks.map((lock) => ({ block, lock, cursor: undefined })));
   const made = new Set();
-  // A block whose page of 1024 entries is full is read on from its cursor, so cells outsiders give this key in the
-  // same block can't hide the key's own entry; only after MAX_HISTORY_PAGES full pages (CKB the outsider gave away)
-  // is it an error. 256 calls a batch keeps the run within Lit's request limit, with room for the code email.
+  // A block whose page of 1024 transactions is full is read on from its cursor; only after MAX_HISTORY_PAGES full pages
+  // (more transactions than a block can hold) is it an error. 256 calls a batch keeps the run within Lit's request limit, with room for the code email.
   for (let round = 0; pending.length > 0; round++) {
     if (round >= MAX_HISTORY_PAGES) throw new Error("A block holds too much of this key's history to check");
     const next = [];
     for (let at = 0; at < pending.length; at += 256) {
       const slice = pending.slice(at, at + 256);
+      // Grouped by transaction, so a page counts transactions, not cells: outsiders can't fill one by sending the key
+      // thousands of cells in one transaction, and a block can't hold 4 pages of transactions.
       const calls = slice.map(({ block, lock, cursor }) => ({
         method: "get_transactions",
-        params: [lockSearchKey(lock, { block_range: [`0x${block.toString(16)}`, `0x${(block + 1n).toString(16)}`] }), "asc", "0x400", ...(cursor ? [cursor] : [])],
+        params: [{ ...lockSearchKey(lock, { block_range: [`0x${block.toString(16)}`, `0x${(block + 1n).toString(16)}`] }), group_by_transaction: true }, "asc", "0x400", ...(cursor ? [cursor] : [])],
       }));
       (await rpcBatch(calls, urls)).forEach((result, i) => {
         if (!Array.isArray(result?.objects)) throw new Error("CKB RPC returned an invalid get_transactions page");
         for (const entry of result.objects) {
-          if (entry?.io_type === "input" && (options.anyInput || num(entry.io_index, "io index") === 0n)) made.add(String(entry.tx_hash).toLowerCase());
+          if (!Array.isArray(entry?.cells)) throw new Error("CKB RPC returned an invalid get_transactions page");
+          if (entry.cells.some((cell) => Array.isArray(cell) && cell[0] === "input" && (options.anyInput || num(cell[1], "io index") === 0n))) made.add(String(entry.tx_hash).toLowerCase());
         }
         if (result.objects.length >= 0x400) {
           if (typeof result.last_cursor !== "string") throw new Error("CKB RPC returned an invalid get_transactions page");
@@ -596,14 +596,19 @@ function lockKind(account, lock) {
   return undefined;
 }
 
-/** A lock this key can unlock that isn't one of the account's own shapes (anyone-can-pay, or another Omnilock). */
-function strayKeyLock(account, lock) {
+/**
+ * Whether a lock names this key (its blake160 or public key anywhere in the args) without being one of the account's
+ * own shapes: anyone-can-pay, another Omnilock deployment or hash type, secp256k1 by data hash, and the like, which
+ * the key's signature may unlock but whose cells nothing here counts. Decided from the lock alone, never from
+ * witnesses, which other parties can change after the Action signs.
+ */
+function foreignKeyLock(account, lock) {
   if (lockKind(account, lock)) return false;
-  const code = bytesToHex(lock.codeHash);
-  const args = lock.args;
-  if (lock.hashType === "type" && ACP_CODE_HASHES.includes(code)) return args.length >= 20 && equalBytes(args.slice(0, 20), account.blake160);
-  const omnilock = (lock.hashType === "data1" && code === OMNILOCK_CODE_HASH) || (lock.hashType === "type" && code === OFFICIAL_OMNILOCK_CODE_HASH);
-  return omnilock && args.length >= 21 && args[0] === 0x00 && equalBytes(args.slice(1, 21), account.blake160);
+  const contains = (haystack, needle) => {
+    for (let i = 0; i + needle.length <= haystack.length; i++) if (equalBytes(haystack.slice(i, i + needle.length), needle)) return true;
+    return false;
+  };
+  return contains(lock.args, account.blake160) || contains(lock.args, account.publicKey);
 }
 
 /**
@@ -871,9 +876,9 @@ async function analyse(pkpId, params) {
     if (kind && !groups.some((group) => sameScript(group.lock, lock))) groups.push({ lock, kind });
   });
   if (groups.length === 0) throw new Error("The transaction spends nothing of this account's");
-  // Locks KeyWay never uses that this key's signature can still unlock (anyone-can-pay, other Omnilock shapes): the
-  // analysis below wouldn't count what they hold, so they can't be spent here at all.
-  if (inputLocks.some((lock) => strayKeyLock(account, lock))) throw new Error("An input is locked to this key in a form KeyWay doesn't use");
+  // Locks naming this key that KeyWay never uses: the key's signature may unlock them, and nothing below would count
+  // what they hold, so they can't be spent here at all.
+  if (inputLocks.some((lock) => foreignKeyLock(account, lock))) throw new Error("An input is locked to this key in a form KeyWay doesn't use");
 
   let op = { kind: "plain" };
   // Outside turning recovery on, the account's recovery address may only be the one naming its live list, so no
@@ -1253,7 +1258,20 @@ async function refuseOwnAsForeign(account, unproven) {
   const blockHashes = [...new Set(unproven.map((cell) => cell.createdBlockHash))];
   const headers = await rpcBatch(blockHashes.map((hash) => ({ method: "get_header", params: [hash] })));
   const numbers = new Map(blockHashes.map((hash, i) => [hash, num(headers[i]?.number, "block number")]));
-  const made = await madeByKey(account, unproven.map((cell) => ({ block: numbers.get(cell.createdBlockHash) })), RPC_URLS, { anyInput: true, locks: [account.secp] });
+  // From one node whose indexer has caught up, so a lagging node's empty history can't read as "not the key's".
+  const candidates = unproven.map((cell) => ({ block: numbers.get(cell.createdBlockHash) }));
+  let made;
+  let lastError;
+  for (const url of RPC_URLS) {
+    try {
+      await freshIndexer([url]);
+      made = await madeByKey(account, candidates, [url], { anyInput: true, locks: [account.secp] });
+      break;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  if (!made) throw lastError ?? new Error("CKB RPC is unavailable");
   if (unproven.some((cell) => made.has(cell.createdByHash.toLowerCase()))) throw new Error("A send-limit cell of this account's can't be read; try again later");
 }
 
@@ -1713,31 +1731,6 @@ function signGroups(analysis) {
     if (!witness.lock || witness.lock.length !== length || !isZero(witness.lock)) throw new Error("A signing witness isn't prepared");
     return { lock, digest, first };
   });
-  // Any lock that checks a raw signature by this key (secp256k1 or anyone-can-pay by data hash, another Omnilock
-  // deployment or hash type, …) would accept the account's signature for its own group if that group's signing hash
-  // came out the same, and such inputs aren't counted above. A group's signing hash doesn't depend on its lock, so
-  // another party's input with the same witness layout matches too; only a lock naming this key (its blake160 or
-  // public key in the args) can be opened by its signature, so those may not share a digest the Action signs.
-  const digests = new Set(signed.map(({ digest }) => bytesToHex(digest)));
-  const contains = (haystack, needle) => {
-    for (let i = 0; i + needle.length <= haystack.length; i++) if (equalBytes(haystack.slice(i, i + needle.length), needle)) return true;
-    return false;
-  };
-  const namesKey = (lock) => contains(lock.args, account.blake160) || contains(lock.args, account.publicKey);
-  const others = [];
-  inputLocks.forEach((lock) => { if (namesKey(lock) && !groups.some((group) => sameScript(group.lock, lock)) && !others.some((other) => sameScript(other, lock))) others.push(lock); });
-  for (const lock of others) {
-    // As the chain checks it: that group's first witness with its lock field zeroed, whatever it holds now, since the
-    // signature would be put there afterwards.
-    const first = inputLocks.findIndex((one) => sameScript(one, lock));
-    if (first >= tx.witnesses.length) continue;
-    let witness;
-    try { witness = parseWitnessArgs(tx.witnesses[first]); } catch { continue; }
-    const zeroed = { ...tx, witnesses: tx.witnesses.map((one, i) => i === first && witness.lock ? encodeWitnessArgs({ ...witness, lock: new Uint8Array(witness.lock.length) }) : one) };
-    let digest;
-    try { ({ digest } = sighash(zeroed, inputLocks, lock)); } catch { continue; }
-    if (digests.has(bytesToHex(digest))) throw new Error("Another input's lock would accept this account's signature");
-  }
   return signed.map(({ lock, digest, first }) => ({ lockHash: bytesToHex(scriptHash(lock)), witnessIndex: first, ...signDigest(account, digest) }));
 }
 

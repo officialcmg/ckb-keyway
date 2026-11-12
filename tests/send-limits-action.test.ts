@@ -883,7 +883,7 @@ test("review: a node that strips a chained cell's record can't make it pass for 
   await assert.rejects(env.run("transaction", destroy), /can't be read/);
 });
 
-test("review: no input whose lock would accept the account's signature (secp256k1 by data hash, KeyWay's Omnilock as data2) is signed for", async () => {
+test("review: no input under a lock naming this key in a form KeyWay doesn't use (secp256k1 by data hash, KeyWay's Omnilock as data2) is signed for, whatever its witness", async () => {
   const env = await account();
   const blake160 = ccc.bytesFrom(env.secp.args);
   const shapes = [
@@ -891,7 +891,9 @@ test("review: no input whose lock would accept the account's signature (secp256k
     ccc.Script.from({ codeHash: "0x6b29b6f10346b43c540e53806ba88ba0fe3a0c3a29d7448ef555840c8f8318fa", hashType: "data2", args: ccc.bytesConcat([0x00], blake160, [0x00]) }),
   ];
   for (const lock of shapes) {
-    for (const otherLock of [new Uint8Array(65), new Uint8Array(65).fill(7)]) {
+    // The other input's witness is chosen by whoever builds the transaction and can change after signing, so the
+    // refusal can't depend on it: absent, empty, a short lock or a full one.
+    for (const otherWitness of [undefined, ccc.hexFrom("0x"), ccc.hexFrom(ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(64)) }).toBytes()), ccc.hexFrom(ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(65).fill(7)) }).toBytes())]) {
       const held = plant(env, { lock, capacity: 50_000n * CKB });
       const drain = ccc.Transaction.from({
         inputs: [{ previousOutput: cellOf(env.funding, 1).outPoint }, { previousOutput: held.outPoint }],
@@ -899,9 +901,9 @@ test("review: no input whose lock would accept the account's signature (secp256k
         outputsData: ["0x", "0x"],
       });
       drain.setWitnessArgsAt(0, ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(65)) }));
-      // The other group's lock field zeroed or not: the chain zeroes it before hashing, so the check must too.
-      drain.setWitnessArgsAt(1, ccc.WitnessArgs.from({ lock: ccc.hexFrom(otherLock) }));
-      await assert.rejects(env.run("transaction", drain), /would accept this account's signature/, `${lock.hashType} ${otherLock[0]}`);
+      if (otherWitness !== undefined) drain.witnesses[1] = otherWitness;
+      await assert.rejects(env.run("plan", drain), /form KeyWay doesn't use/, `${lock.hashType} ${otherWitness}`);
+      await assert.rejects(env.run("transaction", drain), /form KeyWay doesn't use/, `${lock.hashType} ${otherWitness}`);
     }
   }
   // An ordinary input of someone else's (another key) still signs.
@@ -940,4 +942,22 @@ test("review: a node whose whole chain has stalled isn't believed either", async
   const behind = await account({ tipAge: () => 20 * 60_000 });
   const send = sendTx(behind, null, [cellOf(behind.funding, 1)], 90n * CKB);
   await assert.rejects(behind.run("plan", send), /chain is behind the network/);
+});
+
+test("review: a look-alike in a block padded with 4,100 cells for the key blocks neither sends nor its own cleanup", async () => {
+  const env = await account();
+  // One outsider transaction: a send-limit-shaped look-alike with a correct Type ID, plus 4,100 small cells at the key.
+  const source = plant(env, { lock: stranger, capacity: 300_000n * CKB });
+  const input = ccc.CellInput.from({ previousOutput: source.outPoint });
+  const padded = env.add(ccc.Transaction.from({
+    inputs: [input],
+    outputs: [{ lock: env.secp, type: typeIdScript(ccc.hashTypeId(input, 0)), capacity: 130n * CKB }, ...Array.from({ length: 4100 }, () => ({ lock: env.secp, capacity: 61n * CKB }))],
+    outputsData: ["0x4b57534c", ...Array.from({ length: 4100 }, () => "0x")],
+  }));
+  const send = sendTx(env, null, [cellOf(env.funding, 1)], 90n * CKB);
+  assert.equal((await planned(env, send, null)).limits, "legacy");
+  const cleanup = ccc.Transaction.from({ inputs: [{ previousOutput: cellOf(padded, 0).outPoint }], outputs: [{ lock: env.secp, capacity: 130n * CKB - FEE }], outputsData: ["0x"] });
+  prepare(env, cleanup, [env.secp]);
+  assert.equal((await env.run("plan", cleanup) as Plan).limits, "exempt");
+  assert.ok((await env.run("transaction", cleanup) as { signatures: unknown[] }).signatures.length > 0);
 });

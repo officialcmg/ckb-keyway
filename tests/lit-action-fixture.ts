@@ -109,7 +109,7 @@ export function fakeLit(options: {
     // What this node's indexer has seen: all but the newest `indexerLag` transactions.
     const indexed = () => { const txs = options.transactions(); const lag = options.indexerLag?.(url) ?? 0; return lag > 0 ? txs.slice(0, Math.max(txs.length - lag, 0)) : txs; };
     // Each transaction is in its own block, numbered by its place in `transactions()`.
-    const history = (key: { script: { code_hash: string; hash_type: string; args: string }; script_search_mode?: string; filter?: { block_range?: [string, string] } }) => {
+    const history = (key: { script: { code_hash: string; hash_type: string; args: string }; script_search_mode?: string; filter?: { block_range?: [string, string] } }): object[] => {
       const { script: wanted, script_search_mode: mode, filter } = key;
       const matches = (lock: ccc.Script) => lock.codeHash === wanted.code_hash && lock.hashType === wanted.hash_type && (mode === "exact" ? lock.args === wanted.args : lock.args.startsWith(wanted.args));
       const all = indexed();
@@ -123,7 +123,15 @@ export function fakeLit(options: {
         ...tx.outputs.flatMap((output, index) => matches(output.lock) ? [{ tx_hash: hashOf(tx), io_type: "output", io_index: ccc.numToHex(index), block_number: ccc.numToHex(block) }] : []),
       ]);
       historyReads.push(objects.length);
-      return objects;
+      if (!(key as { group_by_transaction?: boolean }).group_by_transaction) return objects;
+      // As ckb-indexer with group_by_transaction: one object per transaction, its cells as [io_type, io_index] pairs.
+      const grouped: Array<{ tx_hash: string; block_number: string; cells: Array<[string, string]> }> = [];
+      for (const entry of objects) {
+        const last = grouped.at(-1);
+        if (last && last.tx_hash === entry.tx_hash) last.cells.push([entry.io_type, entry.io_index]);
+        else grouped.push({ tx_hash: entry.tx_hash, block_number: entry.block_number, cells: [[entry.io_type, entry.io_index]] });
+      }
+      return grouped;
     };
     if (Array.isArray(parsed) && parsed.every((call: { method: string }) => call.method === "get_transactions")) {
       return new Response(JSON.stringify(parsed.map((call: { id: number; params: [Parameters<typeof history>[0], string, string?, string?] }) => ({ id: call.id, jsonrpc: "2.0", result: page(history(call.params[0]), call.params[2], call.params[3]) }))), { status: 200 });

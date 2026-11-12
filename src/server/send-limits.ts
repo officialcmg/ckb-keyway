@@ -180,8 +180,8 @@ async function liveSendLimitCellAt(url: string, secp: ccc.Script, spent: Set<str
   const live = candidates.filter(({ outPoint }) => !spent.has(`${outPoint.txHash}:${Number(outPoint.index)}`));
   if (live.length === 0) return undefined;
 
-  // A full page of a block's history is read on from its cursor, so cells outsiders give the key in the same block
-  // can't hide its own entry; only past MAX_HISTORY_PAGES full pages (CKB the outsider gave away) is it an error.
+  // A full page of a block's history (1024 transactions) is read on from its cursor; only past MAX_HISTORY_PAGES full
+  // pages (more transactions than a block can hold) is it an error.
   let pending: Array<{ block: bigint; cursor?: string }> = [...new Set(live.map(({ block }) => block))].map((block) => ({ block }));
   const madeByKey = new Set<string>();
   for (let round = 0; pending.length > 0; round++) {
@@ -189,13 +189,17 @@ async function liveSendLimitCellAt(url: string, secp: ccc.Script, spent: Set<str
     const next: typeof pending = [];
     for (let at = 0; at < pending.length; at += BATCH_SIZE) {
       const slice = pending.slice(at, at + BATCH_SIZE);
+      // Grouped by transaction, as the Action reads it: a page counts transactions, not cells.
       const calls = slice.map(({ block, cursor }) => ({
         method: "get_transactions",
-        params: [lockKey({ block_range: [ccc.numToHex(block), ccc.numToHex(block + 1n)] }), "asc", ccc.numToHex(MAX_BLOCK_HISTORY), ...(cursor ? [cursor] : [])],
+        params: [{ ...lockKey({ block_range: [ccc.numToHex(block), ccc.numToHex(block + 1n)] }), group_by_transaction: true }, "asc", ccc.numToHex(MAX_BLOCK_HISTORY), ...(cursor ? [cursor] : [])],
       }));
-      (await rpcBatch(url, calls) as Array<{ objects?: Array<{ tx_hash?: string; io_type?: string }>; last_cursor?: string }>).forEach((result, i) => {
+      (await rpcBatch(url, calls) as Array<{ objects?: Array<{ tx_hash?: string; cells?: unknown }>; last_cursor?: string }>).forEach((result, i) => {
         if (!Array.isArray(result.objects)) throw new Error("CKB RPC returned an invalid get_transactions page");
-        for (const entry of result.objects) if (entry.io_type === "input" && typeof entry.tx_hash === "string") madeByKey.add(entry.tx_hash.toLowerCase());
+        for (const entry of result.objects) {
+          if (!Array.isArray(entry.cells)) throw new Error("CKB RPC returned an invalid get_transactions page");
+          if (entry.cells.some((cell) => Array.isArray(cell) && cell[0] === "input") && typeof entry.tx_hash === "string") madeByKey.add(entry.tx_hash.toLowerCase());
+        }
         if (result.objects.length >= MAX_BLOCK_HISTORY) {
           if (typeof result.last_cursor !== "string") throw new Error("CKB RPC returned an invalid get_transactions page");
           next.push({ ...slice[i], cursor: result.last_cursor });
@@ -251,7 +255,7 @@ const PAGE_SIZE = 256;
 const MAX_PAGES = 16;
 /** History lookups in one request. */
 const BATCH_SIZE = 256;
-/** Entries of the key's history in one page, and full pages read from one block, as in the Action. */
+/** Transactions of the key's history in one page, and full pages read from one block, as in the Action. */
 const MAX_BLOCK_HISTORY = 1024;
 const MAX_HISTORY_PAGES = 4;
 /** Blocks an indexer may be behind its chain tip before its answer isn't believed, as in the Action. */

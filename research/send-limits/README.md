@@ -223,7 +223,8 @@ counted send, and fund channels only from there.
 - Inputs under a lock this key can unlock in a form KeyWay doesn't use (anyone-can-pay, other Omnilocks): refused,
   since nothing they hold would be counted.
 - Freezing an account with planted cells: look-alike send-limit cells don't count toward any cap until proven the
-  key's own, a block full of cells sent to the key is read past, and look-alikes can be destroyed like any other
+  key's own, the key's history is read per transaction (so thousands of cells sent to it in one transaction fill
+  nothing), and look-alikes can be destroyed like any other
   Type ID cell (the cells their creators spent are read in one batch, so one transaction can destroy many). The
   lookup is refused only from 4,096 send-limit-shaped cells at the address (16 full pages of 256): 4,095
   look-alikes on an account with limits, each at least 130 CKB (532,350 CKB, all left at the account's address).
@@ -235,9 +236,12 @@ counted send, and fund channels only from there.
   Type ID makes it "chained" (a record shape on another party's input is ignored, so the genesis check still
   applies), and a cell the key's own history shows it made is never treated as someone else's, even if a node
   serves its creating transaction with a witness changed.
-- A lock that would accept the account's signature for an input KeyWay doesn't count: the Action refuses to sign
-  when another input's lock names this key (its blake160 or public key in the args) and that input's group, with
-  its lock field zeroed as the chain checks it, has the same signing hash as a group the Action signs.
+- A lock that would accept the account's signature for an input KeyWay doesn't count (anyone-can-pay, another
+  Omnilock deployment or hash type, secp256k1 by data hash, …): the Action refuses any input whose lock names this
+  key (its blake160 or public key anywhere in the args) without being one of the account's own shapes. The rule
+  reads only the lock, never witnesses, which another party can change after the Action signs. A custom lock that
+  checks this key's signature without naming it in its args isn't covered; it could only hold funds someone sent to
+  it on purpose.
 - Backup changes on a recovery list made before the email binding: with send limits on, they need the code at the
   limits' address. (The server's flow for such lists doesn't ask the Action for it yet, so on such an account the
   change is refused until it does.)
@@ -272,9 +276,8 @@ counted send, and fund channels only from there.
   try codes as fast as Lit runs allow; the Action keeps no state to count failures. Longer codes were considered and
   not taken.
 - **Lit's 50-request limit.** Measured with the fake chain: turning recovery on with 4,094 look-alike send-limit
-  cells, 1,024 look-alike lists and one block of 3,000 cells at the list lock takes 50 RPC requests plus the email,
-  one over the limit, so it fails (nothing is signed). That costs about 850k CKB, of which the look-alike lists
-  (about 131k CKB) can never be spent again. Without the padded block it is 48 plus the email.
+  cells, 1,024 look-alike lists and one transaction of 3,000 cells at the list lock takes 48 RPC requests plus the
+  email (49), within the limit. Past 16 pages of look-alikes the lookup is refused instead.
 - **Small leftovers.** A phase-2 DAO withdrawal's interest is counted net of the fee, so up to the interest can go to
   fee without the code. For about 3 blocks after a genesis commits, a send that leaves the cell out can read as
   "no limits". Locks that only require an input of the account's to be present (for example cheque claims) can still
