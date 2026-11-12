@@ -188,7 +188,9 @@ counted send, and fund channels only from there.
   hand must leave room for about 300 more bytes), and the transaction hash the user approves doesn't change when
   the server fills in the record (witnesses aren't in the hash).
 - **Codes.** When the plan says a code is needed, `request-email-code` has the Action email it (`send-code`), the
-  server stores only the ticket, and the SDK's prompt takes 8 digits. The email names the full address of each
+  server stores only the ticket, and the SDK's prompt takes 8 digits. The ticket carries a tag only the Action can
+  make, bound to the PKP, the address and what the code is for, so every window for guessing a code is an email the
+  user sees, closed when the ticket expires (10 minutes). The email names the full address of each
   recipient and what it gets, so a page that swapped the recipient can't send one that reads as expected. When
   only the server's own rule (Fiber payments in the total) asks for a code, the Action emails it too, so the user
   always gets one code.
@@ -199,8 +201,9 @@ counted send, and fund channels only from there.
   `keyway_v2_pending_transactions` (migration 20). `POST /api/keyway/pending-transactions` returns the account's
   pending ones, after dropping those the node reports committed or rejected, or no longer knows after a grace period.
   It also returns the newest send-limit cell and the record size to reserve. The server finds that cell the way the
-  Action does, from one node: the send-limit-shaped cells at the address (up to 1024, so look-alikes anyone plants
-  can't hide it), each checked against the key's own history in its block, in batched requests. The node's status is read raw
+  Action does, from one node whose indexer is within 3 blocks of its tip: the send-limit-shaped cells at the address
+  (up to 16 pages of 256; look-alikes anyone plants count toward nothing until proven), each checked against the
+  key's own history in its block, read past a full page when outsiders filled the block, in batched requests. The node's status is read raw
   (`get_transaction` with verbosity 1), because CCC returns nothing for "unknown" and "rejected". The SDK loads this when its signer
   starts and before every `findCells` (the step CCC uses to pick inputs), then marks the transactions in CCC's cache
   in the order they were signed, so their spent cells are skipped and their change can be used.
@@ -211,6 +214,38 @@ counted send, and fund channels only from there.
   requests, balance splitting, delayed broadcast, hiding an ancestor, leaving the send-limit cell out, using a
   forged send-limit cell, and channel funding all fail (tests in `tests/send-limits-action.test.ts`).
 - The server choosing the email the code goes to, or raising the amount, on an account with a send-limit cell.
+- Turning recovery on, which moves everything to an address the new backups can spend, with a backup and an email
+  the server picks: on an account with a send-limit cell, the code for it goes only to the cell's bound address,
+  and the enable is refused while more than one send-limit cell shows.
+- Value that appears without leaving an input: the interest a Nervos DAO withdrawal adds counts as the account's
+  CKB, and new supply of a token the account issued counts as that token leaving. A token counted per cell (one
+  whose amounts KeyWay can't read) always needs the code once it has a daily amount.
+- Inputs under a lock this key can unlock in a form KeyWay doesn't use (anyone-can-pay, other Omnilocks): refused,
+  since nothing they hold would be counted.
+- Freezing an account with planted cells: look-alike send-limit cells don't count toward any cap until proven the
+  key's own, the key's history is read per transaction (so thousands of cells sent to it in one transaction fill
+  nothing), and look-alikes can be destroyed like any other
+  Type ID cell (the cells their creators spent are read in one batch, so one transaction can destroy many). The
+  lookup is refused only from 4,096 send-limit-shaped cells at the address (16 full pages of 256): 4,095
+  look-alikes on an account with limits, each at least 130 CKB (532,350 CKB, all left at the account's address).
+  Measured with the fake chain, every look-alike in its own block, at 4,094 look-alikes: an ordinary send makes 34
+  CKB RPC requests plus the code email, and turning limits on 35 plus the email (see "Lit's 50-request limit" below
+  for turning recovery on).
+- A lagging indexer: an empty answer counts as "no limits" only from a node whose indexer is within 3 blocks of
+  its tip and whose tip is under 10 minutes old; when every node lags, nothing is signed.
+- A send-limit cell passing for a look-alike: only a record on an input at the key's address with the cell's own
+  Type ID makes it "chained" (a record shape on another party's input is ignored, so the genesis check still
+  applies), and a cell the key's own history shows it made is never treated as someone else's, even if a node
+  serves its creating transaction with a witness changed.
+- A lock that would accept the account's signature for an input KeyWay doesn't count (anyone-can-pay, another
+  Omnilock deployment or hash type, secp256k1 by data hash, …): the Action refuses any input whose lock names this
+  key (its blake160 or public key anywhere in the args) without being one of the account's own shapes. The rule
+  reads only the lock, never witnesses, which another party can change after the Action signs. A custom lock that
+  checks this key's signature without naming it in its args isn't covered; it could only hold funds someone sent to
+  it on purpose.
+- Backup changes on a recovery list made before the email binding: with send limits on, they need the code at the
+  limits' address. (The server's flow for such lists doesn't ask the Action for it yet, so on such an account the
+  change is refused until it does.)
 
 ## 5. What stays trusted
 
@@ -237,6 +272,24 @@ counted send, and fund channels only from there.
   transaction that later drops out keeps its cells marked in that tab until it reloads. Two clients that both hold an
   approval dialog open on the same send-limit cell each get a valid signature; the node keeps one. Channel funding
   doesn't use the list (Fiber chooses its inputs).
+- **Guessing the 8-digit code (accepted, 2026-11-10).** Only the Action can issue a code ticket, so every guessing
+  window is an email to the user and closes after 10 minutes, but within a window someone holding the usage key can
+  try codes as fast as Lit runs allow; the Action keeps no state to count failures. Longer codes were considered and
+  not taken.
+- **Lit's 50-request limit.** Measured with the fake chain: turning recovery on with 4,094 look-alike send-limit
+  cells, 1,024 look-alike lists and one transaction of 3,000 cells at the list lock takes 48 RPC requests plus the
+  email (49), within the limit. Past 16 pages of look-alikes the lookup is refused instead.
+- **Small leftovers.** A phase-2 DAO withdrawal's interest is counted net of the fee, so up to the interest can go to
+  fee without the code. For about 3 blocks after a genesis commits, a send that leaves the cell out can read as
+  "no limits". Locks that only require an input of the account's to be present (for example cheque claims) can still
+  redirect incoming value uncounted.
+- **Lit's 1 MB response limit.** Batched history reads and cell listings can be made larger than that (for example
+  about 29 transactions to the key in each of 256 look-alike blocks, roughly 490k CKB given to the account, or a few
+  look-alikes carrying very large data). The lookup then fails and nothing is signed; destroying look-alikes in small
+  batches clears it.
+- **The indexer's grouped paging.** History is read with `group_by_transaction`; ckb-indexer (checked in
+  `util/indexer/src/service.rs` at `d0dcbcafc7`) ends a page only between transactions and resumes right after the
+  last entry it returned, so no transaction is skipped where pages meet.
 - **Retired Action CIDs left in the Lit group.** A compromised server can sign anything through any older
   Action still in the group, including a record or a genesis-shaped transaction that this Action would then
   trust. The group must hold only the CIDs pinned in `src/server/lit-config.ts`.
@@ -247,7 +300,9 @@ counted send, and fund channels only from there.
 - **CKB RPC:** transaction status, block timestamps and which cells are live, as before. A lying node, not the
   server, could make an old ancestor look older than it is.
 - **Recovery backups** can create a send-limit cell's genesis only by signing for the key's secp256k1 address,
-  which they can't. They can still move everything at the Omnilock address, by design.
+  which they can't. They can still move everything at the Omnilock address, by design. Which backups those are is
+  approved with the code to the bound address on accounts with limits on, and trusted on first use on accounts
+  without them.
 - **The Lit clock**, the TEE network, the founder's Lit account, and everything else listed in the lit-policy
   README. The retired `sign-ckb-digest` CID must stay out of the group, or none of this holds.
 
@@ -287,8 +342,8 @@ server: roughly +0.4 s per send with limits on. Today's policy signer takes 0.65
 
 1. Run the migration (`npm run migrate:production`): it adds `keyway_v2_pending_transactions`.
 2. In the Chipotle dashboard, paste `lit-actions/sign-ckb-transaction.js` into **Action Runner**, click **Get Lit
-   Action IPFS CID**, and check it is `QmaZABPThjFpeBWpRSw3TXosHG4yVsfbHwsF9RGruGuS9b`, the same as `LIT_ACTION_CIDS["sign-ckb-transaction"]` in
-   `src/server/lit-config.ts`.
+   Action IPFS CID**, and check it is the CID in `LIT_ACTION_CIDS["sign-ckb-transaction"]` in
+   `src/server/lit-config.ts` (`tests/lit-action-packaging.test.ts` checks the two match).
 3. Register it under **IPFS Actions** (for example as `keyway-ckb-policy-signer-v2`) and add it to group 1,
    `CKB Keyway`.
 4. Run `npm run verify:lit -- --policy` locally. It should print "policy Action".

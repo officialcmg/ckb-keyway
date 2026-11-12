@@ -625,13 +625,13 @@ test("with the policy Action: Lit emails the code, binds the email on chain, and
   assert.deepEqual(onChainAuths(), await saltedAuths(current));
 
   // A JoyID passkey (the proof the cross-origin-isolated popup or redirect returns) is added through the Action too,
-  // which names it by its key id; the record names neither backup.
+  // which names it by the full JoyID address the user knows; the record names neither backup.
   const joy = await joyIdWallet(h.client);
   const joyBackup = { kind: "joyid" as const, address: joy.address };
   const { challengeNonce } = issueBackupChallenge(h.user);
   const joyProof = { ...joyBackup, challengeNonce, ...joy.sign(recoveryBackupChallenge(h.legacyAddress, joyBackup, challengeNonce)) };
   const added = await changeThroughLit(current, { change: "add", backup: joyProof });
-  assert.match(added.email.text, new RegExp(`Adding: JoyID passkey \\(key id ${ccc.hexFrom(ccc.hashCkbShort(joy.publicKey))}\\)`));
+  assert.ok(added.email.text.includes(`Adding: JoyID ${joy.address}\n`), added.email.text);
   assert.match(added.email.text, /Backups after this change: 3/);
   current = added.wallet;
   assert.equal(current.recovery!.backups!.length, 3);

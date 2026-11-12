@@ -11,6 +11,7 @@ import { execAuth, execPreimage, saltedBackupId, type RecoveryBackup } from "../
 import { backupAuths, recoveryListRecord, setRecoveryListRecord } from "../src/sdk/browser/recovery-list.ts";
 import { adminListData, whitelistTree } from "../src/sdk/browser/recovery-smt.ts";
 import { fakeLit, litCodeIn, type ActionModule } from "./lit-action-fixture.ts";
+import { encodeSendLimitSettings } from "../src/sdk/browser/send-limits.ts";
 import { litBackupIds, policyIdentitySignature, policySendCode, policySignMessage, policySignTransaction, setEmailBinding } from "../src/server/lit-policy.ts";
 import { planBackupChange, planRecovery } from "../src/server/recovery.ts";
 import type { ReadyWallet } from "../src/server/user-wallet.ts";
@@ -190,12 +191,21 @@ test("turning recovery on needs the code the Action emailed, to the address boun
   const swapped = plan.transaction.clone();
   setEmailBinding(swapped, other.binding!);
   await assert.rejects(sign(swapped, { code, ticket: sent.ticket }), /isn't the email address bound/);
+  // The ticket is bound to the transaction, the address and the PKP, so it can't be used for another transaction.
   const changed = bound.clone();
   changed.outputs[changed.outputs.length - 1].capacity -= 1n;
-  await assert.rejects(sign(changed, { code, ticket: sent.ticket }), /isn't right/);
-  // An expired or far-future ticket is refused.
-  await assert.rejects(sign(bound, { code, ticket: `v1.${Date.now() - 1}.${"0".repeat(32)}` }), /expired/);
-  await assert.rejects(sign(bound, { code, ticket: `v1.${Date.now() + 3_600_000}.${"0".repeat(32)}` }), /ticket is invalid/);
+  await assert.rejects(sign(changed, { code, ticket: sent.ticket }), /ticket is invalid/);
+  // Only the Action issues tickets: one made up, or a real one with its expiry or random part changed, is refused
+  // before any code is compared, so guessing a code always costs an email the user sees.
+  const [, expiry, random, tag] = sent.ticket.split(".");
+  assert.match(sent.ticket, /^v2\.\d{13}\.[0-9a-f]{32}\.[0-9a-f]{64}$/);
+  for (const ticket of [`v1.${Date.now() + 60_000}.${"0".repeat(32)}`, `v2.${Number(expiry) + 1}.${random}.${tag}`, `v2.${expiry}.${"0".repeat(32)}.${tag}`, `v2.${expiry}.${random}.${"0".repeat(64)}`]) {
+    await assert.rejects(sign(bound, { code, ticket }), /ticket is invalid/);
+  }
+  // A real ticket stops working once it expires.
+  const realNow = Date.now;
+  Date.now = () => Number(expiry) + 1;
+  try { await assert.rejects(sign(bound, { code, ticket: sent.ticket }), /expired/); } finally { Date.now = realNow; }
   const signed = await sign(bound, { code, ticket: sent.ticket });
   assert.equal(signed.hash(), plan.transaction.hash());
 });
@@ -335,6 +345,48 @@ test("an account that turned recovery on before the policy Action keeps its serv
   const result = await policySignTransaction(change.transaction.clone(), groups, listClient, wallet, { enableTransactionHash: recovery.enableTransactionHash, backups: all }, runner(action));
   assert.equal(result.hash(), change.transaction.hash());
   await assert.rejects(action.main({ mode: "send-code", pkpId, transaction: JSON.parse(ccc.stringify(change.transaction)), enableTransactionHash: recovery.enableTransactionHash, backups: await litBackupIds(listClient, all), emailApiKey: "re_test_sending_key" }), /doesn't need an email code/);
+});
+
+test("a list made before the binding, on an account with send limits on: a backup change needs the code at the limits' address", async () => {
+  const backups = [evm(21)];
+  const { funding, client } = await funded();
+  const plan = await planRecovery(client, walletFor(), backups, { emailBinding: false });
+  const signed = plan.transaction.clone();
+  await signed.prepareSighashAllWitness(plan.secp, 65, client);
+  const digest = (await signed.getSignHashInfo(plan.secp, client))!.message;
+  const raw = secp256k1.sign(ccc.bytesFrom(digest), privateKey, { prehash: false, format: "recovered" } as never) as Uint8Array;
+  const witness = signed.getWitnessArgsAt(0)!;
+  witness.lock = ccc.hexFrom(Uint8Array.from([...raw.slice(1), raw[0]]));
+  signed.setWitnessArgsAt(0, witness);
+  const env = world([funding, signed]);
+  const action = await loadAction(env);
+  // A send-limit cell this key made at its secp256k1 address, bound to the account's email.
+  const more = ccc.Transaction.from({ inputs: [{ previousOutput: { txHash: `0x${"ee".repeat(32)}`, index: 0 } }], outputs: [{ lock: plan.secp, capacity: 500n * CKB }], outputsData: ["0x"] });
+  const input = ccc.CellInput.from({ previousOutput: { txHash: more.hash(), index: 0 } });
+  const typeId = ccc.Script.from({ codeHash: "0x00000000000000000000000000000000000000000000000000545950455f4944", hashType: "type", args: ccc.hashTypeId(input, 0) });
+  const settings = encodeSendLimitSettings({ fingerprint: ccc.hexFrom(await action.emailFingerprint(pkpId, "user@example.com")), tokensUnlimited: true, tokens: new Map(), ckb: 100n * CKB });
+  env.add(more);
+  env.add(ccc.Transaction.from({ inputs: [input], outputs: [{ lock: plan.secp, type: typeId, capacity: 174n * CKB }, { lock: plan.secp, capacity: 325n * CKB }], outputsData: [settings, "0x"] }));
+  const recovery: KeyWayRecovery = {
+    omnilockArgs: plan.omnilock.args, omnilock: KEYWAY_OMNILOCK.testnet, adminListTypeArgs: plan.adminListType.args, adminListTypeHash: plan.adminListType.hash(),
+    adminListOutPoint: { txHash: signed.hash(), index: 0 }, enableTransactionHash: signed.hash(), legacyAddress: plan.preview.legacyAddress, enabledAt: "2026-10-01T00:00:00.000Z", backups,
+  };
+  const listClient = await offlineClient([funding, signed], [`${funding.hash()}:0`, `${funding.hash()}:1`]);
+  const change = await planBackupChange(listClient, walletFor(recovery), { change: "add", backup: evm(22) });
+  const groups = [{ script: change.listLock, kind: "omnilock" as const }, { script: change.omnilock, kind: "omnilock" as const }];
+  const all = [...backups, evm(22)];
+  const ids = await litBackupIds(listClient, all);
+  const base = { enableTransactionHash: recovery.enableTransactionHash, backups: all };
+  // No code: refused. A code to another address: refused before anything is sent.
+  await assert.rejects(policySignTransaction(change.transaction.clone(), groups, listClient, wallet, { ...base, email: "user@example.com" }, runner(action)), /eight-digit code/);
+  const sentBefore = env.emails.length;
+  await assert.rejects(action.main({ mode: "send-code", pkpId, transaction: JSON.parse(ccc.stringify(change.transaction)), enableTransactionHash: recovery.enableTransactionHash, backups: ids, email: "attacker@example.com", emailApiKey: "re_test_sending_key", appName: "Demo" }), /bound to this account's send limits/);
+  assert.equal(env.emails.length, sentBefore);
+  // The code at the limits' address signs.
+  const sent = await action.main({ mode: "send-code", pkpId, transaction: JSON.parse(ccc.stringify(change.transaction)), enableTransactionHash: recovery.enableTransactionHash, backups: ids, email: "user@example.com", emailApiKey: "re_test_sending_key", appName: "Demo" }) as { ticket: string; sentTo: string };
+  assert.equal(sent.sentTo, "user@example.com");
+  const result = await policySignTransaction(change.transaction.clone(), groups, listClient, wallet, { ...base, email: "user@example.com", emailCode: { code: codeIn(env.emails.at(-1)!), ticket: sent.ticket } }, runner(action));
+  assert.equal(result.hash(), change.transaction.hash());
 });
 
 test("a key with a recovery list can't make a second one, or move funds to an address naming another list", async () => {
