@@ -881,6 +881,7 @@ test("a node whose submitted funding can never confirm, as a cell it spends was 
 });
 
 test("a node with channels whose start fails stops no other node again until it has run", async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const { module, root, request, running, markedNode } = await host(context);
   assert.equal(await request(A), 200);
   assert.equal(await request(B), 200);
@@ -891,8 +892,9 @@ test("a node with channels whose start fails stops no other node again until it 
   assert.equal(running().length, 1);
   const stopped = [A, B].find((user) => !running().includes(user))!;
   assert.equal(await request(stopped), 200);
-  // Its retries find no room, and stop nobody.
+  // Its retries find no room, and stop nobody, even once the other nodes are past their first minute.
   await until(async () => (await readFile(join(root, "users", F, "failed-starts"), "utf8").catch(() => "")).length >= 1);
+  context.mock.timers.tick(61_000);
   await new Promise((resolve) => setTimeout(resolve, 2_500));
   assert.deepEqual(running(), [A, B]);
   assert.equal(module.readiness().offline, 1);

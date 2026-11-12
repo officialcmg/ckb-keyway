@@ -320,7 +320,12 @@ async function fileExists(path) {
 /** Marks a node by its current channels (marked if they can't be read) and records that it has been checked. */
 async function checkChannels(userId, node) {
   let holds = true;
-  try { holds = await holdsChannels(await nodeChannels(node), await fundingRecord(userId)); } catch {}
+  try {
+    holds = await holdsChannels(await nodeChannels(node), await fundingRecord(userId));
+  } catch {
+    // A node that stopped meanwhile is checked on its next start instead; one that still runs is marked.
+    if (nodes.get(userId) !== node) return;
+  }
   // A node handing over signed funding keeps its marker whatever its channels show yet.
   if (!holds && submittingNow(userId)) return;
   await markChannels(userId, holds);
@@ -384,6 +389,8 @@ async function ensureNode(userId, { provision = true } = {}) {
   if (shuttingDown) throw new Error("Managed host is shutting down");
   const full = new Set([...nodes.keys(), ...starting.keys()]).size >= maxNodes();
   if (full && !priority && Date.now() - noRoomAt < NO_ROOM_RETRY_MS) throw new RoomError("Managed node capacity is full");
+  // A node whose last start failed takes no other node's place until it has run, or ten minutes have passed.
+  if (full && failing) throw new RoomError("Managed node capacity is full");
   // A node with channels that found no room waits before scanning every node again.
   if (full && priority && Date.now() - (priorityNoRoomAt.get(userId) ?? -Infinity) < PRIORITY_NO_ROOM_RETRY_MS) {
     throw new RoomError("Managed node capacity is full");
@@ -728,6 +735,8 @@ async function startNode(userId) {
     await waitForExit(child);
     throw new Error("Managed host is shutting down");
   }
+  // A process that died as its RPC answered is not registered as running.
+  if (child.exitCode !== null || child.signalCode !== null) throw new Error("Fiber node exited during startup");
   node.lastUsed = ++uses;
   node.startedAt = Date.now();
   nodes.set(userId, node);
