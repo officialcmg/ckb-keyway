@@ -164,7 +164,7 @@ test("turning recovery on: preview, emailed code, enable", { skip: !enabled }, a
     await recoverySetup(h.context(h.wallet), { operation: "request-email-code", backups: [h.proof], confirmationNonce: nonce });
     assert.equal(h.emails.length, 1);
     assert.match(h.emails[0].subject, /Turn on account recovery/);
-    assert.match(h.emails[0].plaintext, new RegExp(`Backup: EVM wallet ${h.proof.address.slice(0, 10)}`));
+    assert.ok(h.emails[0].plaintext.includes(`Backup: EVM wallet ${h.proof.address}\n`), h.emails[0].plaintext);
     assert.match(h.emails[0].plaintext, /Your address will change because you're turning on recovery\./);
     const wrong = h.codeFrom() === "000000" ? "111111" : "000000";
     await assert.rejects(recoverySetup(h.context(h.wallet), { operation: "enable", backups: [h.proof], confirmationNonce: nonce, emailCode: wrong }), /isn't right/);
@@ -443,7 +443,7 @@ test("adding and removing backups: preview, emailed code, apply", { skip: !enabl
     await assert.rejects(recoveryBackupChange(h.context(enabledWallet), { operation: "apply", change: "add", backup: proof, confirmationNonce: preview.confirmationNonce, emailCode: "123456" }), /expired/);
     await recoveryBackupChange(h.context(enabledWallet), { operation: "request-email-code", change: "add", backup: proof, confirmationNonce: preview.confirmationNonce });
     assert.match(h.emails.at(-1)!.subject, /Add a recovery backup/);
-    assert.match(h.emails.at(-1)!.plaintext, new RegExp(`Adding: EVM wallet ${second.address.slice(0, 10)}`));
+    assert.ok(h.emails.at(-1)!.plaintext.includes(`Adding: EVM wallet ${second.address}\n`), h.emails.at(-1)!.plaintext);
     assert.match(h.emails.at(-1)!.plaintext, /move everything in your account without KeyWay/);
     // Without the backup's own signature, or with another one, nothing is applied.
     await assert.rejects(recoveryBackupChange(h.context(enabledWallet), { operation: "apply", change: "add", backup, confirmationNonce: preview.confirmationNonce, emailCode: h.codeFrom() }), /approval request is invalid/);
@@ -638,6 +638,8 @@ test("with the policy Action: Lit emails the code, binds the email on chain, and
   const added = await changeThroughLit(current, { change: "add", backup: joyProof });
   assert.ok(added.email.text.includes(`Adding: JoyID ${joy.address}\n`), added.email.text);
   assert.match(added.email.text, /Backups after this change: 3/);
+  // The notice once it's on chain names the passkey by its whole address too.
+  assert.ok(h.emails.at(-1)!.plaintext.includes(`JoyID ${joy.address}\n`), h.emails.at(-1)!.plaintext);
   current = added.wallet;
   assert.equal(current.recovery!.backups!.length, 3);
   assert.deepEqual(onChainAuths(), await saltedAuths(current));

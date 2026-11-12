@@ -29,21 +29,16 @@ const note = (palette: ModalPalette): CSSProperties => ({ ...modalCopy, margin: 
 const details: CSSProperties = { textAlign: "left", fontSize: 12, margin: "8px 0 0" };
 const detailLine: CSSProperties = { margin: "8px 0 0", fontFamily: "ui-monospace, monospace", overflowWrap: "anywhere" };
 
-function shortAddress(value: string): string {
-  return value.length <= 24 ? value : `${value.slice(0, 12)}…${value.slice(-6)}`;
-}
-
 /** Escape cancels; while the approved step runs it only hides the dialog, like Close. */
 const escape = (_step: ApprovalStep | undefined, answer: (approved: boolean) => void) => () => answer(false);
 
 type ApprovalProps<P> = { theme: Theme; appName: string; preview: P; step?: ApprovalStep; answer: (approved: boolean) => void };
 
-/** A token's change for people: "25 RUSD", or the raw amount with a short ID when KeyWay can't name it. */
+/** A token's change for people: "25 RUSD", or the raw amount with the token's whole ID when KeyWay can't name it. */
 function tokenText(token: TransactionPreview["tokens"][number]): string {
   const raw = BigInt(token.amount.replace(/^\+/, ""));
   const size = raw < 0n ? -raw : raw;
-  if (token.amountText) return token.amountText.replace(/^[+-]/, "");
-  return token.asset ? formatAsset(size, token.asset) : `${size} of token ${token.id}`;
+  return formatAsset(size, token.asset);
 }
 
 /** The built-in approval dialog for a transaction, drawn from the backend's decoding of its effects. */
@@ -60,14 +55,14 @@ export function KeyWayTransactionModal({ theme, appName, preview, step, answer }
           <h2 id="keyway-transaction-title" style={modalTitle}>{title}</h2>
           {preview.unrecognized.length > 0 && (
             <p role="alert" style={errorNote(palette)}>
-              This transaction uses {preview.unrecognized.length === 1 ? "a script" : "scripts"} KeyWay doesn&apos;t recognize ({preview.unrecognized.map((item) => `${item.codeHash}, ${item.cells} cell${item.cells === 1 ? "" : "s"}`).join("; ")}). Only approve it if you trust {appName}.
+              This transaction uses {preview.unrecognized.length === 1 ? "a script" : "scripts"} KeyWay doesn&apos;t recognize ({preview.unrecognized.map((item) => `${item.codeHash} (${item.hashType}), ${item.cells} cell${item.cells === 1 ? "" : "s"}`).join("; ")}). Only approve it if you trust {appName}.
             </p>
           )}
           <dl style={{ ...fundingDetails, margin: "16px 0" }}>
             {sending && <Row palette={palette} label="You send" value={`${preview.sendingCkb} CKB`} />}
             {preview.receivingCkb !== "0" && <Row palette={palette} label="You receive" value={`${preview.receivingCkb} CKB`} />}
-            {preview.tokens.map((token) => <Row key={`t-${token.id}`} palette={palette} label={token.amount.startsWith("-") ? "You send" : "You receive"} value={tokenText(token)} />)}
-            {preview.nfts.map((nft) => <Row key={`n-${nft.id}`} palette={palette} label={`${nft.kind} ${nft.change}`} value={nft.id} />)}
+            {preview.tokens.map((token) => <Row key={`t-${token.asset}`} palette={palette} label={token.amount.startsWith("-") ? "You send" : "You receive"} value={tokenText(token)} />)}
+            {preview.nfts.map((nft, index) => <Row key={`n-${index}`} palette={palette} label={`${nft.kind} ${nft.change}`} value={nft.id} />)}
             {preview.dao.map((action, index) => <Row key={`d-${index}`} palette={palette} label={`Nervos DAO ${action.action}`} value={`${action.amountCkb} CKB`} />)}
             {preview.recipients.map((recipient) => (
               <Row
@@ -78,7 +73,7 @@ export function KeyWayTransactionModal({ theme, appName, preview, step, answer }
                   {/* The whole address: two look-alike addresses can share their start and their checksum. */}
                   {recipient.address}
                   <span style={{ display: "block", color: palette.muted }}>
-                    {[`${recipient.ckb} CKB`, ...recipient.tokens.map((token) => token.amountText ?? `${token.amount} of token ${token.id}`), ...recipient.nfts].join(" · ")}
+                    {[`${recipient.ckb} CKB`, ...recipient.tokens.map((token) => formatAsset(BigInt(token.amount), token.asset)), ...recipient.nfts].join(" · ")}
                   </span>
                 </>}
               />
@@ -90,7 +85,7 @@ export function KeyWayTransactionModal({ theme, appName, preview, step, answer }
           {preview.requiresEmailCode && !step?.failure && <p style={note(palette)}>This reaches your email confirmation amount, so we&apos;ll email you a code next.</p>}
           <details style={{ ...details, color: palette.muted }}>
             <summary style={{ cursor: "pointer" }}>Details</summary>
-            {preview.tokens.map((token) => <p key={`d-${token.id}`} style={detailLine}>Token {token.asset ?? token.id} ({token.standard}) {token.amount}</p>)}
+            {preview.tokens.map((token) => <p key={`d-${token.asset}`} style={detailLine}>Token {token.asset} ({token.standard}) {token.amount}</p>)}
             {preview.recipients.map((recipient) => <p key={`r-${recipient.address}`} style={detailLine}>To {recipient.address}</p>)}
             <CellList title="Inputs" cells={preview.details.inputs} />
             <CellList title="Outputs" cells={preview.details.outputs} />
@@ -257,7 +252,7 @@ export function KeyWayChannelCloseModal({ theme, appName, preview, step, answer,
           <h2 id="keyway-close-title" style={modalTitle}>{preview.force ? "Force-close this channel?" : "Close this channel?"}</h2>
           <dl style={{ ...fundingDetails, margin: "16px 0" }}>
             <Row palette={palette} label="Returns to you, before the closing fee" value={preview.returningText} />
-            <Row palette={palette} label="Peer" value={shortAddress(preview.peer)} />
+            <Row palette={palette} label="Peer" value={preview.peer} />
             <Row palette={palette} label="Network" value={preview.network} mono={false} />
           </dl>
           <p style={note(palette)}>
@@ -284,7 +279,7 @@ export function KeyWayPeerModal({ theme, appName, preview, step, answer }: Appro
           <p style={{ ...modalEyebrow, color: palette.muted }}>{appName} · FIBER PEER</p>
           <h2 id="keyway-peer-title" style={modalTitle}>{connect ? "Connect to this peer?" : "Disconnect this peer?"}</h2>
           <dl style={{ ...fundingDetails, margin: "16px 0" }}>
-            {preview.pubkey && <Row palette={palette} label="Node ID" value={shortAddress(preview.pubkey)} />}
+            {preview.pubkey && <Row palette={palette} label="Node ID" value={preview.pubkey} />}
             {preview.address && <Row palette={palette} label="Address" value={preview.address} />}
           </dl>
           <p style={note(palette)}>
@@ -347,7 +342,7 @@ export function KeyWayChannelSettingsModal({ theme, appName, preview, step, answ
             {preview.changes.map((change) => (
               <Row key={change.setting} palette={palette} label={SETTING_LABELS[change.setting]} value={`${settingText(change.setting, change.from, preview.asset)} → ${settingText(change.setting, change.to, preview.asset)}`} />
             ))}
-            <Row palette={palette} label="Peer" value={shortAddress(preview.peer)} />
+            <Row palette={palette} label="Peer" value={preview.peer} />
           </dl>
           <p style={note(palette)}>These settings apply to payments other people route through this channel. No funds move.</p>
           <Actions palette={palette} confirm="Save settings" busyLabel="Saving…" step={step} answer={answer} />
@@ -373,7 +368,7 @@ export function KeyWayRecoveryModal({ theme, appName, preview, step, answer }: A
             <Row palette={palette} label="Locked for the recovery list" value={`${preview.adminListCkb} CKB`} />
             {preview.tokenCellsExtraCkb !== "0" && <Row palette={palette} label="Locked in token cells" value={`${preview.tokenCellsExtraCkb} CKB`} />}
             <Row palette={palette} label="Network fee" value={`${preview.feeCkb} CKB`} />
-            <Row palette={palette} label="New address" value={shortAddress(preview.newAddress)} />
+            <Row palette={palette} label="New address" value={preview.newAddress} />
             <Row palette={palette} label="Network" value={preview.network} mono={false} />
           </dl>
           <p role="note" style={errorNote(palette)}>Your address will change because you&apos;re turning on recovery.</p>
@@ -383,7 +378,6 @@ export function KeyWayRecoveryModal({ theme, appName, preview, step, answer }: A
           </p>
           <details style={{ ...details, color: palette.muted }}>
             <summary style={{ cursor: "pointer" }}>Details</summary>
-            <p style={detailLine}>New address {preview.newAddress}</p>
             <p style={detailLine}>Transaction {preview.transactionHash}</p>
           </details>
           <Actions palette={palette} confirm="Turn on recovery" busyLabel="Sending code…" step={step} answer={answer} />
@@ -435,7 +429,7 @@ export function KeyWayFundingModal({ theme, appName, preview, step, answer }: Ap
           <dl style={{ ...fundingDetails, margin: "16px 0" }}>
             {preview.token && <Row palette={palette} label="Channel funding" value={preview.token.amountText} />}
             <Row palette={palette} label={preview.token ? "CKB reserve" : "Channel funding"} value={`${preview.amountCkb} CKB`} />
-            {preview.peer && <Row palette={palette} label="Peer" value={shortAddress(preview.peer)} />}
+            {preview.peer && <Row palette={palette} label="Peer" value={preview.peer} />}
             {preview.feeReserveCkb && <Row palette={palette} label="Fee reserve" value={`${preview.feeReserveCkb} CKB`} />}
             <Row palette={palette} label="Network fee" value={`${preview.feeCkb} CKB`} />
             <Row palette={palette} label="Network" value="CKB testnet" mono={false} />

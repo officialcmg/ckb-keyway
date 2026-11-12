@@ -2,8 +2,10 @@
 // scripts/approval-fixtures.ts):
 // - tests/fixtures/approval-text-cases.json: random scripts and amounts with the full address CCC produces and
 //   the approval text the SDK builds (null when it is too long);
-// - tests/fixtures/approval-transaction-cases.json: random transactions spending an account's cells, with the
-//   text the SDK's `rescueApproval` reads from them, or null when it refuses them as not a rescue.
+// - tests/fixtures/approval-transaction-cases.json: random transactions spending an account's cells (plain and
+//   token cells, some of them someone else's), with the text the SDK's `rescueApproval` reads from them, or null
+//   when it refuses them as not a rescue: among them token cells changed, left out, moved twice, taken from
+//   someone else, made under a type script the account didn't hold, or given more CKB than they held.
 import { writeFileSync } from "node:fs";
 import * as ccc from "@ckb-ccc/core";
 import { recoveryApprovalText, rescueApproval } from "../src/sdk/browser/recovery-approval.ts";
@@ -46,35 +48,61 @@ const account = ccc.Script.from({ codeHash: ccc.hashCkb("0x00"), hashType: "data
 const randomScript = (argsLength = Math.floor(random() * 60)) => ccc.Script.from({ codeHash: bytes(32), hashType: pick(Object.keys(hashTypes) as ccc.HashType[]), args: bytes(argsLength) });
 const json = (script: ccc.Script) => ({ codeHash: script.codeHash, hashType: script.hashType, args: script.args });
 const transactions = [];
-for (let index = 0; index < 120; index++) {
+type Cell = { lock: ccc.Script; type?: ccc.Script; data: ccc.Hex; capacity: bigint };
+for (let index = 0; index < 160; index++) {
   const network = pick([...networks]);
   const destination = randomScript();
-  const outputs = Array.from({ length: 1 + Math.floor(random() * 6) }, () => {
-    const roll = random();
-    const lock = roll < 0.04 ? account : roll < 0.08 ? randomScript() : destination;
-    const typed = random() < 0.4;
-    return {
-      lock, type: typed ? randomScript(32) : undefined,
-      data: typed ? ccc.hexFrom(bytes(16)) : random() < 0.05 ? ccc.hexFrom(bytes(4)) : "0x",
-      capacity: 6_100_000_000n + bigRandom(10n ** 13n),
-    };
-  });
-  const outputTotal = outputs.reduce((sum, output) => sum + output.capacity, 0n);
-  const inputCount = 1 + Math.floor(random() * 4);
-  const extra = random() < 0.05 ? -1n : pick([0n, 765n, bigRandom(10n ** 8n)]);
-  const inputs = Array.from({ length: inputCount }, (_, at) => ({
-    lock: at === 0 || random() < 0.8 ? account : randomScript(20),
-    capacity: at === 0 ? outputTotal + extra : 6_100_000_000n + bigRandom(10n ** 11n),
+  // The account's token cells, which an honest rescue moves to the destination one to one, unchanged.
+  const tokenInputs: Cell[] = Array.from({ length: Math.floor(random() * 4) }, () => ({
+    lock: account, type: randomScript(32), data: ccc.hexFrom(bytes(16)), capacity: 20_000_000_000n + bigRandom(10n ** 11n),
   }));
-  const inputTotal = inputs.reduce((sum, input) => sum + input.capacity, 0n);
-  const transaction = ccc.Transaction.from({ outputs: outputs.map(({ lock, type, capacity }) => ({ lock, type, capacity })), outputsData: outputs.map(({ data }) => data) });
+  // Sometimes two of them are identical (same type script and data): each must still move once.
+  if (tokenInputs.length > 1 && random() < 0.15) tokenInputs[1] = { ...tokenInputs[0] };
+  let moved = tokenInputs.map((cell) => ({ ...cell, lock: destination }));
+  // What a builder might try behind the same "N token cells" text instead.
+  const roll = random();
+  if (roll < 0.06 && moved.length > 0) moved[0] = { ...moved[0], data: ccc.hexFrom(bytes(16)) }; // a token cell changed (burned in part)
+  else if (roll < 0.12 && moved.length > 0) moved = moved.slice(1); // a token cell left out (burned)
+  else if (roll < 0.18) moved.push({ lock: destination, type: randomScript(32), data: ccc.hexFrom(bytes(8)), capacity: 20_000_000_000n }); // CKB under a type script the account didn't hold
+  else if (roll < 0.22 && moved.length > 0) moved[0] = { ...moved[0], type: randomScript(32) }; // the same data under another type script
+  else if (roll < 0.26 && moved.length > 0) moved.push({ ...moved[0] }); // one token cell moved twice
+  else if (roll < 0.30 && moved.length > 0) moved[0] = { ...moved[0], capacity: moved[0].capacity + 100_000_000n }; // a token cell given more CKB than it held
+  const plain = Array.from({ length: Math.floor(random() * 3) }, (): Cell => {
+    const other = random();
+    return { lock: other < 0.04 ? account : other < 0.08 ? randomScript() : destination, data: random() < 0.05 ? ccc.hexFrom(bytes(4)) : "0x", capacity: 6_100_000_000n + bigRandom(10n ** 13n) };
+  });
+  const outputs = [...moved, ...plain].sort(() => random() - 0.5);
+  if (outputs.length === 0) outputs.push({ lock: destination, data: "0x", capacity: 6_100_000_000n + bigRandom(10n ** 13n) });
+  const outputTotal = outputs.reduce((sum, output) => sum + output.capacity, 0n);
+  const tokenTotal = tokenInputs.reduce((sum, cell) => sum + cell.capacity, 0n);
+  const extra = random() < 0.05 ? -1n : pick([0n, 765n, bigRandom(10n ** 8n)]);
+  // Plain inputs: the first pays for the outputs; others may be the account's or someone else's, sometimes with a
+  // type script of their own (someone else's token cell isn't the account's to move).
+  const plainInputs: Cell[] = Array.from({ length: 1 + Math.floor(random() * 3) }, (_, at) => {
+    const foreign = at > 0 && random() >= 0.8;
+    const typed = foreign && random() < 0.5;
+    return { lock: foreign ? randomScript(20) : account, type: typed ? randomScript(32) : undefined, data: typed ? ccc.hexFrom(bytes(16)) : "0x", capacity: at === 0 ? 0n : 6_100_000_000n + bigRandom(10n ** 11n) };
+  });
+  const first = outputTotal + extra - tokenTotal;
+  plainInputs[0].capacity = first > 0n ? first : 1n;
+  // A token cell moved from someone else's input rather than the account's.
+  if (random() < 0.05 && tokenInputs.length > 0) tokenInputs[0] = { ...tokenInputs[0], lock: randomScript(20) };
+  const inputs = [...tokenInputs, ...plainInputs].sort(() => random() - 0.5);
+  const transaction = ccc.Transaction.from({
+    inputs: inputs.map((_, at) => ({ previousOutput: { txHash: ccc.hexFrom(ccc.numBeToBytes(at + 0x100, 32)), index: 0 } })),
+    outputs: outputs.map(({ lock, type, capacity }) => ({ lock, type, capacity })),
+    outputsData: outputs.map(({ data }) => data),
+  });
   const sighash = ccc.hexFrom(bytes(32));
   let text: string | null;
-  try { text = recoveryApprovalText(network.client, rescueApproval(transaction, account, inputTotal), sighash); } catch { text = null; }
+  try {
+    text = recoveryApprovalText(network.client, rescueApproval(transaction, account, inputs.map(({ lock, type, data, capacity }) => ({ cellOutput: { lock, type, capacity }, outputData: data }))), sighash);
+  } catch { text = null; }
   transactions.push({
     network: network.name, account: json(account), sighash, text,
-    inputs: inputs.map(({ lock, capacity }) => ({ lock: json(lock), capacity: capacity.toString() })),
-    outputs: outputs.map(({ lock, type, data, capacity }) => ({ lock: json(lock), type: type ? json(type) : null, data, capacity: capacity.toString() })),
+    inputs: inputs.map(({ lock, type, data, capacity }) => ({ lock: json(lock), type: type ? json(type) : null, data, capacity: capacity.toString() })),
+    // The capacities as the transaction holds them: CCC raises one below its cell's occupied size.
+    outputs: outputs.map(({ lock, type, data }, at) => ({ lock: json(lock), type: type ? json(type) : null, data, capacity: transaction.outputs[at].capacity.toString() })),
   });
 }
 writeFileSync(new URL("../tests/fixtures/approval-transaction-cases.json", import.meta.url), JSON.stringify(transactions, null, 1) + "\n");

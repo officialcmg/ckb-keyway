@@ -430,8 +430,9 @@ export function weakens(before: DailyAmounts, after: DailyAmounts): boolean {
   });
 }
 
+/** A token by its whole ID (type script hash): a shortened one could be ground to match another token's. */
 function assetName(asset: string): string {
-  return asset === "ckb" ? "CKB" : `token ${asset.slice(0, 10)}…${asset.slice(-6)}`;
+  return asset === "ckb" ? "CKB" : `token ${asset}`;
 }
 
 function describeAmount(amounts: DailyAmounts, asset: string): string {

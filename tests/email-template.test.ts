@@ -3,6 +3,7 @@ import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
 import { createConfirmationEmailTemplate, createOtpEmailTemplate, createRecoveryNoticeEmailTemplate } from "../src/server/email-template";
 import { previewSummaryLines, type TransactionPreview } from "../src/server/transaction-policy.ts";
+import { recoveryLines } from "../src/server/recovery.ts";
 
 test("OTP email keeps the code selectable, prominent, and paired with a plaintext alternative", () => {
   const email = createOtpEmailTemplate("My Fiber App", "{{ STYTCH_VARIABLE }}");
@@ -39,20 +40,20 @@ const address = (byte: number) => ccc.Address.fromScript(ccc.Script.from({
 function preview(recipients: number): TransactionPreview {
   return {
     network: "CKB testnet", sendingCkb: "1100", receivingCkb: "0", feeCkb: "0.0001",
-    tokens: [{ id: "0x55555555…5555", asset: `0x${"55".repeat(32)}`, standard: "xUDT", amount: "-1000", amountText: "-1000 of token 0x55555555…5555" }],
+    tokens: [{ id: "0x55555555…5555", asset: `0x${"55".repeat(32)}`, standard: "xUDT", amount: "-1000", amountText: `-1000 of token 0x${"55".repeat(32)}` }],
     nfts: [], dao: [],
     recipients: Array.from({ length: recipients }, (_, index) => ({ address: address(index + 1), kind: "wallet" as const, walletType: "standard", ckb: "100", tokens: [], nfts: [] })),
-    unrecognized: [{ codeHash: "0x9f9f9f9f…9f9f", cells: 1 }],
+    unrecognized: [{ codeHash: `0x${"9f".repeat(32)}`, hashType: "type", cells: 1 }],
     otherSigners: 0, details: { inputs: [], outputs: [] }, transactionHash: `0x${"ab".repeat(32)}`,
   };
 }
 
 test("the confirmation email never drops what a transaction does to the account's assets", () => {
-  const lines = previewSummaryLines(preview(11));
+  const lines = previewSummaryLines(preview(13));
   const email = createConfirmationEmailTemplate("Acme Pay", "123456", "Confirm a transaction", lines);
   for (const body of [email.plaintext, email.html]) {
-    assert.match(body, /Token -1000 of token 0x55555555…5555/);
-    assert.match(body, /Unrecognized script 0x9f9f9f9f…9f9f/);
+    assert.ok(body.includes(`Token -1000 of token 0x${"55".repeat(32)} (xUDT 0x${"55".repeat(32)})`));
+    assert.ok(body.includes(`Unrecognized script 0x${"9f".repeat(32)} (type, 1 cells)`));
     // Whatever doesn't fit is said to be missing, not silently left out.
     assert.match(body, /and \d+ more/);
   }
@@ -87,4 +88,16 @@ test("a recipient line too long for the email keeps its amount and is marked as 
   // A line that fits is left as it is.
   const short = createConfirmationEmailTemplate("Acme Pay", "123456", "Confirm a transaction", previewSummaryLines(preview(1)));
   assert.doesNotMatch(short.plaintext, /…$/m);
+});
+
+test("turning recovery on with all 8 backups emails every backup and every amount", () => {
+  const backups = Array.from({ length: 8 }, (_, index) => ({ kind: "evm" as const, address: `0x${(index + 1).toString(16).padStart(2, "0").repeat(20)}`, label: `EVM wallet 0x${(index + 1).toString(16).padStart(2, "0").repeat(20)}` }));
+  const lines = recoveryLines({
+    network: "CKB testnet", newAddress: address(9), legacyAddress: address(10), backups,
+    adminListCkb: "165", minimumCellCkb: "95", tokenCellsExtraCkb: "0", lockedCkb: "165", feeCkb: "0.00000981", movedCkb: "9802.99999019",
+    tokens: [], cellsLeft: 0, transactionHash: `0x${"12".repeat(32)}`,
+  });
+  const email = createConfirmationEmailTemplate("Acme Pay", "123456", "Turn on account recovery", lines);
+  for (const line of lines) assert.ok(email.plaintext.includes(`${line}\n`), line);
+  assert.doesNotMatch(email.plaintext, /more not shown/);
 });

@@ -79,7 +79,7 @@ test("creates a JoyID backup from a CCC JoyID signer", async () => {
 
 const preview: RecoveryPreview = {
   network: "CKB testnet", newAddress: "ckt1qrejnmlar3r452tcg57gvq8patctcgy8acync0hxfnyka35ywafvkqgqnewaddress", legacyAddress: "ckt1qzda0old",
-  backups: [{ kind: "evm", address: `0x${"ab".repeat(20)}`, label: "EVM wallet 0xabababab…ababab" }],
+  backups: [{ kind: "evm", address: `0x${"ab".repeat(20)}`, label: `EVM wallet 0x${"ab".repeat(20)}` }],
   adminListCkb: "165", minimumCellCkb: "95", tokenCellsExtraCkb: "0", lockedCkb: "165", feeCkb: "0.00000981", movedCkb: "9802.99999019",
   tokens: [], cellsLeft: 0, transactionHash: `0x${"12".repeat(32)}`,
 };
@@ -142,11 +142,12 @@ test("a recovery change the network drops is reported, not taken as done", async
 test("the built-in dialog shows the backups, the CKB locked, the fee and the new address", () => {
   const html = renderToStaticMarkup(createElement(KeyWayRecoveryModal, { theme: "light", appName: "Acme Pay", preview, answer: () => undefined }));
   assert.match(html, /Turn on recovery\?/);
-  assert.match(html, /EVM wallet 0xabababab…ababab/);
+  assert.ok(html.includes(`EVM wallet 0x${"ab".repeat(20)}`));
   assert.match(html, /165 CKB/);
   assert.match(html, /0\.00000981 CKB/);
-  assert.match(html, /ckt1qrejnmla…ddress/);
-  assert.match(html, new RegExp(preview.newAddress));
+  // The new address is shown whole where the user approves, not as a start and a checksum.
+  assert.ok(html.includes(`>${preview.newAddress}<`), html);
+  assert.doesNotMatch(html, /…/);
   assert.match(html, /Your address will change because you&#x27;re turning on recovery\./);
   const code = renderToStaticMarkup(createElement(KeyWayEmailCodeModal, { theme: "light", reason: "recovery", resend: async () => undefined, answer: () => undefined }));
   assert.match(code, /confirm turning on recovery/);
@@ -154,8 +155,8 @@ test("the built-in dialog shows the backups, the CKB locked, the fee and the new
 
 const changePreview: BackupChangePreview = {
   network: "CKB testnet", change: "add",
-  backup: { kind: "evm", address: `0x${"cd".repeat(20)}`, label: "EVM wallet 0xcdcdcdcd…cdcdcd" },
-  backups: [preview.backups[0], { kind: "evm", address: `0x${"cd".repeat(20)}`, label: "EVM wallet 0xcdcdcdcd…cdcdcd" }],
+  backup: { kind: "evm", address: `0x${"cd".repeat(20)}`, label: `EVM wallet 0x${"cd".repeat(20)}` },
+  backups: [preview.backups[0], { kind: "evm", address: `0x${"cd".repeat(20)}`, label: `EVM wallet 0x${"cd".repeat(20)}` }],
   feeCkb: "0.00001274", transactionHash: `0x${"34".repeat(32)}`,
 };
 
@@ -201,7 +202,8 @@ test("adds and removes a backup: preview, the user's approval, then the emailed 
 test("the built-in backup dialog names the backup, what it can do, and the fee", () => {
   const html = renderToStaticMarkup(createElement(KeyWayBackupChangeModal, { theme: "light", appName: "Acme Pay", preview: changePreview, answer: () => undefined }));
   assert.match(html, /Add this backup\?/);
-  assert.match(html, /EVM wallet 0xcdcdcdcd…cdcdcd/);
+  assert.ok(html.includes(`EVM wallet 0x${"cd".repeat(20)}`));
+  assert.doesNotMatch(html, /…/);
   assert.match(html, /move everything in your account without KeyWay/);
   assert.match(html, /0\.00001274 CKB/);
   assert.match(html, /Your address doesn&#x27;t change/);
@@ -244,7 +246,7 @@ async function recoveryFixture() {
       return JSON.stringify({ alg: -7, signature: Buffer.from(der).toString("base64url"), message: Buffer.from(ccc.bytesConcat(authData, clientData)).toString("base64url") });
     },
   } as unknown as ccc.Signer;
-  const spend = (entry: (typeof list)[number]) => ({ client, lock, omnilock: KEYWAY_OMNILOCK.testnet, auths: list.map(({ auth }) => auth), entry, adminList: { txHash: `0x${"ad".repeat(32)}`, index: 0 }, inputCapacity: 1000n * 100_000_000n });
+  const spend = (entry: (typeof list)[number]) => ({ client, lock, omnilock: KEYWAY_OMNILOCK.testnet, auths: list.map(({ auth }) => auth), entry, adminList: { txHash: `0x${"ad".repeat(32)}`, index: 0 }, inputCells: [input] });
   return { tx, lock, destination, list, evm, joySigner, signs, spend, salt };
 }
 

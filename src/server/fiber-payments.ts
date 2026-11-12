@@ -119,7 +119,8 @@ async function payOnce(context: PaymentContext, node: FiberCaller, body: Record<
     const lines = [
       `Pay ${preview.amountText}${preview.description ? ` for "${preview.description}"` : ""}`,
       `Estimated network fee: ${preview.feeText}`,
-      ...(preview.payee ? [`To Fiber node ${preview.payee.slice(0, 10)}…${preview.payee.slice(-6)}`] : []),
+      // The whole node ID: a shortened one could be ground to match another node's.
+      ...(preview.payee ? [`To Fiber node ${preview.payee}`] : []),
     ];
     const confirmationNonce = await issueRequest(context.user, "payment", digest, { lines, outflow: outflow.toString(), asset }, requiresEmailCode);
     return { preview: { ...preview, requiresEmailCode }, confirmationNonce, requiresEmailCode };

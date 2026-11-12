@@ -173,6 +173,6 @@ test("even with funds at a forged address, the attacker's backup must sign a tex
       return ccc.hexFrom(ccc.bytesConcat(raw.slice(1), [raw[0] + 27]));
     },
   };
-  await signRecoverySpendWithEvm(drain, { client: after, lock: omnilock, omnilock: forged.omnilock, auths: list.auths, entry: (await recoveryListEntry(after, list, { kind: "evm", address: attackerEvm }))!, adminList: adminList.outPoint, inputCapacity: 5_000n * CKB }, wallet);
+  await signRecoverySpendWithEvm(drain, { client: after, lock: omnilock, omnilock: forged.omnilock, auths: list.auths, entry: (await recoveryListEntry(after, list, { kind: "evm", address: attackerEvm }))!, adminList: adminList.outPoint, inputCells: [swept] }, wallet);
   assert.match(shown, new RegExp(`^KeyWay recovery\nMove everything to ${ccc.Address.fromScript(attackerSecp, after).toString()}\nCKB: 4,999\nTokens: none\nFee: 1 CKB\nTransaction: 0x[0-9a-f]{64}$`));
 });

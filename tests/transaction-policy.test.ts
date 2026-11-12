@@ -135,7 +135,56 @@ test("shows an NFT leaving the account and flags unrecognized scripts", () => {
   assert.equal(preview.nfts[0].change, "sent");
   assert.equal(preview.unrecognized.length, 1);
   assert.equal(preview.unrecognized[0].cells, 2);
+  // By its whole code hash.
+  assert.equal(preview.unrecognized[0].codeHash, mystery.codeHash);
+  assert.ok(previewSummaryLines(preview).includes(`Unrecognized script ${mystery.codeHash} (type, 2 cells)`));
+  // The same code hash run another way is another program, and is listed apart.
+  const other = ccc.Script.from({ ...mystery, hashType: "data1" });
+  const both = build(
+    [{ lock: own, capacity: 500n * CKB, type: mystery }, { lock: own, capacity: 500n * CKB, type: other }],
+    [{ lock: contract, capacity: 500n * CKB, type: mystery }, { lock: own, capacity: 500n * CKB - 4_000n, type: other }],
+  ).preview;
+  assert.deepEqual(both.unrecognized, [{ codeHash: mystery.codeHash, hashType: "type", cells: 2 }, { codeHash: mystery.codeHash, hashType: "data1", cells: 2 }]);
+  assert.ok(both.details.outputs.every(({ type }) => !type?.includes("…")));
+  assert.equal(both.details.outputs[0].lock, contract.hash());
   assert.equal(preview.recipients.find((recipient) => recipient.kind === "contract")?.ckb, "499.99996");
+});
+
+test("names NFTs and tokens by their whole ID, and keeps tokens apart that a short ID would merge", () => {
+  // Two xUDT tokens ground (in seconds) so their type script hashes share the old short form, 0xbdb681…72b5.
+  const twinA = ccc.Script.from({ codeHash: known.xudt.codeHash, hashType: "type", args: `0x71d40e${"00".repeat(29)}` });
+  const twinB = ccc.Script.from({ codeHash: known.xudt.codeHash, hashType: "type", args: `0xedc32b${"00".repeat(29)}` });
+  assert.equal(twinA.hash(), "0xbdb681eee837511ca24e81fff9e2476fbcb402d5ef264a31c4fa30ef01da72b5");
+  assert.equal(twinB.hash(), "0xbdb68117fdbb5becaaeaaa710e97c5e02cf34fa8eac6abafea610c90224472b5");
+  // Two Spores whose IDs share their start and end.
+  const sporeA = ccc.Script.from({ ...spore, args: `0x${"5e".repeat(14)}${"00".repeat(4)}${"5e".repeat(14)}` });
+  const sporeB = ccc.Script.from({ ...spore, args: `0x${"5e".repeat(14)}${"ff".repeat(4)}${"5e".repeat(14)}` });
+  const { preview } = build(
+    [
+      { lock: own, capacity: 300n * CKB, type: sporeA, data: "0x01" },
+      { lock: own, capacity: 200n * CKB, type: twinA, data: u128(1_000n) },
+      { lock: own, capacity: 200n * CKB, type: twinB, data: u128(7n) },
+      { lock: own, capacity: 500n * CKB },
+    ],
+    [
+      { lock: alice, capacity: 300n * CKB, type: sporeA, data: "0x01" },
+      { lock: alice, capacity: 200n * CKB, type: twinA, data: u128(1_000n) },
+      { lock: alice, capacity: 200n * CKB, type: twinB, data: u128(7n) },
+      { lock: own, capacity: 300n * CKB, type: sporeB, data: "0x02" },
+      { lock: own, capacity: 200n * CKB - 5_000n },
+    ],
+  );
+  assert.deepEqual(preview.nfts, [{ kind: "Spore", id: sporeA.args, change: "sent" }, { kind: "Spore", id: sporeB.args, change: "minted" }]);
+  const [recipient] = preview.recipients;
+  assert.deepEqual(recipient.nfts, [`Spore ${sporeA.args}`]);
+  assert.deepEqual(recipient.tokens.map(({ asset, amount }) => ({ asset, amount })), [{ asset: twinA.hash(), amount: "1000" }, { asset: twinB.hash(), amount: "7" }]);
+  assert.deepEqual(recipient.tokens.map(({ amountText }) => amountText), [`1000 of token ${twinA.hash()}`, `7 of token ${twinB.hash()}`]);
+  const lines = previewSummaryLines(preview);
+  assert.ok(lines.includes(`Spore ${sporeA.args}: sent`), lines.join("\n"));
+  assert.ok(lines.includes(`Spore ${sporeB.args}: minted`), lines.join("\n"));
+  assert.ok(lines.includes(`Token -1000 of token ${twinA.hash()} (xUDT ${twinA.hash()})`), lines.join("\n"));
+  assert.ok(lines.includes(`Token -7 of token ${twinB.hash()} (xUDT ${twinB.hash()})`), lines.join("\n"));
+  assert.ok(lines.every((line) => !line.includes("…")), lines.join("\n"));
 });
 
 test("counts inputs that other people must sign", () => {

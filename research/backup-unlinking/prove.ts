@@ -153,7 +153,7 @@ type Name = "E1" | "J1";
 /** Signs `text` as the backup does and writes the admin witness for `entry` into the prepared rescue. */
 async function signedRescue(rescue: RescueAccount, name: Name, entry: RecoveryListEntry, destination: string, text?: (approval: string) => string) {
   const plan = await planRescue(client, rescue, entry, destination);
-  const spend = { client, lock: rescue.lock, omnilock: rescue.omnilock, auths: rescue.auths, entry, adminList: rescue.adminList.outPoint, inputCapacity: rescue.ckb + rescue.tokenCkb };
+  const spend = { client, lock: rescue.lock, omnilock: rescue.omnilock, auths: rescue.auths, entry, adminList: rescue.adminList.outPoint, inputCells: plan.transaction.inputs.map(({ previousOutput }) => rescue.movable.find((cell) => cell.outPoint.eq(previousOutput))!) };
   const prepared = await prepareRecoverySpend(plan.transaction, spend);
   const message = text ? text(prepared.text) : prepared.text;
   const signature = name === "E1"

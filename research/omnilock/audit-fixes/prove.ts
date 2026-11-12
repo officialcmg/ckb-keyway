@@ -110,7 +110,7 @@ async function rescueFor(name: "E1" | "J1", destination: string) {
 /** Puts `signature` (made over whatever text) into the backup's admin witness of the prepared transaction. */
 async function withSignature(name: "E1" | "J1", destination: string, text: (approval: string, sighash: ccc.Hex) => string) {
   const { rescue, entry, plan } = await rescueFor(name, destination);
-  const spend = { client, lock: rescue.lock, omnilock: rescue.omnilock, auths: rescue.auths, entry, adminList: rescue.adminList.outPoint, inputCapacity: rescue.ckb + rescue.tokenCkb };
+  const spend = { client, lock: rescue.lock, omnilock: rescue.omnilock, auths: rescue.auths, entry, adminList: rescue.adminList.outPoint, inputCells: plan.transaction.inputs.map(({ previousOutput }) => rescue.movable.find((cell) => cell.outPoint.eq(previousOutput))!) };
   const prepared = await prepareRecoverySpend(plan.transaction, spend);
   const signed = text(prepared.text, prepared.sighash);
   const signature = name === "E1"
@@ -174,7 +174,7 @@ async function negative() {
   ];
   for (const [label, outputs] of attempts) {
     const transaction = ccc.Transaction.from({ inputs: [{ previousOutput: rescue.adminList.outPoint }], outputs, outputsData: outputs.map((output) => output.type ? rescue.adminList.outputData : "0x") });
-    const spend = { client, lock: listLock, omnilock: rescue.omnilock, auths: rescue.auths, entry, adminList: rescue.adminList.outPoint, inputCapacity: rescue.adminList.cellOutput.capacity };
+    const spend = { client, lock: listLock, omnilock: rescue.omnilock, auths: rescue.auths, entry, adminList: rescue.adminList.outPoint, inputCells: [rescue.adminList] };
     // The text a backup would sign can't even be built for the moving one (data without a type is fine, a type
     // isn't refused by the shape), so sign the readable text the verifier would rebuild where it can, and the
     // old format otherwise.

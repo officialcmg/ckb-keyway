@@ -146,7 +146,7 @@ test("builds the one recovery transaction from the account's own cells", async (
   const fee = 2_443n * CKB - transaction.getOutputsCapacity();
   assert.equal(preview.feeCkb, (Number(fee) / 1e8).toString());
   assert.ok(fee > 0n && fee < CKB / 1000n);
-  assert.deepEqual(preview.tokens, [{ asset: token.hash(), amount: "2500", amountText: `2500 of token ${token.hash().slice(0, 10)}…${token.hash().slice(-6)}` }]);
+  assert.deepEqual(preview.tokens, [{ asset: token.hash(), amount: "2500", amountText: `2500 of token ${token.hash()}` }]);
   assert.equal(preview.transactionHash, transaction.hash());
 
   // Deterministic: the same cells give the same transaction, so enable can rebuild and compare it.
@@ -154,7 +154,9 @@ test("builds the one recovery transaction from the account's own cells", async (
   await checkRecoveryTransaction(client, transaction, publicKey, backups);
 
   const lines = recoveryLines(preview);
-  assert.ok(lines.includes(`Backup: EVM wallet ${evmAddress.slice(0, 10)}…${evmAddress.slice(-6)}`));
+  assert.ok(lines.includes(`Backup: EVM wallet ${evmAddress}`));
+  assert.ok(lines.includes(`New address: ${preview.newAddress}`));
+  assert.ok(lines.every((line) => !line.includes("…")), "nothing the user approves is shortened");
   assert.ok(lines.includes("Your address will change because you're turning on recovery."));
   assert.ok(lines.some((line) => line.startsWith("Locks 198 CKB")));
 });
@@ -182,6 +184,11 @@ test("reproduces the testnet proof: two accounts, one EVM and one JoyID-style ba
     const plan = await planRecovery(client, walletFor(fixture[`publicKey${name}`]), [evm, joy], { emailBinding: false });
     assert.equal(plan.transaction.hash(), hash);
     assert.equal(enable.hash(), hash);
+    // The emailed code names the JoyID backup by its whole address, as JoyID shows it, not a start and a checksum.
+    const lines = recoveryLines(plan.preview);
+    assert.ok(lines.includes(`Backup: JoyID ${fixture.joyIdBackup}`), lines.join("\n"));
+    assert.ok(lines.includes(`Backup: EVM wallet ${fixture.evmBackup.toLowerCase()}`), lines.join("\n"));
+    assert.equal(plan.preview.backups[1].label, `JoyID ${fixture.joyIdBackup}`);
     await checkRecoveryTransaction(client, enable, fixture[`publicKey${name}`], [evm, joy]);
     // The record is the two auths salted with this account's AdminList type hash; it names neither backup.
     const salt = plan.adminListType.hash();
@@ -203,7 +210,7 @@ test("reproduces the testnet proof: two accounts, one EVM and one JoyID-style ba
     const zeroed = transaction.clone();
     zeroed.setWitnessArgsAt(0, ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(witness.length)) }));
     const sighash = (await zeroed.getSignHashInfo(lock, spendClient))!.message;
-    const inputs = recorded.inputCells.reduce((sum, cell) => sum + ccc.CellOutput.from(cell.cellOutput).capacity, 0n);
+    const inputs = recorded.inputCells.map((cell) => ({ cellOutput: cell.cellOutput, outputData: cell.outputData ?? "0x" }));
     return { text: recoveryApprovalText(spendClient, rescueApproval(transaction, lock, inputs), sighash), witness, salt: accountSalt(lock.args) };
   };
   const evmRescue = await approvalOf(fixture.rescueEvmA);
@@ -403,12 +410,27 @@ test("builds the list update: same AdminList cell with the new root and record, 
   assert.equal(ccc.bytesFrom(transaction.getWitnessArgsAt(0)!.lock!).length, 85);
   assert.equal(ccc.bytesFrom(transaction.getWitnessArgsAt(1)!.lock!).length, 85);
   assert.deepEqual(plan.backups, [...backups, added]);
-  assert.equal(plan.preview.backup.label, `EVM wallet 0x55555555…555555`);
+  assert.equal(plan.preview.backup.label, `EVM wallet 0x${"55".repeat(20)}`);
   await checkBackupChangeTransaction(client, transaction, recovery, plan.backups);
   const lines = backupChangeLines(plan.preview);
   assert.equal(lines[0], "Add a recovery backup");
-  assert.ok(lines.includes("Adding: EVM wallet 0x55555555…555555"));
+  assert.ok(lines.includes(`Adding: EVM wallet 0x${"55".repeat(20)}`));
   assert.ok(lines.includes("Backups after this change: 2"));
+
+  // A JoyID passkey is named in the email by its whole address, as JoyID shows it: every JoyID address starts the
+  // same, so a start and a 6-character checksum would leave only the checksum to tell two apart.
+  const joy: RecoveryBackup = { kind: "joyid", address: "ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqqxhnyynqdn0w3ukfvnlz44tgcusk2p6ecurrdqmx" };
+  const joyPlan = await planBackupChange(client, wallet, { change: "add", backup: joy });
+  assert.equal(joyPlan.preview.backup.label, `JoyID ${joy.address}`);
+  assert.ok(backupChangeLines(joyPlan.preview).includes(`Adding: JoyID ${joy.address}`));
+  assert.ok(backupChangeLines(joyPlan.preview).every((line) => !line.includes("…")));
+  // Given in CKB's old full-address format, the same passkey is still named as JoyID shows it.
+  const { bech32 } = await import("bech32");
+  const joyIdScript = await client.getKnownScript(ccc.KnownScript.JoyId);
+  const oldFormat = bech32.encode("ckt", bech32.toWords([0x04, ...ccc.bytesFrom(joyIdScript.codeHash), ...ccc.bytesFrom((await ccc.Address.fromString(joy.address, client)).script.args)]), 1023);
+  assert.notEqual(oldFormat, joy.address);
+  const oldPlan = await planBackupChange(client, wallet, { change: "add", backup: { kind: "joyid", address: oldFormat } });
+  assert.ok(backupChangeLines(oldPlan.preview).includes(`Adding: JoyID ${joy.address}`));
 
   const removal = await planBackupChange(client, walletFor(publicKey, recovery), { change: "remove", backup: backups[0] }).catch((error: Error) => error);
   assert.match(String(removal), /Keep at least one backup\. Add another backup before removing this one/);
@@ -422,7 +444,7 @@ test("removes a backup and refuses an add past the limit", async () => {
   const plan = await planBackupChange(client, wallet, { change: "remove", backup: extra[3] });
   assert.deepEqual(plan.backups, [...backups, ...extra.filter((_, index) => index !== 3)]);
   assert.equal(plan.preview.change, "remove");
-  assert.ok(backupChangeLines(plan.preview).includes("Removing: EVM wallet 0x04040404…040404"));
+  assert.ok(backupChangeLines(plan.preview).includes(`Removing: EVM wallet 0x${"04".repeat(20)}`));
   assert.ok(!backupChangeLines(plan.preview).some((line) => /move everything/.test(line)));
   await checkBackupChangeTransaction(client, plan.transaction, recovery, plan.backups);
   await assert.rejects(planBackupChange(client, wallet, { change: "add", backup: { kind: "evm", address: `0x${"99".repeat(20)}` } }), /At most 8 backups/);

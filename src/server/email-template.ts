@@ -39,8 +39,9 @@ export function createConfirmationEmailTemplate(appName: string, code: string, h
   if (!name || !/^\d{6}$/.test(code) || !heading.trim()) throw new Error("Application name, heading and a six-digit code are required");
   const safeName = escapeHtml(name);
   const safeHeading = escapeHtml(heading);
-  // Up to 12 lines; past that the last one says how many more there are, so nothing is left out unannounced.
-  const shown = summary.length > 12 ? [...summary.slice(0, 11), `…and ${summary.length - 11} more not shown here. If you didn't start this, don't enter the code.`] : summary;
+  // Up to 16 lines, enough for turning recovery on with all 8 backups; past that the last one says how many more
+  // there are, so nothing is left out unannounced.
+  const shown = summary.length > 16 ? [...summary.slice(0, 15), `…and ${summary.length - 15} more not shown here. If you didn't start this, don't enter the code.`] : summary;
   // Long enough for a whole address, which the email shows rather than its start and checksum. A longer line
   // (an address with unusually long lock args) ends in "…" so the reader knows it was cut.
   const lines = shown.map((line) => (line.length > 240 ? `${line.slice(0, 239)}…` : line));

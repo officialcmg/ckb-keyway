@@ -41,12 +41,12 @@ const TRANSACTION: TransactionPreview = {
   tokens: [{ id: "0x45b32a…df52", asset: RUSD, standard: "xUDT", amount: "-2500000000", amountText: "-25 RUSD" }],
   nfts: [],
   dao: [],
-  recipients: [{ address: ADDRESS.replace("zda0", "zdb1"), kind: "wallet", walletType: "standard", ckb: "143", tokens: [{ id: "0x45b32a…df52", amount: "2500000000", amountText: "25 RUSD" }], nfts: [] }],
+  recipients: [{ address: ADDRESS.replace("zda0", "zdb1"), kind: "wallet", walletType: "standard", ckb: "143", tokens: [{ id: "0x45b32a…df52", asset: RUSD, amount: "2500000000", amountText: "25 RUSD" }], nfts: [] }],
   unrecognized: [],
   otherSigners: 0,
   details: {
-    inputs: [{ lock: "you", type: "xUDT 0x45b32a…df52", capacityCkb: "143", dataBytes: 16 }, { lock: "you", capacityCkb: "9,000", dataBytes: 0 }],
-    outputs: [{ lock: "0x9f2c41…7a1e", type: "xUDT 0x45b32a…df52", capacityCkb: "143", dataBytes: 16 }, { lock: "you", capacityCkb: "8,999.99998568", dataBytes: 0 }],
+    inputs: [{ lock: "you", type: "xUDT", capacityCkb: "143", dataBytes: 16 }, { lock: "you", capacityCkb: "9,000", dataBytes: 0 }],
+    outputs: [{ lock: `0x9f2c41${"3".repeat(52)}b0c47a1e`, type: "xUDT", capacityCkb: "143", dataBytes: 16 }, { lock: "you", capacityCkb: "8,999.99998568", dataBytes: 0 }],
   },
   transactionHash: HASH,
   requiresEmailCode: true,
@@ -54,8 +54,8 @@ const TRANSACTION: TransactionPreview = {
 
 const UNKNOWN_TOKEN: TransactionPreview = {
   ...TRANSACTION,
-  tokens: [{ id: "0x9a1f03…77c2", asset: `0x9a1f03${"5".repeat(52)}c0de77c2`, standard: "xUDT", amount: "-1000", amountText: "-1000 of token 0x9a1f0355…de77c2" }],
-  recipients: [{ ...TRANSACTION.recipients[0], tokens: [{ id: "0x9a1f03…77c2", amount: "1000", amountText: "1000 of token 0x9a1f0355…de77c2" }] }],
+  tokens: [{ id: "0x9a1f03…77c2", asset: `0x9a1f03${"5".repeat(52)}c0de77c2`, standard: "xUDT", amount: "-1000", amountText: `-1000 of token 0x9a1f03${"5".repeat(52)}c0de77c2` }],
+  recipients: [{ ...TRANSACTION.recipients[0], tokens: [{ id: "0x9a1f03…77c2", asset: `0x9a1f03${"5".repeat(52)}c0de77c2`, amount: "1000", amountText: `1000 of token 0x9a1f03${"5".repeat(52)}c0de77c2` }] }],
 };
 
 const CKB_TRANSACTION: TransactionPreview = {
@@ -70,7 +70,7 @@ const RECOVERY: RecoveryPreview = {
   network: "CKB testnet",
   newAddress: "ckt1qrejnmlar3r452tcg57gvq8patctcgy8acync0hxfnyka35ywafvkqgqqywhsqz6a9nuq7n78x78eqrnwzsj37faqxrn7dq20dqufhj5gwyme9azeu9hjf6c4fyrhs5qhgasjkf2vj44ypl035x",
   legacyAddress: ADDRESS,
-  backups: [{ kind: "evm", address: "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", label: "EVM wallet 0x5aAeb6…BeAed" }],
+  backups: [{ kind: "evm", address: "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", label: "EVM wallet 0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed" }],
   adminListCkb: "165",
   minimumCellCkb: "61",
   tokenCellsExtraCkb: "0",
@@ -85,10 +85,10 @@ const RECOVERY: RecoveryPreview = {
 const BACKUP: BackupChangePreview = {
   network: "CKB testnet",
   change: "add",
-  backup: { kind: "evm", address: "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359", label: "EVM wallet 0xfB6916…5d359" },
+  backup: { kind: "evm", address: "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359", label: "EVM wallet 0xfb6916095ca1df60bb79ce92ce3ea74c37c5d359" },
   backups: [
-    { kind: "evm", address: "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", label: "EVM wallet 0x5aAeb6…BeAed" },
-    { kind: "evm", address: "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359", label: "EVM wallet 0xfB6916…5d359" },
+    { kind: "evm", address: "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", label: "EVM wallet 0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed" },
+    { kind: "evm", address: "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359", label: "EVM wallet 0xfb6916095ca1df60bb79ce92ce3ea74c37c5d359" },
   ],
   feeCkb: "0.00001",
   transactionHash: HASH,
