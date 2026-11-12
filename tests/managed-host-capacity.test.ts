@@ -42,7 +42,8 @@ const server = createServer((request, response) => {
     if (method === "open_channel_with_external_funding") result = { channel_id: "0x" + "33".repeat(32) };
     // Refused in Fiber's checks before it sends anything, or failing after it has sent the funding to the peer.
     const refusal = existsSync(join(dir, "refuse-funding")) ? "Signed funding transaction raw data mismatch; only witnesses may change for external funding"
-      : existsSync(join(dir, "fail-after-sending")) ? "Failed to sign the commitment" : undefined;
+      : existsSync(join(dir, "fail-after-sending")) ? "Failed to sign the commitment"
+      : existsSync(join(dir, "channel-gone")) ? "Channel not found error: Hash256(0x44)" : undefined;
     if (method === "submit_signed_funding_tx" && refusal) {
       response.writeHead(200, { "content-type": "application/json" });
       return response.end(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message: refusal } }));
@@ -351,7 +352,7 @@ test("a setup holds its node at most 15 minutes from its first step, a few setup
   }
 });
 
-test("accounts that only connect can't make the host start nodes faster than once a slot a minute, nor lock out a user", async (context) => {
+test("accounts that only connect can't make the host start nodes faster than once a slot a minute", async (context) => {
   context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const { request, running, starts } = await host(context);
   const crowd = ["1", "2", "3", "4"].map((digit) => digit.repeat(64));
@@ -361,7 +362,8 @@ test("accounts that only connect can't make the host start nodes faster than onc
   context.mock.timers.tick(61_000);
   await hammer();
   assert.equal((await starts()).length, 4);
-  // Once a slot's minute is up, a user who asks gets it.
+  // Once a slot's minute is up, whoever asks first gets it. (Accounts that ask constantly win most such
+  // handovers; sharing slots fairly among them is a capacity decision, not something this test shows.)
   context.mock.timers.tick(61_000);
   assert.equal(await request(B), 200);
   assert.ok(running().includes(B));
@@ -818,4 +820,22 @@ test("a funding submission is refused when the node's channels can't be read", a
   await mkdir(join(root, "users", A, "keyway-funded-channels"));
   assert.equal(await submit(A), 502);
   assert.equal(await marked(A), false);
+});
+
+test("a batch request is refused, so no call can slip past the host's checks", async (context) => {
+  const { module, request, marked } = await host(context);
+  assert.equal(await request(A), 200);
+  const batch = Buffer.from(JSON.stringify([{ jsonrpc: "2.0", id: 1, method: "submit_signed_funding_tx", params: [{ channel_id: WAITING_ID, signed_funding_tx: {} }] }]));
+  await assert.rejects(module.proxyUserRequest(A, batch), /Batch requests/);
+  assert.equal(await marked(A), false);
+});
+
+test("funding refused because Fiber no longer has the channel is undone", async (context) => {
+  const { root, request, submit, marked, withChannels } = await host(context);
+  await withChannels(A, WAITING_CHANNEL);
+  assert.equal(await request(A), 200);
+  await writeFile(join(root, "users", A, "channel-gone"), "");
+  assert.equal(await submit(A), 200);
+  assert.equal(await marked(A), false);
+  assert.equal((await readFile(join(root, "users", A, "keyway-funded-channels"), "utf8")).includes(WAITING_ID), false);
 });

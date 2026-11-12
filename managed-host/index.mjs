@@ -167,6 +167,8 @@ export function proxyUserRequest(userId, body, signal) {
   return withUserOperation(userId, async () => {
     // A request the API gave up on while it waited in the queue starts nothing.
     if (signal?.aborted) throw new Error("The request was abandoned");
+    // One call at a time: a batch would carry methods the checks below never see.
+    if (isBatch(body)) throw new Error("Batch requests aren't supported");
     const setup = CHANNEL_SETUP.has(method);
     // Signed funding goes to Fiber only for a channel the node lists as waiting for it. Its node is never stopped
     // to make room from before it is found until a minute after Fiber answers (see SUBMIT_PROTECTION_MS), and it
@@ -236,6 +238,10 @@ export function proxyUserRequest(userId, body, signal) {
   });
 }
 
+function isBatch(body) {
+  try { return Array.isArray(JSON.parse(body.toString("utf8"))); } catch { return false; }
+}
+
 function rpcMethod(body) {
   try {
     const { method } = JSON.parse(body.toString("utf8"));
@@ -255,7 +261,8 @@ function refusedBeforeSending(body) {
   try { error = JSON.parse(body.toString("utf8"))?.error; } catch { return false; }
   if (!error) return false;
   if ([-32700, -32600, -32602].includes(error.code)) return true;
-  return /Expected channel in AWAITING_EXTERNAL_FUNDING-compatible state|Channel is not configured for external funding|Unsigned funding transaction not found|raw data mismatch|is not final for external funding/.test(String(error.message));
+  // Including a channel Fiber no longer has (aborted meanwhile) or has closed, refused before it is reached.
+  return /Expected channel in AWAITING_EXTERNAL_FUNDING-compatible state|Channel is not configured for external funding|Unsigned funding transaction not found|raw data mismatch|is not final for external funding|channel not found|is already closed/i.test(String(error.message));
 }
 
 /** A successful JSON-RPC answer, or undefined for an error or anything else. */
@@ -479,7 +486,9 @@ async function recordFundedChannel(userId, id) {
 async function unrecordFundedChannel(userId, id) {
   const path = join(managedDataDir(userId), FUNDED_CHANNELS);
   const lines = (await readFile(path, "utf8")).split("\n").filter((line) => line && line !== id);
-  await writeFile(path, `${lines.join("\n")}\n`, { mode: 0o600 });
+  // Replaced whole, so a crash part-way can't lose other channels from the record.
+  await writeFile(`${path}.tmp`, `${lines.join("\n")}\n`, { mode: 0o600 });
+  await rename(`${path}.tmp`, path);
 }
 
 /** The node's funding record, `{ since, ids }`, or undefined for a node from before it was kept. */
@@ -721,7 +730,8 @@ async function waitForRpc(port, child) {
     } catch {}
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  child.kill("SIGTERM");
+  // Stopped for good (escalating to SIGKILL), so a wedged process can't keep its database locked.
+  await waitForExit(child).catch(logError);
   throw new Error("Fiber node startup timed out");
 }
 
@@ -872,13 +882,15 @@ function stateName(channel) {
  */
 function channelClass(channel, record) {
   if (channelFinished(channel)) return "finished";
+  const covered = recordCovers(record, channel);
+  // Funding handed to the node is with the peer, whatever state Fiber last stored.
+  if (covered && record.ids.has(String(channel?.channel_id).toLowerCase())) return "open";
   const name = stateName(channel);
   if (name === "negotiatingfunding") return "unfunded";
   const flags = new Set(JSON.stringify(channel?.state?.state_flags ?? "").match(/\b[A-Z][A-Z0-9_]*\b/g) ?? []);
   const abortable = ["collaboratingfundingtx", "signingcommitment"].includes(name) ||
     (name === "awaitingtxsignatures" && !flags.has("OUR_TX_SIGNATURES_SENT"));
-  const submitted = !recordCovers(record, channel) || record.ids.has(String(channel?.channel_id).toLowerCase());
-  return abortable && !submitted ? "unfunded" : "open";
+  return abortable && covered ? "unfunded" : "open";
 }
 
 /** Whether a node must keep running for its channels: any channel that isn't finished or unfunded. */
