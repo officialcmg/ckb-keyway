@@ -2,8 +2,7 @@ import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { sha256 } from "@noble/hashes/sha2.js";
-import { loadLitAction } from "./lit-actions.ts";
-import { signCkbDigest, type LitRuntimeConfig, type LitSignature } from "./lit.ts";
+import type { LitSignature } from "./lit.ts";
 
 const IDENTITY_DIGEST = sha256(new TextEncoder().encode("CKB KeyWay identity v1"));
 
@@ -14,19 +13,14 @@ export type PkpIdentity = {
 };
 
 /**
- * Learns the PKP's public key from its signature over KeyWay's fixed identity digest. `signIdentity` is the
- * policy Action's identity mode once it is in use; otherwise the digest signer signs it.
+ * Learns the PKP's public key from its signature over KeyWay's fixed identity digest, made by the policy Action's
+ * identity mode (`signIdentity`).
  */
 export async function derivePkpIdentity(
   litPkpId: string,
-  config: LitRuntimeConfig,
-  signIdentity?: (litPkpId: string) => Promise<LitSignature>,
+  signIdentity: (litPkpId: string) => Promise<LitSignature>,
 ): Promise<PkpIdentity> {
-  const digest = toHex(IDENTITY_DIGEST);
-  const signature = signIdentity ? await signIdentity(litPkpId) : await signCkbDigest(digest, litPkpId, {
-    ...config,
-    actionCode: await loadLitAction("sign-ckb-digest"),
-  });
+  const signature = await signIdentity(litPkpId);
   const publicKeyBytes = recoverPkpPublicKey(IDENTITY_DIGEST, signature);
   const recoveredPkpId = `0x${toBareHex(keccak_256(secp256k1.Point.fromBytes(publicKeyBytes).toBytes(false).slice(1)).slice(-20))}`;
 

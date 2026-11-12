@@ -9,7 +9,6 @@ import { secp256k1Lock } from "../src/sdk/browser/account-lock.ts";
 import { chainOnSendLimit, decodeSendLimitSettings, DEFAULT_DAILY_LIMIT_SHANNONS, isSendLimitCell, type SendLimitHead } from "../src/sdk/browser/send-limits.ts";
 import { database } from "../src/server/database.ts";
 import { fundingCode, fundingNeedsLitCode, issueFundingCodeRequest, sendFundingCode, sendLimitOffer, signingSettings, transactionSigning, type SigningContext } from "../src/server/general-signing.ts";
-import { litSignerOverride } from "../src/server/lit-config.ts";
 import { litPolicyRunner } from "../src/server/lit-policy.ts";
 import { listPendingTransactions } from "../src/server/pending-transactions.ts";
 import { sendLimitHead, sendLimitPlanner, sendLimitRpc } from "../src/server/send-limits.ts";
@@ -86,7 +85,6 @@ async function setUp() {
     outputsData: ["0x", "0x"],
   }));
   const action = await world.lit.load();
-  litSignerOverride.mode = "policy";
   litPolicyRunner.run = async (_config, params) => action.main(params);
   sendLimitPlanner.run = async (params) => action.main(params);
   sendLimitRpc.fetch = world.lit.fetch;
@@ -124,7 +122,6 @@ const codeFrom = (world: ReturnType<typeof chain>) => litCodeIn(world.lit.emails
 
 test("send limits through the server: turning them on, sending under and over the amount, and a channel funding", { skip: !enabled }, async (t) => {
   const { world, secp, funding, user, wallet, context, sent } = await setUp();
-  t.after(() => { litSignerOverride.mode = undefined; });
 
   await t.test("turning limits on builds the genesis, asks for the Lit code and binds only a fingerprint", async () => {
     const asked = await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (150n * CKB).toString() }) as { requiresEmailCode: boolean; codeLength: number; confirmationNonce: string; sentTo: string };
@@ -210,7 +207,6 @@ test("send limits through the server: turning them on, sending under and over th
 
 test("send limits are offered by default to an account that could have them", { skip: !enabled }, async (t) => {
   const { world, user, wallet } = await setUp();
-  t.after(() => { litSignerOverride.mode = undefined; });
   // The indexer's capacity sum over the same committed cells the fake client lists.
   const withCapacity = (plain: bigint) => Object.assign(world.client(), { getCellsCapacity: async () => plain });
   const head = { outPoint: { txHash: `0x${"ab".repeat(32)}`, index: 0 }, cellOutput: { lock: wallet.litPublicKey, capacity: 0n }, outputData: "0x", recordEntriesBytes: 0 } as unknown as SendLimitHead;
@@ -224,14 +220,10 @@ test("send limits are offered by default to an account that could have them", { 
   const sql = await database();
   await sql`insert into keyway_v2_daily_amounts (user_id, asset, amount) values (${user.id}, 'ckb', ${(7_000n * CKB).toString()})`;
   assert.deepEqual(await sendLimitOffer(user, wallet, undefined, withCapacity(2_500n * CKB)), { ckb: 7_000n * CKB });
-
-  litSignerOverride.mode = "digest";
-  assert.equal(await sendLimitOffer(user, wallet, undefined, withCapacity(2_500n * CKB)), undefined, "not without the policy signer, which enforces them");
 });
 
 test("a token without an amount of its own sends without a code through the server and the Action", { skip: !enabled }, async (t) => {
   const { world, secp, user, wallet, context, sent } = await setUp();
-  t.after(() => { litSignerOverride.mode = undefined; });
   const xudt = ccc.Script.from({ codeHash: "0x25c29dc317811a6f6f3985a7a9ebc4838bd388d19d0feeecf0bcd60f6c0975bb", hashType: "type", args: `0x${"ab".repeat(32)}` });
   const asked = await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (1_000n * CKB).toString() }) as { confirmationNonce: string };
   await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (1_000n * CKB).toString(), confirmationNonce: asked.confirmationNonce, emailCode: codeFrom(world) });

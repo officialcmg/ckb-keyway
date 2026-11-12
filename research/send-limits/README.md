@@ -290,8 +290,9 @@ counted send, and fund channels only from there.
 - **The indexer's grouped paging.** History is read with `group_by_transaction`; ckb-indexer (checked in
   `util/indexer/src/service.rs` at `d0dcbcafc7`) ends a page only between transactions and resumes right after the
   last entry it returned, so no transaction is skipped where pages meet.
-- **Before the old policy CID is removed** (founder step 6), a compromised server can sign anything through the
-  previous Action, including a record or a genesis-shaped transaction that this Action would then trust.
+- **Retired Action CIDs left in the Lit group.** A compromised server can sign anything through any older
+  Action still in the group, including a record or a genesis-shaped transaction that this Action would then
+  trust. The group must hold only the CIDs pinned in `src/server/lit-config.ts`.
 - **Fiber.** Payments and channel balances are moved by the Fiber key, which a compromised server can obtain
   (`wrap-fiber-key`). Only the funding needs the code.
 - **Exempt transactions** may burn up to 0.001 CKB each as fee, so a compromised server could waste about
@@ -303,7 +304,7 @@ counted send, and fund channels only from there.
   approved with the code to the bound address on accounts with limits on, and trusted on first use on accounts
   without them.
 - **The Lit clock**, the TEE network, the founder's Lit account, and everything else listed in the lit-policy
-  README. The `sign-ckb-digest` CID must still be removed from the group, or none of this holds.
+  README. The retired `sign-ckb-digest` CID must stay out of the group, or none of this holds.
 
 ## 6. Live proof and latency
 

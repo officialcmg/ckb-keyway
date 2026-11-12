@@ -18,7 +18,7 @@ import {
   type RequestRow,
   type SigningContext,
 } from "./general-signing.ts";
-import { litPolicyEnabled, type LitEmailCode } from "./lit-policy.ts";
+import type { LitEmailCode } from "./lit-policy.ts";
 import { recordPendingTransaction } from "./pending-transactions.ts";
 import { consumeConfirmation, issueConfirmation } from "./signing-confirmation.ts";
 import type { ReadyWallet } from "./user-wallet.ts";
@@ -42,7 +42,7 @@ export async function fundingSigning(context: FundingContext, body: Record<strin
   const validated = await (context.preview ?? previewFundingTransaction)(wallet, body.transaction);
   const serialized = JSON.stringify(serializeTransaction(validated.transaction));
   const outflow = fundingOutflow(validated);
-  const policy = !context.sign && litPolicyEnabled();
+  const policy = !context.sign;
   const { operation, confirmationNonce } = body;
   if (operation === "preview") {
     // Once the account has send limits, Lit signs a funding only with its code: Fiber chooses the inputs, so the

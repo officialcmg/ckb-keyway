@@ -2,11 +2,7 @@ import * as ccc from "@ckb-ccc/core";
 import type { User } from "./auth-user.ts";
 import { accountLocks, omnilockOwnerWitnessLock, refuseAdminListSpend, refuseForeignOmnilockOutputs, verifyRecoveryAnchor, witnessLockLength, type KeyWayLockKind } from "../sdk/browser/account-lock.ts";
 import { isXudtCompatible } from "../sdk/browser/tokens.ts";
-import { loadLitAction } from "./lit-actions.ts";
-import { LIT_ACTION_CIDS } from "./lit-config.ts";
-import { signCkbDigest } from "./lit.ts";
-import { litPolicyEnabled, policySignTransaction, type LitEmailCode } from "./lit-policy.ts";
-import { recoverPkpPublicKey } from "./pkp-identity.ts";
+import { policySignTransaction, type LitEmailCode } from "./lit-policy.ts";
 import type { ReadyWallet } from "./user-wallet.ts";
 
 const SHANNONS_PER_CKB = 100_000_000n;
@@ -192,19 +188,8 @@ export async function signFundingTransaction(
   /** The Lit code, which a funding needs once the account has send limits (Fiber chooses its inputs, so it can't chain). */
   options: { email?: string; emailCode?: LitEmailCode } = {},
 ): Promise<ccc.Transaction> {
-  if (litPolicyEnabled()) return policySignTransaction(validated.transaction, validated.groups, validated.signer.client, wallet, options);
-  return signAccountGroups(validated.transaction, validated.groups, validated.signer.client, async (digest) => {
-    const signature = await signCkbDigest(digest, wallet.litPkpId, {
-      apiKey: requiredEnv("LIT_USAGE_API_KEY"),
-      actionCid: LIT_ACTION_CIDS["sign-ckb-digest"],
-      actionCode: await loadLitAction("sign-ckb-digest"),
-    });
-    const recovered = ccc.hexFrom(recoverPkpPublicKey(ccc.bytesFrom(digest), signature));
-    if (recovered.toLowerCase() !== wallet.litPublicKey.toLowerCase()) {
-      throw new Error("Lit signature does not match the KeyWay wallet");
-    }
-    return formatCkbSignature(signature);
-  }, "Funding transaction has no KeyWay signing group");
+  if (validated.groups.length === 0) throw new Error("Funding transaction has no KeyWay signing group");
+  return policySignTransaction(validated.transaction, validated.groups, validated.signer.client, wallet, options);
 }
 
 /**
@@ -270,10 +255,4 @@ function formatCkb(shannons: bigint): string {
 
 function sumCapacities(capacities: readonly bigint[]): bigint {
   return capacities.reduce((sum, capacity) => sum + capacity, 0n);
-}
-
-function requiredEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) throw new Error(`Missing server configuration: ${name}`);
-  return value;
 }

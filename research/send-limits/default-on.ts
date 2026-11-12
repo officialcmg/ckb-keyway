@@ -20,7 +20,6 @@ import { decodeSendLimitSettings, isSendLimitCell, sendLimitInputIndex } from ".
 import { serializeTransaction } from "../../src/server/funding-transaction.ts";
 import { sendLimitOffer, signingSettings, transactionSigning, type SigningContext } from "../../src/server/general-signing.ts";
 import { loadLitAction } from "../../src/server/lit-actions.ts";
-import { litSignerOverride } from "../../src/server/lit-config.ts";
 import { litPolicyRunner } from "../../src/server/lit-policy.ts";
 import { listPendingTransactions, nodeStatus } from "../../src/server/pending-transactions.ts";
 import { sendLimitHead } from "../../src/server/send-limits.ts";
@@ -59,7 +58,6 @@ async function waitFor(hash: string, status = "committed") {
 async function main() {
   process.env.LIT_USAGE_API_KEY ??= "live-proof";
   process.env.RESEND_API_KEY ??= "re_live_proof_only";
-  litSignerOverride.mode = "policy";
   const privateKey = keys.N as ccc.Hex;
   const publicKey = ccc.hexFrom(secp256k1.getPublicKey(ccc.bytesFrom(privateKey), true));
   const pkpId = ccc.hexFrom(keccak_256(secp256k1.getPublicKey(ccc.bytesFrom(privateKey), false).slice(1)).slice(12));

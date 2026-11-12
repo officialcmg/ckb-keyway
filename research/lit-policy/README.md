@@ -316,11 +316,9 @@ You run these locally. The server has no Lit account credentials.
 
 ## Rollback
 
-1. Re-add the `sign-ckb-digest` CID to group 1.
-2. Set `LIT_SIGNER` back to `"digest"` in `src/server/lit-config.ts` and deploy.
-
-Accounts that turned recovery on under the policy signer keep their on-chain binding. With the digest signer back,
-their list changes use the server's 6-digit code again, as before. Nothing in the database needs undoing.
+None. Step 6 is done: the `sign-ckb-digest` CID is out of group 1, and its source, its CID and the `LIT_SIGNER`
+switch were removed from the code (2026-11-10). The policy Action is the only signer; a fix to it ships as a new
+CID added to the group before the code that pins it.
 
 ## Tests
 

@@ -1,21 +1,19 @@
 # Lit Actions
 
-## `sign-ckb-digest.js`
-
-Signs one raw 32-byte CKB transaction digest with a permitted Lit PKP. It does not apply an Ethereum message prefix or hash the digest again.
-
-To publish it with the Chipotle dashboard:
+Every Action's CID is pinned in `src/server/lit-config.ts`. To publish one with the Chipotle dashboard:
 
 1. Paste the file exactly into **Action Runner > Lit Action code**.
-2. Click **Get Lit Action IPFS CID**.
-3. Register that CID under **IPFS Actions** as `keyway-ckb-signer`.
-4. Add the CID and the intended PKP wallet to the `CKB Keyway` group.
+2. Click **Get Lit Action IPFS CID** and check it matches `src/server/lit-config.ts`.
+3. Register that CID under **IPFS Actions**.
+4. Add the CID to the `CKB Keyway` group.
 
-Any source change creates a different CID and must be reviewed and registered again.
+Any source change creates a different CID and must be reviewed and registered again. The group should hold only
+the CIDs in `lit-config.ts`.
 
 ## `sign-ckb-transaction.js` (policy signer)
 
-Replaces `sign-ckb-digest.js`. It never signs a digest it is handed:
+KeyWay's only signer. It never signs a digest it is handed (the earlier `sign-ckb-digest` signer, which did, is
+retired: removed from the Lit group and from this repository):
 
 - **transaction:** it fetches every input from CKB testnet, checks each against its transaction hash, derives the
   account's locks from the PKP's own key and computes each sighash itself. It refuses any change to the recovery
@@ -31,9 +29,7 @@ Replaces `sign-ckb-digest.js`. It never signs a digest it is handed:
 - **identity:** signs only the fixed identity digest.
 - **message:** hashes a CKB "Nervos Message:" itself.
 
-The server uses it once `LIT_SIGNER` is `"policy"` in `src/server/lit-config.ts`, where every Action's CID is
-pinned. Register it the same way as above, as `keyway-ckb-policy-signer`, then remove the
-`sign-ckb-digest` CID from the group. The full steps, the design and what stays trusted are in
+Register it as `keyway-ckb-policy-signer`. The design and what stays trusted are in
 `research/lit-policy/README.md`.
 
 ## Fiber key protection
