@@ -26,13 +26,18 @@ const SETUPS_PER_HOUR = 3;
 // A node serving requests isn't stopped to make room for a node without channels until its user's requests
 // have kept it busy this long, however long Fiber takes to answer them.
 const BUSY_PROTECTION_MS = 30_000;
+// Nor for this long after it starts, however it is used, so each slot changes hands at most once a minute and
+// no number of accounts can make the host cold-start nodes faster than that.
+const RESIDENCY_MS = 60_000;
+// Written in a node's data directory: the channels whose signed funding was handed to it, one ID a line.
+const FUNDED_CHANNELS = "keyway-funded-channels";
 // A node handing its user's signed funding to Fiber isn't stopped for this long, even for a node with channels.
 const SUBMIT_PROTECTION_MS = 60_000;
 // After the host found no room, an admission without channels is refused at once for this long.
 const NO_ROOM_RETRY_MS = 2_000;
-// Only these calls may create a node for a user who has none: connecting a hosted node (the SDK's start and its
-// fee reserve read node_info) and setting up a channel. Any other read of a user without a node is refused.
-const PROVISIONING = new Set(["node_info", "connect_peer", "open_channel", "open_channel_with_external_funding"]);
+// Only node_info may create a node for a user who has none: it is how a hosted node is connected (the SDK's
+// start and its fee reserve read it first). Any other call for a user without a node is refused.
+const PROVISIONING = new Set(["node_info"]);
 // The steps of a channel setup, which hold the node for RECENT_USE_MS.
 const CHANNEL_SETUP = new Set(["connect_peer", "open_channel", "open_channel_with_external_funding", "submit_signed_funding_tx"]);
 // A node that may hold channels and isn't running is started again after 1s, then 2s, 4s, ... up to every minute.
@@ -169,7 +174,10 @@ export function proxyUserRequest(userId, body, signal) {
     let result;
     try {
       const node = await ensureNode(userId, { provision: PROVISIONING.has(method) });
-      if (funding) await markChannels(userId, true);
+      if (funding) {
+        await markChannels(userId, true);
+        await recordFundedChannel(userId, body);
+      }
       const upstream = await fetch(`http://127.0.0.1:${node.port}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -184,7 +192,8 @@ export function proxyUserRequest(userId, body, signal) {
         node,
       };
     } finally {
-      if (funding) submitting.delete(userId);
+      // Protected for a minute after Fiber's answer too, as Fiber stores the channel's new state after answering.
+      if (funding) submitting.set(userId, Date.now());
     }
     const { node } = result;
     delete result.node;
@@ -194,7 +203,7 @@ export function proxyUserRequest(userId, body, signal) {
     // Funding Fiber refused leaves the channel as it was, so its marker follows its channels again.
     if (funding && !answer) await checkChannels(userId, node).catch(logError);
     // A channel holds funds once they are handed to Fiber: the user's signed funding, or the node's own for
-    // open_channel. An external-funding open alone holds nothing, and Fiber keeps it only in memory.
+    // open_channel. An external-funding open alone holds nothing.
     if (answer && ["open_channel", "submit_signed_funding_tx"].includes(method)) await markChannels(userId, true);
     // A channel can also be opened to the node by a peer: it is marked once the node's channels show it.
     if (answer && method === "list_channels" && Array.isArray(answer.result?.channels) && answer.result.channels.some((channel) => channelClass(channel) === "open")) {
@@ -308,7 +317,8 @@ async function ensureNode(userId, { provision = true } = {}) {
     throw error;
   }
   const failed = failedStarts.get(userId);
-  const failing = failed && failed.count >= PRIORITY_FAILED_STARTS && Date.now() - failed.at < 10 * 60_000;
+  const failing = failed && failed.count >= PRIORITY_FAILED_STARTS && failed.at - failed.since >= 5 * 60_000 &&
+    Date.now() - failed.at < 10 * 60_000;
   const priority = !failing && await mayHoldChannels(userId);
   // Looked up again after the waits above.
   const again = current();
@@ -369,11 +379,22 @@ function hold(userId, node) {
 
 class RoomError extends Error {}
 
-/** Counts a failed start; after PRIORITY_FAILED_STARTS within ten minutes, the node loses its priority. */
+/**
+ * Counts a failed start. A node loses its priority after PRIORITY_FAILED_STARTS failures spread over at least
+ * five minutes, so a short outage (of CKB, say) doesn't take it away, and gets it back ten minutes after the last.
+ */
 function failedStart(userId) {
   const previous = failedStarts.get(userId);
-  const count = previous && Date.now() - previous.at < 10 * 60_000 ? previous.count + 1 : 1;
-  failedStarts.set(userId, { count, at: Date.now() });
+  const ongoing = previous && Date.now() - previous.at < 10 * 60_000;
+  failedStarts.set(userId, { count: ongoing ? previous.count + 1 : 1, since: ongoing ? previous.since : Date.now(), at: Date.now() });
+}
+
+async function recordFundedChannel(userId, body) {
+  let id;
+  try { id = JSON.parse(body.toString("utf8"))?.params?.[0]?.channel_id; } catch {}
+  if (typeof id === "string" && /^0x[0-9a-f]{64}$/i.test(id)) {
+    await writeFile(join(managedDataDir(userId), FUNDED_CHANNELS), `${id.toLowerCase()}\n`, { flag: "a", mode: 0o600 });
+  }
 }
 
 /**
@@ -388,7 +409,7 @@ async function makeRoom(userId, priority = false) {
   const busy = (id) => operations.has(id) && now() - (busySince.get(id) ?? 0) < BUSY_PROTECTION_MS;
   const reusable = (id, node) => id !== userId && !node.stopping &&
     !(submitting.has(id) && now() - submitting.get(id) < SUBMIT_PROTECTION_MS) &&
-    (priority || (!busy(id) && now() >= node.heldUntil));
+    (priority || (!busy(id) && now() >= Math.max(node.heldUntil, node.startedAt + RESIDENCY_MS)));
   const candidates = [...nodes.entries()]
     .filter(([id, node]) => reusable(id, node))
     .sort(([, left], [, right]) => left.lastUsed - right.lastUsed);
@@ -619,7 +640,12 @@ async function stopNodeForDatabase(userId) {
 
 /** Starts a node again after a database operation, or has it started if it may now hold channels. */
 async function resumeNode(userId, wasRunning) {
-  if (wasRunning) return void await ensureNode(userId);
+  try {
+    if (wasRunning) return void await ensureNode(userId);
+  } catch (error) {
+    if (!shuttingDown && await mayHoldChannels(userId).catch(() => true)) superviseNode(userId);
+    throw error;
+  }
   if (!shuttingDown && await mayHoldChannels(userId).catch(() => true)) superviseNode(userId);
 }
 
@@ -787,9 +813,16 @@ export async function retireUser(userId) {
   const node = await ensureNode(userId);
   const channels = await nodeChannels(node);
   requireClosedChannels(channels);
-  // Funding aborted after it was signed may still be broadcast by the peer, and only this node can co-sign it.
-  if (channels.some((channel) => channel?.channel_outpoint && /\b(FUNDING_ABORTED|ABANDONED)\b/.test(JSON.stringify(channel?.state?.state_flags ?? "")))) {
-    throw new Error("A channel's funding was aborted after it was built; preserve the node database");
+  // Funding aborted after the user's signed funding was handed over may still be broadcast by the peer, and only
+  // this node can co-sign it. For a node from before funding was recorded, any aborted funding that was built.
+  const funded = await readFile(join(managedDataDir(userId), FUNDED_CHANNELS), "utf8").then(
+    (text) => new Set(text.split("\n").filter(Boolean)),
+    (error) => { if (error?.code === "ENOENT") return undefined; throw error; },
+  );
+  const abortedAfterFunding = (channel) => /\b(FUNDING_ABORTED|ABANDONED)\b/.test(JSON.stringify(channel?.state?.state_flags ?? "")) &&
+    (funded ? funded.has(String(channel?.channel_id).toLowerCase()) : Boolean(channel?.channel_outpoint));
+  if (channels.some(abortedAfterFunding)) {
+    throw new Error("A channel's funding was aborted after it was signed; preserve the node database");
   }
   await requireNothingOnChain(node, channels);
   await mkdir(required("KEYWAY_MANAGED_RETIRED_DIR", "/fiber/retired"), { recursive: true });

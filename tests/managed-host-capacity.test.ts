@@ -149,6 +149,7 @@ test("at capacity, a node idle for a few minutes makes room for a new user; one 
 
   assert.equal(await request(F), 200);
   await withChannels(F);
+  assert.equal(await request(A), 200);
   assert.equal(await request(A, "connect_peer"), 200);
   // A just connected to a peer: its user may be about to open a channel with it.
   assert.equal(await request(B), 502);
@@ -264,15 +265,14 @@ test("a node still starting when the host shuts down stops with it", async (cont
   assert.deepEqual(running(), []);
 });
 
-test("a read never creates a hosted node; connecting one or setting up a channel does", async (context) => {
+test("only connecting a hosted node creates one; no other call does", async (context) => {
   const { root, request, running } = await host(context);
-  for (const method of ["list_channels", "list_peers", "graph_nodes", "get_invoice", "submit_signed_funding_tx"]) assert.equal(await request(A, method), 502, method);
+  const others = ["list_channels", "list_peers", "graph_nodes", "get_invoice", "connect_peer", "open_channel_with_external_funding", "submit_signed_funding_tx"];
+  for (const method of others) assert.equal(await request(A, method), 502, method);
   assert.equal(await exists(join(root, "users", A)), false);
   assert.deepEqual(running(), []);
   assert.equal(await request(A, "node_info"), 200);
-  assert.equal(await request(A, "list_channels"), 200);
-  assert.equal(await request(B, "connect_peer"), 200);
-  assert.deepEqual(running(), [A, B]);
+  for (const method of others) assert.equal(await request(A, method), 200, method);
 });
 
 test("reads don't keep a node from making room; the steps of a channel setup do, for a few minutes", async (context) => {
@@ -298,21 +298,24 @@ test("reads don't keep a node from making room; the steps of a channel setup do,
 test("a setup holds its node at most 15 minutes from its first step, a few setups an hour, on at most half the host", async (context) => {
   context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const { request, running } = await host(context);
+  const minute = () => context.mock.timers.tick(61_000);
   // A's user opens a channel long after connecting: the setup is held from its own first step.
   assert.equal(await request(A), 200);
   context.mock.timers.tick(20 * 60_000);
   assert.equal(await request(A, "connect_peer"), 200);
   // With A held, B's setup step doesn't hold B: half of this host is one node.
+  assert.equal(await request(B), 200);
   assert.equal(await request(B, "connect_peer"), 200);
+  minute();
   assert.equal(await request(C), 200);
   assert.deepEqual(running(), [A, C]);
   // A keeps repeating a setup step, while C is read after it each time; the hold ends 15 minutes in.
-  for (let minute = 4; minute < 16; minute += 4) {
-    context.mock.timers.tick(4 * 60_000);
+  for (let step = 0; step < 4; step++) {
+    context.mock.timers.tick(3 * 60_000);
     assert.equal(await request(A, "connect_peer"), 200);
     assert.equal(await request(C, "list_channels"), 200);
   }
-  context.mock.timers.tick(3 * 60_000);
+  context.mock.timers.tick(4 * 60_000);
   assert.equal(await request(B), 200);
   assert.deepEqual(running(), [B, C]);
   // A new setup is held again, but only a few times an hour.
@@ -320,6 +323,7 @@ test("a setup holds its node at most 15 minutes from its first step, a few setup
     assert.equal(await request(A, "connect_peer"), 200, `setup ${setup}`);
     assert.ok(running().includes(A));
     assert.equal(await request(B, "list_channels"), 200);
+    minute();
     assert.equal(await request(C), 200);
     // Held, A stays and B makes room; past the budget, A isn't held and makes room itself.
     assert.deepEqual(running(), setup <= 3 ? [A, C] : [B, C], `setup ${setup}`);
@@ -328,22 +332,20 @@ test("a setup holds its node at most 15 minutes from its first step, a few setup
   }
 });
 
-test("accounts that only connect can't keep the host full, nor lock out a user they keep pushing out", async (context) => {
+test("accounts that only connect can't make the host start nodes faster than once a slot a minute, nor lock out a user", async (context) => {
   context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
-  const { request, running } = await host(context);
+  const { request, running, starts } = await host(context);
   const crowd = ["1", "2", "3", "4"].map((digit) => digit.repeat(64));
-  // Each new node of the crowd's takes the place of the one before, as each was only read.
-  for (const user of crowd) assert.equal(await request(user), 200);
-  assert.equal(await request(A), 200);
-  assert.ok(running().includes(A));
-  // B is stopped by the crowd over and over, yet always gets its node back.
-  for (let round = 0; round < 10; round++) {
-    assert.equal(await request(B), 200, `round ${round}`);
-    assert.equal(await request(crowd[round % 4]), 200);
-    assert.equal(await request(crowd[(round + 1) % 4]), 200);
-    assert.ok(!running().includes(B));
-    context.mock.timers.tick(10_000);
-  }
+  const hammer = async () => { for (let round = 0; round < 20; round++) await request(crowd[round % 4]); };
+  await hammer();
+  assert.equal((await starts()).length, 2);
+  context.mock.timers.tick(61_000);
+  await hammer();
+  assert.equal((await starts()).length, 4);
+  // Once a slot's minute is up, a user who asks gets it.
+  context.mock.timers.tick(61_000);
+  assert.equal(await request(B), 200);
+  assert.ok(running().includes(B));
 });
 
 test("a node started on demand is recorded as checked, so a restart starts it only if it has channels", async (context) => {
@@ -498,10 +500,15 @@ test("a node can be retired once its channels are finished and nothing of it is 
   chain.live.clear();
   await withChannels(F, SETTLING_FORCE_CLOSE);
   await assert.rejects(retire(), /closure is incomplete/);
-  // Funding aborted after it was built: the peer may still broadcast it.
-  await withChannels(F, [{ ...ABORTED_FUNDING[0], channel_outpoint: `${FUNDING_TX}00000000` }]);
-  await assert.rejects(retire(), /aborted after it was built/);
-  await withChannels(F, SETTLED_REMOTE_CLOSE);
+  // Funding aborted after the user's signed funding was handed over: the peer may still broadcast it. Without a
+  // record of submitted funding (a node from before it was kept), any aborted funding that was built counts.
+  const aborted = { ...ABORTED_FUNDING[0], channel_id: `0x${"55".repeat(32)}`, channel_outpoint: `${FUNDING_TX}00000000` };
+  await withChannels(F, [aborted]);
+  await assert.rejects(retire(), /aborted after it was signed/);
+  await writeFile(join(root, "users", F, "keyway-funded-channels"), `0x${"55".repeat(32)}\n`);
+  await assert.rejects(retire(), /aborted after it was signed/);
+  // An open the user never funded, aborted after its transaction was built, doesn't block retirement.
+  await withChannels(F, [...SETTLED_REMOTE_CLOSE, { ...aborted, channel_id: `0x${"66".repeat(32)}` }]);
   assert.deepEqual(await retire(), { retired: true, databasePreserved: true });
   assert.equal(await exists(join(root, "retired", F)), true);
 });
@@ -576,11 +583,13 @@ test("a slow channel setup step keeps its node only briefly, and never from a no
     context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
     const { root, request, running } = await host(context);
     assert.equal(await request(A), 200);
+    assert.equal(await request(B), 200);
     assert.equal(await request(B, "connect_peer"), 200);
+    context.mock.timers.tick(61_000);
     await writeFile(join(root, "users", A, "slow-rpc"), "");
     const slow = request(A, "open_channel_with_external_funding");
     await new Promise((resolve) => setTimeout(resolve, 200));
-    // Within the first half minute A's request keeps it; after that, a new user may take its place.
+    // For half a minute A's request keeps it; after that, however long Fiber takes, a new user may take its place.
     assert.equal(await request(C), 502);
     context.mock.timers.tick(31_000);
     assert.equal(await request(C), 200);
