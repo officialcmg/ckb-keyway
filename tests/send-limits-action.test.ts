@@ -8,7 +8,11 @@ import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { chainOnSendLimit, decodeSendLimitSettings, encodeSendLimitSettings, sendLimitInputIndex, setSendLimitRecord, settingsFromDailyAmounts, type SendLimitHead, type SendLimitSettings } from "../src/sdk/browser/send-limits.ts";
 import { dailyAllowance } from "../src/server/general-signing.ts";
-import { fakeLit, litCodeIn, type ActionModule } from "./lit-action-fixture.ts";
+import { loadLitAction } from "../src/server/lit-actions.ts";
+import { litBackupIds, setEmailBinding } from "../src/server/lit-policy.ts";
+import { planRecovery } from "../src/server/recovery.ts";
+import type { ReadyWallet } from "../src/server/user-wallet.ts";
+import { fakeEthers, fakeLit, litCodeIn, type ActionModule } from "./lit-action-fixture.ts";
 
 const CKB = 100_000_000n;
 const HOUR = 60 * 60_000;
@@ -36,11 +40,11 @@ type Cell = { outPoint: { txHash: ccc.Hex; index: number }; cellOutput: ccc.Cell
 const cellOf = (tx: ccc.Transaction, index: number): Cell => ({ outPoint: { txHash: tx.hash(), index }, cellOutput: tx.outputs[index], outputData: tx.outputsData[index] });
 
 /** A fake chain for one key: transactions are committed or pending, committed ones optionally at a block time. */
-async function account() {
+async function account(options: { indexerLag?: (url: string) => number; tipAge?: (url: string) => number } = {}) {
   const k = key();
   const known = new Map<string, { tx: ccc.Transaction; status: string; blockHash?: string }>();
   const headers = new Map<string, number>();
-  const lit = fakeLit({ privateKey: k.privateKey, pkpId: k.pkpId, lookup: (hash) => known.get(hash), transactions: () => [...known.values()].map(({ tx }) => tx), header: (hash) => headers.get(hash) });
+  const lit = fakeLit({ privateKey: k.privateKey, pkpId: k.pkpId, lookup: (hash) => known.get(hash), transactions: () => [...known.values()].map(({ tx }) => tx), header: (hash) => headers.get(hash), indexerLag: options.indexerLag, tipAge: options.tipAge });
   const add = (tx: ccc.Transaction, status = "committed", time?: number) => {
     let blockHash: string | undefined;
     if (time !== undefined) { blockHash = ccc.hashCkb(ccc.numLeToBytes(time, 8)); headers.set(blockHash, time); }
@@ -258,9 +262,10 @@ test("a send-limit cell someone else made can't stand in for the account's own",
     outputs: [{ lock: env.secp, type: typeIdScript(ccc.hashTypeId(input, 0)), capacity: 174n * CKB }],
     outputsData: [encodeSendLimitSettings({ fingerprint: ccc.hexFrom(new Uint8Array(32)), tokensUnlimited: true, tokens: new Map() })],
   }));
+  // Chaining on it treats it as the ordinary cell it is, so its successor is a new send-limit cell, which is refused.
   const send = sendTx(env, cellOf(forged, 0), [change], 500n * CKB);
-  await assert.rejects(env.run("plan", send), /isn't one this account made/);
-  await assert.rejects(env.run("transaction", send), /isn't one this account made/);
+  await assert.rejects(env.run("plan", send), /new send-limit cell/);
+  await assert.rejects(env.run("transaction", send), /new send-limit cell/);
   // The forged cell doesn't hide the real one, and doesn't count as limits on an account without any.
   const unchained = sendTx(env, null, [cellOf(env.funding, 1)], 90n * CKB);
   assert.equal((await planned(env, unchained, null)).limits, "unchained");
@@ -608,4 +613,351 @@ test("the code email names where the funds go, so a swapped recipient shows", as
   const text = env.emails[env.emails.length - 1].text;
   assert.ok(text.includes(`To ${address(x)}: 100 CKB`), text);
   assert.ok(!text.includes("To a Fiber channel"));
+});
+
+/** A testnet client that answers from the account's committed transactions and never reaches the network. */
+async function offlineClient(env: Account): Promise<ccc.Client> {
+  const transactions = [...env.known.values()].filter(({ status }) => status === "committed").map(({ tx }) => tx);
+  const spent = new Set(transactions.flatMap((tx) => tx.inputs.map((input) => `${input.previousOutput.txHash}:${Number(input.previousOutput.index)}`)));
+  const client = new ccc.ClientPublicTestnet({ url: "https://testnet.ckb.dev/" });
+  const cells = transactions.flatMap((tx) => tx.outputs.map((cellOutput, index) => ccc.Cell.from({ outPoint: { txHash: tx.hash(), index }, cellOutput, outputData: tx.outputsData[index] })));
+  await client.cache.recordCells(cells);
+  const live = cells.filter((cell) => !spent.has(`${cell.outPoint.txHash}:${Number(cell.outPoint.index)}`));
+  Object.assign(client, {
+    findCells: async function* () {},
+    findCellsByLock: async function* (lock: ccc.ScriptLike) { for (const cell of live) if (cell.cellOutput.lock.eq(ccc.Script.from(lock))) yield cell; },
+  });
+  return client;
+}
+
+/**
+ * An account with limits on (100 CKB a day, bound to EMAIL) and recovery off, and the transaction turning recovery
+ * on that a compromised server would plan: every plain cell to an address its own backup can spend.
+ */
+async function limitedEnable(before: (env: Account) => void = () => {}) {
+  const env = await account();
+  await turnOn(env, { ckb: 100n * CKB });
+  before(env);
+  const client = await offlineClient(env);
+  const wallet = { version: 1, status: "ready", litPkpId: env.pkpId, litPublicKey: env.publicKey, ckbAddress: "ckt1test", encryptedFiberKey: "x", primaryDeviceIdHash: "a".repeat(64), hasOpenedChannel: false, createdAt: "2026-11-10T00:00:00.000Z", updatedAt: "2026-11-10T00:00:00.000Z" } as ReadyWallet;
+  const backup = { kind: "evm" as const, address: ccc.hexFrom(keccak_256(Uint8Array.of(0xbb)).slice(12)) };
+  const plan = await planRecovery(client, wallet, [backup], { emailBinding: true });
+  const backups = await litBackupIds(client, [backup]);
+  const binding = async (email: string) => ccc.hexFrom(ccc.bytesConcat("0x4b57454202", await env.action.emailFingerprint(env.pkpId, email)));
+  return { env, tx: plan.transaction, backups, binding, moved: plan.transaction.outputs.reduce((sum, output) => sum + output.capacity, 0n) };
+}
+
+test("with send limits on, turning recovery on needs the code at the limits' bound address, not one the server names", async () => {
+  const attacker = "attacker@example.com";
+  const { env, tx, backups, binding, moved } = await limitedEnable();
+  assert.ok(moved > 1_000n * CKB, "the enable moves far more than the daily amount");
+
+  // send-code to the server's own address: refused, nothing emailed, no binding handed back.
+  const sentBefore = env.emails.length;
+  await assert.rejects(env.run("send-code", tx, { email: attacker, emailApiKey: "re_test_sending_key", appName: "Demo", backups }), /bound to this account's send limits/);
+  assert.equal(env.emails.length, sentBefore);
+
+  // Transaction mode bound to the server's address, holding a valid code for it: refused for the address.
+  const action = new Function("Lit", "ethers", "fetch", `${await loadLitAction("sign-ckb-transaction")}\nreturn { codeFor };`)(env.Lit, fakeEthers, env.fetch) as { codeFor: (pkpId: string, txHash: Uint8Array, email: string, ticket: string) => Promise<string> };
+  const forged = tx.clone();
+  setEmailBinding(forged, await binding(attacker));
+  const { transactionHash } = await env.run("plan", forged, { backups }) as { transactionHash: ccc.Hex };
+  const ticket = `v1.${Date.now() + 5 * 60_000}.${"ab".repeat(16)}`;
+  const code = await action.codeFor(env.pkpId, ccc.bytesFrom(transactionHash), attacker, ticket);
+  await assert.rejects(env.run("transaction", forged, { email: attacker, backups, emailCode: { code, ticket } }), /bound to this account's send limits/);
+  // Nor can the bound address sign a binding to another one.
+  await assert.rejects(env.run("transaction", forged, { email: EMAIL, backups, emailCode: { code, ticket } }), /bound to this account's recovery/);
+
+  // The bound address works in both modes, and the code goes only there.
+  const sent = await env.run("send-code", tx, { email: EMAIL, emailApiKey: "re_test_sending_key", appName: "Demo", backups }) as { ticket: string; binding: ccc.Hex; sentTo: string };
+  assert.equal(sent.sentTo, EMAIL);
+  assert.deepEqual(env.emails.slice(sentBefore).map((email) => email.to), [[EMAIL]]);
+  setEmailBinding(tx, sent.binding);
+  const signed = await env.run("transaction", tx, { email: EMAIL, backups, emailCode: { code: litCodeIn(env.emails[env.emails.length - 1]), ticket: sent.ticket } }) as { operation: string; signatures: unknown[] };
+  assert.equal(signed.operation, "enable");
+  assert.ok(signed.signatures.length > 0);
+});
+
+test("turning recovery on is refused while the account shows two send-limit cells", async () => {
+  const { env, tx, backups } = await limitedEnable((env) => {
+    // A second send-limit cell this key made (spending its own cell), as a conflicting genesis would leave.
+    const input = ccc.CellInput.from({ previousOutput: cellOf(env.funding, 3).outPoint });
+    const settings: SendLimitSettings = { fingerprint: `0x${"11".repeat(32)}`, tokensUnlimited: false, tokens: new Map(), ckb: 100n * CKB };
+    env.add(ccc.Transaction.from({
+      inputs: [input],
+      outputs: [{ lock: env.secp, type: typeIdScript(ccc.hashTypeId(input, 0)), capacity: 174n * CKB }, { lock: env.secp, capacity: 226n * CKB - FEE }],
+      outputsData: [encodeSendLimitSettings(settings), "0x"],
+    }));
+  });
+  const sentBefore = env.emails.length;
+  await assert.rejects(env.run("send-code", tx, { email: EMAIL, emailApiKey: "re_test_sending_key", appName: "Demo", backups }), /more than one send-limit cell/);
+  assert.equal(env.emails.length, sentBefore);
+});
+
+// ---------- run-3 audit: the policy Action's remaining gaps (issue #25) ----------
+
+const dao = ccc.Script.from({ codeHash: "0x82d76d1b75fe2fd9a27dfbaa65a039221a380d76c926f378d3f81cf3e7e13f2e", hashType: "type", args: "0x" });
+
+/** A cell under `lock` (and `type`) holding `data`, committed in a transaction of its own. */
+function plant(env: Account, output: { lock: ccc.Script; type?: ccc.Script; capacity: bigint }, data: ccc.HexLike = "0x") {
+  return cellOf(env.add(ccc.Transaction.from({ inputs: [outside()], outputs: [output], outputsData: [ccc.hexFrom(data)] })), 0);
+}
+
+test("M5/M26: 1100 planted look-alike send-limit cells in one block hide neither the account's own cell nor its absence, and one can be cleaned up", async () => {
+  const lookalikes = (env: Account) => env.add(ccc.Transaction.from({
+    inputs: [outside()],
+    outputs: Array.from({ length: 1100 }, (_, i) => ({ lock: env.secp, type: typeIdScript(ccc.hexFrom(ccc.numLeToBytes(i + 1, 32))), capacity: 174n * CKB })),
+    outputsData: Array.from({ length: 1100 }, () => encodeSendLimitSettings({ fingerprint: `0x${"11".repeat(32)}`, tokensUnlimited: true, ckb: 1n, tokens: new Map() })),
+  }));
+  // Without limits: still no limits, and turning them on still works.
+  const fresh = await account();
+  const planted = lookalikes(fresh);
+  assert.equal((await planned(fresh, sendTx(fresh, null, [cellOf(fresh.funding, 1)], 90n * CKB), null)).limits, "legacy");
+  await turnOn(fresh, { ckb: 100n * CKB });
+  // With limits on: a send that leaves the cell out still finds it, so it needs the code.
+  const unchained = sendTx(fresh, null, [cellOf(fresh.funding, 1)], 90n * CKB);
+  const plan = await planned(fresh, unchained, null);
+  assert.equal(plan.limits, "unchained");
+  assert.equal(plan.needsCode, true);
+  // A planted look-alike is an ordinary Type ID cell: destroying it, its CKB back at the address, is exempt and signs.
+  const cleanup = ccc.Transaction.from({ inputs: [{ previousOutput: cellOf(planted, 0).outPoint }], outputs: [{ lock: fresh.secp, capacity: 174n * CKB - FEE }], outputsData: ["0x"] });
+  prepare(fresh, cleanup, [fresh.secp]);
+  assert.equal((await fresh.run("plan", cleanup) as Plan).limits, "exempt");
+  assert.ok((await fresh.run("transaction", cleanup) as { signatures: unknown[] }).signatures.length > 0);
+});
+
+test("M26: one transaction can destroy many well-formed look-alikes within Lit's request limit", async () => {
+  const env = await account();
+  // Each look-alike has a correct Type ID from its creator's input 0 (an outsider's cell) and minimal "KWSL" data.
+  const planted = Array.from({ length: 60 }, () => {
+    const source = plant(env, { lock: stranger, capacity: 200n * CKB });
+    const input = ccc.CellInput.from({ previousOutput: source.outPoint });
+    return cellOf(env.add(ccc.Transaction.from({ inputs: [input], outputs: [{ lock: env.secp, type: typeIdScript(ccc.hashTypeId(input, 0)), capacity: 130n * CKB }], outputsData: ["0x4b57534c"] })), 0);
+  });
+  const cleanup = ccc.Transaction.from({ inputs: planted.map((cell) => ({ previousOutput: cell.outPoint })), outputs: [{ lock: env.secp, capacity: 60n * 130n * CKB - FEE }], outputsData: ["0x"] });
+  prepare(env, cleanup, [env.secp]);
+  const before = env.requests.length;
+  assert.equal((await env.run("plan", cleanup) as Plan).limits, "exempt");
+  // The creators' inputs, their blocks and the key's history there are each read in one batch, not one request per
+  // look-alike.
+  assert.ok(env.requests.length - before <= 5, `${env.requests.length - before} requests`);
+});
+
+test("M27: an indexer behind its chain is never read as 'no send limits'", async () => {
+  const lagging = await account({ indexerLag: (url) => (url === "https://testnet.ckb.dev/" ? 10 : 0) });
+  await turnOn(lagging, { ckb: 100n * CKB });
+  const send = sendTx(lagging, null, [cellOf(lagging.funding, 1)], 90n * CKB);
+  // The first node lags, so the second one answers: limits are on.
+  assert.equal((await planned(lagging, send, null)).limits, "unchained");
+  await assert.rejects(lagging.run("transaction", send), /eight-digit code/);
+  // When every node lags, nothing is signed.
+  const behind = await account({ indexerLag: () => 10 });
+  const blind = sendTx(behind, null, [cellOf(behind.funding, 1)], 90n * CKB);
+  await assert.rejects(behind.run("plan", blind), /indexer is behind/);
+  await assert.rejects(behind.run("transaction", blind), /indexer is behind/);
+});
+
+test("M16: the interest a Nervos DAO withdrawal adds counts as the account's, so sending it away isn't exempt", async () => {
+  const env = await account();
+  const withdrawing = plant(env, { lock: env.secp, type: dao, capacity: 10_000n * CKB }, ccc.numLeToBytes(1234, 8));
+  const plain = cellOf(env.funding, 1);
+  const away = ccc.Transaction.from({
+    inputs: [{ previousOutput: withdrawing.outPoint }, { previousOutput: plain.outPoint }],
+    outputs: [{ lock: env.secp, capacity: 10_300n * CKB - FEE }, { lock: stranger, capacity: 300n * CKB }],
+    outputsData: ["0x", "0x"],
+  });
+  prepare(env, away, [env.secp, env.secp]);
+  const plan = await env.run("plan", away) as Plan;
+  assert.notEqual(plan.limits, "exempt");
+  assert.ok(BigInt(plan.outflow.ckb) >= 300n * CKB, plan.outflow.ckb);
+  // Everything back to the account, interest included, is still exempt; so is a withdrawal request (phase 1).
+  const home = ccc.Transaction.from({ inputs: [{ previousOutput: withdrawing.outPoint }], outputs: [{ lock: env.secp, capacity: 10_250n * CKB }], outputsData: ["0x"] });
+  prepare(env, home, [env.secp]);
+  assert.equal((await env.run("plan", home) as Plan).limits, "exempt");
+  const deposit = plant(env, { lock: env.secp, type: dao, capacity: 5_000n * CKB }, new Uint8Array(8));
+  const request = ccc.Transaction.from({ inputs: [{ previousOutput: deposit.outPoint }], outputs: [{ lock: env.secp, type: dao, capacity: 5_000n * CKB - FEE }], outputsData: [ccc.hexFrom(ccc.numLeToBytes(99, 8))] });
+  prepare(env, request, [env.secp]);
+  assert.equal((await env.run("plan", request) as Plan).limits, "exempt");
+});
+
+test("M17: minting a token the account issued to someone else counts as that token leaving", async () => {
+  const env = await account();
+  const own = ccc.Script.from({ codeHash: xudt.codeHash, hashType: xudt.hashType, args: env.secp.hash() });
+  const theirs = plant(env, { lock: stranger, capacity: 200n * CKB });
+  const mint = ccc.Transaction.from({
+    inputs: [{ previousOutput: cellOf(env.funding, 1).outPoint }, { previousOutput: theirs.outPoint }],
+    outputs: [{ lock: env.secp, capacity: 300n * CKB - FEE }, { lock: stranger, type: own, capacity: 200n * CKB }],
+    outputsData: ["0x", ccc.hexFrom(ccc.numLeToBytes(10n ** 30n, 16))],
+  });
+  prepare(env, mint, [env.secp, stranger]);
+  const plan = await env.run("plan", mint) as Plan & { outflow: { tokens: Array<{ asset: string; amount: string }> } };
+  assert.notEqual(plan.limits, "exempt");
+  assert.deepEqual(plan.outflow.tokens, [{ asset: own.hash(), amount: (10n ** 30n).toString() }]);
+  // Minting to the account itself nets out; another issuer's token isn't the account's to count.
+  const toSelf = mint.clone();
+  toSelf.outputs[1].lock = env.secp;
+  assert.equal((await env.run("plan", toSelf) as Plan).limits, "exempt");
+  const foreign = mint.clone();
+  foreign.outputs[1].type = xudt;
+  assert.equal((await env.run("plan", foreign) as Plan).limits, "exempt");
+});
+
+test("M18: inputs under a lock this key can unlock in a form KeyWay doesn't use (anyone-can-pay, other Omnilocks) are refused", async () => {
+  const env = await account();
+  const blake160 = ccc.bytesFrom(env.secp.args);
+  const shapes = [
+    ccc.Script.from({ codeHash: "0x3419a1c09eb2567f6552ee7a8ecffd64155cffe0f1796e6e61ec088d740c1356", hashType: "type", args: env.secp.args }),
+    ccc.Script.from({ codeHash: "0xd369597ff47f29fbc0d47d2e3775370d1250b85140c670e4718af712983a2354", hashType: "type", args: ccc.bytesConcat(blake160, [0x01]) }),
+    ccc.Script.from({ codeHash: "0xf329effd1c475a2978453c8600e1eaf0bc2087ee093c3ee64cc96ec6847752cb", hashType: "type", args: ccc.bytesConcat([0x00], blake160, [0x00]) }),
+  ];
+  for (const lock of shapes) {
+    const held = plant(env, { lock, capacity: 50_000n * CKB });
+    const drain = ccc.Transaction.from({
+      inputs: [{ previousOutput: cellOf(env.funding, 1).outPoint }, { previousOutput: held.outPoint }],
+      outputs: [{ lock: env.secp, capacity: 300n * CKB - FEE }, { lock: stranger, capacity: 50_000n * CKB }],
+      outputsData: ["0x", "0x"],
+    });
+    drain.setWitnessArgsAt(0, ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(65)) }));
+    drain.setWitnessArgsAt(1, ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(65)) }));
+    await assert.rejects(env.run("plan", drain), /form KeyWay doesn't use/, lock.codeHash);
+    await assert.rejects(env.run("transaction", drain), /form KeyWay doesn't use/, lock.codeHash);
+  }
+});
+
+test("M30: a token counted per cell needs the code whenever it has a daily amount, whatever the amount", async () => {
+  const env = await account();
+  const unlisted = ccc.Script.from({ codeHash: `0x${"5a".repeat(32)}`, hashType: "type", args: "0x01" });
+  const { head, change } = await turnOn(env, { ckb: 1_000_000n * CKB, tokensUnlimited: true, tokens: new Map([[unlisted.hash(), 1_000_000n]]) });
+  const token = plant(env, { lock: env.secp, type: unlisted, capacity: 200n * CKB }, ccc.numLeToBytes(10n ** 12n, 16));
+  const whole = ccc.Transaction.from({
+    inputs: [{ previousOutput: token.outPoint }, { previousOutput: change.outPoint }],
+    outputs: [{ lock: stranger, type: unlisted, capacity: 200n * CKB }, { lock: env.secp, capacity: change.cellOutput.capacity - FEE }],
+    outputsData: [token.outputData, "0x"],
+  });
+  chainOnSendLimit(whole, { ...head, recordEntriesBytes: 0 } as SendLimitHead);
+  prepare(env, whole, [env.secp, env.secp, env.secp]);
+  const plan = await planned(env, whole, head);
+  assert.equal(plan.limits, "chained");
+  assert.equal(plan.needsCode, true);
+  await assert.rejects(env.run("transaction", whole), /eight-digit code/);
+});
+
+test("review: a record-shaped witness on someone else's input of the genesis doesn't turn the account's own send-limit cell into a look-alike", async () => {
+  const env = await account();
+  const foreign = plant(env, { lock: stranger, capacity: 200n * CKB });
+  const from = cellOf(env.funding, 0);
+  const settings: SendLimitSettings = { fingerprint: ccc.hexFrom(new Uint8Array(32)), tokensUnlimited: false, tokens: new Map(), ckb: 100n * CKB };
+  const input = ccc.CellInput.from({ previousOutput: from.outPoint });
+  const genesis = ccc.Transaction.from({
+    inputs: [input, { previousOutput: foreign.outPoint }],
+    outputs: [{ lock: env.secp, type: typeIdScript(ccc.hashTypeId(input, 0)), capacity: 200n * CKB }, { lock: env.secp, capacity: from.cellOutput.capacity - 200n * CKB }, { lock: stranger, capacity: foreign.cellOutput.capacity - FEE }],
+    outputsData: [encodeSendLimitSettings(settings), "0x", "0x"],
+  });
+  prepare(env, genesis, [env.secp, stranger]);
+  const { sent, emailCode } = await codeFor(env, genesis);
+  genesis.outputsData[0] = encodeSendLimitSettings({ ...settings, fingerprint: sent.fingerprint! });
+  assert.equal((await env.run("transaction", genesis, { email: EMAIL, emailCode }) as { limits: string }).limits, "genesis");
+  // After signing, a record shape on the other party's input (its witness isn't covered by the account's signature).
+  genesis.setWitnessArgsAt(1, ccc.WitnessArgs.from({ inputType: "0x4b5753520100" }));
+  env.add(genesis);
+  const destroy = ccc.Transaction.from({ inputs: [{ previousOutput: cellOf(genesis, 0).outPoint }], outputs: [{ lock: env.secp, capacity: 200n * CKB - FEE }], outputsData: ["0x"] });
+  prepare(env, destroy, [env.secp]);
+  await assert.rejects(env.run("transaction", destroy), /can't be destroyed/);
+  const send = sendTx(env, null, [cellOf(env.funding, 1)], 290n * CKB);
+  assert.equal((await planned(env, send, null)).limits, "unchained");
+  await assert.rejects(env.run("transaction", send), /eight-digit code/);
+});
+
+test("review: a node that strips a chained cell's record can't make it pass for a look-alike", async () => {
+  const env = await account();
+  const { head, change } = await turnOn(env, { ckb: 100n * CKB });
+  const send = sendTx(env, head, [change], 10n * CKB);
+  await planned(env, send, head);
+  await env.run("transaction", send);
+  env.add(send);
+  // The node now serves the chained transaction without its record (witnesses aren't in the hash it's checked against).
+  const served = env.known.get(send.hash())!.tx;
+  served.witnesses = served.witnesses.map(() => ccc.hexFrom(ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(65)) }).toBytes()));
+  const destroy = ccc.Transaction.from({ inputs: [{ previousOutput: headAfter(send).outPoint }], outputs: [{ lock: env.secp, capacity: headAfter(send).cellOutput.capacity - FEE }], outputsData: ["0x"] });
+  prepare(env, destroy, [env.secp]);
+  await assert.rejects(env.run("transaction", destroy), /can't be read/);
+});
+
+test("review: no input under a lock naming this key in a form KeyWay doesn't use (secp256k1 by data hash, KeyWay's Omnilock as data2) is signed for, whatever its witness", async () => {
+  const env = await account();
+  const blake160 = ccc.bytesFrom(env.secp.args);
+  const shapes = [
+    ccc.Script.from({ codeHash: "0x709f3fda12f561cfacf92273c57a98fede188a3f1a59b1f888d113f9cce08649", hashType: "data1", args: env.secp.args }),
+    ccc.Script.from({ codeHash: "0x6b29b6f10346b43c540e53806ba88ba0fe3a0c3a29d7448ef555840c8f8318fa", hashType: "data2", args: ccc.bytesConcat([0x00], blake160, [0x00]) }),
+  ];
+  for (const lock of shapes) {
+    // The other input's witness is chosen by whoever builds the transaction and can change after signing, so the
+    // refusal can't depend on it: absent, empty, a short lock or a full one.
+    for (const otherWitness of [undefined, ccc.hexFrom("0x"), ccc.hexFrom(ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(64)) }).toBytes()), ccc.hexFrom(ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(65).fill(7)) }).toBytes())]) {
+      const held = plant(env, { lock, capacity: 50_000n * CKB });
+      const drain = ccc.Transaction.from({
+        inputs: [{ previousOutput: cellOf(env.funding, 1).outPoint }, { previousOutput: held.outPoint }],
+        outputs: [{ lock: env.secp, capacity: 300n * CKB - FEE }, { lock: stranger, capacity: 50_000n * CKB }],
+        outputsData: ["0x", "0x"],
+      });
+      drain.setWitnessArgsAt(0, ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(65)) }));
+      if (otherWitness !== undefined) drain.witnesses[1] = otherWitness;
+      await assert.rejects(env.run("plan", drain), /form KeyWay doesn't use/, `${lock.hashType} ${otherWitness}`);
+      await assert.rejects(env.run("transaction", drain), /form KeyWay doesn't use/, `${lock.hashType} ${otherWitness}`);
+    }
+  }
+  // An ordinary input of someone else's (another key) still signs.
+  const theirs = plant(env, { lock: ccc.Script.from({ ...env.secp, args: `0x${"cd".repeat(20)}` }), capacity: 100n * CKB });
+  const together = ccc.Transaction.from({
+    inputs: [{ previousOutput: cellOf(env.funding, 2).outPoint }, { previousOutput: theirs.outPoint }],
+    outputs: [{ lock: env.secp, capacity: 500n * CKB - FEE }, { lock: stranger, capacity: 100n * CKB }],
+    outputsData: ["0x", "0x"],
+  });
+  together.setWitnessArgsAt(0, ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(65)) }));
+  together.setWitnessArgsAt(1, ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(65)) }));
+  assert.ok((await env.run("transaction", together) as { signatures: unknown[] }).signatures.length > 0);
+});
+
+test("review: a token whose owner is the type of one of the account's cells counts as leaving when minted away", async () => {
+  const env = await account();
+  const issuer = plant(env, { lock: env.secp, type: typeIdScript(`0x${"31".repeat(32)}`), capacity: 150n * CKB });
+  const owned = ccc.Script.from({ codeHash: xudt.codeHash, hashType: xudt.hashType, args: ccc.bytesConcat(ccc.bytesFrom(issuer.cellOutput.type!.hash()), ccc.numLeToBytes(0x80000000, 4)) });
+  const theirs = plant(env, { lock: stranger, capacity: 200n * CKB });
+  const mint = ccc.Transaction.from({
+    inputs: [{ previousOutput: issuer.outPoint }, { previousOutput: theirs.outPoint }],
+    outputs: [{ lock: env.secp, type: issuer.cellOutput.type, capacity: 150n * CKB - FEE }, { lock: stranger, type: owned, capacity: 200n * CKB }],
+    outputsData: ["0x", ccc.hexFrom(ccc.numLeToBytes(10n ** 20n, 16))],
+  });
+  prepare(env, mint, [env.secp, stranger]);
+  const plan = await env.run("plan", mint) as Plan & { outflow: { tokens: Array<{ asset: string; amount: string }> } };
+  assert.notEqual(plan.limits, "exempt");
+  assert.deepEqual(plan.outflow.tokens, [{ asset: owned.hash(), amount: (10n ** 20n).toString() }]);
+});
+
+test("review: a node whose whole chain has stalled isn't believed either", async () => {
+  const stalled = await account();
+  await turnOn(stalled, { ckb: 100n * CKB });
+  const fresh = await account({ tipAge: () => 0 });
+  void fresh;
+  const behind = await account({ tipAge: () => 20 * 60_000 });
+  const send = sendTx(behind, null, [cellOf(behind.funding, 1)], 90n * CKB);
+  await assert.rejects(behind.run("plan", send), /chain is behind the network/);
+});
+
+test("review: a look-alike in a block padded with 4,100 cells for the key blocks neither sends nor its own cleanup", async () => {
+  const env = await account();
+  // One outsider transaction: a send-limit-shaped look-alike with a correct Type ID, plus 4,100 small cells at the key.
+  const source = plant(env, { lock: stranger, capacity: 300_000n * CKB });
+  const input = ccc.CellInput.from({ previousOutput: source.outPoint });
+  const padded = env.add(ccc.Transaction.from({
+    inputs: [input],
+    outputs: [{ lock: env.secp, type: typeIdScript(ccc.hashTypeId(input, 0)), capacity: 130n * CKB }, ...Array.from({ length: 4100 }, () => ({ lock: env.secp, capacity: 61n * CKB }))],
+    outputsData: ["0x4b57534c", ...Array.from({ length: 4100 }, () => "0x")],
+  }));
+  const send = sendTx(env, null, [cellOf(env.funding, 1)], 90n * CKB);
+  assert.equal((await planned(env, send, null)).limits, "legacy");
+  const cleanup = ccc.Transaction.from({ inputs: [{ previousOutput: cellOf(padded, 0).outPoint }], outputs: [{ lock: env.secp, capacity: 130n * CKB - FEE }], outputsData: ["0x"] });
+  prepare(env, cleanup, [env.secp]);
+  assert.equal((await env.run("plan", cleanup) as Plan).limits, "exempt");
+  assert.ok((await env.run("transaction", cleanup) as { signatures: unknown[] }).signatures.length > 0);
 });
