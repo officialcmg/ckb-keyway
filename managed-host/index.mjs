@@ -49,8 +49,6 @@ const RESTART_MAX_MS = 60_000;
 const RESTART_STABLE_MS = 60_000;
 // How many times in a row a crashed node without a marker is started again.
 const RESTARTS_WITHOUT_MARKER = 3;
-// After this many failed starts in a row, a node that may hold channels no longer stops other nodes to start.
-const PRIORITY_FAILED_STARTS = 3;
 const nodes = new Map();
 const starting = new Map();
 const operations = new Map();
@@ -189,7 +187,7 @@ export function proxyUserRequest(userId, body, signal) {
           throw new Error("This channel isn't waiting for its funding");
         }
         await markChannels(userId, true);
-        await recordFundedChannel(userId, fundingId);
+        await recordFundedChannel(userId, fundingId, fundingInputs(body));
         // A node stopped meanwhile never gets the funding.
         if (nodes.get(userId) !== node || node.stopping) {
           await unrecordFundedChannel(userId, fundingId).catch(logError);
@@ -234,7 +232,7 @@ export function proxyUserRequest(userId, body, signal) {
     if (answer && method === "open_channel") await markChannels(userId, true);
     // A channel can also be opened to the node by a peer: it is marked once the node's channels show it.
     if (answer && method === "list_channels" && Array.isArray(answer.result?.channels) &&
-      holdsChannels(answer.result.channels, await fundingRecord(userId).catch(() => undefined))) {
+      await holdsChannels(answer.result.channels, await fundingRecord(userId).catch(() => undefined))) {
       await markChannels(userId, true);
     }
     return result;
@@ -317,7 +315,7 @@ async function fileExists(path) {
 /** Marks a node by its current channels (marked if they can't be read) and records that it has been checked. */
 async function checkChannels(userId, node) {
   let holds = true;
-  try { holds = holdsChannels(await nodeChannels(node), await fundingRecord(userId)); } catch {}
+  try { holds = await holdsChannels(await nodeChannels(node), await fundingRecord(userId)); } catch {}
   // A node handing over signed funding keeps its marker whatever its channels show yet.
   if (!holds && submittingNow(userId)) return;
   await markChannels(userId, holds);
@@ -365,8 +363,8 @@ async function ensureNode(userId, { provision = true } = {}) {
     throw error;
   }
   const failed = failedStarts.get(userId);
-  const failing = failed && failed.count >= PRIORITY_FAILED_STARTS && failed.at - failed.since >= 5 * 60_000 &&
-    Date.now() - failed.at < 10 * 60_000;
+  // A node whose last start failed doesn't stop other nodes again until it has run, or ten minutes have passed.
+  const failing = failed && Date.now() - failed.at < 10 * 60_000;
   // Only a marked node may take the place of a held or busy one: a node merely never checked starts where there
   // is room, as most of those hold nothing.
   const priority = !failing && await hasChannelsMarker(userId).catch(() => true);
@@ -380,6 +378,7 @@ async function ensureNode(userId, { provision = true } = {}) {
     .then(() => startNode(userId))
     .then(async (node) => {
       forgetOffline(userId);
+      failedStarts.delete(userId);
       await checkChannels(userId, node).catch(logError);
       return node;
     }, async (error) => {
@@ -439,8 +438,8 @@ function submittingNow(userId) {
 }
 
 /**
- * Counts a failed start. A node loses its priority after PRIORITY_FAILED_STARTS failures spread over at least
- * five minutes, so a short outage (of CKB, say) doesn't take it away, and gets it back ten minutes after the last.
+ * Counts a failed start (or a node dying soon after one). A node that may hold channels then loses its priority
+ * until it has run, so a node that can't start doesn't stop another node on every attempt.
  */
 function failedStart(userId) {
   const previous = failedStarts.get(userId);
@@ -481,28 +480,48 @@ async function awaitingFunding(userId, node, id) {
   }
 }
 
-async function recordFundedChannel(userId, id) {
+/** The cells a submitted funding transaction spends, as "tx_hash:index". */
+function fundingInputs(body) {
+  let inputs;
+  try { inputs = JSON.parse(body.toString("utf8"))?.params?.[0]?.signed_funding_tx?.inputs; } catch {}
+  if (!Array.isArray(inputs)) return [];
+  return inputs.map((input) => input?.previous_output)
+    .filter((out) => /^0x[0-9a-f]{64}$/i.test(String(out?.tx_hash)) && /^0x[0-9a-f]+$/i.test(String(out?.index)))
+    .map((out) => `${out.tx_hash.toLowerCase()}:${out.index.toLowerCase()}`)
+    .slice(0, 64);
+}
+
+/** Appends a channel to the funding record, with the cells its funding spends: "<channel id> <cell>,<cell>". */
+async function recordFundedChannel(userId, id, inputs = []) {
   await startFundingRecord(userId);
-  await writeFile(join(managedDataDir(userId), FUNDED_CHANNELS), `${id}\n`, { flag: "a", mode: 0o600 });
+  await writeFile(join(managedDataDir(userId), FUNDED_CHANNELS), `${[id, inputs.join(",")].filter(Boolean).join(" ")}\n`, { flag: "a", mode: 0o600 });
 }
 
 async function unrecordFundedChannel(userId, id) {
   const path = join(managedDataDir(userId), FUNDED_CHANNELS);
-  const lines = (await readFile(path, "utf8")).split("\n").filter((line) => line && line !== id);
+  const lines = (await readFile(path, "utf8")).split("\n").filter((line) => line && line.split(" ")[0] !== id);
   // Replaced whole, so a crash part-way can't lose other channels from the record.
   await writeFile(`${path}.tmp`, `${lines.join("\n")}\n`, { mode: 0o600 });
   await rename(`${path}.tmp`, path);
 }
 
-/** The node's funding record, `{ since, ids }`, or undefined for a node from before it was kept. */
+/**
+ * The node's funding record, `{ since, ids, inputs }` (inputs: channel ID to the cells its funding spends), or
+ * undefined for a node from before it was kept.
+ */
 async function fundingRecord(userId) {
   let text;
   try { text = await readFile(join(managedDataDir(userId), FUNDED_CHANNELS), "utf8"); }
   catch (error) { if (error?.code === "ENOENT") return undefined; throw error; }
-  const [first, ...ids] = text.split("\n").filter(Boolean);
+  const [first, ...lines] = text.split("\n").filter(Boolean);
   const since = Number(/^since (\d+)$/.exec(first ?? "")?.[1]);
   // A record without its start is judged as no record.
-  return Number.isFinite(since) ? { since, ids: new Set(ids.map((id) => id.toLowerCase())) } : undefined;
+  if (!Number.isFinite(since)) return undefined;
+  const inputs = new Map(lines.map((line) => {
+    const [id, cells = ""] = line.split(" ");
+    return [id.toLowerCase(), cells.split(",").filter(Boolean)];
+  }));
+  return { since, ids: new Set(inputs.keys()), inputs };
 }
 
 /** Whether a channel was created after the node's funding record began, so the record speaks for it. */
@@ -532,7 +551,7 @@ async function makeRoom(userId, priority = false) {
     try { channels = await nodeChannels(node); } catch { continue; }
     let record;
     try { record = await fundingRecord(id); } catch { continue; }
-    const idle = !holdsChannels(channels, record);
+    const idle = !(await holdsChannels(channels, record));
     if (!idle) await markChannels(id, true).catch(logError);
     // Checked again after the wait, in case the node was stopped or picked up a request meanwhile.
     if (!idle || nodes.get(id) !== node || !reusable(id, node)) continue;
@@ -901,9 +920,50 @@ function channelClass(channel, record) {
   return abortable && covered ? "unfunded" : "open";
 }
 
-/** Whether a node must keep running for its channels: any channel that isn't finished or unfunded. */
-function holdsChannels(channels, record) {
-  return !Array.isArray(channels) || channels.some((channel) => channelClass(channel, record) === "open");
+/**
+ * Whether a node must keep running for its channels: any channel that isn't finished or unfunded, except a
+ * channel whose recorded funding can never confirm (see fundingDead).
+ */
+async function holdsChannels(channels, record) {
+  if (!Array.isArray(channels)) return true;
+  for (const channel of channels) {
+    if (channelClass(channel, record) !== "open") continue;
+    if (!(await fundingDead(channel, record))) return true;
+  }
+  return false;
+}
+
+// Channels found unable ever to be funded: a spent cell stays spent.
+const deadFunding = new Set();
+const NOT_READY = ["negotiatingfunding", "collaboratingfundingtx", "signingcommitment", "awaitingtxsignatures", "awaitingchannelready"];
+
+/**
+ * Whether a channel not yet ready, whose funding the node was handed, can never be funded: a cell its funding
+ * spends was spent by another transaction, and the funding itself isn't on chain or in the pool. Nothing of the
+ * user's can be in such a channel. It stays in the funding record, so retirement still waits for it. If CKB
+ * can't be asked, it counts as funded.
+ */
+async function fundingDead(channel, record) {
+  const id = String(channel?.channel_id).toLowerCase();
+  if (deadFunding.has(id)) return true;
+  const cells = recordCovers(record, channel) ? record.inputs.get(id) : undefined;
+  const outpoint = String(channel?.channel_outpoint ?? "");
+  if (!cells?.length || !NOT_READY.includes(stateName(channel)) || !/^0x[0-9a-f]{72}$/i.test(outpoint)) return false;
+  try {
+    let spent = false;
+    for (const cell of cells) {
+      const [tx_hash, index] = cell.split(":");
+      if ((await ckbRpc("get_live_cell", [{ tx_hash, index }, false]))?.status === "dead") { spent = true; break; }
+    }
+    if (!spent) return false;
+    const status = (await ckbRpc("get_transaction", [outpoint.slice(0, 66)]))?.tx_status?.status;
+    if (status !== "unknown" && status !== "rejected") return false;
+    if (deadFunding.size >= 10_000) deadFunding.clear();
+    deadFunding.add(id);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Retirement needs every channel finished. */

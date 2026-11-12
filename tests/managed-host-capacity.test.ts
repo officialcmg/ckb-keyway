@@ -69,6 +69,8 @@ const ABORTED_FUNDING = [{ state: { state_name: "Closed", state_flags: "FUNDING_
 const FUNDING_TX = `0x${"77".repeat(32)}`;
 // A creation time after any funding record in these tests began.
 const LATER = `0x${(4_000_000_000_000).toString(16)}`;
+// The cell `submit`'s funding spends.
+const FUNDING_INPUT_TX = `0x${"88".repeat(32)}`;
 // A channel waiting for its user's signed funding, which `submit` hands over.
 const WAITING_ID = `0x${"44".repeat(32)}`;
 const WAITING_CHANNEL = [{ channel_id: WAITING_ID, created_at: LATER, state: { state_name: "NegotiatingFunding", state_flags: "AWAITING_EXTERNAL_FUNDING" } }];
@@ -94,19 +96,23 @@ const [A, B, C, F] = ["a", "b", "c", "f"].map((letter) => letter.repeat(64));
 const FEW_MINUTES = 5 * 60_000;
 let instances = 0;
 
-/** A stand-in for the CKB node: live cells by "hash:index", and the CKB at the hosted nodes' own lock. */
+/**
+ * A stand-in for the CKB node: transaction statuses by hash, live and spent cells by "hash:index", and the CKB at
+ * the hosted nodes' own lock.
+ */
 async function fakeCkb(context: TestContext) {
-  const chain = { live: new Set<string>(), capacity: 0n };
+  const chain = { live: new Set<string>(), dead: new Set<string>(), transactions: new Map<string, string>(), capacity: 0n };
   const server = createServer((request, response) => {
     let body = "";
     request.on("data", (chunk) => { body += chunk; });
     request.on("end", () => {
       const { id, method, params } = JSON.parse(body);
       let result: unknown = null;
-      // It has never seen any funding transaction: a node must not take that to mean a channel holds nothing.
-      if (method === "get_transaction") result = { tx_status: { status: "unknown" } };
+      // Unless a test says otherwise, it has never seen a transaction.
+      if (method === "get_transaction") result = { tx_status: { status: chain.transactions.get(params[0]) ?? "unknown" } };
       if (method === "get_cells_capacity") result = { capacity: `0x${chain.capacity.toString(16)}` };
-      if (method === "get_live_cell") result = { status: chain.live.has(`${params[0].tx_hash}:${params[0].index}`) ? "live" : "unknown" };
+      const cell = `${params?.[0]?.tx_hash}:${params?.[0]?.index}`;
+      if (method === "get_live_cell") result = { status: chain.dead.has(cell) ? "dead" : chain.live.has(cell) ? "live" : "unknown" };
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({ jsonrpc: "2.0", id, result }));
     });
@@ -143,7 +149,7 @@ async function host(context: TestContext) {
     .proxyUserRequest(user, Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: [] })), signal)
     .then(({ status }) => status, () => 502);
   const submit = (user: string, channelId = WAITING_ID, signal?: AbortSignal) => module
-    .proxyUserRequest(user, Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "submit_signed_funding_tx", params: [{ channel_id: channelId, signed_funding_tx: {} }] })), signal)
+    .proxyUserRequest(user, Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "submit_signed_funding_tx", params: [{ channel_id: channelId, signed_funding_tx: { inputs: [{ previous_output: { tx_hash: FUNDING_INPUT_TX, index: "0x0" }, since: "0x0" }] } }] })), signal)
     .then(({ status }) => status, () => 502);
   const running = () => module.runningUsers().sort();
   const marked = (user: string) => stat(join(root, "users", user, "keyway-channels")).then(() => true, () => false);
@@ -842,4 +848,45 @@ test("funding refused because Fiber no longer has the channel is undone", async 
   assert.equal(await submit(A), 200);
   assert.equal(await marked(A), false);
   assert.equal((await readFile(join(root, "users", A, "keyway-funded-channels"), "utf8")).includes(WAITING_ID), false);
+});
+
+test("a node whose submitted funding can never confirm, as a cell it spends was spent elsewhere, makes room", async (context) => {
+  // The peer withheld its signatures and the account spent the funding's cell in another transaction.
+  const stalled = [{ channel_id: WAITING_ID, created_at: LATER, channel_outpoint: `${FUNDING_TX}00000000`, state: { state_name: "AwaitingTxSignatures", state_flags: "OUR_TX_SIGNATURES_SENT|TX_SIGNATURES_SENT" } }];
+  for (const outcome of ["still live", "spent elsewhere", "spent by the funding"] as const) {
+    context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+    const { root, chain, request, submit, running, marked, withChannels } = await host(context);
+    await withChannels(F, WAITING_CHANNEL);
+    assert.equal(await request(F), 200);
+    assert.equal(await submit(F), 200);
+    await withChannels(F, stalled);
+    if (outcome !== "still live") chain.dead.add(`${FUNDING_INPUT_TX}:0x0`);
+    if (outcome === "spent by the funding") chain.transactions.set(FUNDING_TX, "committed");
+    assert.equal(await request(A), 200);
+    context.mock.timers.tick(FEW_MINUTES);
+    assert.equal(await request(B), 200, outcome);
+    assert.deepEqual(running(), outcome === "spent elsewhere" ? [A, B] : [B, F], outcome);
+    assert.equal(await marked(F), outcome !== "spent elsewhere", outcome);
+    // The record stays, so retirement still waits for the channel.
+    assert.ok((await readFile(join(root, "users", F, "keyway-funded-channels"), "utf8")).includes(WAITING_ID));
+    context.mock.timers.reset();
+  }
+});
+
+test("a node with channels whose start fails stops no other node again until it has run", async (context) => {
+  const { module, root, request, running, markedNode } = await host(context);
+  assert.equal(await request(A), 200);
+  assert.equal(await request(B), 200);
+  await markedNode(F);
+  await writeFile(join(root, "users", F, "fail-start"), "");
+  await module.startKnownNodes([F]);
+  // Its first start took one node's place, and failed.
+  assert.equal(running().length, 1);
+  const stopped = [A, B].find((user) => !running().includes(user))!;
+  assert.equal(await request(stopped), 200);
+  // Its retries find no room, and stop nobody.
+  await until(async () => (await readFile(join(root, "users", F, "failed-starts"), "utf8").catch(() => "")).length >= 1);
+  await new Promise((resolve) => setTimeout(resolve, 2_500));
+  assert.deepEqual(running(), [A, B]);
+  assert.equal(module.readiness().offline, 1);
 });
