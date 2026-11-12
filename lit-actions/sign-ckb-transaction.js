@@ -478,11 +478,16 @@ async function madeByKey(account, candidates, urls, options = {}) {
   return made;
 }
 
-/** Refuses a node whose indexer is behind its chain tip: its empty answer could hide a cell that is there. */
+/**
+ * Refuses a node whose indexer is behind its chain tip: its empty answer could hide a cell that is there. Returns the
+ * block the indexer has reached.
+ */
 async function freshIndexer(urls) {
   const [indexer, tip] = await rpcBatch([{ method: "get_indexer_tip", params: [] }, { method: "get_tip_header", params: [] }], urls);
-  if (num(tip?.number, "tip block number") - num(indexer?.block_number, "indexer tip") > MAX_INDEXER_LAG) throw new Error("CKB RPC's indexer is behind the chain");
+  const indexed = num(indexer?.block_number, "indexer tip");
+  if (num(tip?.number, "tip block number") - indexed > MAX_INDEXER_LAG) throw new Error("CKB RPC's indexer is behind the chain");
   if (Date.now() - Number(num(tip?.timestamp, "tip timestamp")) > MAX_TIP_AGE_MS) throw new Error("CKB RPC's chain is behind the network");
+  return indexed;
 }
 
 /**
@@ -1256,16 +1261,17 @@ async function refuseOwnAsForeign(account, unproven) {
   if (unproven.length === 0) return;
   if (unproven.some((cell) => cell.createdStatus !== "committed" || typeof cell.createdBlockHash !== "string")) throw new Error("A send-limit-shaped input isn't committed yet");
   const blockHashes = [...new Set(unproven.map((cell) => cell.createdBlockHash))];
-  const headers = await rpcBatch(blockHashes.map((hash) => ({ method: "get_header", params: [hash] })));
-  const numbers = new Map(blockHashes.map((hash, i) => [hash, num(headers[i]?.number, "block number")]));
-  // From one node whose indexer has caught up, so a lagging node's empty history can't read as "not the key's".
-  const candidates = unproven.map((cell) => ({ block: numbers.get(cell.createdBlockHash) }));
+  // Everything from one node whose indexer has reached every creator's block, so a lagging node's empty history can't
+  // read as "not the key's".
   let made;
   let lastError;
   for (const url of RPC_URLS) {
     try {
-      await freshIndexer([url]);
-      made = await madeByKey(account, candidates, [url], { anyInput: true, locks: [account.secp] });
+      const indexed = await freshIndexer([url]);
+      const headers = await rpcBatch(blockHashes.map((hash) => ({ method: "get_header", params: [hash] })), [url]);
+      const numbers = new Map(blockHashes.map((hash, i) => [hash, num(headers[i]?.number, "block number")]));
+      if ([...numbers.values()].some((block) => block > indexed)) throw new Error("CKB RPC's indexer hasn't reached a send-limit-shaped input's block");
+      made = await madeByKey(account, unproven.map((cell) => ({ block: numbers.get(cell.createdBlockHash) })), [url], { anyInput: true, locks: [account.secp] });
       break;
     } catch (error) {
       lastError = error;

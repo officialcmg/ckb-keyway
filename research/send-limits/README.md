@@ -282,6 +282,13 @@ counted send, and fund channels only from there.
   fee without the code. For about 3 blocks after a genesis commits, a send that leaves the cell out can read as
   "no limits". Locks that only require an input of the account's to be present (for example cheque claims) can still
   redirect incoming value uncounted.
+- **Lit's 1 MB response limit.** Batched history reads and cell listings can be made larger than that (for example
+  about 29 transactions to the key in each of 256 look-alike blocks, roughly 490k CKB given to the account, or a few
+  look-alikes carrying very large data). The lookup then fails and nothing is signed; destroying look-alikes in small
+  batches clears it.
+- **The indexer's grouped paging.** History is read with `group_by_transaction`; ckb-indexer (checked in
+  `util/indexer/src/service.rs` at `d0dcbcafc7`) ends a page only between transactions and resumes right after the
+  last entry it returned, so no transaction is skipped where pages meet.
 - **Before the old policy CID is removed** (founder step 6), a compromised server can sign anything through the
   previous Action, including a record or a genesis-shaped transaction that this Action would then trust.
 - **Fiber.** Payments and channel balances are moved by the Fiber key, which a compromised server can obtain
