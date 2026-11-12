@@ -34,6 +34,7 @@ const server = createServer((request, response) => {
   request.on("data", (chunk) => { body += chunk; });
   request.on("end", () => {
     const { id, method } = JSON.parse(body);
+    if (method === "submit_signed_funding_tx") writeFileSync(join(dir, "funding-received"), "");
     let result = null;
     if (method === "node_info") result = { pubkey: "02" + "11".repeat(32), version: "fake", default_funding_lock_script: { code_hash: "0x" + "22".repeat(32), hash_type: "type", args: "0x" } };
     if (method === "list_channels") {
@@ -706,15 +707,18 @@ test("a node with channels stopped for a snapshot counts as offline until it run
   await until(async () => module.readiness().offline === 0);
 });
 
-test("a node is marked before its signed funding goes to Fiber, even if no answer comes back", async (context) => {
+test("signed funding the host recorded reaches Fiber even if the API stops waiting, and the node is marked first", async (context) => {
   const { root, request, submit, marked, withChannels } = await host(context);
   await withChannels(A, WAITING_CHANNEL);
   assert.equal(await request(A), 200);
   await writeFile(join(root, "users", A, "slow-rpc"), "");
   const gone = new AbortController();
   const handed = submit(A, WAITING_ID, gone.signal);
-  setTimeout(() => gone.abort(), 200);
-  assert.equal(await handed, 502);
+  await until(() => marked(A));
+  gone.abort();
+  assert.equal(await handed, 200);
+  assert.equal(await exists(join(root, "users", A, "funding-received")), true);
+  assert.ok((await readFile(join(root, "users", A, "keyway-funded-channels"), "utf8")).includes(WAITING_ID));
   assert.equal(await marked(A), true);
 });
 

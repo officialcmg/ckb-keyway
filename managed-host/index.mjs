@@ -47,6 +47,8 @@ const CHANNEL_SETUP = new Set(["connect_peer", "open_channel", "open_channel_wit
 const RESTART_BASE_MS = 1_000;
 const RESTART_MAX_MS = 60_000;
 const RESTART_STABLE_MS = 60_000;
+// How many times in a row a crashed node without a marker is started again.
+const RESTARTS_WITHOUT_MARKER = 3;
 // After this many failed starts in a row, a node that may hold channels no longer stops other nodes to start.
 const PRIORITY_FAILED_STARTS = 3;
 const nodes = new Map();
@@ -199,7 +201,8 @@ export function proxyUserRequest(userId, body, signal) {
         method: "POST",
         headers: { "content-type": "application/json" },
         body,
-        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(120_000)]) : AbortSignal.timeout(120_000),
+        // Funding recorded for Fiber is always sent, even if the API stops waiting, so the record stays true.
+        signal: signal && !sent ? AbortSignal.any([signal, AbortSignal.timeout(120_000)]) : AbortSignal.timeout(120_000),
       });
       result = {
         ok: upstream.ok,
@@ -616,9 +619,14 @@ async function restartNode(userId) {
   }
 }
 
-/** Starts a crashed node without channel markers once, after the restart backoff, where there is room. */
-function restartOnce(userId) {
+/**
+ * Starts a crashed node without channel markers again, after the restart backoff, where there is room; at most
+ * RESTARTS_WITHOUT_MARKER times until it stays up a minute.
+ */
+function restartUnmarked(userId) {
   const attempts = restarts.get(userId) ?? 0;
+  // A node without a marker that keeps dying soon after it starts is left for its user's next request.
+  if (attempts >= RESTARTS_WITHOUT_MARKER) return;
   restarts.set(userId, attempts + 1);
   const timer = setTimeout(() => {
     if (shuttingDown || nodes.has(userId)) return;
@@ -693,7 +701,7 @@ async function startNode(userId) {
     // A node that exits unexpectedly is started again, as it may hold a channel it was never marked for; one that
     // may hold channels keeps being started until it runs (see superviseNode).
     if (wasRunning && !node.stopping && !shuttingDown) {
-      void mayHoldChannels(userId).catch(() => true).then((may) => may ? superviseNode(userId) : restartOnce(userId));
+      void mayHoldChannels(userId).catch(() => true).then((may) => may ? superviseNode(userId) : restartUnmarked(userId));
     }
   });
   await waitForRpc(port, child);

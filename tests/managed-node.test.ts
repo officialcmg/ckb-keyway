@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import * as ccc from "@ckb-ccc/core";
+import { normalizeCkbTransactionForCcc } from "@fiber-pay/sdk/browser";
 import { managedNodeRequest, parseManagedNodeAssignments } from "../src/server/managed-node.ts";
 
 const ownLock = async () => ({ code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" }) as never;
@@ -122,6 +124,7 @@ test("managed funding strips older SDK input caches before native RPC submission
       outputData: "0x",
     }],
   };
+  const signed = ccc.Transaction.from(normalizeCkbTransactionForCcc(cached) as never);
   await managedNodeRequest("older-sdk-test", {
     operation: "submit-channel-funding",
     params: { channel_id: `0x${"33".repeat(32)}`, signed_funding_tx: cached },
@@ -132,7 +135,30 @@ test("managed funding strips older SDK input caches before native RPC submission
       assert.deepEqual(params.signed_funding_tx.witnesses, ["0x1234"]);
       return node.submitSignedFundingTx();
     },
-  } as never);
+  } as never, undefined, async (hash) => hash === signed.hash() ? signed : undefined);
+});
+
+test("only channel funding KeyWay signed for the account reaches the node, exactly as KeyWay signed it", async () => {
+  const unsigned = {
+    version: "0x0", cell_deps: [], header_deps: [], outputs: [], outputs_data: [], witnesses: ["0x"],
+    inputs: [{ since: "0x0", previous_output: { tx_hash: `0x${"11".repeat(32)}`, index: "0x0" } }],
+  };
+  // What KeyWay signed: the same transaction, with the account's real witness.
+  const signed = ccc.Transaction.from({ ...normalizeCkbTransactionForCcc(unsigned), witnesses: ["0xabcd"] } as never);
+  const submitted: Array<{ witnesses: string[] }> = [];
+  const recording = { ...node, submitSignedFundingTx: async (params: { signed_funding_tx: { witnesses: string[] } }) => { submitted.push(params.signed_funding_tx); return node.submitSignedFundingTx(); } };
+  const submit = (transaction: unknown, signedFunding?: (hash: string) => Promise<ccc.Transaction | undefined>) => managedNodeRequest("signed-funding-test", {
+    operation: "submit-channel-funding",
+    params: { channel_id: `0x${"33".repeat(32)}`, signed_funding_tx: transaction },
+  }, recording as never, undefined, signedFunding);
+  const kept = async (hash: string) => hash === signed.hash() ? signed : undefined;
+  // Without KeyWay's record, or for a transaction KeyWay never signed, nothing is submitted.
+  await assert.rejects(submit(unsigned), /as KeyWay signed it/);
+  await assert.rejects(submit({ ...unsigned, outputs_data: ["0x"], outputs: [{ capacity: "0x1", lock: { code_hash: `0x${"22".repeat(32)}`, hash_type: "type", args: "0x" } }] }, kept), /Only channel funding KeyWay signed/);
+  assert.equal(submitted.length, 0);
+  // With garbage witnesses, KeyWay's signed witnesses are what the node gets.
+  await submit({ ...unsigned, witnesses: ["0xdeadbeef"] }, kept);
+  assert.deepEqual(submitted.map(({ witnesses }) => witnesses), [["0xabcd"]]);
 });
 
 test("managed channels can only close to the user's own lock", async () => {

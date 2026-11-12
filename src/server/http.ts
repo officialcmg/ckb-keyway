@@ -36,7 +36,7 @@ import { recordSigningEvent } from "./security-alerts.ts";
 import { fundingSigning, type FundingContext } from "./funding-signing.ts";
 import { messageSigning, sendLimitOffer, signingSettings, transactionSigning, type SigningContext } from "./general-signing.ts";
 import { litPolicyEnabled } from "./lit-policy.ts";
-import { listPendingTransactions, nodeStatus } from "./pending-transactions.ts";
+import { listPendingTransactions, nodeStatus, signedTransaction } from "./pending-transactions.ts";
 import { sendLimitHead } from "./send-limits.ts";
 import { recoveryBackupChange, recoverySetup, settleRecoveryChange } from "./recovery.ts";
 import { sweepLegacyAfterSignIn } from "./legacy-sweep.ts";
@@ -126,7 +126,7 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
       `managed:${operation}`,
       request.headers.get("idempotency-key") ?? "",
       body,
-      () => managedNodeRequest(user.id, body, undefined, () => ownLockScript(user)),
+      () => managedNodeRequest(user.id, body, undefined, () => ownLockScript(user), (hash) => signedTransaction(user.id, hash)),
     )
     : await managedNodeRequest(user.id, body);
   return Response.json(result, {

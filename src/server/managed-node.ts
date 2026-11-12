@@ -14,6 +14,7 @@ import { serializeCccTransactionForRpc } from "../sdk/browser/ccc-transaction.ts
 import { approveFiberParams, FIBER_METHODS, fundingFeeRate, freeFiberParams, paymentFiberParams, type FiberMethod } from "../sdk/browser/fiber-methods.ts";
 import { pinPublicPeerAddress } from "./peer-address.ts";
 import * as ccc from "@ckb-ccc/core";
+import { JsonRpcTransformers } from "@ckb-ccc/core/advanced";
 import { channelFinished, FEE_RESERVE, needsFeeReserve, sweepSettlement } from "../sdk/browser/settlement-sweep.ts";
 
 type ManagedNodeClient = Pick<
@@ -37,11 +38,15 @@ const mutations = new Map<string, Promise<void>>();
 
 type RpcScript = NonNullable<OpenChannelWithExternalFundingParams["shutdown_script"]>;
 
+/** The signed transaction KeyWay signed for this account with the given hash, if it signed one. */
+export type SignedFunding = (hash: string) => Promise<ccc.TransactionLike | undefined>;
+
 export async function managedNodeRequest(
   userId: string,
   body: Record<string, unknown>,
   override?: ManagedNodeClient,
   ownLock?: () => Promise<RpcScript>,
+  signedFunding?: SignedFunding,
 ): Promise<unknown> {
   const node = override ?? managedNodeClient(userId);
 
@@ -140,7 +145,14 @@ export async function managedNodeRequest(
     });
   }
   if (body.operation === "submit-channel-funding") {
-    return serializeMutation(userId, () => node.submitSignedFundingTx(submitFundingParams(body.params)));
+    // Fiber doesn't check the signatures on submitted funding, and a submission keeps the hosted node running,
+    // so only funding KeyWay signed for this account goes to the node, exactly as KeyWay signed it.
+    if (!signedFunding) throw new Error("Channel funding can only be submitted as KeyWay signed it");
+    const params = submitFundingParams(body.params);
+    const signed = await signedFunding(JsonRpcTransformers.transactionTo(params.signed_funding_tx as never).hash());
+    if (!signed) throw new Error("Only channel funding KeyWay signed for this account can be submitted");
+    params.signed_funding_tx = serializeCccTransactionForRpc(ccc.Transaction.from(signed));
+    return serializeMutation(userId, () => node.submitSignedFundingTx(params));
   }
   if (body.operation === "wait-channel-ready") {
     return node.waitForChannelReady(channelId(body.channelId), { timeout: 180_000, interval: 3_000 });
