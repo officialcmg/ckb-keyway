@@ -39,6 +39,8 @@ const FUNDED_CHANNELS = "keyway-funded-channels";
 const SUBMIT_PROTECTION_MS = 60_000;
 // After the host found no room, an admission without channels is refused at once for this long.
 const NO_ROOM_RETRY_MS = 2_000;
+// After a node with channels found no room, its next admission waits this long before scanning again.
+const PRIORITY_NO_ROOM_RETRY_MS = 10_000;
 // Only node_info may create a node for a user who has none: it is how a hosted node is connected (the SDK's
 // start and its fee reserve read it first). Any other call for a user without a node is refused.
 const PROVISIONING = new Set(["node_info"]);
@@ -66,6 +68,7 @@ let bootTimer;
 const busySince = new Map();
 const idleSince = new Map();
 let noRoomAt = 0;
+const priorityNoRoomAt = new Map();
 // Set from launch until the nodes to start after a restart are known, so /readyz isn't ready before then.
 let booting = false;
 let shuttingDown = false;
@@ -383,15 +386,21 @@ async function ensureNode(userId, { provision = true } = {}) {
   if (shuttingDown) throw new Error("Managed host is shutting down");
   const full = new Set([...nodes.keys(), ...starting.keys()]).size >= maxNodes();
   if (full && !priority && Date.now() - noRoomAt < NO_ROOM_RETRY_MS) throw new RoomError("Managed node capacity is full");
+  // A node with channels that found no room waits before scanning every node again.
+  if (full && priority && Date.now() - (priorityNoRoomAt.get(userId) ?? -Infinity) < PRIORITY_NO_ROOM_RETRY_MS) {
+    throw new RoomError("Managed node capacity is full");
+  }
   const promise = (full ? makeRoom(userId, priority) : Promise.resolve())
     .then(() => startNode(userId))
     .then(async (node) => {
       forgetOffline(userId);
       failedStarts.delete(userId);
+      priorityNoRoomAt.delete(userId);
       await checkChannels(userId, node).catch(logError);
       return node;
     }, async (error) => {
       if (!(error instanceof RoomError)) failedStart(userId);
+      else if (priority) priorityNoRoomAt.set(userId, Date.now());
       // A node that may hold channels keeps being started until it runs; one that no longer may isn't offline.
       if (!shuttingDown && await mayHoldChannels(userId).catch(() => true)) superviseNode(userId);
       else forgetOffline(userId);
@@ -942,8 +951,9 @@ async function holdsChannels(channels, record) {
   return false;
 }
 
-// Channels found unable ever to be funded (a spent cell stays spent), and when others were last found not so.
-const deadFunding = new Set();
+// When each channel was first found unable ever to be funded, and when others were last found not so.
+const deadFunding = new Map();
+const DEAD_FUNDING_CONFIRM_MS = 60_000;
 const liveFunding = new Map();
 const UNSPENT_FUNDING_TTL_MS = 60_000;
 const NOT_READY = ["negotiatingfunding", "collaboratingfundingtx", "signingcommitment", "awaitingtxsignatures", "awaitingchannelready"];
@@ -956,12 +966,12 @@ const NOT_READY = ["negotiatingfunding", "collaboratingfundingtx", "signingcommi
  */
 async function fundingDead(channel, record) {
   const id = String(channel?.channel_id).toLowerCase();
-  if (deadFunding.has(id)) return true;
-  // A recent "still live" answer is reused for a minute, so repeated checks don't flood CKB.
-  if (Date.now() - (liveFunding.get(id) ?? -Infinity) < UNSPENT_FUNDING_TTL_MS) return false;
   const cells = recordCovers(record, channel) ? record.inputs.get(id) : undefined;
   const outpoint = String(channel?.channel_outpoint ?? "");
+  // The channel's state as Fiber reports it now comes first: a channel that has become ready is funded.
   if (!cells?.length || !NOT_READY.includes(stateName(channel)) || !/^0x[0-9a-f]{72}$/i.test(outpoint)) return false;
+  // A recent "still live" answer is reused for a minute, so repeated checks don't flood CKB.
+  if (Date.now() - (liveFunding.get(id) ?? -Infinity) < UNSPENT_FUNDING_TTL_MS) return false;
   try {
     let spent = false;
     for (const cell of cells) {
@@ -970,13 +980,20 @@ async function fundingDead(channel, record) {
     }
     const status = spent ? (await ckbRpc("get_transaction", [outpoint.slice(0, 66)]))?.tx_status?.status : undefined;
     if (!spent || (status !== "unknown" && status !== "rejected")) {
+      deadFunding.delete(id);
       if (liveFunding.size >= 10_000) liveFunding.clear();
       liveFunding.set(id, Date.now());
       return false;
     }
-    if (deadFunding.size >= 10_000) deadFunding.clear();
-    deadFunding.add(id);
-    return true;
+    // Believed only when CKB says so twice, at least DEAD_FUNDING_CONFIRM_MS apart, so one inconsistent answer
+    // (a load-balanced node, a reorg) can't free a node whose funding is landing.
+    const firstSeen = deadFunding.get(id);
+    if (firstSeen === undefined) {
+      if (deadFunding.size >= 10_000) deadFunding.clear();
+      deadFunding.set(id, Date.now());
+      return false;
+    }
+    return Date.now() - firstSeen >= DEAD_FUNDING_CONFIRM_MS;
   } catch {
     return false;
   }

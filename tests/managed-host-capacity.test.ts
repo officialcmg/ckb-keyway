@@ -853,7 +853,8 @@ test("funding refused because Fiber no longer has the channel is undone", async 
 test("a node whose submitted funding can never confirm, as a cell it spends was spent elsewhere, makes room", async (context) => {
   // The peer withheld its signatures and the account spent the funding's cell in another transaction.
   const stalled = [{ channel_id: WAITING_ID, created_at: LATER, channel_outpoint: `${FUNDING_TX}00000000`, state: { state_name: "AwaitingTxSignatures", state_flags: "OUR_TX_SIGNATURES_SENT|TX_SIGNATURES_SENT" } }];
-  for (const outcome of ["still live", "spent elsewhere", "spent by the funding"] as const) {
+  const ready = [{ ...stalled[0], state: { state_name: "ChannelReady" } }];
+  for (const outcome of ["still live", "spent elsewhere", "spent by the funding", "ready after one reading"] as const) {
     context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
     const { root, chain, request, submit, running, marked, withChannels } = await host(context);
     await withChannels(F, WAITING_CHANNEL);
@@ -864,8 +865,14 @@ test("a node whose submitted funding can never confirm, as a cell it spends was 
     if (outcome === "spent by the funding") chain.transactions.set(FUNDING_TX, "committed");
     assert.equal(await request(A), 200);
     context.mock.timers.tick(FEW_MINUTES);
+    // One reading isn't believed: F keeps running.
     assert.equal(await request(B), 200, outcome);
-    assert.deepEqual(running(), outcome === "spent elsewhere" ? [A, B] : [B, F], outcome);
+    assert.deepEqual(running(), [B, F], outcome);
+    // A minute later CKB says so again, unless the channel has become ready meanwhile.
+    if (outcome === "ready after one reading") await withChannels(F, ready);
+    context.mock.timers.tick(61_000);
+    assert.equal(await request(C), 200, outcome);
+    assert.deepEqual(running(), outcome === "spent elsewhere" ? [B, C] : [C, F], outcome);
     assert.equal(await marked(F), outcome !== "spent elsewhere", outcome);
     // The record stays, so retirement still waits for the channel.
     assert.ok((await readFile(join(root, "users", F, "keyway-funded-channels"), "utf8")).includes(WAITING_ID));
