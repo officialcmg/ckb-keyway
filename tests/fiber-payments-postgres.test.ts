@@ -8,9 +8,10 @@ import { signingSettings, type SigningContext } from "../src/server/general-sign
 const enabled = Boolean(process.env.KEYWAY_AUTH_TEST_DATABASE_URL);
 const CKB = 100_000_000n;
 
-function harness(amount: bigint, options: { failSend?: boolean } = {}) {
+function harness(amount: bigint, options: { failSend?: boolean; fee?: bigint } = {}) {
   const emails: Array<{ subject: string; plaintext: string }> = [];
   const sent: unknown[] = [];
+  const dryRuns: Array<Record<string, unknown>> = [];
   const context: PaymentContext = {
     user: { id: crypto.randomUUID() },
     appName: "Acme Pay",
@@ -23,7 +24,10 @@ function harness(amount: bigint, options: { failSend?: boolean } = {}) {
       if (method === "parse_invoice") {
         return { invoice: { amount: `0x${amount.toString(16)}`, data: { payment_hash: `0x${"ab".repeat(32)}`, attrs: [{ description: "tea" }] } } } as T;
       }
-      if (method === "send_payment" && params[0]?.dry_run) return { fee: "0x0" } as T;
+      if (method === "send_payment" && params[0]?.dry_run) {
+        dryRuns.push(params[0]);
+        return { fee: `0x${(options.fee ?? 0n).toString(16)}` } as T;
+      }
       if (method === "send_payment") {
         // As Fiber refuses: its own error, with the request's params attached as data.
         if (options.failSend) throw Object.assign(new Error("no route"), { code: -32000, data: params[0] });
@@ -37,7 +41,7 @@ function harness(amount: bigint, options: { failSend?: boolean } = {}) {
   };
   // The amounts as the server keeps them (a test signer, so no send-limit cell is built on chain).
   const settings = (threshold: bigint | null, asset = "ckb") => signingSettings({ ...context, wallet: {}, signDigest: async () => "0x" } as unknown as SigningContext, { operation: "set-daily-amount", asset, amount: threshold?.toString() ?? null });
-  return { context, node, emails, sent, settings, codeFrom: () => /code is (\d{6})/.exec(emails.at(-1)!.plaintext)![1] };
+  return { context, node, emails, sent, dryRuns, settings, codeFrom: () => /code is (\d{6})/.exec(emails.at(-1)!.plaintext)![1] };
 }
 
 /** Moves a pending request, and its code, this many minutes into the past, as if that time had gone by. */
@@ -510,4 +514,42 @@ test("hosted Fiber payments: daily amount, email codes and overlapping approvals
     await assert.rejects(() => fiberPayment(h.context, h.node, { method: "sendPayment", stage: "preview", params: { amount: "0x1" } }), /keysend/);
     await assert.rejects(() => fiberPayment(h.context, h.node, { method: "openChannel", stage: "preview", params: {} }), /payment method/);
   });
+});
+
+test("a hosted payment can't pay a higher fee than the one counted toward the daily amount (audit M14)", { skip: !enabled }, async () => {
+  process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
+  const fee = 5_000n;
+  const h = harness(40n * CKB, { fee });
+  // The caller's own fee limits are far above the dry run's estimate.
+  const params = { invoice: "fibt1test", max_fee_amount: `0x${(10n * CKB).toString(16)}` };
+  // A fee rate is refused rather than left out: the counted fee is the one cap.
+  await assert.rejects(fiberPayment(h.context, h.node, { method: "sendPayment", params: { ...params, max_fee_rate: "0x3e8" }, stage: "preview" }), /max_fee_amount, not max_fee_rate/);
+  const preview = await fiberPayment(h.context, h.node, { method: "sendPayment", params, stage: "preview" }) as Record<string, unknown>;
+  assert.equal((preview.preview as { fee: string }).fee, fee.toString());
+  await fiberPayment(h.context, h.node, { method: "sendPayment", params, stage: "send", confirmationNonce: preview.confirmationNonce });
+  const sent = h.sent.at(-1) as Record<string, unknown>;
+  assert.equal(sent.max_fee_amount, `0x${fee.toString(16)}`, "capped at the counted fee");
+
+  // A caller's own lower cap still holds.
+  const lower = { invoice: "fibt1test", max_fee_amount: "0x3e8" };
+  const second = await fiberPayment(h.context, h.node, { method: "sendPayment", params: lower, stage: "preview" }) as Record<string, unknown>;
+  await fiberPayment(h.context, h.node, { method: "sendPayment", params: lower, stage: "send", confirmationNonce: second.confirmationNonce });
+  assert.equal((h.sent.at(-1) as Record<string, unknown>).max_fee_amount, "0x3e8");
+
+  // No cap given: the counted fee is the cap.
+  const bare = await fiberPayment(h.context, h.node, { method: "sendPayment", params: { invoice: "fibt1test" }, stage: "preview" }) as Record<string, unknown>;
+  await fiberPayment(h.context, h.node, { method: "sendPayment", params: { invoice: "fibt1test" }, stage: "send", confirmationNonce: bare.confirmationNonce });
+  assert.equal((h.sent.at(-1) as Record<string, unknown>).max_fee_amount, `0x${fee.toString(16)}`);
+});
+
+test("a payment request without a counted fee is refused before anything is counted", { skip: !enabled }, async () => {
+  process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
+  const h = harness(40n * CKB, { fee: 5_000n });
+  const preview = await pay(h, { stage: "preview" });
+  const sql = await database();
+  await sql`update keyway_v2_signature_requests set summary = summary - 'fee' where nonce = ${String(preview.confirmationNonce)}`;
+  await assert.rejects(pay(h, { stage: "send", confirmationNonce: preview.confirmationNonce }), /expired/);
+  const counted = await sql`select 1 from keyway_v2_signed_outflows where user_id = ${h.context.user.id}`;
+  assert.equal(counted.length, 0, "nothing stays counted for a payment that was never sent");
+  assert.equal(h.sent.length, 0);
 });

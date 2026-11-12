@@ -21,6 +21,8 @@ export type FundingPreview = {
   transactionHash: string;
   /** For a token channel: the token (by type script hash) and the amount put in, in its smallest unit. */
   token?: { asset: string; amount: string };
+  /** CKB the account's change puts under the token's script when that script could keep it; counted as sent. */
+  heldUnderScriptsCkb?: string;
 };
 
 /** One of the account's lock groups in a transaction, signed with the witness its lock expects. */
@@ -33,7 +35,10 @@ export type ValidatedFunding = {
   /** The account's lock group in the transaction: a funding spends only its current lock. */
   groups: SigningGroup[];
   preview: FundingPreview;
-  /** All CKB leaving the account, the fee included; it counts toward the daily email-confirmation amount. */
+  /**
+   * All CKB leaving the account, the fee included, and any CKB its change puts under a token script that could keep
+   * it, as the policy Action counts it; it counts toward the daily email-confirmation amount.
+   */
   outflowShannons: bigint;
 };
 
@@ -82,12 +87,17 @@ export async function previewFundingTransaction(
   const fundingOutput = fundingOutputs[0];
   const token = await checkTokenFunding(client, transaction, inputCells, current.script, fundingOutput);
   refuseUncoveredForeignOutputs(transaction, inputCells, isOwn, fundingOutput);
+  const ownedChange = transaction.outputs.filter(({ lock }) => isOwn(lock)).map((cellOutput) => ({ cellOutput }));
+  const ownedChangeCapacity = sumCapacities(ownedChange.map(({ cellOutput }) => cellOutput.capacity));
   const spend = calculateFundingSpend({
     ownedInputCapacity: sumCapacities(ownedInputs.map(({ cellOutput }) => cellOutput.capacity)),
-    ownedChangeCapacity: sumCapacities(transaction.outputs.filter(({ lock }) => isOwn(lock)).map(({ capacity }) => capacity)),
+    ownedChangeCapacity,
     totalInputCapacity: sumCapacities(inputCells.map(({ cellOutput }) => cellOutput.capacity)),
     totalOutputCapacity: transaction.getOutputsCapacity(),
   });
+  // Change under the channel's token counts as kept only when the token has no extension scripts (args of just the
+  // owner's lock hash), which could otherwise keep the CKB; past what the account held under it, it counts as sent.
+  const atRisk = ownedChangeCapacity - keptCapacity(ownedInputs, ownedChange, (type) => !type || ccc.bytesFrom(type.args).length === 32);
 
   const groups = signingGroups([current], inputCells);
   const related = await signer.getRelatedScripts(transaction);
@@ -108,8 +118,9 @@ export async function previewFundingTransaction(
       destination: `${fundingOutput.lock.codeHash}:${fundingOutput.lock.args}`,
       transactionHash: transaction.hash(),
       ...(token ? { token: { asset: token.asset, amount: token.amount.toString() } } : {}),
+      ...(atRisk > 0n ? { heldUnderScriptsCkb: formatCkb(atRisk) } : {}),
     },
-    outflowShannons: spend.fundingAmount + spend.fee,
+    outflowShannons: spend.fundingAmount + spend.fee + atRisk,
   };
 }
 
@@ -168,6 +179,35 @@ export async function checkTokenFunding(
     - tokenAmount(outputs.filter((cell) => cell.cellOutput.type && cell.cellOutput !== fundingOutput && owns(cell.cellOutput.lock)));
   if (amount <= 0n) throw new Error("A token channel must take the token from the KeyWay wallet");
   return { asset: type.hash(), amount };
+}
+
+/**
+ * The CKB the account gets back in its own outputs that it keeps, as the policy Action counts it: a type script runs
+ * whenever its cell is spent, so whoever wrote it could keep the CKB put under it. Under no type, or one that can't
+ * stop the account spending its cell (`keepsFree`), all of it is kept; under any other, only as far as the account's
+ * inputs already held that much under the same script.
+ */
+export function keptCapacity(
+  ownInputs: Array<{ cellOutput: ccc.CellOutput }>,
+  ownOutputs: Array<{ cellOutput: ccc.CellOutput }>,
+  keepsFree: (type: ccc.Script | undefined) => boolean,
+): bigint {
+  const heldUnder = new Map<string, bigint>();
+  for (const { cellOutput } of ownInputs) {
+    if (!keepsFree(cellOutput.type)) heldUnder.set(cellOutput.type!.hash(), (heldUnder.get(cellOutput.type!.hash()) ?? 0n) + cellOutput.capacity);
+  }
+  let kept = 0n;
+  for (const { cellOutput } of ownOutputs) {
+    if (keepsFree(cellOutput.type)) {
+      kept += cellOutput.capacity;
+      continue;
+    }
+    const held = heldUnder.get(cellOutput.type!.hash()) ?? 0n;
+    const amount = cellOutput.capacity < held ? cellOutput.capacity : held;
+    heldUnder.set(cellOutput.type!.hash(), held - amount);
+    kept += amount;
+  }
+  return kept;
 }
 
 export function calculateFundingSpend(capacities: {

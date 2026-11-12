@@ -14,6 +14,8 @@ export type FiberChannelOpenPreview = {
   transactionHash: string;
   /** For a token channel: the token's type script hash, the amount in its smallest unit, and the amount for people. */
   token?: { asset: string; amount: string; amountText: string };
+  /** CKB the account's change puts under the token's script when that script could keep it; counted as sent. */
+  heldUnderScriptsCkb?: string;
   /** The peer's Fiber node ID. The channel always closes back to the user's own account. */
   peer?: string;
   /**

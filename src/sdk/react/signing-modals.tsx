@@ -65,6 +65,7 @@ export function KeyWayTransactionModal({ theme, appName, preview, step, answer }
           )}
           <dl style={{ ...fundingDetails, margin: "16px 0" }}>
             {sending && <Row palette={palette} label="You send" value={`${preview.sendingCkb} CKB`} />}
+            {preview.heldUnderScriptsCkb && <Row palette={palette} label="Of which goes to your own address, under a script that could keep it" value={`${preview.heldUnderScriptsCkb} CKB`} />}
             {preview.receivingCkb !== "0" && <Row palette={palette} label="You receive" value={`${preview.receivingCkb} CKB`} />}
             {preview.tokens.map((token) => <Row key={`t-${token.id}`} palette={palette} label={token.amount.startsWith("-") ? "You send" : "You receive"} value={tokenText(token)} />)}
             {preview.nfts.map((nft) => <Row key={`n-${nft.id}`} palette={palette} label={`${nft.kind} ${nft.change}`} value={nft.id} />)}
@@ -437,6 +438,7 @@ export function KeyWayFundingModal({ theme, appName, preview, step, answer }: Ap
             <Row palette={palette} label={preview.token ? "CKB reserve" : "Channel funding"} value={`${preview.amountCkb} CKB`} />
             {preview.peer && <Row palette={palette} label="Peer" value={shortAddress(preview.peer)} />}
             {preview.feeReserveCkb && <Row palette={palette} label="Fee reserve" value={`${preview.feeReserveCkb} CKB`} />}
+            {preview.heldUnderScriptsCkb && <Row palette={palette} label="Also counted as sent: change under the token's script, which could keep it" value={`${preview.heldUnderScriptsCkb} CKB`} />}
             <Row palette={palette} label="Network fee" value={`${preview.feeCkb} CKB`} />
             <Row palette={palette} label="Network" value="CKB testnet" mono={false} />
           </dl>
