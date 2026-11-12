@@ -436,7 +436,8 @@ test("a lowering made while a raise is being sent leaves the server no looser th
     }
     return hash;
   };
-  await set(1_000n * CKB, { confirmationNonce: raise.confirmationNonce, emailCode: codeFrom(world) });
+  // The raise reached the node, but the server keeps the lowering made meanwhile, and says so.
+  await assert.rejects(set(1_000n * CKB, { confirmationNonce: raise.confirmationNonce, emailCode: codeFrom(world) }), /changed while this was waiting/);
   const lowered = await lowering;
   assert.ok(!(lowered instanceof Error), lowered instanceof Error ? lowered.message : "");
   const onChain = newestCellAmount(sent, secp)!;
@@ -527,4 +528,45 @@ test("lowering an amount applies on the server at once, even while turning limit
   assert.equal(sent.length, 0);
   const stored = (await signingSettings(context, { operation: "get" }) as { dailyAmounts: Record<string, string> }).dailyAmounts;
   assert.deepEqual(stored, { ckb: (50n * CKB).toString() }, "the lower amount already gates what the server checks");
+});
+
+test("a raise approved with the Lit code isn't sent once a stricter amount was set meanwhile", { skip: !enabled }, async (t) => {
+  const { world, user, context, sent } = await setUp();
+  t.after(() => { litSignerOverride.mode = undefined; });
+  const { set, amounts } = await limitsOn(world, context, sent, 10n * CKB);
+  const raise = await set(100n * CKB);
+  assert.equal(raise.requiresEmailCode, true);
+  const code = codeFrom(world);
+  // A lowering to 5 CKB whose broadcast failed: the server holds 5, the cell is still unspent at 10.
+  const broadcast = context.broadcast!;
+  context.broadcast = async () => { throw new Error("connection reset"); };
+  await assert.rejects(set(5n * CKB), /connection reset/);
+  context.broadcast = broadcast;
+  const before = sent.length;
+  await assert.rejects(set(100n * CKB, { confirmationNonce: raise.confirmationNonce, emailCode: code }), /changed while this was waiting/);
+  assert.equal(sent.length, before, "the stale raise never reaches the chain");
+  assert.deepEqual(await amounts(), { ckb: (5n * CKB).toString() });
+
+  t.after(async () => {
+    const sql = await database();
+    await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
+  });
+});
+
+test("an account already past eight token amounts can only remove them until it is back within the cell's eight", { skip: !enabled }, async (t) => {
+  const { user, context } = await setUp();
+  t.after(() => { litSignerOverride.mode = undefined; });
+  const serverOnly = { ...context, signDigest: async () => "0x" as ccc.Hex };
+  const token = (i: number) => `0x${i.toString(16).padStart(2, "0").repeat(32)}`;
+  const sql = await database();
+  for (let i = 1; i <= 9; i++) await sql`insert into keyway_v2_daily_amounts (user_id, asset, amount) values (${user.id}, ${token(i)}, '1000')`;
+  const set = (asset: string, amount: bigint | null) => signingSettings(serverOnly, { operation: "set-daily-amount", asset, amount: amount?.toString() ?? null });
+  await assert.rejects(set(token(1), 10n), /At most 8 tokens/);
+  await assert.rejects(set("ckb", 100n * CKB), /At most 8 tokens/);
+  // Removing one is a loosening, confirmed with the server's code, and brings the account back within the cell.
+  const emails: string[] = [];
+  const confirm = { ...serverOnly, sendEmail: async (_to: string, message: { plaintext: string }) => { emails.push(message.plaintext); } };
+  const asked = await signingSettings(confirm, { operation: "set-daily-amount", asset: token(9), amount: null }) as { confirmationNonce: string };
+  await signingSettings(confirm, { operation: "set-daily-amount", asset: token(9), amount: null, confirmationNonce: asked.confirmationNonce, emailCode: /code is (\d{6})/.exec(emails.at(-1)!)![1] });
+  await set(token(1), 10n);
 });

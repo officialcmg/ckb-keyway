@@ -328,7 +328,7 @@ async function setDailyAmount(context: SigningContext, body: Record<string, unkn
   const change = { asset: parseAsset(body.asset), amount: parseThreshold(body.amount) };
   const next = new Map(current);
   if (change.amount === null) next.delete(change.asset); else next.set(change.asset, change.amount);
-  refuseUnencodable(current, next, change);
+  refuseUnencodable(next, change);
   if (!context.signDigest && litPolicyEnabled()) {
     const onChain = await sendLimitSettings(context, body, current, next, change);
     if (onChain) return { ...view(onChain.amounts), enforcedByLit: true, ...onChain.response };
@@ -479,8 +479,10 @@ async function sendLimitSettings(
 async function serverAmountsAround(user: User, current: DailyAmounts, next: DailyAmounts, change: { asset: string; amount: bigint | null }, from: bigint | undefined, send: () => Promise<void>): Promise<DailyAmounts> {
   const tightens = !weakens(current, next);
   if (tightens) await writeDailyAmount(user, change.asset, change.amount, "lower");
+  // A loosening approved from an amount that has since changed (a stricter one set meanwhile) isn't sent at all.
+  if (!tightens && (await readDailyAmounts(user)).get(change.asset) !== from) throw new Error(AMOUNTS_CHANGED);
   await send();
-  if (!tightens) await writeDailyAmount(user, change.asset, change.amount, { from });
+  if (!tightens && !await writeDailyAmount(user, change.asset, change.amount, { from })) throw new Error(AMOUNTS_CHANGED);
   return readDailyAmounts(user);
 }
 
@@ -521,13 +523,13 @@ function sameSettings(a: Omit<SendLimitSettings, "fingerprint">, b: Omit<SendLim
  * Daily amounts are written to the account's send-limit cell, so a new one must fit there: at most eight tokens, a
  * CKB amount below the cell's "no limit" value and a token amount within 16 bytes. Otherwise the cell could never
  * be made (and every send that has to make it would fail) or would read as a different amount. Removing an amount
- * is always allowed.
+ * is always allowed, so an account past eight tokens can get back within them.
  */
-function refuseUnencodable(current: DailyAmounts, next: DailyAmounts, change: { asset: string; amount: bigint | null }): void {
+function refuseUnencodable(next: DailyAmounts, change: { asset: string; amount: bigint | null }): void {
   if (change.amount === null) return;
   if (change.asset === "ckb" ? change.amount >= SEND_LIMIT_UNLIMITED : change.amount >= 1n << 128n) throw new Error("That amount is too large");
   const tokens = (amounts: DailyAmounts) => [...amounts.keys()].filter((asset) => asset !== "ckb").length;
-  if (tokens(next) > MAX_SEND_LIMIT_TOKENS && tokens(next) > tokens(current)) throw new Error(`At most ${MAX_SEND_LIMIT_TOKENS} tokens can have their own daily amount`);
+  if (tokens(next) > MAX_SEND_LIMIT_TOKENS) throw new Error(`At most ${MAX_SEND_LIMIT_TOKENS} tokens can have their own daily amount`);
 }
 
 /** A change weakens protection if any asset can then send more: an amount raised or removed. */
