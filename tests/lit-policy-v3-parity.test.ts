@@ -110,7 +110,9 @@ test("an enable built by the server, with an EVM wallet and a JoyID passkey, is 
   assert.ok(sent.ticket && sent.binding);
   const text = env.emails[0].text;
   assert.match(text, new RegExp(`Backup: EVM wallet ${list[0].address}`));
-  assert.match(text, new RegExp(`Backup: JoyID passkey \\(key id ${ids[1].id}\\)`));
+  // The JoyID backup is named by the full address the user knows it by, not a key id they can't check.
+  assert.ok(text.includes(`Backup: JoyID ${list[1].address}\n`), text);
+  assert.ok(!text.includes("key id"));
   // The same ids in another order name the same list.
   assert.ok(await sendCode(action, plan.transaction, [...ids].reverse()));
 });

@@ -159,7 +159,7 @@ export async function policySendCode(
     ...(options.email ? { email: options.email } : {}),
     ...(backups ? { backups } : {}),
   }) as Record<string, unknown> | undefined;
-  if (typeof response?.ticket !== "string" || !/^v1\.\d{13}\.[0-9a-f]{32}$/.test(response.ticket)) throw new Error("Lit Action returned an invalid code ticket");
+  if (typeof response?.ticket !== "string" || !/^v2\.\d{13}\.[0-9a-f]{32}\.[0-9a-f]{64}$/.test(response.ticket)) throw new Error("Lit Action returned an invalid code ticket");
   if (response.transactionHash !== transaction.hash()) throw new Error("Lit Action sent a code for a different transaction");
   const binding = response.binding;
   if (binding !== undefined && (typeof binding !== "string" || !/^0x[0-9a-f]*$/.test(binding) || (binding.length - 2) / 2 !== EMAIL_BINDING_SIZE)) {
