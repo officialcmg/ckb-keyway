@@ -40,9 +40,12 @@ const server = createServer((request, response) => {
       try { result = { channels: JSON.parse(readFileSync(join(dir, "channels.json"), "utf8")) }; } catch { result = { channels: [] }; }
     }
     if (method === "open_channel_with_external_funding") result = { channel_id: "0x" + "33".repeat(32) };
-    if (method === "submit_signed_funding_tx" && existsSync(join(dir, "refuse-funding"))) {
+    // Refused in Fiber's checks before it sends anything, or failing after it has sent the funding to the peer.
+    const refusal = existsSync(join(dir, "refuse-funding")) ? "Signed funding transaction raw data mismatch; only witnesses may change for external funding"
+      : existsSync(join(dir, "fail-after-sending")) ? "Failed to sign the commitment" : undefined;
+    if (method === "submit_signed_funding_tx" && refusal) {
       response.writeHead(200, { "content-type": "application/json" });
-      return response.end(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message: "Invalid funding transaction" } }));
+      return response.end(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message: refusal } }));
     }
     response.writeHead(200, { "content-type": "application/json" });
     const slow = method === "slow_call" || (existsSync(join(dir, "slow-rpc")) && method !== "list_channels");
@@ -288,7 +291,7 @@ test("only connecting a hosted node creates one; no other call does", async (con
   assert.equal(await exists(join(root, "users", A)), false);
   assert.deepEqual(running(), []);
   assert.equal(await request(A, "node_info"), 200);
-  for (const method of others) assert.equal(await request(A, method), 200, method);
+  for (const method of others.filter((method) => method !== "submit_signed_funding_tx")) assert.equal(await request(A, method), 200, method);
 });
 
 test("reads don't keep a node from making room; the steps of a channel setup do, for a few minutes", async (context) => {
@@ -782,8 +785,8 @@ test("a funding submission for no channel waiting for it, or one Fiber refuses, 
   const { module, root, request, submit, running, marked, withChannels, markedNode } = await host(context);
   assert.equal(await request(A), 200);
   assert.equal(await request(B), 200);
-  // A names a channel its node doesn't have; B's is waiting, but Fiber refuses the funding.
-  assert.equal(await submit(A, `0x${"99".repeat(32)}`), 200);
+  // A names a channel its node doesn't have, so the host refuses it; B's is waiting, but Fiber refuses the funding.
+  assert.equal(await submit(A, `0x${"99".repeat(32)}`), 502);
   await withChannels(B, WAITING_CHANNEL);
   await writeFile(join(root, "users", B, "refuse-funding"), "");
   assert.equal(await submit(B), 200);
@@ -794,4 +797,25 @@ test("a funding submission for no channel waiting for it, or one Fiber refuses, 
   await markedNode(F);
   await module.startKnownNodes([F]);
   assert.ok(running().includes(F), running().join(","));
+});
+
+test("funding Fiber fails on after sending it to the peer stays recorded and marked", async (context) => {
+  const { root, request, submit, marked, withChannels } = await host(context);
+  await withChannels(A, WAITING_CHANNEL);
+  assert.equal(await request(A), 200);
+  await writeFile(join(root, "users", A, "fail-after-sending"), "");
+  assert.equal(await submit(A), 200);
+  assert.equal(await marked(A), true);
+  assert.ok((await readFile(join(root, "users", A, "keyway-funded-channels"), "utf8")).includes(WAITING_ID));
+});
+
+test("a funding submission is refused when the node's channels can't be read", async (context) => {
+  const { root, request, submit, marked, withChannels } = await host(context);
+  assert.equal(await request(A), 200);
+  await withChannels(A, WAITING_CHANNEL);
+  // The funding record can't be read, so whether the channel was handed funding before can't be checked.
+  await rm(join(root, "users", A, "keyway-funded-channels"));
+  await mkdir(join(root, "users", A, "keyway-funded-channels"));
+  assert.equal(await submit(A), 502);
+  assert.equal(await marked(A), false);
 });

@@ -168,20 +168,30 @@ export function proxyUserRequest(userId, body, signal) {
     // A request the API gave up on while it waited in the queue starts nothing.
     if (signal?.aborted) throw new Error("The request was abandoned");
     const setup = CHANNEL_SETUP.has(method);
-    // A node handing over its user's signed funding for a channel waiting for it is never stopped to make room
-    // (see SUBMIT_PROTECTION_MS), and it is marked and the channel recorded before the funding goes to Fiber,
-    // which passes it to the peer at once: an answer may never come back. Any other submission gets none of this.
-    const fundingId = method === "submit_signed_funding_tx" ? submittedChannelId(body) : undefined;
-    let funding = false;
+    // Signed funding goes to Fiber only for a channel the node lists as waiting for it. Its node is never stopped
+    // to make room from before it is found until a minute after Fiber answers (see SUBMIT_PROTECTION_MS), and it
+    // is marked and the channel recorded before the funding goes to Fiber, which passes it to the peer at once:
+    // an answer may never come back. Any other submission is refused here, and so is one that can't be checked.
+    const funding = method === "submit_signed_funding_tx";
+    const fundingId = funding ? submittedChannelId(body) : undefined;
+    let sent = false;
     let result;
+    // While the call is in flight its protection doesn't run out.
+    if (funding) submitting.set(userId, Infinity);
     try {
       const node = await ensureNode(userId, { provision: PROVISIONING.has(method) });
-      if (fundingId && await awaitingFunding(userId, node, fundingId)) {
-        funding = true;
-        // While the call is in flight its protection doesn't run out.
-        submitting.set(userId, Infinity);
+      if (funding) {
+        if (!fundingId || !(await awaitingFunding(userId, node, fundingId))) {
+          throw new Error("This channel isn't waiting for its funding");
+        }
         await markChannels(userId, true);
         await recordFundedChannel(userId, fundingId);
+        // A node stopped meanwhile never gets the funding.
+        if (nodes.get(userId) !== node || node.stopping) {
+          await unrecordFundedChannel(userId, fundingId).catch(logError);
+          throw new Error("The hosted node stopped; try again");
+        }
+        sent = true;
       }
       const upstream = await fetch(`http://127.0.0.1:${node.port}`, {
         method: "POST",
@@ -198,16 +208,18 @@ export function proxyUserRequest(userId, body, signal) {
       };
     } finally {
       // Protected for a minute after Fiber's answer too, as Fiber stores the channel's new state after answering.
-      if (funding) submitting.set(userId, Date.now());
+      if (sent) submitting.set(userId, Date.now());
+      else if (funding) submitting.delete(userId);
     }
     const { node } = result;
     delete result.node;
     const answer = result.ok ? rpcResult(result.body) : undefined;
     delete result.ok;
     if (answer && setup) hold(userId, node);
-    // Fiber checks submitted funding before it installs or sends it, so funding it refused went nowhere: the
-    // protection and the record go, and the marker follows the node's channels again.
-    if (funding && !answer) {
+    // Funding Fiber refused in its checks before it installs or sends anything went nowhere: the protection and
+    // the record go, and the marker follows the node's channels again. After any other error the peer may already
+    // have it, so it stays recorded.
+    if (sent && !answer && refusedBeforeSending(result.body)) {
       submitting.delete(userId);
       await unrecordFundedChannel(userId, fundingId).catch(logError);
       await checkChannels(userId, node).catch(logError);
@@ -231,6 +243,19 @@ function rpcMethod(body) {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Whether Fiber 0.9.1 refused a funding submission in the checks it makes before installing the funding or
+ * sending it to the peer (handle_submit_external_funding_tx, validate_external_funding_signed_tx), or refused
+ * the request's parameters outright.
+ */
+function refusedBeforeSending(body) {
+  let error;
+  try { error = JSON.parse(body.toString("utf8"))?.error; } catch { return false; }
+  if (!error) return false;
+  if ([-32700, -32600, -32602].includes(error.code)) return true;
+  return /Expected channel in AWAITING_EXTERNAL_FUNDING-compatible state|Channel is not configured for external funding|Unsigned funding transaction not found|raw data mismatch|is not final for external funding/.test(String(error.message));
 }
 
 /** A successful JSON-RPC answer, or undefined for an error or anything else. */
@@ -573,7 +598,7 @@ async function restartNode(userId) {
         restarts.delete(userId);
         return forgetOffline(userId);
       }
-      await ensureNode(userId);
+      await ensureNode(userId, { provision: false });
     });
   } catch (error) {
     logError(error);
@@ -588,7 +613,7 @@ function restartOnce(userId) {
   restarts.set(userId, attempts + 1);
   const timer = setTimeout(() => {
     if (shuttingDown || nodes.has(userId)) return;
-    void withUserOperation(userId, () => ensureNode(userId)).catch(logError);
+    void withUserOperation(userId, () => ensureNode(userId, { provision: false })).catch(logError);
   }, Math.min(RESTART_MAX_MS, RESTART_BASE_MS * 2 ** attempts));
   timer.unref?.();
 }
@@ -628,10 +653,9 @@ async function startNode(userId) {
   const ckbDir = join(baseDir, "ckb");
   await mkdir(ckbDir, { recursive: true });
   // A new node holds no channels, so it is checked from the start, even if its first start fails.
-  if (created) {
-    await writeFile(join(baseDir, CHECKED_MARKER), "", { mode: 0o600 });
-    await startFundingRecord(userId);
-  }
+  if (created) await writeFile(join(baseDir, CHECKED_MARKER), "", { mode: 0o600 });
+  // A node from before the funding record gets one now; channels created before it began are judged without it.
+  await startFundingRecord(userId);
   await createCkbKey(join(ckbDir, "key"));
   // The host may have begun shutting down while this admission waited, for room or for the steps above.
   if (shuttingDown) throw new Error("Managed host is shutting down");
@@ -727,7 +751,7 @@ async function stopNodeForDatabase(userId) {
 /** Starts a node again after a database operation, or has it started if it may now hold channels. */
 async function resumeNode(userId, wasRunning) {
   try {
-    if (wasRunning) return void await ensureNode(userId);
+    if (wasRunning) return void await ensureNode(userId, { provision: false });
   } catch (error) {
     if (!shuttingDown && await mayHoldChannels(userId).catch(() => true)) superviseNode(userId);
     throw error;
