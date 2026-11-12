@@ -22,12 +22,14 @@ type LockBudget = { held: number; waiting: Array<() => void> };
 const MAX_RESERVED_LOCKS = 3;
 const walletLocks: LockBudget = { held: 0, waiting: [] };
 const loginCodeLocks: LockBudget = { held: 0, waiting: [] };
-// Calls for one key, running or waiting. More get a fast refusal instead of queueing without end.
+// Calls for one wallet, running or waiting. More get a fast refusal instead of queueing without end. Login-code
+// locks have no such cap: their key is an email anyone can type, so a cap there would let a stranger refuse the
+// owner's own sign-in. Their callers are capped per requester instead (src/server/auth.ts).
 const MAX_CALLS_PER_LOCK = 8;
 const lockQueues = new Map<string, { calls: number; tail: Promise<void> }>();
 
 export function withUserLock<T>(userId: string, task: (sql: DatabaseSql) => Promise<T>): Promise<T> {
-  return withLock(userId, walletLocks, task);
+  return withLock(userId, walletLocks, task, MAX_CALLS_PER_LOCK);
 }
 
 /** The lock for sending or checking one email's login code in one scope. */
@@ -35,11 +37,34 @@ export function withLoginCodeLock<T>(key: string, task: (sql: DatabaseSql) => Pr
   return withLock(key, loginCodeLocks, task);
 }
 
-async function withLock<T>(key: string, budget: LockBudget, task: (sql: DatabaseSql) => Promise<T>): Promise<T> {
+/**
+ * Runs login-code work that needs no email lock (deciding whether to send a code) in one of the login-code slots, so
+ * a flood of sign-in requests waits in this process instead of on pool connections.
+ */
+export async function withLoginCodeSlot<T>(task: () => Promise<T>): Promise<T> {
+  await acquire(loginCodeLocks);
+  try {
+    return await task();
+  } finally {
+    release(loginCodeLocks);
+  }
+}
+
+async function acquire(budget: LockBudget): Promise<void> {
+  if (budget.held < MAX_RESERVED_LOCKS) budget.held += 1;
+  else await new Promise<void>((resolve) => budget.waiting.push(resolve));
+}
+
+function release(budget: LockBudget): void {
+  const next = budget.waiting.shift();
+  if (next) next(); else budget.held -= 1;
+}
+
+async function withLock<T>(key: string, budget: LockBudget, task: (sql: DatabaseSql) => Promise<T>, maxCalls = Infinity): Promise<T> {
   const sql = await database();
   // Callers for the same key wait here, in this process, rather than on a pool connection blocked in Postgres.
   const queue = lockQueues.get(key) ?? { calls: 0, tail: Promise.resolve() };
-  if (queue.calls >= MAX_CALLS_PER_LOCK) throw new Error("Too many requests in progress for this account. Try again in a moment");
+  if (queue.calls >= maxCalls) throw new Error("Too many requests in progress for this account. Try again in a moment");
   queue.calls += 1;
   lockQueues.set(key, queue);
   const previous = queue.tail;
@@ -47,13 +72,11 @@ async function withLock<T>(key: string, budget: LockBudget, task: (sql: Database
   queue.tail = new Promise<void>((resolve) => { finished = resolve; });
   try {
     await previous;
-    if (budget.held < MAX_RESERVED_LOCKS) budget.held += 1;
-    else await new Promise<void>((resolve) => budget.waiting.push(resolve));
+    await acquire(budget);
     try {
       return await withReservedLock(sql, key, task);
     } finally {
-      const next = budget.waiting.shift();
-      if (next) next(); else budget.held -= 1;
+      release(budget);
     }
   } finally {
     queue.calls -= 1;

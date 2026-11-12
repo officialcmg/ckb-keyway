@@ -2,7 +2,7 @@ import { createHmac, randomBytes } from "node:crypto";
 import { isIP } from "node:net";
 import type { User } from "./auth-user.ts";
 import { database, type DatabaseSql } from "./database";
-import { sendSecurityAlert } from "./security-alerts";
+import { securityAlertSentWithin, sendSecurityAlert, sendSecurityAlertOnce } from "./security-alerts";
 
 const APP_ID = /^keyway_[A-Za-z0-9_-]{24}$/;
 const LEGACY_APP_ID = "dashboard";
@@ -162,37 +162,67 @@ export async function applicationAllowsOrigin(appId: string, origin: string): Pr
   return rows.length === 1;
 }
 
-// Login-code limits, per 10 minutes unless named otherwise. A source is one IP address (an IPv6 /64). Limits on one
-// source are hard; budgets shared with other people refuse only a source that already asked in the last minute.
+// Login-code limits, per 10 minutes unless named otherwise. A source is one IP address (an IPv6 /64); a network is
+// one IPv4 address or IPv6 /48, the most one holder can cheaply spread over. Limits on one source are hard; budgets
+// shared with other people refuse only a source that already asked in the last minute.
 const OTP_EMAIL_APP_LIMIT = 5; // codes for one email in one app from one source
 const OTP_SOURCE_LIMIT = 60; // codes asked for from one source
+// Codes asked for from one network. Many people can share a /48 (an ISP's customers, a carrier, a host), so a source
+// that hasn't asked in the window still gets its first code up to the hard limit, and known networks are exempt.
+const OTP_NETWORK_LIMIT = 60;
+const OTP_NETWORK_HARD_LIMIT = 600;
+// Codes to one email from one network, across apps. A network the owner signed in from gets far more, so a neighbour
+// sharing it can't cheaply use the cap to shut the owner out, while flooding the inbox from it stays bounded.
+const OTP_NETWORK_EMAIL_LIMIT = 10;
+const OTP_KNOWN_NETWORK_EMAIL_LIMIT = 100;
 const OTP_EMAIL_LIMIT = 15; // codes to one email across all apps, shared
-const OTP_EMAIL_HARD_LIMIT = 30; // codes to one email from anyone, so no inbox gets more than 3 a minute
+// A known network is one that signed in to this email's account in the app in the last OTP_KNOWN_NETWORK_DAYS days.
+// Strangers can't make one, so the owner's usual networks get through the limits below that strangers can fill.
+const OTP_KNOWN_NETWORK_DAYS = 90;
+// Codes to one email from anyone, across apps: past it, only a known network or one that hasn't had a code for this
+// email in the window gets one, so each further code costs strangers another network.
+const OTP_EMAIL_HARD_LIMIT = 30;
+// Codes to one email in one app from anyone: past it, only a known network gets one. Counted per app, so another
+// developer's app can't use it to lock this app's users out.
+const OTP_EMAIL_ABSOLUTE_LIMIT = 50;
 const DASHBOARD_OTP_LIMIT_PER_MINUTE = 30;
 const OWNER_OTP_LIMIT_PER_MINUTE = 120; // all of one developer's apps together, the most a single app may set
 const GLOBAL_OTP_LIMIT_PER_MINUTE = 200; // every app together, shared: all login email goes out through one sender
-const OTP_FAILURE_LIMIT = 20; // wrong codes for one email in one app from one source per 24 hours
-const OTP_FAILURE_ALERT = 20; // the same from anyone: one alert
-const OTP_FAILURE_PAUSE = 30; // the same from anyone in the last hour: checks pause until it drops back
+// Every app together: past it, only known networks, which bounds what floods can take of the sender's quota.
+const GLOBAL_OTP_HARD_LIMIT_PER_MINUTE = 1000;
+const OTP_CEILING_ALERT_MINUTES = 10; // one alert per shared ceiling (and inbox) reached in this long
+// Wrong codes, for one email in one app over 24 hours. Codes stay six digits, so these bound guessing for the day.
+const OTP_FAILURE_LIMIT = 20; // from one source: that source is refused
+const OTP_FAILURE_ALERT = 20; // from anyone: one alert
+const OTP_FAILURE_PAUSE = 30; // from anyone: checks pause until it drops back, except a fresh code's first try (below)
+// While paused, a code's first try still goes ahead, so strangers' wrong codes can't lock the owner out of a network
+// they signed in from (from other networks, only within the limits that follow). Each such
+// try needs a newly sent code, and an unknown network gets it while it has fewer than OTP_BYPASS_NETWORK_LIMIT wrong
+// codes, until OTP_BYPASS_LIMIT wrong first tries from anyone. A known network keeps it while it has fewer than
+// OTP_FAILURE_LIMIT. So at most OTP_FAILURE_PAUSE + OTP_BYPASS_LIMIT wrong codes (90 of a million) reach Better Auth
+// a day, plus up to OTP_FAILURE_LIMIT from each network the owner signed in from.
+const OTP_BYPASS_NETWORK_LIMIT = 3;
+const OTP_BYPASS_LIMIT = 60;
+const OTP_PLATFORM_FAILURE_ALERT = 500; // wrong codes in an hour across every app and email: one alert an hour
+const OTP_PLATFORM_ALERT_MINUTES = 60;
 const OTP_FAILURE_MESSAGE = "Too many incorrect codes for this email. Try again tomorrow";
+
+export type OtpContext = { appId: string; emailHash: string; ipHash: string; networkHash: string };
 
 export async function prepareOtpSend(input: {
   appId?: string;
   email: string;
   ipAddress: string;
-}): Promise<{
-  appId: string;
-  emailHash: string;
-  ipHash: string;
-}> {
+}): Promise<OtpContext> {
   const sql = await database();
   const app = input.appId ? await activeApplication(input.appId, sql) : undefined;
   const context = otpSubject(app?.app_id ?? LEGACY_APP_ID, input.email, input.ipAddress);
-  const { appId, emailHash, ipHash } = context;
+  const { appId, emailHash, ipHash, networkHash } = context;
   const owner = app?.owner_user_id ?? null;
   const appLimit = app?.otp_limit_per_minute ?? DASHBOARD_OTP_LIMIT_PER_MINUTE;
-  const result = await sql.begin(async (transaction) => {
-    const keys = [`otp:app:${appId}`, `otp:email:${emailHash}`, `otp:ip:${ipHash}`, ...owner ? [`otp:owner:${owner}`] : []];
+  type Ceiling = "global" | "owner" | "inbox";
+  const result = await sql.begin(async (transaction): Promise<"failures" | "cooldown" | "limited" | "limited-first" | { ceilings: Ceiling[] }> => {
+    const keys = [`otp:app:${appId}`, `otp:email:${emailHash}`, `otp:ip:${ipHash}`, `otp:network:${networkHash}`, ...owner ? [`otp:owner:${owner}`] : []];
     for (const key of keys.sort()) {
       await transaction`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`;
     }
@@ -200,7 +230,8 @@ export async function prepareOtpSend(input: {
     // Bounded by time in the WHERE clause so the index skips older history.
     const [limits] = await transaction<Array<{
       app_count: number; owner_count: number; global_count: number; cooldown: number; email_app_count: number;
-      email_count: number; source_count: number; source_minute_count: number; source_limited: number; app_limited: number;
+      email_count: number; network_email_count: number; email_app_total: number; source_count: number; source_minute_count: number;
+      network_count: number; network_minute_count: number; source_limited: number; app_limited: number;
     }>>`
       select
         count(*) filter (where requested and events.app_id = ${appId} and events.created_at >= now() - interval '1 minute')::int as app_count,
@@ -210,8 +241,12 @@ export async function prepareOtpSend(input: {
           and events.created_at >= now() - interval '60 seconds')::int as cooldown,
         count(*) filter (where requested and email_hash = ${emailHash} and events.app_id = ${appId} and ip_hash = ${ipHash})::int as email_app_count,
         count(*) filter (where requested and email_hash = ${emailHash})::int as email_count,
+        count(*) filter (where requested and email_hash = ${emailHash} and network_hash = ${networkHash})::int as network_email_count,
+        count(*) filter (where requested and email_hash = ${emailHash} and events.app_id = ${appId})::int as email_app_total,
         count(*) filter (where requested and ip_hash = ${ipHash})::int as source_count,
         count(*) filter (where requested and ip_hash = ${ipHash} and events.created_at >= now() - interval '1 minute')::int as source_minute_count,
+        count(*) filter (where requested and network_hash = ${networkHash})::int as network_count,
+        count(*) filter (where requested and network_hash = ${networkHash} and events.created_at >= now() - interval '1 minute')::int as network_minute_count,
         count(*) filter (where not requested and ip_hash = ${ipHash} and events.app_id = ${appId} and events.created_at >= now() - interval '1 minute')::int as source_limited,
         count(*) filter (where not requested and events.app_id = ${appId})::int as app_limited
       from (
@@ -223,33 +258,60 @@ export async function prepareOtpSend(input: {
     // One code a minute for one email in one app from one source.
     if (limits.cooldown > 0) return "cooldown";
     // Budgets shared with other people (the app's, the developer's, everyone's, the inbox's across apps) refuse only a
-    // source that already asked in the last minute, so strangers filling them can't block anyone else's first request.
-    // The inbox's hard limit is the one exception: past it, more codes would be flooding that inbox.
+    // source that already asked in the last minute, so strangers filling them can't block anyone else's first request;
+    // past everyone's per-minute budget, a network that asked in the last minute is refused too, so one /48 can't fill
+    // it alone. The inbox's hard limit refuses a network that already had a code for this email in the window. Past the
+    // inbox's absolute limit in this app or everyone's hard limit, only a known network gets a code. Known networks,
+    // which strangers can't make, are exempt from every limit counted per network.
+    let known: boolean | undefined;
+    const isKnown = async () => known ??= await knownNetwork(transaction as unknown as DatabaseSql, context);
     const shared = limits.app_count >= appLimit || limits.owner_count >= OWNER_OTP_LIMIT_PER_MINUTE
       || limits.global_count >= GLOBAL_OTP_LIMIT_PER_MINUTE || limits.email_count >= OTP_EMAIL_LIMIT;
+    const knownOnly = limits.email_app_total >= OTP_EMAIL_ABSOLUTE_LIMIT || limits.global_count >= GLOBAL_OTP_HARD_LIMIT_PER_MINUTE;
+    const busyNetwork = (limits.network_count >= OTP_NETWORK_LIMIT && limits.source_count > 0)
+      || limits.network_count >= OTP_NETWORK_HARD_LIMIT
+      || (limits.global_count >= GLOBAL_OTP_LIMIT_PER_MINUTE && limits.network_minute_count > 0)
+      || (limits.email_count >= OTP_EMAIL_HARD_LIMIT && limits.network_email_count > 0);
     if (limits.email_app_count >= OTP_EMAIL_APP_LIMIT || limits.source_count >= OTP_SOURCE_LIMIT
-      || limits.email_count >= OTP_EMAIL_HARD_LIMIT || (shared && limits.source_minute_count > 0)) {
+      || (limits.network_email_count >= OTP_NETWORK_EMAIL_LIMIT && (limits.network_email_count >= OTP_KNOWN_NETWORK_EMAIL_LIMIT || !await isKnown()))
+      || (shared && limits.source_minute_count > 0) || (busyNetwork && !await isKnown())
+      || (knownOnly && !await isKnown())) {
       // At most one record a minute per source and app, and one alert per app every 10 minutes, however many are refused.
-      if (limits.source_limited === 0) await insertOtpEvent(transaction as unknown as DatabaseSql, appId, emailHash, ipHash, "rate_limited");
+      if (limits.source_limited === 0) await insertOtpEvent(transaction as unknown as DatabaseSql, context, "rate_limited");
       return limits.app_limited === 0 ? "limited-first" : "limited";
     }
-    await insertOtpEvent(transaction as unknown as DatabaseSql, appId, emailHash, ipHash, "requested");
-    return "allowed";
+    await insertOtpEvent(transaction as unknown as DatabaseSql, context, "requested");
+    // A shared ceiling only slows sources that asked recently, so the codes it lets through are worth an alert.
+    const ceilings: Ceiling[] = [];
+    if (limits.global_count + 1 >= GLOBAL_OTP_LIMIT_PER_MINUTE) ceilings.push("global");
+    if (owner && limits.owner_count + 1 >= OWNER_OTP_LIMIT_PER_MINUTE) ceilings.push("owner");
+    if (limits.email_count + 1 >= OTP_EMAIL_HARD_LIMIT) ceilings.push("inbox");
+    return { ceilings };
   });
   await pruneOtpEvents(sql);
   if (result === "failures") throw new Error(OTP_FAILURE_MESSAGE);
   if (result === "cooldown") throw new Error("Too many login codes requested. Wait 60 seconds before resending");
-  if (result !== "allowed") {
+  if (typeof result === "string") {
     // Not awaited: the caller holds a per-email lock and a pool connection.
     if (result === "limited-first") void sendSecurityAlert("otp_rate_limit", { appId });
     throw new Error("Too many login codes requested. Try again later");
+  }
+  const subjects: Record<Ceiling, string> = { global: "all", owner: owner ?? "", inbox: emailHash };
+  for (const ceiling of result.ceilings) {
+    // The code is already counted against the requester; an alert that can't be recorded mustn't fail the request.
+    await sendSecurityAlertOnce(`otp_${ceiling}_ceiling`, subjects[ceiling], OTP_CEILING_ALERT_MINUTES, { appId }).catch(() => undefined);
   }
   return context;
 }
 
 /** The rate-limit subject for a login code, shared by sending and checking it. */
-export function otpSubject(appId: string, email: string, ipAddress: string): { appId: string; emailHash: string; ipHash: string } {
-  return { appId, emailHash: privateHash("email", email.trim().toLowerCase()), ipHash: privateHash("ip", otpSource(ipAddress)) };
+export function otpSubject(appId: string, email: string, ipAddress: string): OtpContext {
+  return {
+    appId,
+    emailHash: privateHash("email", email.trim().toLowerCase()),
+    ipHash: privateHash("ip", otpSource(ipAddress)),
+    networkHash: privateHash("network", otpNetwork(ipAddress)),
+  };
 }
 
 /**
@@ -257,6 +319,15 @@ export function otpSubject(appId: string, email: string, ipAddress: string): { a
  * and an IPv6 address by its /64, which one holder can fill with as many addresses as they like.
  */
 export function otpSource(address: string): string {
+  return addressPrefix(address, 4);
+}
+
+/** The network a source belongs to: an IPv4 address as is, and an IPv6 address by its /48, a typical single site. */
+export function otpNetwork(address: string): string {
+  return addressPrefix(address, 3);
+}
+
+function addressPrefix(address: string, prefixGroups: number): string {
   if (isIP(address) !== 6) return address;
   let text = address.toLowerCase().split("%")[0];
   const dotted = /(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(text);
@@ -272,46 +343,87 @@ export function otpSource(address: string): string {
   if (words.slice(0, 5).every((word) => word === 0) && words[5] === 0xffff) {
     return [words[6] >> 8, words[6] & 0xff, words[7] >> 8, words[7] & 0xff].join(".");
   }
-  return `${words.slice(0, 4).map((word) => word.toString(16)).join(":")}::/64`;
+  return `${words.slice(0, prefixGroups).map((word) => word.toString(16)).join(":")}::/${prefixGroups * 16}`;
+}
+
+/** A code check refused while the email's checks are paused: the challenge it was for can't be checked again. */
+export class OtpPausedError extends Error {
+  constructor() { super("Too many incorrect codes for this email. Try again later"); }
 }
 
 /**
- * Refuses a code check once this source has had too many wrong codes for this email in the app, or, for a while,
- * once anyone has. The second keeps guessing from many addresses slow without letting one stranger lock a user out.
+ * Whether this code check may go ahead. Refuses one once this source has had too many wrong codes for this email in
+ * the app, and pauses checks once anyone has: that keeps guessing from many addresses slow. While paused, a code's
+ * first try still goes ahead (`bypass`), within the limits above, so strangers can't lock the owner out. The challenge
+ * ID is the requester's own secret, so only they can try their code. Run before the email's login-code lock to turn
+ * refusals away early, and again under it, where checks for one email are counted one at a time.
  */
-export async function checkOtpFailures(context: { appId: string; emailHash: string; ipHash: string }): Promise<void> {
-  const failures = await otpFailures(await database(), context);
+export async function checkOtpFailures(context: OtpContext, challenge: { wrongAttempts: number }): Promise<{ bypass: boolean }> {
+  const sql = await database();
+  const failures = await otpFailures(sql, context);
   if (failures.source >= OTP_FAILURE_LIMIT) throw new Error(OTP_FAILURE_MESSAGE);
-  if (failures.hour >= OTP_FAILURE_PAUSE) throw new Error("Too many incorrect codes for this email. Try again later");
+  if (failures.day < OTP_FAILURE_PAUSE) return { bypass: false };
+  if (challenge.wrongAttempts === 0 && (failures.network < OTP_BYPASS_NETWORK_LIMIT && failures.bypass < OTP_BYPASS_LIMIT
+    || failures.network < OTP_FAILURE_LIMIT && await knownNetwork(sql, context))) return { bypass: true };
+  throw new OtpPausedError();
 }
 
-export async function recordOtpResult(
-  context: { appId: string; emailHash: string; ipHash: string },
-  outcome: "sent" | "send_failed",
-): Promise<void> {
+export async function recordOtpResult(context: OtpContext, outcome: "sent" | "send_failed"): Promise<void> {
   const sql = await database();
-  await insertOtpEvent(sql, context.appId, context.emailHash, context.ipHash, outcome);
+  await insertOtpEvent(sql, context, outcome);
 }
 
-export async function recordOtpVerification(
-  context: { appId: string; emailHash: string; ipHash: string },
-  outcome: "verified" | "verify_failed",
-): Promise<void> {
+export async function recordOtpVerification(context: OtpContext, outcome: "verified" | "verify_failed", bypass = false): Promise<void> {
   const sql = await database();
-  await insertOtpEvent(sql, context.appId, context.emailHash, context.ipHash, outcome);
-  // Rotated codes each allow 5 tries, so wrong codes add up per email. Alert once when they reach the limit.
-  if (outcome === "verify_failed" && (await otpFailures(sql, context)).day === OTP_FAILURE_ALERT) {
-    void sendSecurityAlert("otp_failure_limit", { appId: context.appId });
+  await insertOtpEvent(sql, context, outcome, bypass);
+  if (outcome === "verified") {
+    // The session is already issued; not recording the network only costs the owner that exemption later.
+    try {
+      await sql`insert into keyway_otp_known_networks (app_id, email_hash, network_hash, verified_at)
+        values (${context.appId}, ${context.emailHash}, ${context.networkHash}, now())
+        on conflict (app_id, email_hash, network_hash) do update set verified_at = now()`;
+      await sql`delete from keyway_otp_known_networks where (app_id, email_hash, network_hash) in (
+        select app_id, email_hash, network_hash from keyway_otp_known_networks
+        where verified_at < now() - ${`${OTP_KNOWN_NETWORK_DAYS} days`}::interval limit 100
+      )`;
+    } catch (error) {
+      console.error("[keyway] could not record a sign-in network", error instanceof Error ? error.message : "unknown error");
+    }
+    return;
+  }
+  // Rotated codes each allow 5 tries, so wrong codes add up per email. Alert once when they reach the limit, and
+  // once when the paused checks' first tries are used up too.
+  const failures = await otpFailures(sql, context);
+  if (failures.day === OTP_FAILURE_ALERT) void sendSecurityAlert("otp_failure_limit", { appId: context.appId });
+  if (bypass && failures.bypass === OTP_BYPASS_LIMIT) void sendSecurityAlert("otp_failure_bypass_limit", { appId: context.appId });
+  // Limits per email don't slow guessing spread over many emails, so watch the total too, until the hour's alert is out.
+  if (await securityAlertSentWithin("otp_platform_failures", "all", OTP_PLATFORM_ALERT_MINUTES)) return;
+  const [total] = await sql<Array<{ count: number }>>`
+    select count(*)::int as count from keyway_otp_events where outcome = 'verify_failed' and created_at >= now() - interval '1 hour'
+  `;
+  if (total.count >= OTP_PLATFORM_FAILURE_ALERT) {
+    await sendSecurityAlertOnce("otp_platform_failures", "all", OTP_PLATFORM_ALERT_MINUTES, { count: total.count }).catch(() => undefined);
   }
 }
 
-/** Wrong codes for one email in one app: from this source and from anyone in 24 hours, and from anyone in the last hour. */
-async function otpFailures(sql: DatabaseSql, context: { appId: string; emailHash: string; ipHash: string }) {
-  const [row] = await sql<Array<{ source: number; day: number; hour: number }>>`
+/** Whether this network signed in to this email's account in the app recently. */
+async function knownNetwork(sql: DatabaseSql, context: OtpContext): Promise<boolean> {
+  const rows = await sql`
+    select 1 from keyway_otp_known_networks
+    where app_id = ${context.appId} and email_hash = ${context.emailHash} and network_hash = ${context.networkHash}
+      and verified_at > now() - ${`${OTP_KNOWN_NETWORK_DAYS} days`}::interval
+  `;
+  return rows.length > 0;
+}
+
+/** Wrong codes for one email in one app in 24 hours: from this source, from this network, from anyone, and while paused. */
+async function otpFailures(sql: DatabaseSql, context: OtpContext) {
+  const [row] = await sql<Array<{ source: number; network: number; day: number; bypass: number }>>`
     select
       count(*) filter (where ip_hash = ${context.ipHash})::int as source,
+      count(*) filter (where network_hash = ${context.networkHash})::int as network,
       count(*)::int as day,
-      count(*) filter (where created_at >= now() - interval '1 hour')::int as hour
+      count(*) filter (where bypass)::int as bypass
     from keyway_otp_events
     where outcome = 'verify_failed' and created_at >= now() - interval '24 hours'
       and app_id = ${context.appId} and email_hash = ${context.emailHash}
@@ -413,13 +525,12 @@ function privateHash(kind: string, value: string): string {
 
 function insertOtpEvent(
   sql: DatabaseSql,
-  appId: string,
-  emailHash: string,
-  ipHash: string,
+  context: OtpContext,
   outcome: "requested" | "sent" | "send_failed" | "verified" | "verify_failed" | "rate_limited",
+  bypass = false,
 ) {
   return sql`
-    insert into keyway_otp_events (app_id, email_hash, ip_hash, outcome)
-    values (${appId}, ${emailHash}, ${ipHash}, ${outcome})
+    insert into keyway_otp_events (app_id, email_hash, ip_hash, network_hash, outcome, bypass)
+    values (${context.appId}, ${context.emailHash}, ${context.ipHash}, ${context.networkHash}, ${outcome}, ${bypass})
   `;
 }

@@ -16,6 +16,7 @@ import { litPolicyEnabled, parseLitEmailCode, policySendCode, policySignMessage,
 import { listPendingTransactions, nodeStatus, recordPendingTransaction } from "./pending-transactions.ts";
 import { applySendLimitRecord, buildSendLimitChange, buildSendLimitGenesis, LIT_CODE_KINDS, planSendLimits, sendLimitHead, withFingerprint } from "./send-limits.ts";
 import { recoverPkpPublicKey } from "./pkp-identity.ts";
+import { sendSecurityAlert } from "./security-alerts.ts";
 import { formatCkb, previewGeneralTransaction, previewSummaryLines, type ValidatedTransaction } from "./transaction-policy.ts";
 import type { ReadyWallet } from "./user-wallet.ts";
 
@@ -42,6 +43,12 @@ const REQUEST_TTL_MS = 5 * 60_000;
 const CODE_TTL_MS = 10 * 60_000;
 export const REQUEST_EXPIRED = "This request expired. Start again.";
 const MAX_CODE_ATTEMPTS = 5;
+// Wrong six-digit codes in 24 hours, across every code sent. Each code allows five tries and codes can be sent again,
+// so without this the tries add up day after day. Only someone signed in can make them, and they are counted per
+// session, so a stolen session can't use up the owner's own: a new session needs a login code from the inbox.
+const MAX_CODE_FAILURES_PER_SESSION = 20;
+const MAX_CODE_FAILURES_PER_USER = 60;
+const CODE_FAILURES_MESSAGE = "Too many wrong email codes today. Try again tomorrow";
 const MAX_MESSAGE_BYTES = 4096;
 
 /** Transactions: preview, request-email-code, sign. */
@@ -539,9 +546,10 @@ export async function consumeRequest(user: User, purpose: Purpose, nonce: string
  * email limit bounds how often that can happen.
  */
 export async function sendCode(context: Pick<SigningContext, "user" | "appName" | "email" | "sendEmail" | "rateLimit">, purpose: Purpose, nonce: string, heading: string, lines: string[], options: { limited?: boolean } = {}): Promise<string> {
+  const sql = await database();
+  if (overFailureLimit(await codeFailures(sql, context.user))) throw new Error(CODE_FAILURES_MESSAGE);
   if (!options.limited) await codeLimit(context);
   const code = randomInt(0, 1_000_000).toString().padStart(6, "0");
-  const sql = await database();
   const rows = await sql`
     update keyway_v2_signature_requests
     set email_code_hash = ${codeHash(nonce, code)}, email_code_expires_at = now() + ${`${CODE_TTL_MS} milliseconds`}::interval, email_attempts = 0,
@@ -598,16 +606,53 @@ function waitText(seconds: number): string {
 export async function verifyCode(user: User, purpose: Purpose, nonce: string, code: unknown): Promise<void> {
   if (typeof code !== "string" || !/^\d{6}$/.test(code)) throw new Error("Enter the six-digit code from your email");
   const sql = await database();
-  const [row] = await sql<Array<{ email_code_hash: string | null; email_attempts: number }>>`
-    update keyway_v2_signature_requests set email_attempts = email_attempts + 1
-    where user_id = ${user.id} and purpose = ${purpose} and nonce = ${nonce} and expires_at > now() and email_code_expires_at > now()
-    returning email_code_hash, email_attempts
+  // A session past its limit is refused before it competes for the lock below.
+  if (overFailureLimit(await codeFailures(sql, user))) throw new Error(CODE_FAILURES_MESSAGE);
+  // One check at a time per user, so the day's wrong codes are counted before the next one is compared. Another
+  // check already running is refused rather than waited for, so checks never queue on pool connections.
+  const outcome = await sql.begin(async (tx) => {
+    const query = tx as unknown as DatabaseSql;
+    const [{ locked }] = await query<Array<{ locked: boolean }>>`select pg_try_advisory_xact_lock(hashtextextended(${`step-up-failures:${user.id}`}, 0)) as locked`;
+    if (!locked) return "busy";
+    if (overFailureLimit(await codeFailures(query, user))) return "failures";
+    const [row] = await query<Array<{ email_code_hash: string | null; email_attempts: number }>>`
+      update keyway_v2_signature_requests set email_attempts = email_attempts + 1
+      where user_id = ${user.id} and purpose = ${purpose} and nonce = ${nonce} and expires_at > now() and email_code_expires_at > now()
+      returning email_code_hash, email_attempts
+    `;
+    if (!row?.email_code_hash) return "expired";
+    if (row.email_attempts > MAX_CODE_ATTEMPTS) return "attempts";
+    const expected = Buffer.from(row.email_code_hash, "hex");
+    const supplied = Buffer.from(codeHash(nonce, code), "hex");
+    if (expected.length === supplied.length && timingSafeEqual(expected, supplied)) return "ok";
+    await query`insert into keyway_v2_step_up_failures (user_id, session_id) values (${user.id}, ${user.sessionId ?? ""})`;
+    const failures = await codeFailures(query, user);
+    return failures.session === MAX_CODE_FAILURES_PER_SESSION || failures.user === MAX_CODE_FAILURES_PER_USER ? "wrong-last" : "wrong";
+  });
+  if (outcome === "ok") return;
+  if (outcome === "busy") throw new Error("Another email code check is in progress. Try again in a moment");
+  if (outcome === "failures") throw new Error(CODE_FAILURES_MESSAGE);
+  if (outcome === "expired") throw new Error("The email code has expired. Request a new one");
+  if (outcome === "attempts") throw new Error("Too many wrong codes. Request a new one");
+  if (outcome === "wrong-last") void sendSecurityAlert("step_up_failure_limit", { userId: user.id });
+  // Failures older than a day count for nothing; a few go with each wrong code.
+  await sql`delete from keyway_v2_step_up_failures where id in (
+    select id from keyway_v2_step_up_failures where created_at < now() - interval '1 day' limit 100
+  )`;
+  throw new Error("That email code isn't right");
+}
+
+/** Wrong codes in the last day: from this session, and from all of the user's sessions. */
+async function codeFailures(sql: DatabaseSql, user: User): Promise<{ session: number; user: number }> {
+  const [row] = await sql<Array<{ session: number; user: number }>>`
+    select count(*) filter (where session_id = ${user.sessionId ?? ""})::int as session, count(*)::int as user
+    from keyway_v2_step_up_failures where user_id = ${user.id} and created_at > now() - interval '1 day'
   `;
-  if (!row?.email_code_hash) throw new Error("The email code has expired. Request a new one");
-  if (row.email_attempts > MAX_CODE_ATTEMPTS) throw new Error("Too many wrong codes. Request a new one");
-  const expected = Buffer.from(row.email_code_hash, "hex");
-  const supplied = Buffer.from(codeHash(nonce, code), "hex");
-  if (expected.length !== supplied.length || !timingSafeEqual(expected, supplied)) throw new Error("That email code isn't right");
+  return row;
+}
+
+function overFailureLimit(failures: { session: number; user: number }): boolean {
+  return failures.session >= MAX_CODE_FAILURES_PER_SESSION || failures.user >= MAX_CODE_FAILURES_PER_USER;
 }
 
 /**

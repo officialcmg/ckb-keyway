@@ -14,6 +14,7 @@ import {
   sessionEmail,
   sendTransactionalEmail,
   consumeRateLimit,
+  CHALLENGE_ID,
 } from "./auth.ts";
 import { acquireLease, heartbeatLease, releaseLease, requireLease } from "./device-lease.ts";
 import { loadLitAction } from "./lit-actions.ts";
@@ -179,7 +180,9 @@ async function legacyCleanupRequest(request: Request): Promise<Response> {
 
 async function verifyCodeRequest(request: Request): Promise<Response> {
   const { challengeId, code } = await objectBody(request, "Invalid email OTP verification");
-  if (typeof challengeId !== "string" || !challengeId) throw new Error("OTP challenge is required");
+  if (typeof challengeId !== "string" || !CHALLENGE_ID.test(challengeId)) {
+    throw new Error("A valid OTP challenge is required");
+  }
   if (typeof code !== "string" || !/^\d{6}$/.test(code)) throw new Error("Enter the six-digit code");
   return Response.json(await verifyEmailCode(request, challengeId, code));
 }

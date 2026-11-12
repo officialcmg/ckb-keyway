@@ -401,4 +401,51 @@ export const migrations: Array<{
     // close reopens it only when it can punish that commitment.
     up: (sql) => sql`alter table keyway_v2_watchtower_channels add column closing_commitment_number numeric(20, 0)`,
   },
+  {
+    version: 23, name: "session-origin-required",
+    // Every session issued since version 21 has the origin it was issued at. The older ones have none, so removing an
+    // origin could never end them; they are signed out, and sessions without an origin are refused.
+    up: (sql) => sql`delete from keyway_auth_sessions where "origin" is null`,
+  },
+  {
+    version: 24, name: "step-up-code-failures",
+    up: async (sql) => {
+      // Wrong step-up codes per user and session, kept for a day: each code allows five tries, and codes can be sent again.
+      await sql`create table keyway_v2_step_up_failures (
+        id bigint generated always as identity primary key,
+        user_id uuid not null,
+        session_id text not null,
+        created_at timestamptz not null default now()
+      )`;
+      await sql`create index keyway_v2_step_up_failures_user on keyway_v2_step_up_failures (user_id, created_at)`;
+      await sql`create index keyway_v2_step_up_failures_age on keyway_v2_step_up_failures (created_at)`;
+    },
+  },
+  {
+    version: 25, name: "login-code-sources",
+    up: async (sql) => {
+      // The wrong codes tried on each login challenge, so its owner can still use a fresh code while wrong codes from
+      // others pause the email's checks.
+      await sql`alter table keyway_auth_challenges add column wrong_attempts integer not null default 0`;
+      // Expired challenges hold the emails people typed: removed now, and from here on as new ones are made.
+      await sql`delete from keyway_auth_challenges where expires_at < now()`;
+      await sql`create index keyway_auth_challenges_expiry on keyway_auth_challenges (expires_at)`;
+      // The network (IPv4 address or IPv6 /48) of each login-code event, and whether a wrong code was tried while
+      // the email's checks were paused.
+      await sql`alter table keyway_otp_events add column network_hash text, add column bypass boolean not null default false`;
+      // Every code check counts one email's wrong codes over a day; this keeps that from reading everyone's.
+      await sql`create index keyway_otp_events_failures on keyway_otp_events (app_id, email_hash, created_at) where outcome = 'verify_failed'`;
+      // Networks that signed in to an email's account in an app, kept 90 days: the owner's own, which strangers can't add.
+      await sql`create table keyway_otp_known_networks (
+        app_id text not null, email_hash text not null, network_hash text not null, verified_at timestamptz not null,
+        primary key (app_id, email_hash, network_hash)
+      )`;
+      await sql`create index keyway_otp_known_networks_age on keyway_otp_known_networks (verified_at)`;
+    },
+  },
+  {
+    version: 26, name: "security-alert-marks",
+    // When each deduplicated security alert last went out, by kind and hashed subject.
+    up: (sql) => sql`create table keyway_security_alert_marks (key text primary key, sent_at timestamptz not null)`,
+  },
 ];
