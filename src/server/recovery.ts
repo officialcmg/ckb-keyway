@@ -19,6 +19,8 @@ import { readWallet, saveWallet, type PendingRecoveryChange, type ReadyWallet } 
 /** What the recovery service needs beyond signing: a CKB client and a way to broadcast, both replaceable in tests. */
 export type RecoveryContext = SigningContext & {
   client?: ccc.Client;
+  /** The nodes a pending change is settled from, one at a time; replaceable in tests. Default: `settlementNodes()`. */
+  nodes?: ccc.Client[];
   broadcast?: (transaction: ccc.Transaction) => Promise<ccc.Hex>;
 };
 
@@ -214,31 +216,24 @@ function recoveryStatus(wallet: ReadyWallet): RecoveryStatus {
  * rejected, or hasn't known for the grace period, is dropped only once it can no longer commit. Called on every
  * sign-in and status check.
  */
-export async function settleRecoveryChange(context: Pick<RecoveryContext, "user" | "client" | "broadcast" | "appName" | "email" | "sendEmail">, now = new Date()): Promise<ReadyWallet> {
-  const client = context.client ?? new ccc.ClientPublicTestnet();
+export async function settleRecoveryChange(context: Pick<RecoveryContext, "user" | "client" | "nodes" | "broadcast" | "appName" | "email" | "sendEmail">, now = new Date()): Promise<ReadyWallet> {
   const settled = await withUserLock(context.user.id, async (sql) => {
     const wallet = await readWallet(context.user, sql);
     if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
     const pending = wallet.recoveryPending;
     if (!pending) return { wallet };
-    const found = await client.getTransaction(pending.transactionHash);
-    const unknown = !found || found.status === "unknown";
-    // A node also reports "rejected" for removals that aren't final (expiry, a full pool), so that is checked the same way.
-    const gone = found?.status === "rejected" || (unknown && now.getTime() - Date.parse(pending.sentAt) > PENDING_GRACE_MS);
-    const stale = gone ? await resendStale(context, client, pending) : undefined;
-    if (stale === "kept") return { wallet };
+    const nodes = context.nodes ?? (context.client ? [context.client] : settlementNodes());
+    const state = await onOneNode(nodes, (client) => pendingState(context, client, pending, now), undecidedSettlement(nodes.length));
+    if (state === "kept") return { wallet };
     const { recoveryPending: _done, ...rest } = wallet;
-    if (found?.status === "committed" || stale === "committed") {
+    if (state === "committed") {
       const updated: ReadyWallet = { ...rest, recovery: pending.recovery, ckbAddress: pending.ckbAddress, updatedAt: now.toISOString() };
       await saveWallet(context.user, updated, sql);
       return { wallet: updated, notice: pending };
     }
-    if (stale === "dropped") {
-      const updated: ReadyWallet = { ...rest, updatedAt: now.toISOString() };
-      await saveWallet(context.user, updated, sql);
-      return { wallet: updated };
-    }
-    return { wallet };
+    const updated: ReadyWallet = { ...rest, updatedAt: now.toISOString() };
+    await saveWallet(context.user, updated, sql);
+    return { wallet: updated };
   });
   if (settled.notice) {
     const { kind, ckbAddress, recovery, transactionHash } = settled.notice;
@@ -248,19 +243,86 @@ export async function settleRecoveryChange(context: Pick<RecoveryContext, "user"
   return settled.wallet;
 }
 
+/** The public testnet nodes a pending change is settled from, each a client of its own with no fallback. */
+const SETTLEMENT_NODES = ["https://testnet.ckb.dev/", "https://testnet.ckbapp.dev/"];
+
+export function settlementNodes(): ccc.Client[] {
+  return SETTLEMENT_NODES.map((url) => new ccc.ClientPublicTestnet({ url, fallbacks: [] }));
+}
+
+/** The node doesn't know a cell the change spends, so it can't say whether that cell is spent: ask another. */
+export class NodeBehind extends Error {}
+
+/**
+ * A change recorded without its transaction whose AdminList output this node doesn't show live. A node that is
+ * behind shows the same, so it is dropped only once every node says so.
+ */
+export class AdminListAbsent extends NodeBehind {}
+
+/**
+ * When no node could decide: dropped if every node answered that the AdminList of a change recorded without its
+ * transaction isn't live; kept (pending) if a node was only behind; otherwise undecided, and the failure is thrown.
+ */
+export function undecidedSettlement(nodeCount: number): (failures: unknown[]) => "kept" | "dropped" | undefined {
+  return (failures) => {
+    if (failures.length === nodeCount && failures.every((failure) => failure instanceof AdminListAbsent)) return "dropped";
+    return failures.some((failure) => failure instanceof NodeBehind) ? "kept" : undefined;
+  };
+}
+
+/**
+ * Runs `read` against one node at a time, so every answer it combines comes from the same node: CCC's fallback
+ * would send a failed request to another node mid-way, and two nodes can disagree (one lagging, one reorged).
+ * If a node fails, the whole read starts again on the next one. When none answers, `undecided` may still settle
+ * it from the failures; otherwise the last failure is thrown.
+ */
+export async function onOneNode<T>(nodes: ccc.Client[], read: (client: ccc.Client) => Promise<T>, undecided?: (failures: unknown[]) => T | undefined): Promise<T> {
+  const failures: unknown[] = [];
+  for (const node of nodes) {
+    try {
+      return await read(node);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  const decided = undecided?.(failures);
+  if (decided !== undefined) return decided;
+  throw failures.at(-1) ?? new Error("No CKB node to read from");
+}
+
+/** Where a pending change stands on this node: committed, dropped for good, or still pending (and sent again if needed). */
+async function pendingState(context: Pick<RecoveryContext, "broadcast">, client: ccc.Client, pending: PendingRecoveryChange, now: Date): Promise<"kept" | "committed" | "dropped"> {
+  const found = await client.getTransaction(pending.transactionHash);
+  if (found?.status === "committed") return "committed";
+  const unknown = !found || found.status === "unknown";
+  // A node also reports "rejected" for removals that aren't final (expiry, a full pool), so that is checked the same way.
+  const gone = found?.status === "rejected" || (unknown && now.getTime() - Date.parse(pending.sentAt) > PENDING_GRACE_MS);
+  return gone ? resendStale(context, client, pending) : "kept";
+}
+
 /**
  * A change the node rejected or hasn't known for the grace period. While all its inputs are unspent the signed
  * transaction can still commit, so it is sent again (no node may have got it, or one dropped it) and stays pending,
  * unless the resend is refused in a way that holds for good. Any other refusal can pass, however long it lasts. Once
- * an input is spent the change is dropped, unless this transaction spent it. A change recorded without its
- * transaction is dropped, as before.
+ * an input is spent, the change's own AdminList output (output 0) being live means it committed. Otherwise the
+ * input counts as spent only if the node knows the transaction that made it (CCC reads a cell the node hasn't seen
+ * as not live too); if it doesn't, the node is behind and another one decides. Then the change is kept while the
+ * node still has it pending, proposed or committed, and dropped otherwise. A change recorded without its
+ * transaction is applied when its AdminList output is live, and dropped only once no node shows it.
  */
 async function resendStale(context: Pick<RecoveryContext, "broadcast">, client: ccc.Client, pending: PendingRecoveryChange): Promise<"kept" | "committed" | "dropped"> {
-  if (!pending.transaction) return "dropped";
+  const adminListLive = async () => Boolean(await client.getCellLive({ txHash: pending.transactionHash, index: 0 }, false));
+  if (!pending.transaction) {
+    if (await adminListLive()) return "committed";
+    throw new AdminListAbsent("This node doesn't show the change's recovery list");
+  }
   const transaction = ccc.Transaction.fromBytes(pending.transaction);
   for (const input of transaction.inputs) {
     if (await client.getCellLive(input.previousOutput, false)) continue;
-    return (await client.getTransaction(pending.transactionHash))?.status === "committed" ? "committed" : "dropped";
+    if (await adminListLive()) return "committed";
+    if ((await client.getTransaction(input.previousOutput.txHash))?.status !== "committed") throw new NodeBehind("The CKB node hasn't caught up with this change's inputs");
+    const status = (await client.getTransaction(pending.transactionHash))?.status;
+    return status === "pending" || status === "proposed" || status === "committed" ? "kept" : "dropped";
   }
   try {
     await send(context, client, transaction);
