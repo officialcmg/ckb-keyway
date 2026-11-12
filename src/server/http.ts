@@ -36,7 +36,7 @@ import { recordSigningEvent } from "./security-alerts.ts";
 import { fundingSigning, type FundingContext } from "./funding-signing.ts";
 import { messageSigning, sendLimitOffer, signingSettings, transactionSigning, type SigningContext } from "./general-signing.ts";
 import { litPolicyEnabled } from "./lit-policy.ts";
-import { listPendingTransactions, nodeStatus } from "./pending-transactions.ts";
+import { listPendingTransactions, nodeStatus, signedTransaction } from "./pending-transactions.ts";
 import { sendLimitHead } from "./send-limits.ts";
 import { recoveryBackupChange, recoverySetup, settleRecoveryChange } from "./recovery.ts";
 import { sweepLegacyAfterSignIn } from "./legacy-sweep.ts";
@@ -109,13 +109,10 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
   if (operation === "status" || operation === "list-channels" || operation === "call") {
     sweepHostedSettlement(user.id, () => ownLockScript(user));
   }
-  if (operation === "call") {
-    const limit = await consumeRateLimit(`fiber-call:${user.id}`, { max: 120, window: 60 });
-    if (!limit.allowed) throw new Error(`Too many Fiber node requests. Try again in ${limit.retryAfter ?? 60} seconds`);
-  }
-  if (operation === "act") {
-    const limit = await consumeRateLimit(`fiber-act:${user.id}`, { max: 30, window: 60 });
-    if (!limit.allowed) throw new Error(`Too many Fiber node changes. Try again in ${limit.retryAfter ?? 60} seconds`);
+  const rateLimit = managedNodeRateLimit(operation);
+  if (rateLimit) {
+    const limit = await consumeRateLimit(`${rateLimit.key}:${user.id}`, rateLimit.rule);
+    if (!limit.allowed) throw new Error(`${rateLimit.message}. Try again in ${limit.retryAfter ?? 60} seconds`);
   }
   if (operation === "pay") {
     const scope = await resolveAuthScope(request);
@@ -129,12 +126,23 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
       `managed:${operation}`,
       request.headers.get("idempotency-key") ?? "",
       body,
-      () => managedNodeRequest(user.id, body, undefined, () => ownLockScript(user)),
+      () => managedNodeRequest(user.id, body, undefined, () => ownLockScript(user), (hash) => signedTransaction(user.id, hash)),
     )
     : await managedNodeRequest(user.id, body);
   return Response.json(result, {
     headers: { "Cache-Control": "no-store" },
   });
+}
+
+/**
+ * Per-user limits on hosted-node requests: free calls, changes such as peers, channel opens and their funding,
+ * and every other read (status and the fee reserve also start the node). Payments have limits of their own.
+ */
+export function managedNodeRateLimit(operation: string): { key: string; rule: { max: number; window: number }; message: string } | undefined {
+  if (operation === "pay") return undefined;
+  if (operation === "call") return { key: "fiber-call", rule: { max: 120, window: 60 }, message: "Too many Fiber node requests" };
+  if (["act", "open-channel", "submit-channel-funding"].includes(operation)) return { key: "fiber-act", rule: { max: 30, window: 60 }, message: "Too many Fiber node changes" };
+  return { key: "fiber-read", rule: { max: 120, window: 60 }, message: "Too many Fiber node requests" };
 }
 
 /**

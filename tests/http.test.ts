@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { handleKeyWayRequest } from "../src/server/http.ts";
+import { handleKeyWayRequest, managedNodeRateLimit } from "../src/server/http.ts";
 
 test("serves health checks and configured CORS without authentication", async () => {
   process.env.KEYWAY_ALLOWED_ORIGINS = "https://wallet.example";
@@ -57,4 +57,16 @@ test("serves versioned API routes while retaining legacy compatibility", async (
   }));
   assert.equal(response.status, 400);
   assert.deepEqual(await response.json(), { error: "A valid email address is required" });
+});
+
+test("opening a hosted channel counts against the same per-user limit as other node changes", () => {
+  assert.deepEqual(managedNodeRateLimit("open-channel"), managedNodeRateLimit("act"));
+  assert.equal(managedNodeRateLimit("act")?.key, "fiber-act");
+  assert.equal(managedNodeRateLimit("call")?.key, "fiber-call");
+  assert.deepEqual(managedNodeRateLimit("submit-channel-funding"), managedNodeRateLimit("act"));
+  // Every other hosted-node request has a limit too; status and the fee reserve start the node.
+  for (const operation of ["status", "fee-reserve", "list-channels", "get-invoice", "parse-invoice", "get-payment", "wait-for-payment", "wait-channel-ready", "unknown"]) {
+    assert.equal(managedNodeRateLimit(operation)?.key, "fiber-read", operation);
+  }
+  assert.equal(managedNodeRateLimit("pay"), undefined);
 });

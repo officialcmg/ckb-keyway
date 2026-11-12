@@ -14,7 +14,8 @@ import { serializeCccTransactionForRpc } from "../sdk/browser/ccc-transaction.ts
 import { approveFiberParams, FIBER_METHODS, fundingFeeRate, freeFiberParams, paymentFiberParams, type FiberMethod } from "../sdk/browser/fiber-methods.ts";
 import { pinPublicPeerAddress } from "./peer-address.ts";
 import * as ccc from "@ckb-ccc/core";
-import { FEE_RESERVE, needsFeeReserve, sweepSettlement } from "../sdk/browser/settlement-sweep.ts";
+import { JsonRpcTransformers } from "@ckb-ccc/core/advanced";
+import { channelFinished, FEE_RESERVE, needsFeeReserve, sweepSettlement } from "../sdk/browser/settlement-sweep.ts";
 
 type ManagedNodeClient = Pick<
   FiberRpcClient,
@@ -37,11 +38,15 @@ const mutations = new Map<string, Promise<void>>();
 
 type RpcScript = NonNullable<OpenChannelWithExternalFundingParams["shutdown_script"]>;
 
+/** The signed transaction KeyWay signed for this account with the given hash, if it signed one. */
+export type SignedFunding = (hash: string) => Promise<ccc.TransactionLike | undefined>;
+
 export async function managedNodeRequest(
   userId: string,
   body: Record<string, unknown>,
   override?: ManagedNodeClient,
   ownLock?: () => Promise<RpcScript>,
+  signedFunding?: SignedFunding,
 ): Promise<unknown> {
   const node = override ?? managedNodeClient(userId);
 
@@ -77,11 +82,19 @@ export async function managedNodeRequest(
         const peer = `0x${String(params.pubkey).toLowerCase().replace(/^0x/, "")}` as Pubkey;
         const addresses = await assertKnownPublicPeer(node, peer);
         if (addresses.length === 0) return { done: true };
-        await assertPeerRoom(node);
-        await connectGraphPeer(node, peer, addresses);
+        // The room check and the dial run one at a time per user, so parallel requests can't both pass it.
+        await serializePeerWork(userId, async () => {
+          await assertPeerRoom(node, undefined, addresses.length);
+          await connectGraphPeer(node, peer, addresses);
+        });
         return { done: true };
       }
-      await assertPeerRoom(node);
+      await serializePeerWork(userId, async () => {
+        // Only a dial by key to a peer already connected takes no room: a new address can reach another node.
+        await assertPeerRoom(node, typeof params.pubkey === "string" && params.address === undefined ? params.pubkey : undefined);
+        await node.call(FIBER_METHODS[method as FiberMethod].rpc, [dial]);
+      });
+      return { done: true };
     }
     await serializeMutation(userId, () => node.call(FIBER_METHODS[method as FiberMethod].rpc, [dial]));
     return { done: true };
@@ -118,13 +131,28 @@ export async function managedNodeRequest(
   if (body.operation === "open-channel") {
     const params = openChannelParams(body.params);
     if (!ownLock) throw new Error("The account's own lock is required to open a channel");
+    const own = await ownLock();
     // Fiber pays the channel out to the shutdown script when it closes, so it must be the user's own lock.
-    params.shutdown_script = ownShutdownScript(body.params, await ownLock());
-    await connectManagedPeer(node, params.pubkey);
-    return serializeMutation(userId, () => node.openChannelWithExternalFunding(params));
+    params.shutdown_script = ownShutdownScript(body.params, own);
+    // And the account funds it: a lock nobody signs for would leave the channel waiting for funding forever.
+    if (!sameScript(params.funding_lock_script, own)) throw new Error("Channels can only be funded from your own KeyWay address");
+    params.funding_lock_script = own;
+    // One at a time per user, so parallel opens can't all pass the room check.
+    return serializePeerWork(userId, async () => {
+      await assertChannelRoom(node);
+      await connectManagedPeer(node, params.pubkey);
+      return node.openChannelWithExternalFunding(params);
+    });
   }
   if (body.operation === "submit-channel-funding") {
-    return serializeMutation(userId, () => node.submitSignedFundingTx(submitFundingParams(body.params)));
+    // Fiber doesn't check the signatures on submitted funding, and a submission keeps the hosted node running,
+    // so only funding KeyWay signed for this account goes to the node, exactly as KeyWay signed it.
+    if (!signedFunding) throw new Error("Channel funding can only be submitted as KeyWay signed it");
+    const params = submitFundingParams(body.params);
+    const signed = await signedFunding(JsonRpcTransformers.transactionTo(params.signed_funding_tx as never).hash());
+    if (!signed) throw new Error("Only channel funding KeyWay signed for this account can be submitted");
+    params.signed_funding_tx = serializeCccTransactionForRpc(ccc.Transaction.from(signed));
+    return serializeMutation(userId, () => node.submitSignedFundingTx(params));
   }
   if (body.operation === "wait-channel-ready") {
     return node.waitForChannelReady(channelId(body.channelId), { timeout: 180_000, interval: 3_000 });
@@ -276,7 +304,7 @@ function openChannelParams(value: unknown): OpenChannelWithExternalFundingParams
     shutdown_script: params.shutdown_script === undefined ? undefined as never : script(params.shutdown_script),
     funding_lock_script: fundingLock,
     funding_lock_script_cell_deps: cellDeps(params.funding_lock_script_cell_deps),
-    funding_fee_rate: fundingFeeRate(optionalHex(params.funding_fee_rate, "Funding fee rate"), fundingLock),
+    funding_fee_rate: fundingFeeRate(minimumFeeRate(optionalHex(params.funding_fee_rate, "Funding fee rate")), fundingLock),
     commitment_fee_rate: optionalHex(params.commitment_fee_rate, "Commitment fee rate"),
   };
 }
@@ -284,11 +312,13 @@ function openChannelParams(value: unknown): OpenChannelWithExternalFundingParams
 function ownShutdownScript(value: unknown, own: RpcScript): RpcScript {
   const requested = (value as { shutdown_script?: unknown } | undefined)?.shutdown_script;
   if (requested === undefined) return own;
-  const candidate = script(requested);
-  const same = candidate.code_hash.toLowerCase() === own.code_hash.toLowerCase() &&
-    candidate.hash_type === own.hash_type && candidate.args.toLowerCase() === own.args.toLowerCase();
-  if (!same) throw new Error("Channels can only close to your own KeyWay address");
+  if (!sameScript(script(requested), own)) throw new Error("Channels can only close to your own KeyWay address");
   return own;
+}
+
+function sameScript(candidate: RpcScript, own: RpcScript): boolean {
+  return candidate.code_hash.toLowerCase() === own.code_hash.toLowerCase() &&
+    candidate.hash_type === own.hash_type && candidate.args.toLowerCase() === own.args.toLowerCase();
 }
 
 function submitFundingParams(value: unknown): SubmitSignedFundingTxParams {
@@ -301,6 +331,20 @@ function submitFundingParams(value: unknown): SubmitSignedFundingTxParams {
 }
 
 const MAX_PEERS = 32;
+// Each unfinished channel keeps a hosted node running, and Fiber keeps the record of every closed one; so a
+// hosted node opens no more once it has this many unfinished channels or channel records in all.
+const MAX_UNFINISHED_CHANNELS = 32;
+const MAX_CHANNEL_RECORDS = 200;
+
+async function assertChannelRoom(node: ManagedNodeClient): Promise<void> {
+  const { channels } = await node.listChannels({ include_closed: true });
+  if (channels.length >= MAX_CHANNEL_RECORDS) throw new Error(`A hosted node can hold at most ${MAX_CHANNEL_RECORDS} channel records`);
+  if (channels.filter((channel) => !channelFinished(channel as never)).length >= MAX_UNFINISHED_CHANNELS) {
+    throw new Error(`A hosted node can have at most ${MAX_UNFINISHED_CHANNELS} channels open or being set up`);
+  }
+}
+// A peer's announced addresses are checked and dialed; only this many, however many it announces.
+const MAX_PEER_ADDRESSES = 4;
 
 /**
  * Connecting by pubkey makes the node dial the addresses the peer announced to the network, so those must
@@ -323,7 +367,7 @@ async function assertKnownPublicPeer(node: ManagedNodeClient, peer: string): Pro
       const tcp = found.addresses.filter((address) => /\/tcp\/\d+(\/p2p\/|$)/.test(address) && !/\/(ws|wss)(\/|$)/.test(address));
       if (tcp.length === 0) throw new Error("This peer announces no address a hosted node can reach; pass one with connectPeer");
       const pinned: string[] = [];
-      for (const address of tcp) pinned.push(await pinPublicPeerAddress(address));
+      for (const address of tcp.slice(0, MAX_PEER_ADDRESSES)) pinned.push(await pinPublicPeerAddress(address));
       return pinned;
     }
     if (result.nodes.length < 256) break;
@@ -332,8 +376,15 @@ async function assertKnownPublicPeer(node: ManagedNodeClient, peer: string): Pro
   throw new Error("This peer isn't in the Fiber network graph yet; connect to it first with connectPeer and its address");
 }
 
-async function assertPeerRoom(node: ManagedNodeClient): Promise<void> {
-  if ((await node.listPeers()).peers.length >= MAX_PEERS) throw new Error(`A hosted node can connect to at most ${MAX_PEERS} peers`);
+/**
+ * Refuses a connection that could take the node past MAX_PEERS. Each address dialed may reach a different node,
+ * so dialing several needs room for each. A peer that is already connected takes no more room.
+ */
+async function assertPeerRoom(node: ManagedNodeClient, peer?: string, dials = 1): Promise<void> {
+  const { peers } = await node.listPeers();
+  const bare = peer?.toLowerCase().replace(/^0x/, "");
+  if (bare && peers.some(({ pubkey }) => pubkey.toLowerCase().replace(/^0x/, "") === bare)) return;
+  if (peers.length + dials > MAX_PEERS) throw new Error(`A hosted node can connect to at most ${MAX_PEERS} peers`);
 }
 
 /**
@@ -354,9 +405,11 @@ async function connectManagedPeer(node: ManagedNodeClient, peer: Pubkey): Promis
     // Any public peer: its announced addresses must be public, and the handshake must match its key.
     const addresses = await assertKnownPublicPeer(node, peer);
     if (addresses.length === 0) return;
+    await assertPeerRoom(node, undefined, addresses.length);
     await connectGraphPeer(node, peer, addresses);
     return;
   }
+  await assertPeerRoom(node, peer);
   // Native nodes resolve current TCP addresses from gossip, not browser WSS seeds.
   let addresses: string[] = [];
   try {
@@ -421,6 +474,15 @@ function optionalHex(value: unknown, label: string): `0x${string}` | undefined {
   return value === undefined ? undefined : positiveHex(value, label);
 }
 
+// CKB's default minimum fee rate. Funding paying less never confirms, and Fiber keeps rebroadcasting it, so the
+// channel would keep its hosted node running indefinitely.
+const MIN_FUNDING_FEE_RATE = 1_000n;
+
+function minimumFeeRate(rate: `0x${string}` | undefined): `0x${string}` | undefined {
+  if (rate !== undefined && BigInt(rate) < MIN_FUNDING_FEE_RATE) throw new Error(`Funding fee rate must be at least ${MIN_FUNDING_FEE_RATE} shannons/KB`);
+  return rate;
+}
+
 function boolean(value: unknown, label: string): boolean {
   if (typeof value !== "boolean") throw new Error(`${label} must be boolean`);
   return value;
@@ -435,6 +497,24 @@ function object(value: unknown, message: string): Record<string, unknown> {
 function publicNodeInfo<T extends object>(info: T): Omit<T, "addresses" | "default_funding_lock_script"> {
   const { addresses: _addresses, default_funding_lock_script: _lock, ...rest } = info as T & { addresses?: unknown; default_funding_lock_script?: unknown };
   return rest as Omit<T, "addresses" | "default_funding_lock_script">;
+}
+
+// Peer connections and channel opens wait on handshakes (up to 10 s each), so a user may have only this many queued.
+const MAX_QUEUED_PEER_WORK = 3;
+const queuedPeerWork = new Map<string, number>();
+
+/** serializeMutation for peer connections and opens, refusing more once MAX_QUEUED_PEER_WORK are queued. */
+async function serializePeerWork<T>(userId: string, operation: () => Promise<T>): Promise<T> {
+  const queued = queuedPeerWork.get(userId) ?? 0;
+  if (queued >= MAX_QUEUED_PEER_WORK) throw new Error("Too many peer connections in progress. Try again shortly");
+  queuedPeerWork.set(userId, queued + 1);
+  try {
+    return await serializeMutation(userId, operation);
+  } finally {
+    const left = (queuedPeerWork.get(userId) ?? 1) - 1;
+    if (left > 0) queuedPeerWork.set(userId, left);
+    else queuedPeerWork.delete(userId);
+  }
 }
 
 function serializeMutation<T>(userId: string, operation: () => Promise<T>): Promise<T> {

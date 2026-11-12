@@ -15,13 +15,25 @@ export const MIN_PLAIN_CELL = 61n * 100_000_000n;
 
 type ChannelState = { state: { state_name: string; state_flags?: unknown } };
 
+/** A channel's state flags, which Fiber sends as one string such as "UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT". */
+function stateFlags(flags: unknown): Set<string> {
+  return new Set(JSON.stringify(flags ?? "").match(/\b[A-Z][A-Z0-9_]*\b/g) ?? []);
+}
+
+/**
+ * True once a channel is closed and not waiting for its on-chain settlement. Fiber 0.9.1 reports a force close as
+ * UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT (or _REMOTE) and drops WAITING_ONCHAIN_SETTLEMENT once it has
+ * settled. Flags are read as whole names. The hosted node server (managed-host/index.mjs) keeps its own copy; a
+ * test holds the two equal.
+ */
+export function channelFinished({ state }: ChannelState): boolean {
+  if (String(state?.state_name).replaceAll("_", "").toLowerCase() !== "closed") return false;
+  return !stateFlags(state.state_flags).has("WAITING_ONCHAIN_SETTLEMENT");
+}
+
 /** True while any channel is open, closing, or closed but not yet settled on-chain. */
 export function needsFeeReserve(channels: ChannelState[]): boolean {
-  return channels.some(({ state }) => {
-    if (String(state.state_name) !== "CLOSED") return true;
-    const flags = JSON.stringify(state.state_flags ?? "");
-    return flags.includes("WAITING_ONCHAIN_SETTLEMENT") && !flags.includes("ONCHAIN_SETTLEMENT_CONFIRMED");
-  });
+  return channels.some((channel) => !channelFinished(channel));
 }
 
 /**
