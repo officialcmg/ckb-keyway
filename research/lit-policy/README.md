@@ -300,9 +300,9 @@ You run these locally. The server has no Lit account credentials.
    actions to groups.
 3. **Register the policy Action.**
    1. In the Chipotle dashboard, open **Action Runner** and paste `lit-actions/sign-ckb-transaction.js` exactly.
-   2. Click **Get Lit Action IPFS CID**. It must be `QmXEKyvWa2MwCSY9qMBGUp3aawRrWeSW6xqP4SS2w8x2gd`, the same as
-      `LIT_ACTION_CIDS["sign-ckb-transaction"]` in `src/server/lit-config.ts`. Any other
-      CID means the pasted source differs from this branch.
+   2. Click **Get Lit Action IPFS CID**. It must be the CID in `LIT_ACTION_CIDS["sign-ckb-transaction"]` in
+      `src/server/lit-config.ts` (`tests/lit-action-packaging.test.ts` checks the two match). Any other CID means
+      the pasted source differs from this branch.
    3. Under **IPFS Actions**, register the CID as `keyway-ckb-policy-signer`.
    4. Add the CID to group 1, `CKB Keyway`. The PKPs are already in that group.
 4. **Check it against real Lit.** Run `npm run verify:lit -- --policy`. It should print "policy Action".

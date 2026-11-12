@@ -308,8 +308,8 @@ server: roughly +0.4 s per send with limits on. Today's policy signer takes 0.65
 
 1. Run the migration (`npm run migrate:production`): it adds `keyway_v2_pending_transactions`.
 2. In the Chipotle dashboard, paste `lit-actions/sign-ckb-transaction.js` into **Action Runner**, click **Get Lit
-   Action IPFS CID**, and check it is `QmRt1kZYTrgEEPYrnNrLWDCoJe9yr7LiNowPUMEK42db5H`, the same as `LIT_ACTION_CIDS["sign-ckb-transaction"]` in
-   `src/server/lit-config.ts`.
+   Action IPFS CID**, and check it is the CID in `LIT_ACTION_CIDS["sign-ckb-transaction"]` in
+   `src/server/lit-config.ts` (`tests/lit-action-packaging.test.ts` checks the two match).
 3. Register it under **IPFS Actions** (for example as `keyway-ckb-policy-signer-v2`) and add it to group 1,
    `CKB Keyway`.
 4. Run `npm run verify:lit -- --policy` locally. It should print "policy Action".
