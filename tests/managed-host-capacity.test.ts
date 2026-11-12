@@ -55,11 +55,13 @@ const SETTLING_FORCE_CLOSE = [{ state: { state_name: "Closed", state_flags: "UNC
 const SETTLED_FORCE_CLOSE = [{ state: { state_name: "Closed", state_flags: "UNCOOPERATIVE_LOCAL" } }];
 const SETTLED_REMOTE_CLOSE = [{ state: { state_name: "Closed", state_flags: "UNCOOPERATIVE_REMOTE" } }];
 // Fiber names every flag constant that shares a bit with the value, composite ones included.
-const UNFUNDED_CHANNEL = [{ state: { state_name: "NegotiatingFunding", state_flags: "OUR_INIT_SENT|THEIR_INIT_SENT|INIT_SENT|AWAITING_EXTERNAL_FUNDING" } }];
+const UNFUNDED_CHANNEL = [{ state: { state_name: "NegotiatingFunding", state_flags: "AWAITING_EXTERNAL_FUNDING" } }];
 const ABORTED_FUNDING = [{ state: { state_name: "Closed", state_flags: "FUNDING_ABORTED" } }];
 const FUNDING_TX = `0x${"77".repeat(32)}`;
-// After the user's signed funding was submitted, which Fiber passes straight to the peer: the peer may
-// broadcast the funding at any time.
+// A creation time after any funding record in these tests began.
+const LATER = `0x${(4_000_000_000_000).toString(16)}`;
+// Past funding negotiation. Unless the node's funding record shows the funding was never submitted (see the
+// tests below), the peer may hold the user's signed funding and broadcast it at any time.
 const COLLABORATED_CHANNEL = [{ state: { state_name: "CollaboratingFundingTx", state_flags: "OUR_TX_COMPLETE_SENT|THEIR_TX_COMPLETE_SENT|COLLABORATION_COMPLETED" } }];
 const COMMITTING_CHANNEL = [{ state: { state_name: "SigningCommitment", state_flags: "THEIR_COMMITMENT_SIGNED_SENT|COMMITMENT_SIGNED_SENT" } }];
 const THEIRS_SIGNED_CHANNEL = [{ state: { state_name: "AwaitingTxSignatures", state_flags: "THEIR_TX_SIGNATURES_SENT|TX_SIGNATURES_SENT" }, channel_outpoint: `${FUNDING_TX}00000000` }];
@@ -460,7 +462,8 @@ test("a node whose channels can hold nothing more makes room once its user has s
   }
 });
 
-test("a node whose channel is settling, or whose funding was submitted, keeps running whatever CKB shows", async (context) => {
+test("a node whose channel is settling, or may have had its funding submitted, keeps running whatever CKB shows", async (context) => {
+  // These nodes predate the funding record, so nothing shows their funding wasn't submitted.
   for (const channels of [SETTLING_FORCE_CLOSE, COLLABORATED_CHANNEL, COMMITTING_CHANNEL, THEIRS_SIGNED_CHANNEL, SIGNED_CHANNEL, BROADCAST_CHANNEL]) {
     context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
     const { request, running, marked, markedNode } = await host(context);
@@ -500,15 +503,18 @@ test("a node can be retired once its channels are finished and nothing of it is 
   chain.live.clear();
   await withChannels(F, SETTLING_FORCE_CLOSE);
   await assert.rejects(retire(), /closure is incomplete/);
-  // Funding aborted after the user's signed funding was handed over: the peer may still broadcast it. Without a
-  // record of submitted funding (a node from before it was kept), any aborted funding that was built counts.
+  // Funding aborted after the user's signed funding was handed over: the peer may still broadcast it. For a
+  // channel the node's funding record doesn't cover (created before it began), any aborted funding that was built
+  // counts.
   const aborted = { ...ABORTED_FUNDING[0], channel_id: `0x${"55".repeat(32)}`, channel_outpoint: `${FUNDING_TX}00000000` };
-  await withChannels(F, [aborted]);
+  await withChannels(F, [{ ...aborted, created_at: "0x1" }]);
   await assert.rejects(retire(), /aborted after it was signed/);
-  await writeFile(join(root, "users", F, "keyway-funded-channels"), `0x${"55".repeat(32)}\n`);
+  const recorded = { ...aborted, created_at: LATER };
+  await writeFile(join(root, "users", F, "keyway-funded-channels"), `since 1000\n0x${"55".repeat(32)}\n`);
+  await withChannels(F, [recorded]);
   await assert.rejects(retire(), /aborted after it was signed/);
   // An open the user never funded, aborted after its transaction was built, doesn't block retirement.
-  await withChannels(F, [...SETTLED_REMOTE_CLOSE, { ...aborted, channel_id: `0x${"66".repeat(32)}` }]);
+  await withChannels(F, [...SETTLED_REMOTE_CLOSE, { ...recorded, channel_id: `0x${"66".repeat(32)}` }]);
   assert.deepEqual(await retire(), { retired: true, databasePreserved: true });
   assert.equal(await exists(join(root, "retired", F)), true);
 });
@@ -710,4 +716,45 @@ test("a node that no longer may hold channels after a failed restore isn't left 
   assert.equal(await request(F, "list_channels"), 200);
   await assert.rejects(module.withUserOperation(F, () => module.restoreUser(F, name)));
   assert.equal(module.readiness().offline, 0);
+});
+
+test("a channel whose funding was never submitted counts as unfunded in any state Fiber can still abort", async (context) => {
+  // A peer may sign the commitment before the user submits: the channel is then in SigningCommitment, unfunded.
+  const notSubmitted = (channels: Array<{ state: unknown }>) => channels.map((channel, index) => ({ ...channel, channel_id: `0x${String(index + 1).padStart(64, "0")}`, created_at: LATER }));
+  for (const channels of [COLLABORATED_CHANNEL, COMMITTING_CHANNEL, THEIRS_SIGNED_CHANNEL]) {
+    context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+    const { request, running, marked, withChannels } = await host(context);
+    assert.equal(await request(F), 200);
+    await withChannels(F, notSubmitted(channels));
+    assert.equal(await request(A), 200);
+    context.mock.timers.tick(FEW_MINUTES);
+    assert.equal(await request(B), 200, JSON.stringify(channels));
+    assert.deepEqual(running(), [A, B], JSON.stringify(channels));
+    assert.equal(await marked(F), false);
+    context.mock.timers.reset();
+  }
+  // Once its funding is submitted through the host, the same channel keeps the node running.
+  context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const { root, request, running, withChannels } = await host(context);
+  assert.equal(await request(F), 200);
+  const submitted = notSubmitted(COMMITTING_CHANNEL);
+  await withChannels(F, submitted);
+  const record = await readFile(join(root, "users", F, "keyway-funded-channels"), "utf8");
+  await writeFile(join(root, "users", F, "keyway-funded-channels"), `${record}${submitted[0].channel_id}\n`);
+  assert.equal(await request(A), 200);
+  context.mock.timers.tick(FEW_MINUTES);
+  assert.equal(await request(B), 200);
+  assert.deepEqual(running(), [B, F]);
+});
+
+test("a node mid-submission keeps its marker through the host's shutdown check", async (context) => {
+  const { module, root, request, marked, withChannels } = await host(context);
+  await withChannels(F, UNFUNDED_CHANNEL);
+  assert.equal(await request(F), 200);
+  await writeFile(join(root, "users", F, "slow-rpc"), "");
+  const submit = request(F, "submit_signed_funding_tx");
+  await until(() => marked(F));
+  await module.shutdown();
+  assert.equal(await marked(F), true);
+  await submit;
 });
