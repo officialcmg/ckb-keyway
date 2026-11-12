@@ -55,6 +55,12 @@ const CATCH_UP_BUDGET_MS = 120_000;
 const PAGE_TIMEOUT_MS = 15_000;
 /** Channels never seen funded that are checked per pass (see `runWatchtowerPass`). */
 const UNFUNDED_PER_PASS = 500;
+/**
+ * Check time one account's channels may take in a pass before its remaining ones wait for the next (each account's
+ * first check always runs). A channel's check is a page or two of its funding lock, so an honest account's 64
+ * channels take a few seconds; this keeps an account whose locks are padded or slow from lengthening every pass.
+ */
+const ACCOUNT_BUDGET_MS = 30_000;
 /** How long a close or penalty must stay on-chain before it is final (24 blocks are about 4 minutes). */
 const REORG_RECHECK_MINUTES = 30;
 /** Channels whose recent history is checked at the same time in a pass. */
@@ -313,14 +319,13 @@ export async function watchtowerRequest(user: User, request: WatchtowerRequest, 
       }
       // The peer may have force-closed with a commitment this revocation covers (it arrived late): the next pass
       // looks at the close again and punishes it. Only such a close reopens; a cooperative close or the user's own
-      // force-close never does.
-      let reopen = existing.state === "closed" && existing.closing_commitment_number !== null
+      // force-close never does. It reopens even when the account is at the cap: the cap bounds new registrations, and
+      // a revoked close left unpunished loses the user the channel. The row already exists, the peer had to put that
+      // close on-chain, and the next pass settles it for good (penalty, or `invalid` if this revocation can't unlock
+      // it), so this can't grow an account's checks beyond its real closes; the per-account share of each pass
+      // (`ACCOUNT_BUDGET_MS`) keeps them from slowing anyone else's.
+      const reopen = existing.state === "closed" && existing.closing_commitment_number !== null
         && BigInt(existing.closing_commitment_number) <= revocation.commitmentNumber;
-      if (reopen && existing.resolution_confirmed) {
-        // A confirmed close no longer counts toward the cap, so reopening it must not take the account over it.
-        await tx`select pg_advisory_xact_lock(hashtextextended(${`watchtower:${user.id}`}, 0))`;
-        reopen = await checkedChannels(tx, user.id) < MAX_WATCHED_CHANNELS;
-      }
       const [row] = await tx<Row[]>`
         update keyway_v2_watchtower_channels set
           commitment_number = ${revocation.commitmentNumber.toString()},
@@ -448,9 +453,9 @@ export type ChainView = {
    * before it, with the error.
    */
   fundingHistory(lock: ccc.Script, scan: HistoryScan, options?: { backlogBudgetMs?: number; recentScan?: boolean }): Promise<HistoryProgress>;
+  /** What the node says about a transaction now: never a status remembered from an earlier send or read. */
   transaction(hash: ccc.Hex): Promise<{ tx: ccc.Transaction; committed: boolean; status: string } | undefined>;
   isLive(outPoint: ccc.OutPoint): Promise<boolean>;
-  spender(outPoint: ccc.OutPoint, lock: ccc.Script): Promise<ccc.Hex | undefined>;
 };
 
 /**
@@ -575,19 +580,13 @@ export function chainView(client: ccc.Client, options: { recentBudgetMs?: number
 
     },
     async transaction(hash) {
-      const response = await client.getTransaction(hash);
+      // Not `getTransaction`: when the node doesn't know a hash, ccc answers from its cache, where a penalty this
+      // process sent stays "sent" (and a reorganized close "committed") however long ago the chain dropped it.
+      const response = await client.getTransactionNoCache(hash);
       return response ? { tx: response.transaction, committed: response.status === "committed", status: response.status } : undefined;
     },
     async isLive(outPoint) {
       return Boolean(await client.getCellLive(outPoint, false));
-    },
-    async spender(outPoint, lock) {
-      for await (const item of client.findTransactions({ script: lock, scriptType: "lock", scriptSearchMode: "exact" }, "asc", 50)) {
-        if (!item.isInput) continue;
-        const tx = (await client.getTransaction(item.txHash))?.transaction;
-        if (tx?.inputs.some((input) => input.previousOutput.eq(outPoint))) return item.txHash;
-      }
-      return undefined;
     },
   };
 }
@@ -703,6 +702,8 @@ export type PassDependencies = {
   catchUpBudgetMs?: number;
   /** Channels never seen funded checked per pass (default `UNFUNDED_PER_PASS`). */
   unfundedPerPass?: number;
+  /** Check time per account per pass (default `ACCOUNT_BUDGET_MS`). */
+  accountBudgetMs?: number;
 };
 
 /**
@@ -722,12 +723,20 @@ export async function runWatchtowerPass(passDeps: PassDependencies): Promise<voi
       -- A close or penalty is kept until it is confirmed, however long the watchtower was down.
       and (resolution_confirmed or state in ('missed', 'invalid'))
   `;
-  // Channels whose funding is on-chain are all checked, every pass, first. Ones never seen funded can't have been
-  // closed yet; at most UNFUNDED_PER_PASS of them are checked per pass, so registrations can't slow down the funded
-  // channels' checks.
+  // Channels whose funding is on-chain are checked first, from each account in turn (every account's least recently
+  // checked first), each account within its share of the pass (ACCOUNT_BUDGET_MS): what one account's channels
+  // don't get to waits for the next pass, ahead of its others. Ones never seen funded can't have been closed yet; at
+  // most UNFUNDED_PER_PASS of them are checked per pass, so registrations can't slow down the funded channels' checks.
   const funded = await sql<Row[]>`
-    select * from keyway_v2_watchtower_channels where state in ('watching', 'penalty-sent') and (funding_seen or funding_spend is not null)
-    order by checked_at asc nulls first
+    select * from (
+      select *, row_number() over (
+        -- A closed channel (a penalty to send or follow) goes first in its account's turn: its check reads no history.
+        partition by user_id order by (funding_spend is not null or state = 'penalty-sent') desc, checked_at asc nulls first, created_at asc
+      ) as turn
+      from keyway_v2_watchtower_channels
+      where state in ('watching', 'penalty-sent') and (funding_seen or funding_spend is not null)
+    ) funded_rows
+    order by turn, checked_at asc nulls first, created_at asc
   `;
   // Taken from each account in turn (every account's least recently checked first), so one account's
   // registrations only delay its own channels.
@@ -748,8 +757,14 @@ export async function runWatchtowerPass(passDeps: PassDependencies): Promise<voi
   const rows = [...funded, ...unfunded];
   // Penalties are sent one at a time, so two never pick the same fee cells.
   let sending: Promise<unknown> = Promise.resolve();
+  /** Time each account's checks spent queued behind other penalties: not counted against its share of the pass. */
+  const queued = new Map<string, number>();
   const punish: PassDependencies["punish"] = (row, commitment) => {
-    const sent = sending.then(() => deps.punish(row, commitment));
+    const enqueued = Date.now();
+    const sent = sending.then(() => {
+      queued.set(row.user_id, (queued.get(row.user_id) ?? 0) + Date.now() - enqueued);
+      return deps.punish(row, commitment);
+    });
     sending = sent.catch(() => undefined);
     return sent;
   };
@@ -768,8 +783,21 @@ export async function runWatchtowerPass(passDeps: PassDependencies): Promise<voi
 
   const behind: Row[] = [];
   const queue = [...rows];
+  const accountBudget = deps.accountBudgetMs ?? ACCOUNT_BUDGET_MS;
+  const spent = new Map<string, number>();
   await Promise.all(Array.from({ length: Math.min(deps.concurrency ?? CHECK_CONCURRENCY, queue.length) }, async () => {
-    for (let row = queue.shift(); row; row = queue.shift()) if (await check(row, 0)) behind.push(row);
+    for (let row = queue.shift(); row; row = queue.shift()) {
+      // Past its share: left unchecked (so least recently checked, and first in its account's turn next pass).
+      if ((spent.get(row.user_id) ?? 0) >= accountBudget) continue;
+      const started = Date.now();
+      const waitedBefore = queued.get(row.user_id) ?? 0;
+      try {
+        if (await check(row, 0)) behind.push(row);
+      } finally {
+        const waited = (queued.get(row.user_id) ?? 0) - waitedBefore;
+        spent.set(row.user_id, (spent.get(row.user_id) ?? 0) + Math.max(0, Date.now() - started - waited));
+      }
+    }
   }));
   // Several at a time too, so a long list of closes doesn't hold up the next pass.
   const confirming = [...recent];
@@ -907,8 +935,17 @@ async function checkChannel(deps: PassDependencies, row: Row, log: (message: str
     }
   }
   if (!(await chain.isLive(commitment.outPoint))) {
-    const by = await chain.spender(commitment.outPoint, commitment.lock);
-    log(`${row.channel_id}: revoked commitment already spent by ${by ?? "an unknown transaction"}`);
+    // A penalty was sent and the node doesn't know it now: it may have been dropped, or this read hit a node that
+    // hasn't seen it (it may be what spent the commitment). Only a penalty still unknown after the recheck window
+    // counts as missed.
+    const rechecking = "the revoked commitment is spent; checking whether by the penalty";
+    // (The window starts when this detail is first saved, which sets updated_at.)
+    if (row.penalty_tx && (row.detail !== rechecking || Date.now() - row.updated_at.getTime() < REORG_RECHECK_MINUTES * 60_000)) {
+      await save({ detail: rechecking });
+      return false;
+    }
+    // Only logged: finding the spender would mean walking the commitment lock's whole history, which anyone can pad.
+    log(`${row.channel_id}: revoked commitment ${commitment.outPoint.txHash}:${Number(commitment.outPoint.index)} already spent`);
     await save({ state: "missed", detail: "the revoked commitment was spent before the penalty", closing_tx: assessment.closingTx });
     return false;
   }
@@ -944,9 +981,33 @@ function storedRevocation(row: Row): Revocation | undefined {
   };
 }
 
-/** The penalty, built from a stored row and sent with the watchtower's fee key. */
-export function penaltySender(client: ccc.Client, feeSigner: ccc.Signer) {
+/**
+ * The penalty, built from a stored row and sent with the watchtower's fee key. Make one per pass: ccc's client cache
+ * marks a sent penalty's fee cells spent and its change cell live, which lets the penalties of one pass (sent one at
+ * a time) chain on each other, but a penalty the chain dropped would leave that change cell in the cache for good, and
+ * every later penalty would spend a cell that doesn't exist. So the first penalty of each sender clears the cache,
+ * then marks again the penalties (`inFlight`) the node still has in its mempool.
+ */
+export function penaltySender(client: ccc.Client, feeSigner: ccc.Signer, inFlight: () => Promise<string[]> = async () => []) {
+  let cleared: Promise<void> | undefined;
+  // Penalties from earlier passes still in the mempool keep their fee cells spent (the indexer only shows committed
+  // cells), so a new penalty chains on them instead of conflicting with them.
+  const refresh = async () => {
+    await client.cache.clear();
+    const pending: ccc.Transaction[] = [];
+    for (const hash of await inFlight()) {
+      const found = await client.getTransactionNoCache(hash).catch(() => undefined);
+      if (found && (found.status === "pending" || found.status === "proposed")) pending.push(found.transaction);
+    }
+    // Every output first, then every input: a penalty that chained on another's change marks that change spent
+    // whatever order they come in (marking a cell usable would undo an earlier "spent").
+    for (const tx of pending) {
+      await client.cache.markUsable(tx.outputs.map((cellOutput, index) => ({ cellOutput, outputData: tx.outputsData[index] ?? "0x", outPoint: { txHash: tx.hash(), index } })));
+    }
+    for (const tx of pending) await client.cache.markUnusable(tx.inputs.map((input) => input.previousOutput));
+  };
   return async (row: Row, commitment: Commitment) => {
+    await (cleared ??= refresh());
     const revocation = storedRevocation(row);
     if (!revocation) throw new Error("No revocation data");
     const tx = await buildPenaltyTransaction({ client, commitment, revocation, peerKey: row.peer_commitment_key, feeSigner });
@@ -990,7 +1051,10 @@ export function startWatchtower(env: NodeJS.ProcessEnv = process.env): () => Pro
     if (!locked) return;
     if (!lock) console.info(`[watchtower] running; fee address ${await feeSigner.getRecommendedAddress()}`);
     lock = connection;
-    await runWatchtowerPass({ sql, chain: chainView(client), punish: penaltySender(client, feeSigner) });
+    const inFlight = async () => (await sql<Array<{ penalty_tx: string }>>`
+      select penalty_tx from keyway_v2_watchtower_channels where state = 'penalty-sent' and penalty_tx is not null
+    `).map((row) => row.penalty_tx);
+    await runWatchtowerPass({ sql, chain: chainView(client), punish: penaltySender(client, feeSigner, inFlight) });
   };
   const loop = () => {
     if (stopped) return;

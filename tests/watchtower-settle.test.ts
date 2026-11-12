@@ -1,3 +1,4 @@
+import "fake-indexeddb/auto";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
@@ -5,10 +6,10 @@ import * as ccc from "@ckb-ccc/core";
 import { JsonRpcTransformers } from "@ckb-ccc/core/advanced";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import {
-  applyUnlocks, blake160, encodeSettlementWitness, encodeWitnessState, parseCommitmentArgs, parseSettlementWitness,
+  applyUnlocks, blake160, delayFraction, encodeSettlementWitness, encodeWitnessState, epochDelayPassed, parseCommitmentArgs, parseSettlementWitness,
   planClaim, settleChannel, settlementMessage, signSettlement, XUDT_COMPATIBLE_WITNESS,
 } from "../src/sdk/browser/watchtower-settle.ts";
-import type { WatchedChannel } from "../src/sdk/browser/watchtower-store.ts";
+import { openWatchtowerStore, type WatchedChannel } from "../src/sdk/browser/watchtower-store.ts";
 import { COMMITMENT_LOCK } from "../src/sdk/browser/watchtower-settle.ts";
 
 // The commitment and the peer's settlement from the 2026-10-28 browser force close on CKB testnet.
@@ -114,25 +115,159 @@ test("the peer's commitment is matched with the peer's settlement data", () => {
   assert.equal(decision.claim.unlockType, 0xff);
 });
 
-test("an unknown or revoked commitment, pending TLCs, or an already claimed share is left alone", () => {
+test("an unknown or revoked commitment, or an already claimed share, is left alone", () => {
   const { channel, argsFor } = channelFixture();
   assert.ok("skip" in planClaim({ channel, cell: { capacity: 1n, args: argsFor(new Uint8Array([0])) } }));
-  const withTlc = {
-    ...channel,
-    localSettlement: {
-      ...channel.localSettlement,
-      tlcs: [{
-        tlc_id: { Offered: "0x0" }, hash_algorithm: "CkbHash", payment_amount: "0x1", payment_hash: hex(new Uint8Array(32).fill(7)), expiry: "0x19a5d6b6000",
-        local_key: hex(secp256k1.utils.randomSecretKey()).slice(2), remote_key: channel.remoteSettlementKey.slice(2),
-      }],
-    },
-  };
-  const tlcWitness = encodeSettlementWitness(withTlc.localSettlement, false, withTlc.localSettlementKey, withTlc.remoteSettlementKey);
-  const pending = planClaim({ channel: withTlc, cell: { capacity: 75_000_000_000n, args: argsFor(tlcWitness) } });
-  assert.ok("skip" in pending && /TLC/.test(pending.skip));
   const ours = encodeSettlementWitness(channel.localSettlement, false, channel.localSettlementKey, channel.remoteSettlementKey);
   const claimed = ccc.bytesConcat(new Uint8Array([1]), ours, new Uint8Array([0xfe, 0]), new Uint8Array(65));
   assert.ok("skip" in planClaim({ channel, cell: { capacity: 25_000_000_000n, args: "0x" + "00".repeat(57) }, previousWitness: claimed }));
+});
+
+// A force close with payments still in flight. The user's node had offered one TLC (an outgoing payment) and
+// received another (an incoming one) when the peer's commitment went on-chain.
+const HOUR = 3_600_000;
+const NOW = Date.parse("2026-11-11T12:00:00Z");
+function tlcFixture(options: { offeredExpiry?: number; receivedExpiry?: number } = {}) {
+  const { channel, remoteKey, argsFor } = channelFixture();
+  const tlcKey = () => hex(secp256k1.utils.randomSecretKey()).slice(2);
+  const peerTlcKey = () => hex(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true)).slice(2);
+  const incomingPreimage = hex(new Uint8Array(32).fill(0x42));
+  const outgoing = {
+    tlc_id: { Offered: "0x0" }, hash_algorithm: "CkbHash", payment_amount: `0x${(180n * CKB).toString(16)}`, payment_hash: hex(new Uint8Array(32).fill(7)),
+    expiry: `0x${(options.offeredExpiry ?? NOW - HOUR).toString(16)}`, local_key: tlcKey(), remote_key: peerTlcKey(),
+  };
+  const incoming = {
+    tlc_id: { Received: "0x0" }, hash_algorithm: "CkbHash", payment_amount: `0x${(170n * CKB).toString(16)}`, payment_hash: ccc.hashCkb(incomingPreimage),
+    expiry: `0x${(options.receivedExpiry ?? NOW + HOUR).toString(16)}`, local_key: tlcKey(), remote_key: peerTlcKey(),
+  };
+  const remoteSettlement = { ...channel.remoteSettlement!, tlcs: [outgoing, incoming] };
+  const withTlcs = { ...channel, remoteSettlement };
+  const theirs = encodeSettlementWitness(remoteSettlement, true, channel.localSettlementKey, channel.remoteSettlementKey);
+  // 500 CKB of the user's, 250 of the peer's, and the two payments.
+  const capacity = 1100n * CKB;
+  return { channel: withTlcs, remoteKey, argsFor, theirs, capacity, outgoing, incoming, incomingPreimage, cell: { capacity, args: argsFor(theirs) } };
+}
+
+test("an incoming payment in flight is claimed with its preimage once a third of the delay has passed", () => {
+  const f = tlcFixture();
+  const preimages = new Map([[f.incoming.payment_hash, f.incomingPreimage]]);
+  const third = 0xa000030001000000n; // a third of the one-epoch delay, as the lock works it out
+  const passed = new Set<bigint>();
+  const plan = (now = NOW) => planClaim({ channel: f.channel, cell: f.cell, preimages, now, delayPassed: (since) => passed.has(since) });
+  assert.deepEqual(plan(), { skip: "waiting for a pending payment to resolve" });
+  passed.add(third);
+  const decision = plan();
+  assert.ok("claim" in decision);
+  const { claim } = decision;
+  assert.equal(claim.unlockType, 1, "the received TLC, the second pending one");
+  assert.equal(claim.preimage, f.incomingPreimage);
+  assert.equal(claim.since, third);
+  assert.equal(claim.feeSince, undefined, "a preimage unlock carries no timestamp");
+  assert.equal(claim.signingKey, `0x${f.incoming.local_key}`, "signed by the TLC's own key");
+  // Everything else stays in a successor whose args name the state without that TLC.
+  assert.equal(claim.successor?.capacity, f.capacity - 170n * CKB);
+  const after = applyUnlocks({ ...parseSettlementWitness(f.theirs, false)!, unlocks: [{ type: 1, withPreimage: true }] })!;
+  assert.equal(after.pendingTlcs.length, 1);
+  assert.equal(hex(ccc.bytesFrom(claim.successor!.args).slice(36, 56)), hex(blake160(encodeWitnessState(after))));
+  // Still claimed after it expires (the peer may not have taken it back yet), and a preimage that doesn't hash to the
+  // payment hash is never used.
+  assert.equal((planClaim({ channel: f.channel, cell: f.cell, preimages, now: NOW + 2 * HOUR }) as { claim: { unlockType: number } }).claim.unlockType, 1);
+  const wrong = planClaim({ channel: f.channel, cell: f.cell, preimages: new Map([[f.incoming.payment_hash, hex(new Uint8Array(32).fill(1))]]), now: NOW });
+  assert.ok("claim" in wrong && wrong.claim.unlockType !== 1);
+});
+
+test("an outgoing payment in flight is taken back once it expires, with its expiry on the fee inputs", () => {
+  const f = tlcFixture({ offeredExpiry: NOW + HOUR });
+  const twoThirds = 0xa000030002000000n;
+  const passed = new Set<bigint>([twoThirds]);
+  const plan = (now: number) => planClaim({ channel: f.channel, cell: f.cell, now, delayPassed: (since) => passed.has(since) });
+  // Not expired yet: nothing can go, and the user's share waits for its payments.
+  assert.deepEqual(plan(NOW), { skip: "waiting for a pending payment to resolve" });
+  const decision = plan(NOW + 2 * HOUR);
+  assert.ok("claim" in decision);
+  assert.equal(decision.claim.unlockType, 0);
+  assert.equal(decision.claim.preimage, undefined);
+  assert.equal(decision.claim.since, twoThirds);
+  assert.equal(decision.claim.signingKey, `0x${f.outgoing.local_key}`);
+  const expiry = BigInt(Math.floor((NOW + HOUR) / 1000));
+  assert.equal(decision.claim.feeSince, (0x40n << 56n) | expiry, "an absolute timestamp: the TLC's own expiry");
+});
+
+test("the most urgent payment goes first: one claimable with a preimage before one taken back after expiry", () => {
+  const f = tlcFixture({ offeredExpiry: NOW - HOUR });
+  const decision = planClaim({ channel: f.channel, cell: f.cell, preimages: new Map([[f.incoming.payment_hash, f.incomingPreimage]]), now: NOW });
+  assert.ok("claim" in decision);
+  assert.equal(decision.claim.unlockType, 1);
+});
+
+test("the user's share waits while a payment may still be the user's, since whoever settles second may take the cell", () => {
+  // Neither payment is the node's to claim yet: no preimage, and the outgoing one hasn't expired.
+  const f = tlcFixture({ offeredExpiry: NOW + HOUR });
+  // With the user's slot emptied first, the peer (settling second) could sweep the cell, payments and all.
+  assert.deepEqual(planClaim({ channel: f.channel, cell: f.cell, now: NOW }), { skip: "waiting for a pending payment to resolve" });
+  // Once nothing remains that can become the user's (the outgoing one taken back, the incoming one expired without
+  // its preimage), the share goes, and a successor keeps what is the peer's to take back.
+  const resolved = tlcFixture({ receivedExpiry: NOW - HOUR, offeredExpiry: NOW + HOUR });
+  const outgoingBack = ccc.bytesConcat(new Uint8Array([1]), resolved.theirs, new Uint8Array([0, 0]), new Uint8Array(65));
+  const decision = planClaim({ channel: resolved.channel, cell: { capacity: resolved.capacity - 180n * CKB, args: "0x" + "00".repeat(57) }, previousWitness: outgoingBack, now: NOW });
+  assert.ok("claim" in decision);
+  assert.equal(decision.claim.unlockType, 0xff, "the user's slot on the peer's commitment");
+  assert.equal(decision.claim.since, 0n);
+  assert.equal(decision.claim.successor?.capacity, resolved.capacity - 180n * CKB - 500n * CKB);
+  const after = applyUnlocks({ ...parseSettlementWitness(outgoingBack)!, unlocks: [{ type: 0, withPreimage: false }, { type: 0xff, withPreimage: false }] })!;
+  assert.equal(after.pendingTlcs.length, 1);
+  assert.equal(hex(ccc.bytesFrom(decision.claim.successor!.args).slice(36, 56)), hex(blake160(encodeWitnessState(after))));
+
+  // The peer settles its share first. Settling second, the user's claim could take the whole cell, so it still waits
+  // while a payment may become the user's.
+  const peerSettled = ccc.bytesConcat(new Uint8Array([1]), f.theirs, new Uint8Array([0xfe, 0]), new Uint8Array(65));
+  const remaining = f.capacity - 250n * CKB;
+  const afterPeer = { capacity: remaining, args: "0x" + "00".repeat(57) };
+  assert.deepEqual(planClaim({ channel: f.channel, cell: afterPeer, previousWitness: peerSettled, now: NOW }), { skip: "waiting for a pending payment to resolve" });
+  // After expiry the outgoing payment comes back first, leaving the rest in a successor.
+  const back = planClaim({ channel: f.channel, cell: afterPeer, previousWitness: peerSettled, now: NOW + 2 * HOUR });
+  assert.ok("claim" in back && back.claim.unlockType === 0 && back.claim.since === 0n);
+  assert.equal(back.claim.successor?.capacity, remaining - 180n * CKB);
+  // Then, with the incoming one past its expiry and no preimage (the peer's to take back), the user's claim empties
+  // the cell, as Fiber's does: Fiber claims nothing once its own slot is empty, so a successor would hold it for good.
+  const thenBack = ccc.bytesConcat(new Uint8Array([1]), encodeWitnessState(applyUnlocks(parseSettlementWitness(peerSettled)!)!), new Uint8Array([0, 0]), new Uint8Array(65));
+  const last = planClaim({ channel: f.channel, cell: { capacity: remaining - 180n * CKB, args: "0x" + "00".repeat(57) }, previousWitness: thenBack, now: NOW + 2 * HOUR });
+  assert.ok("claim" in last && last.claim.unlockType === 0xff);
+  assert.equal(last.claim.successor, undefined);
+});
+
+test("a payment that could never be claimed alone doesn't hold the cell once the peer has settled", () => {
+  // The peer's commitment: the user's 60 CKB, the peer's 250, and two outgoing payments of 60 CKB, not yet expired.
+  const { channel } = channelFixture();
+  const small = (id: string, fill: number) => ({
+    tlc_id: { Offered: id }, hash_algorithm: "CkbHash", payment_amount: `0x${(60n * CKB).toString(16)}`, payment_hash: hex(new Uint8Array(32).fill(fill)),
+    expiry: `0x${(NOW + HOUR).toString(16)}`, local_key: hex(secp256k1.utils.randomSecretKey()).slice(2), remote_key: hex(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true)).slice(2),
+  });
+  const remoteSettlement = { ...channel.remoteSettlement!, local_amount: `0x${(60n * CKB).toString(16)}`, tlcs: [small("0x0", 1), small("0x1", 2)] };
+  const withTlcs = { ...channel, remoteSettlement };
+  const theirs = encodeSettlementWitness(remoteSettlement, true, channel.localSettlementKey, channel.remoteSettlementKey);
+  const peerSettled = ccc.bytesConcat(new Uint8Array([1]), theirs, new Uint8Array([0xfe, 0]), new Uint8Array(65));
+  const plan = (capacity: bigint) => planClaim({ channel: withTlcs, cell: { capacity, args: "0x" + "00".repeat(57) }, previousWitness: peerSettled, now: NOW });
+  // With room for a successor after either payment, the cell waits for them...
+  assert.deepEqual(plan(500n * CKB), { skip: "waiting for a pending payment to resolve" });
+  // ...but in a cell of 150 CKB, taking back either one would leave 90 CKB, below a commitment cell's 98: neither
+  // could ever go alone, so the user's claim takes the cell as a whole.
+  const decision = plan(150n * CKB);
+  assert.ok("claim" in decision);
+  assert.equal(decision.claim.unlockType, 0xff);
+  assert.equal(decision.claim.successor, undefined);
+});
+
+test("the delay's shares are worked out as the commitment lock does", () => {
+  // fiber-scripts commitment-lock `mul` vectors: 7.6 epochs, 7 1/3 epochs, 10.5 epochs.
+  const since = (number: bigint, index: bigint, length: bigint) => (0xa0n << 56n) | number | (index << 24n) | (length << 40n);
+  assert.equal(delayFraction(since(7n, 60n, 100n), 1n, 3n), since(2n, 160n, 300n));
+  assert.equal(delayFraction(since(7n, 60n, 100n), 2n, 3n), since(5n, 20n, 300n));
+  assert.equal(delayFraction(since(7n, 700n, 2100n), 1n, 3n), since(2n, 700n, 1575n));
+  assert.equal(delayFraction(since(7n, 700n, 2100n), 2n, 3n), since(4n, 1400n, 1575n));
+  assert.equal(delayFraction(since(10n, 1n, 2n), 2n, 3n), since(7n, 0n, 6n));
+  assert.equal(epochDelayPassed([100, 0, 1], since(0n, 1n, 3n), [100, 1, 3]), true);
+  assert.equal(epochDelayPassed([100, 0, 1], since(0n, 1n, 3n), [100, 332, 1000]), false);
 });
 
 test("signs the commitment input with the channel's settlement key", () => {
@@ -178,9 +313,15 @@ test("token channels are left to Fiber's native watchtower", async () => {
  * the node's fee reserve, served by a fake client so the chain following, the delay and the claim are checked
  * without a network.
  */
-function fakeChain(options: { peerSettledFirst?: boolean; settlementWitness?: (ours: Uint8Array) => Uint8Array; peerTookEverything?: boolean } = {}) {
-  const { channel, argsFor } = channelFixture();
-  const ours = encodeSettlementWitness(channel.localSettlement, false, channel.localSettlementKey, channel.remoteSettlementKey);
+function fakeChain(options: {
+  peerSettledFirst?: boolean; settlementWitness?: (ours: Uint8Array) => Uint8Array; peerTookEverything?: boolean;
+  /** The peer's commitment with payments in flight (tlcFixture) instead of the node's own. */
+  tlcs?: ReturnType<typeof tlcFixture>; preimages?: Map<string, string>; now?: number;
+  /** The chain's median block time (ms), answered to `get_block_median_time`. */
+  medianTime?: () => number;
+} = {}) {
+  const { channel, argsFor } = options.tlcs ?? channelFixture();
+  const ours = options.tlcs?.theirs ?? encodeSettlementWitness(channel.localSettlement, false, channel.localSettlementKey, channel.remoteSettlementKey);
   const nodeKey = hex(secp256k1.utils.randomSecretKey());
   const plainLock = { codeHash: "0x" + "00".repeat(32), hashType: "data" as const, args: "0x01" };
   const commitmentLock = (args: ccc.HexLike) => ({ codeHash: COMMITMENT_LOCK.testnet.codeHash, hashType: "type" as const, args });
@@ -196,7 +337,7 @@ function fakeChain(options: { peerSettledFirst?: boolean; settlementWitness?: (o
   const funding = add(ccc.Transaction.from({ outputs: [{ capacity: 751n * CKB, lock: plainLock }], outputsData: ["0x"] }));
   const commitmentTx = add(ccc.Transaction.from({
     inputs: [{ previousOutput: { txHash: funding.hash(), index: 0 } }],
-    outputs: [{ capacity: 750n * CKB, lock: commitmentLock(argsFor(ours)) }],
+    outputs: [{ capacity: options.tlcs?.capacity ?? 750n * CKB, lock: commitmentLock(argsFor(ours)) }],
     outputsData: ["0x"],
     witnesses: ["0x"],
   }), [100, 0, 1]);
@@ -255,6 +396,12 @@ function fakeChain(options: { peerSettledFirst?: boolean; settlementWitness?: (o
         }
       }
     },
+    requestor: {
+      async request(method: string) {
+        if (method !== "get_block_median_time" || !options.medianTime) throw new Error(`unexpected ${method}`);
+        return `0x${options.medianTime().toString(16)}`;
+      },
+    },
     async sendTransaction(tx: ccc.TransactionLike) {
       const signed = ccc.Transaction.from(tx);
       sent.push(signed);
@@ -268,6 +415,7 @@ function fakeChain(options: { peerSettledFirst?: boolean; settlementWitness?: (o
   const settle = (dryRun?: { submit: (tx: ccc.Transaction) => Promise<ccc.Hex> }) => settleChannel({
     client, network: "testnet", nodeKey, channel: watched,
     ref: { channelId: watched.channelId, fundingOutPoint: { txHash: funding.hash(), index: 0 } }, ...(dryRun ? { dryRun } : {}),
+    preimage: async (hash) => options.preimages?.get(hash), now: options.now,
   });
   return {
     channel, settle, sent, liveCell, ready, funding, commitmentTx,
@@ -337,4 +485,67 @@ test("settleChannel reports an open channel, a settled one and a settlement it c
   assert.equal((await fakeChain({ peerTookEverything: true }).settle()).status, "settled");
   const odd = fakeChain({ settlementWitness: (ours) => ccc.bytesConcat(new Uint8Array(16).fill(9), ours) });
   assert.equal((await odd.settle()).status, "unexpected settlement witness");
+});
+
+test("settleChannel claims an incoming payment with its preimage, signed by the payment's key", async () => {
+  const tlcs = tlcFixture();
+  const chain = fakeChain({ tlcs, preimages: new Map([[tlcs.incoming.payment_hash, tlcs.incomingPreimage]]), now: NOW });
+  // A third of the one-epoch delay after the commitment's epoch 100.
+  chain.setTip([100, 1, 3]);
+  const result = await chain.settle();
+  assert.equal(result.status, "claimed");
+  const tx = chain.sent[0];
+  assert.equal(tx.inputs[0].since, 0xa000030001000000n);
+  assert.ok(tx.inputs.slice(1).every((input) => input.since === 0n), "no timestamp anywhere: the lock reads that as an expiry claim");
+  assert.equal(tx.outputs[0].capacity, tlcs.capacity - 170n * CKB);
+  const witness = ccc.bytesFrom(tx.witnesses[0]);
+  const unlock = witness.slice(witness.length - 99);
+  assert.deepEqual([unlock[0], unlock[1]], [1, 1], "the received TLC, with a preimage");
+  assert.equal(hex(unlock.slice(67)), tlcs.incomingPreimage);
+  const signature = unlock.slice(2, 67);
+  const recovered = secp256k1.Signature.fromBytes(signature.slice(0, 64), "compact").addRecoveryBit(signature[64]).recoverPublicKey(ccc.bytesFrom(settlementMessage(tx))).toBytes(true);
+  assert.deepEqual(recovered, secp256k1.getPublicKey(ccc.bytesFrom(`0x${tlcs.incoming.local_key}`), true));
+});
+
+test("settleChannel takes back an expired outgoing payment with its expiry on the node's fee input", async () => {
+  const tlcs = tlcFixture({ offeredExpiry: NOW - HOUR });
+  const chain = fakeChain({ tlcs, now: NOW });
+  chain.setTip([100, 2, 3]);
+  const result = await chain.settle();
+  assert.equal(result.status, "claimed");
+  const tx = chain.sent[0];
+  assert.equal(tx.inputs[0].since, 0xa000030002000000n);
+  const expiry = (0x40n << 56n) | BigInt(Math.floor((NOW - HOUR) / 1000));
+  assert.ok(tx.inputs.length > 1 && tx.inputs.slice(1).every((input) => input.since === expiry));
+  const witness = ccc.bytesFrom(tx.witnesses[0]);
+  const unlock = witness.slice(witness.length - 67);
+  assert.deepEqual([unlock[0], unlock[1]], [0, 0]);
+  const recovered = secp256k1.Signature.fromBytes(unlock.slice(2, 66), "compact").addRecoveryBit(unlock[66]).recoverPublicKey(ccc.bytesFrom(settlementMessage(tx))).toBytes(true);
+  assert.deepEqual(recovered, secp256k1.getPublicKey(ccc.bytesFrom(`0x${tlcs.outgoing.local_key}`), true), "signed over the transaction with the timestamps in place");
+});
+
+test("the in-page store hands back a preimage the node gave it, until the node removes it", async () => {
+  const store = openWatchtowerStore(`/wasm-test-${crypto.randomUUID()}`);
+  const paymentHash = `0x${"AB".repeat(32)}`;
+  const preimage = `0x${"cd".repeat(32)}`;
+  assert.equal(await store.preimage(paymentHash), undefined);
+  await store.apply({ method: "create_preimage", params: { payment_hash: paymentHash, preimage } } as never);
+  assert.equal(await store.preimage(paymentHash.toLowerCase()), preimage);
+  await store.apply({ method: "remove_preimage", params: { payment_hash: paymentHash } } as never);
+  assert.equal(await store.preimage(paymentHash), undefined);
+  store.close();
+});
+
+test("payment expiries are judged by the chain's median time, not the browser's clock", async () => {
+  // Expired an hour ago by this machine's clock, but the chain's median time hasn't reached it yet.
+  const expiry = Date.now() - HOUR;
+  let median = expiry - HOUR;
+  const tlcs = tlcFixture({ offeredExpiry: expiry });
+  const chain = fakeChain({ tlcs, medianTime: () => median });
+  chain.setTip([101, 0, 1]);
+  assert.equal((await chain.settle()).status, "waiting for a pending payment to resolve");
+  assert.equal(chain.sent.length, 0, "a claim the chain would refuse as immature isn't sent");
+  median = expiry + 1_000;
+  assert.equal((await chain.settle()).status, "claimed");
+  assert.equal(chain.sent[0].inputs[1].since, (0x40n << 56n) | BigInt(Math.floor(expiry / 1000)));
 });

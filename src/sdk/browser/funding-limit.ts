@@ -45,3 +45,41 @@ export function refuseFundingBeyondRequest(preview: { amountCkb: string; token?:
     throw new Error("The channel funding takes more CKB than a token channel reserves");
   }
 }
+
+/** The open a funding preview belongs to: what was requested, with which peer, and whether a fee reserve follows. */
+export type ChannelOpening = {
+  peer?: string;
+  withReserve: boolean;
+  request?: FundingRequest;
+  /** The caller's progress callback, told when the preview is shown and once it is approved. */
+  progress?: (stage: "confirming" | "signing") => void;
+};
+
+/**
+ * Runs one channel open at a time. A funding preview is checked against, and shown with, the open in progress, so
+ * two opens that overlapped would have checked one channel's funding against the other's request and shown it with
+ * the other's peer. Each open waits for the one before it, and the slot is empty between opens, so a preview that
+ * arrives outside any open is refused.
+ */
+export function createChannelOpenings() {
+  let tail: Promise<void> = Promise.resolve();
+  let current: ChannelOpening | undefined;
+  return {
+    /** The open in progress, if any. */
+    current: () => current,
+    async run<T>(work: (opening: ChannelOpening) => Promise<T>): Promise<T> {
+      const previous = tail;
+      let finished!: () => void;
+      tail = new Promise((resolve) => { finished = resolve; });
+      await previous;
+      const opening: ChannelOpening = { withReserve: false };
+      current = opening;
+      try {
+        return await work(opening);
+      } finally {
+        current = undefined;
+        finished();
+      }
+    },
+  };
+}
