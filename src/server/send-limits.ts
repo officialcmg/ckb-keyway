@@ -154,8 +154,10 @@ export async function sendLimitHead(
  * its chain, whose empty answer could hide the real cell.
  */
 async function liveSendLimitCellAt(url: string, secp: ccc.Script, spent: Set<string>): Promise<SendLimitHead | undefined> {
-  const [indexer, tip] = await rpcBatch(url, [{ method: "get_indexer_tip", params: [] }, { method: "get_tip_header", params: [] }]) as Array<{ block_number?: string; number?: string }>;
-  if (BigInt(tip.number ?? "0x0") - BigInt(indexer.block_number ?? "0x0") > MAX_INDEXER_LAG) throw new Error("CKB RPC's indexer is behind the chain");
+  const [indexer, tip] = await rpcBatch(url, [{ method: "get_indexer_tip", params: [] }, { method: "get_tip_header", params: [] }]) as Array<{ block_number?: string; number?: string; timestamp?: string }>;
+  if (typeof tip.number !== "string" || typeof tip.timestamp !== "string" || typeof indexer.block_number !== "string") throw new Error("CKB RPC returned an invalid tip");
+  if (BigInt(tip.number) - BigInt(indexer.block_number) > MAX_INDEXER_LAG) throw new Error("CKB RPC's indexer is behind the chain");
+  if (Date.now() - Number(BigInt(tip.timestamp)) > MAX_TIP_AGE_MS) throw new Error("CKB RPC's chain is behind the network");
   const lockKey = (filter: Record<string, unknown>) => ({ script: JsonRpcTransformers.scriptFrom(secp), script_type: "lock", script_search_mode: "exact", filter });
   const filter = { script: { code_hash: TYPE_ID_CODE_HASH, hash_type: "type", args: "0x" }, output_data: SEND_LIMIT_MAGIC, output_data_filter_mode: "prefix" };
   const candidates: Array<{ outPoint: ccc.OutPoint; cellOutput: ccc.CellOutput; outputData: ccc.Hex; block: bigint }> = [];
@@ -254,6 +256,8 @@ const MAX_BLOCK_HISTORY = 1024;
 const MAX_HISTORY_PAGES = 4;
 /** Blocks an indexer may be behind its chain tip before its answer isn't believed, as in the Action. */
 const MAX_INDEXER_LAG = 3n;
+/** How old a node's tip may be before its chain is taken to have stalled, as in the Action. */
+const MAX_TIP_AGE_MS = 10 * 60_000;
 const FEE_RATE = 1_500n;
 
 /** The capacity a send-limit cell with this data occupies, in shannons. */

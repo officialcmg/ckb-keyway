@@ -230,7 +230,17 @@ counted send, and fund channels only from there.
   Measured with the fake chain, every look-alike in its own block: the heaviest run below that (turning recovery
   on) makes 36 CKB RPC requests plus the code email, within Lit's 50.
 - A lagging indexer: an empty answer counts as "no limits" only from a node whose indexer is within 3 blocks of
-  its tip; when every node lags, nothing is signed.
+  its tip and whose tip is under 10 minutes old; when every node lags, nothing is signed.
+- A send-limit cell passing for a look-alike: only a record on an input at the key's address with the cell's own
+  Type ID makes it "chained" (a record shape on another party's input is ignored, so the genesis check still
+  applies), and a cell the key's own history shows it made is never treated as someone else's, even if a node
+  serves its creating transaction with a witness changed.
+- A lock that would accept the account's signature for an input KeyWay doesn't count: the Action refuses to sign
+  when another input's lock names this key (its blake160 or public key in the args) and that input's group, with
+  its lock field zeroed as the chain checks it, has the same signing hash as a group the Action signs.
+- Backup changes on a recovery list made before the email binding: with send limits on, they need the code at the
+  limits' address. (The server's flow for such lists doesn't ask the Action for it yet, so on such an account the
+  change is refused until it does.)
 
 ## 5. What stays trusted
 
@@ -257,6 +267,18 @@ counted send, and fund channels only from there.
   transaction that later drops out keeps its cells marked in that tab until it reloads. Two clients that both hold an
   approval dialog open on the same send-limit cell each get a valid signature; the node keeps one. Channel funding
   doesn't use the list (Fiber chooses its inputs).
+- **Guessing the 8-digit code (accepted, 2026-11-10).** Only the Action can issue a code ticket, so every guessing
+  window is an email to the user and closes after 10 minutes, but within a window someone holding the usage key can
+  try codes as fast as Lit runs allow; the Action keeps no state to count failures. Longer codes were considered and
+  not taken.
+- **Lit's 50-request limit.** Measured with the fake chain: turning recovery on with 4,094 look-alike send-limit
+  cells, 1,024 look-alike lists and one block of 3,000 cells at the list lock takes 50 RPC requests plus the email,
+  one over the limit, so it fails (nothing is signed). That costs about 850k CKB, of which the look-alike lists
+  (about 131k CKB) can never be spent again. Without the padded block it is 48 plus the email.
+- **Small leftovers.** A phase-2 DAO withdrawal's interest is counted net of the fee, so up to the interest can go to
+  fee without the code. For about 3 blocks after a genesis commits, a send that leaves the cell out can read as
+  "no limits". Locks that only require an input of the account's to be present (for example cheque claims) can still
+  redirect incoming value uncounted.
 - **Before the old policy CID is removed** (founder step 6), a compromised server can sign anything through the
   previous Action, including a record or a genesis-shaped transaction that this Action would then trust.
 - **Fiber.** Payments and channel balances are moved by the Fiber key, which a compromised server can obtain

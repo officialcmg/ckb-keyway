@@ -40,11 +40,11 @@ type Cell = { outPoint: { txHash: ccc.Hex; index: number }; cellOutput: ccc.Cell
 const cellOf = (tx: ccc.Transaction, index: number): Cell => ({ outPoint: { txHash: tx.hash(), index }, cellOutput: tx.outputs[index], outputData: tx.outputsData[index] });
 
 /** A fake chain for one key: transactions are committed or pending, committed ones optionally at a block time. */
-async function account(options: { indexerLag?: (url: string) => number } = {}) {
+async function account(options: { indexerLag?: (url: string) => number; tipAge?: (url: string) => number } = {}) {
   const k = key();
   const known = new Map<string, { tx: ccc.Transaction; status: string; blockHash?: string }>();
   const headers = new Map<string, number>();
-  const lit = fakeLit({ privateKey: k.privateKey, pkpId: k.pkpId, lookup: (hash) => known.get(hash), transactions: () => [...known.values()].map(({ tx }) => tx), header: (hash) => headers.get(hash), indexerLag: options.indexerLag });
+  const lit = fakeLit({ privateKey: k.privateKey, pkpId: k.pkpId, lookup: (hash) => known.get(hash), transactions: () => [...known.values()].map(({ tx }) => tx), header: (hash) => headers.get(hash), indexerLag: options.indexerLag, tipAge: options.tipAge });
   const add = (tx: ccc.Transaction, status = "committed", time?: number) => {
     let blockHash: string | undefined;
     if (time !== undefined) { blockHash = ccc.hashCkb(ccc.numLeToBytes(time, 8)); headers.set(blockHash, time); }
@@ -738,8 +738,9 @@ test("M26: one transaction can destroy many well-formed look-alikes within Lit's
   prepare(env, cleanup, [env.secp]);
   const before = env.requests.length;
   assert.equal((await env.run("plan", cleanup) as Plan).limits, "exempt");
-  // The creators' inputs are read in one batch, not one request per look-alike.
-  assert.ok(env.requests.length - before <= 3, `${env.requests.length - before} requests`);
+  // The creators' inputs, their blocks and the key's history there are each read in one batch, not one request per
+  // look-alike.
+  assert.ok(env.requests.length - before <= 5, `${env.requests.length - before} requests`);
 });
 
 test("M27: an indexer behind its chain is never read as 'no send limits'", async () => {
@@ -839,4 +840,104 @@ test("M30: a token counted per cell needs the code whenever it has a daily amoun
   assert.equal(plan.limits, "chained");
   assert.equal(plan.needsCode, true);
   await assert.rejects(env.run("transaction", whole), /eight-digit code/);
+});
+
+test("review: a record-shaped witness on someone else's input of the genesis doesn't turn the account's own send-limit cell into a look-alike", async () => {
+  const env = await account();
+  const foreign = plant(env, { lock: stranger, capacity: 200n * CKB });
+  const from = cellOf(env.funding, 0);
+  const settings: SendLimitSettings = { fingerprint: ccc.hexFrom(new Uint8Array(32)), tokensUnlimited: false, tokens: new Map(), ckb: 100n * CKB };
+  const input = ccc.CellInput.from({ previousOutput: from.outPoint });
+  const genesis = ccc.Transaction.from({
+    inputs: [input, { previousOutput: foreign.outPoint }],
+    outputs: [{ lock: env.secp, type: typeIdScript(ccc.hashTypeId(input, 0)), capacity: 200n * CKB }, { lock: env.secp, capacity: from.cellOutput.capacity - 200n * CKB }, { lock: stranger, capacity: foreign.cellOutput.capacity - FEE }],
+    outputsData: [encodeSendLimitSettings(settings), "0x", "0x"],
+  });
+  prepare(env, genesis, [env.secp, stranger]);
+  const { sent, emailCode } = await codeFor(env, genesis);
+  genesis.outputsData[0] = encodeSendLimitSettings({ ...settings, fingerprint: sent.fingerprint! });
+  assert.equal((await env.run("transaction", genesis, { email: EMAIL, emailCode }) as { limits: string }).limits, "genesis");
+  // After signing, a record shape on the other party's input (its witness isn't covered by the account's signature).
+  genesis.setWitnessArgsAt(1, ccc.WitnessArgs.from({ inputType: "0x4b5753520100" }));
+  env.add(genesis);
+  const destroy = ccc.Transaction.from({ inputs: [{ previousOutput: cellOf(genesis, 0).outPoint }], outputs: [{ lock: env.secp, capacity: 200n * CKB - FEE }], outputsData: ["0x"] });
+  prepare(env, destroy, [env.secp]);
+  await assert.rejects(env.run("transaction", destroy), /can't be destroyed/);
+  const send = sendTx(env, null, [cellOf(env.funding, 1)], 290n * CKB);
+  assert.equal((await planned(env, send, null)).limits, "unchained");
+  await assert.rejects(env.run("transaction", send), /eight-digit code/);
+});
+
+test("review: a node that strips a chained cell's record can't make it pass for a look-alike", async () => {
+  const env = await account();
+  const { head, change } = await turnOn(env, { ckb: 100n * CKB });
+  const send = sendTx(env, head, [change], 10n * CKB);
+  await planned(env, send, head);
+  await env.run("transaction", send);
+  env.add(send);
+  // The node now serves the chained transaction without its record (witnesses aren't in the hash it's checked against).
+  const served = env.known.get(send.hash())!.tx;
+  served.witnesses = served.witnesses.map(() => ccc.hexFrom(ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(65)) }).toBytes()));
+  const destroy = ccc.Transaction.from({ inputs: [{ previousOutput: headAfter(send).outPoint }], outputs: [{ lock: env.secp, capacity: headAfter(send).cellOutput.capacity - FEE }], outputsData: ["0x"] });
+  prepare(env, destroy, [env.secp]);
+  await assert.rejects(env.run("transaction", destroy), /can't be read/);
+});
+
+test("review: no input whose lock would accept the account's signature (secp256k1 by data hash, KeyWay's Omnilock as data2) is signed for", async () => {
+  const env = await account();
+  const blake160 = ccc.bytesFrom(env.secp.args);
+  const shapes = [
+    ccc.Script.from({ codeHash: "0x709f3fda12f561cfacf92273c57a98fede188a3f1a59b1f888d113f9cce08649", hashType: "data1", args: env.secp.args }),
+    ccc.Script.from({ codeHash: "0x6b29b6f10346b43c540e53806ba88ba0fe3a0c3a29d7448ef555840c8f8318fa", hashType: "data2", args: ccc.bytesConcat([0x00], blake160, [0x00]) }),
+  ];
+  for (const lock of shapes) {
+    for (const otherLock of [new Uint8Array(65), new Uint8Array(65).fill(7)]) {
+      const held = plant(env, { lock, capacity: 50_000n * CKB });
+      const drain = ccc.Transaction.from({
+        inputs: [{ previousOutput: cellOf(env.funding, 1).outPoint }, { previousOutput: held.outPoint }],
+        outputs: [{ lock: env.secp, capacity: 300n * CKB - FEE }, { lock: stranger, capacity: 50_000n * CKB }],
+        outputsData: ["0x", "0x"],
+      });
+      drain.setWitnessArgsAt(0, ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(65)) }));
+      // The other group's lock field zeroed or not: the chain zeroes it before hashing, so the check must too.
+      drain.setWitnessArgsAt(1, ccc.WitnessArgs.from({ lock: ccc.hexFrom(otherLock) }));
+      await assert.rejects(env.run("transaction", drain), /would accept this account's signature/, `${lock.hashType} ${otherLock[0]}`);
+    }
+  }
+  // An ordinary input of someone else's (another key) still signs.
+  const theirs = plant(env, { lock: ccc.Script.from({ ...env.secp, args: `0x${"cd".repeat(20)}` }), capacity: 100n * CKB });
+  const together = ccc.Transaction.from({
+    inputs: [{ previousOutput: cellOf(env.funding, 2).outPoint }, { previousOutput: theirs.outPoint }],
+    outputs: [{ lock: env.secp, capacity: 500n * CKB - FEE }, { lock: stranger, capacity: 100n * CKB }],
+    outputsData: ["0x", "0x"],
+  });
+  together.setWitnessArgsAt(0, ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(65)) }));
+  together.setWitnessArgsAt(1, ccc.WitnessArgs.from({ lock: ccc.hexFrom(new Uint8Array(65)) }));
+  assert.ok((await env.run("transaction", together) as { signatures: unknown[] }).signatures.length > 0);
+});
+
+test("review: a token whose owner is the type of one of the account's cells counts as leaving when minted away", async () => {
+  const env = await account();
+  const issuer = plant(env, { lock: env.secp, type: typeIdScript(`0x${"31".repeat(32)}`), capacity: 150n * CKB });
+  const owned = ccc.Script.from({ codeHash: xudt.codeHash, hashType: xudt.hashType, args: ccc.bytesConcat(ccc.bytesFrom(issuer.cellOutput.type!.hash()), ccc.numLeToBytes(0x80000000, 4)) });
+  const theirs = plant(env, { lock: stranger, capacity: 200n * CKB });
+  const mint = ccc.Transaction.from({
+    inputs: [{ previousOutput: issuer.outPoint }, { previousOutput: theirs.outPoint }],
+    outputs: [{ lock: env.secp, type: issuer.cellOutput.type, capacity: 150n * CKB - FEE }, { lock: stranger, type: owned, capacity: 200n * CKB }],
+    outputsData: ["0x", ccc.hexFrom(ccc.numLeToBytes(10n ** 20n, 16))],
+  });
+  prepare(env, mint, [env.secp, stranger]);
+  const plan = await env.run("plan", mint) as Plan & { outflow: { tokens: Array<{ asset: string; amount: string }> } };
+  assert.notEqual(plan.limits, "exempt");
+  assert.deepEqual(plan.outflow.tokens, [{ asset: owned.hash(), amount: (10n ** 20n).toString() }]);
+});
+
+test("review: a node whose whole chain has stalled isn't believed either", async () => {
+  const stalled = await account();
+  await turnOn(stalled, { ckb: 100n * CKB });
+  const fresh = await account({ tipAge: () => 0 });
+  void fresh;
+  const behind = await account({ tipAge: () => 20 * 60_000 });
+  const send = sendTx(behind, null, [cellOf(behind.funding, 1)], 90n * CKB);
+  await assert.rejects(behind.run("plan", send), /chain is behind the network/);
 });

@@ -240,7 +240,11 @@ export function describeTransaction(
   // Minting, as the policy Action counts it: a token whose owner (args[0..32]) is the lock of one of the account's
   // inputs can grow its supply here, and new supply leaves the account wherever it goes (minted to the account
   // itself, it nets out above).
-  const ownInputLocks = new Set(ownInputs.map(({ cellOutput }) => cellOutput.lock.hash()));
+  // Owner mode by lock hash, or (xUDT) by the type hash of one of the account's inputs.
+  const ownInputLocks = new Set([
+    ...ownInputs.map(({ cellOutput }) => cellOutput.lock.hash()),
+    ...ownInputs.filter(({ cellOutput }) => cellOutput.type).map(({ cellOutput }) => cellOutput.type!.hash()),
+  ]);
   const supply = new Map<string, { standard: "xUDT" | "sUDT"; delta: bigint }>();
   const addSupply = (cell: { cellOutput: ccc.CellOutput; outputData: ccc.Hex }, sign: 1n | -1n) => {
     const kind = typeKind(cell.cellOutput.type);

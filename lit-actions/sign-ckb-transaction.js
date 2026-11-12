@@ -33,8 +33,10 @@ const OFFICIAL_OMNILOCK_CODE_HASH = "0xf329effd1c475a2978453c8600e1eaf0bc2087ee0
 // Anyone-can-pay (testnet, mainnet): its args start with a key's blake160, which that key's signature unlocks.
 const ACP_CODE_HASHES = ["0x3419a1c09eb2567f6552ee7a8ecffd64155cffe0f1796e6e61ec088d740c1356", "0xd369597ff47f29fbc0d47d2e3775370d1250b85140c670e4718af712983a2354"];
 const JOYID_CODE_HASH = "0xd23761b364210735c19c60561d213fb3beae2fd6172743719eff6920e020baac";
-// An indexer more than this many blocks behind its node's tip could miss a send-limit cell, so it isn't believed.
+// An indexer more than this many blocks behind its node's tip could miss a send-limit cell, so it isn't believed; nor is
+// a node whose tip is older than this (its whole chain may have stalled behind the network's).
 const MAX_INDEXER_LAG = 3n;
+const MAX_TIP_AGE_MS = 10 * 60_000;
 // Pages of one block's history read for one lock: past this many entries, outsiders have given the key a lot of CKB.
 const MAX_HISTORY_PAGES = 4;
 const TYPE_ID_CODE_HASH = "0x00000000000000000000000000000000000000000000000000545950455f4944";
@@ -480,6 +482,7 @@ async function madeByKey(account, candidates, urls, options = {}) {
 async function freshIndexer(urls) {
   const [indexer, tip] = await rpcBatch([{ method: "get_indexer_tip", params: [] }, { method: "get_tip_header", params: [] }], urls);
   if (num(tip?.number, "tip block number") - num(indexer?.block_number, "indexer tip") > MAX_INDEXER_LAG) throw new Error("CKB RPC's indexer is behind the chain");
+  if (Date.now() - Number(num(tip?.timestamp, "tip timestamp")) > MAX_TIP_AGE_MS) throw new Error("CKB RPC's chain is behind the network");
 }
 
 /**
@@ -952,8 +955,14 @@ async function codeTarget(pkpId, analysis, params) {
     // With limits on, the binding then matches them too, as params.email matches both.
     return emailMatchingBinding(pkpId, op.binding, params.email);
   }
-  // A list made before this Action existed has no binding; it keeps the server's checks and the shape rules above.
-  return op.email;
+  if (op.email) return op.email;
+  // A list made before this Action existed has no binding. With send limits on, a backup change still needs the code
+  // at the limits' address (a new backup could move everything); otherwise it keeps the server's checks and the shape
+  // rules above.
+  const live = await liveSettings(analysis.account);
+  if (live.length > 1) throw new Error("This account has more than one send-limit cell");
+  if (live.length === 1) return emailMatching(pkpId, parseSettings(live[0].data).fingerprint, params.email, "This isn't the email address bound to this account's send limits");
+  return undefined;
 }
 
 // ---------- send limits ----------
@@ -1110,9 +1119,14 @@ function outflowOf(account, tx, inputs) {
   for (const [asset, cells] of unread) {
     if ((tokens.get(asset) ?? 0n) <= 0n && [...cells.values()].some((left) => left > 0n)) tokens.set(asset, 1n);
   }
-  // Minting: a UDT whose owner (args[0..32]) is the lock hash of one of the account's inputs runs in owner mode, so
-  // its supply can grow. The growth counts as leaving, wherever it goes; minting to the account itself nets out.
-  const ownLockHashes = new Set(inputs.filter((cell) => lockKind(account, cell.output.lock)).map((cell) => bytesToHex(scriptHash(cell.output.lock))));
+  // Minting: a UDT whose owner (args[0..32]) is the lock hash, or (xUDT's owner mode by type) the type hash, of one
+  // of the account's inputs runs in owner mode, so its supply can grow. The growth counts as leaving, wherever it
+  // goes; minting to the account itself nets out.
+  const ownInputs = inputs.filter((cell) => lockKind(account, cell.output.lock));
+  const ownLockHashes = new Set([
+    ...ownInputs.map((cell) => bytesToHex(scriptHash(cell.output.lock))),
+    ...ownInputs.filter((cell) => cell.output.type).map((cell) => bytesToHex(scriptHash(cell.output.type))),
+  ]);
   const supply = new Map();
   const tally = (type, data, sign) => {
     if (!type || !isUdt(type) || type.args.length < 32 || !ownLockHashes.has(bytesToHex(type.args.slice(0, 32)))) return;
@@ -1188,12 +1202,11 @@ const outPointKey = (outPoint) => `${bytesToHex(outPoint.txHash)}:${outPoint.ind
  * records sit on), in one batch, so a transaction destroying many look-alikes costs one request, not one each.
  */
 async function creatorCells(shaped) {
-  const wanted = shaped.flatMap(({ createdBy, output, outputIndex }) => {
-    const records = creatorRecords(createdBy);
-    if (records.length > 0) return records.map(({ index }) => createdBy.inputs[index]);
-    // Without records, only a cell whose Type ID comes from its creator's input 0 needs that input read.
-    return equalBytes(output.type.args, typeIdArgs(createdBy.inputs[0], outputIndex)) ? [createdBy.inputs[0]] : [];
-  });
+  const wanted = shaped.flatMap(({ createdBy, output, outputIndex }) => [
+    ...creatorRecords(createdBy).map(({ index }) => createdBy.inputs[index]),
+    // Only a cell whose Type ID comes from its creator's input 0 can be a genesis, and needs that input read.
+    ...(equalBytes(output.type.args, typeIdArgs(createdBy.inputs[0], outputIndex)) ? [createdBy.inputs[0]] : []),
+  ]);
   const cells = wanted.length > 0 ? await inputCellsOf({ inputs: wanted }) : [];
   return new Map(wanted.map((input, i) => [outPointKey(input.previousOutput), cells[i]]));
 }
@@ -1206,23 +1219,42 @@ async function previousEntries(account, input, known = new Map()) {
     missing.forEach((one, i) => known.set(outPointKey(one.previousOutput), fetched[i]));
     return inputs.map((one) => known.get(outPointKey(one.previousOutput)));
   };
+  // A chained cell's record is the one on the input that spent the previous send-limit cell. Witnesses of other
+  // parties' inputs aren't covered by the account's signature, so anyone could add a record-shaped one there: only a
+  // record on an input at the key's address with this cell's Type ID decides that the cell is chained.
   const records = creatorRecords(created);
-  if (records.length === 0) {
-    if (!equalBytes(input.output.type.args, typeIdArgs(created.inputs[0], input.outputIndex))) throw new Error(NOT_MADE_BY_KEY);
-    const check = async () => {
-      const [first] = await cellsOf([created.inputs[0]]);
-      if (lockKind(account, first.output.lock) !== "secp256k1" || !isPlain(first.output, first.data)) throw new Error(NOT_MADE_BY_KEY);
-    };
-    return { entries: [], check };
+  if (records.length > 0) {
+    const cells = await cellsOf(records.map(({ index }) => created.inputs[index]));
+    const own = records.filter((_, i) => sameScript(cells[i].output.lock, account.secp) && sameScript(cells[i].output.type, input.output.type));
+    if (own.length > 1) throw new Error("The send-limit record is malformed");
+    if (own.length === 1) {
+      const entries = parseRecord(own[0].record);
+      if (entries.length === 0 || bytesToHex(entries[entries.length - 1].hash) !== input.createdByHash) throw new Error("The send-limit record is malformed");
+      return { entries, check: async () => undefined };
+    }
   }
-  // The record is the one on the input that spent the previous send-limit cell. Witnesses of other parties' inputs
-  // aren't covered by the account's signature, so anyone could add a record-shaped one there; those are ignored.
-  const cells = await cellsOf(records.map(({ index }) => created.inputs[index]));
-  const own = records.filter((_, i) => sameScript(cells[i].output.lock, account.secp) && sameScript(cells[i].output.type, input.output.type));
-  if (own.length !== 1) throw new Error(NOT_MADE_BY_KEY);
-  const entries = parseRecord(own[0].record);
-  if (entries.length === 0 || bytesToHex(entries[entries.length - 1].hash) !== input.createdByHash) throw new Error("The send-limit record is malformed");
-  return { entries, check: async () => undefined };
+  // Otherwise only a genesis: its Type ID from input 0, which was a plain cell at the key's address.
+  if (!equalBytes(input.output.type.args, typeIdArgs(created.inputs[0], input.outputIndex))) throw new Error(NOT_MADE_BY_KEY);
+  const check = async () => {
+    const [first] = await cellsOf([created.inputs[0]]);
+    if (lockKind(account, first.output.lock) !== "secp256k1" || !isPlain(first.output, first.data)) throw new Error(NOT_MADE_BY_KEY);
+  };
+  return { entries: [], check };
+}
+
+/**
+ * Of these send-limit-shaped inputs that failed the checks above, refuses any whose creator the key's own history
+ * shows spent a cell at its address: a genuine cell a node misreported (say, with a witness changed, which the
+ * transaction hash doesn't cover) must never pass for a look-alike that can be destroyed without the code.
+ */
+async function refuseOwnAsForeign(account, unproven) {
+  if (unproven.length === 0) return;
+  if (unproven.some((cell) => cell.createdStatus !== "committed" || typeof cell.createdBlockHash !== "string")) throw new Error("A send-limit-shaped input isn't committed yet");
+  const blockHashes = [...new Set(unproven.map((cell) => cell.createdBlockHash))];
+  const headers = await rpcBatch(blockHashes.map((hash) => ({ method: "get_header", params: [hash] })));
+  const numbers = new Map(blockHashes.map((hash, i) => [hash, num(headers[i]?.number, "block number")]));
+  const made = await madeByKey(account, unproven.map((cell) => ({ block: numbers.get(cell.createdBlockHash) })), RPC_URLS, { anyInput: true, locks: [account.secp] });
+  if (unproven.some((cell) => made.has(cell.createdByHash.toLowerCase()))) throw new Error("A send-limit cell of this account's can't be read; try again later");
 }
 
 /**
@@ -1399,6 +1431,7 @@ async function limitAnalysis(analysis, params) {
   const settingsInputs = [];
   const shaped = inputs.map((cell, index) => ({ ...cell, index })).filter((cell) => isSettingsShaped(account, cell.output, cell.data));
   const known = await creatorCells(shaped);
+  const unproven = [];
   for (const cell of shaped) {
     try {
       const previous = await previousEntries(account, cell, known);
@@ -1406,8 +1439,10 @@ async function limitAnalysis(analysis, params) {
       settingsInputs.push({ ...cell, previous });
     } catch (error) {
       if (error?.message !== NOT_MADE_BY_KEY) throw error;
+      unproven.push(cell);
     }
   }
+  await refuseOwnAsForeign(account, unproven);
   if (settingsInputs.length > 1) throw new Error("A transaction may spend only one send-limit cell");
   const input = settingsInputs[0];
   const settingsOutputs = tx.outputs.map((output, index) => ({ output, data: tx.outputsData[index], index }))
@@ -1670,14 +1705,40 @@ function signDigest(account, digest) {
 
 function signGroups(analysis) {
   const { tx, inputLocks, groups, account } = analysis;
-  return groups.map(({ lock, kind }) => {
+  const signed = groups.map(({ lock, kind }) => {
     const { digest, first } = sighash(tx, inputLocks, lock);
     // The group's first witness must hold an all-zero lock at its final length, so the digest is the one the chain checks.
     const witness = parseWitnessArgs(tx.witnesses[first]);
     const length = kind === "secp256k1" ? SECP_WITNESS_LOCK : OMNILOCK_WITNESS_LOCK;
     if (!witness.lock || witness.lock.length !== length || !isZero(witness.lock)) throw new Error("A signing witness isn't prepared");
-    return { lockHash: bytesToHex(scriptHash(lock)), witnessIndex: first, ...signDigest(account, digest) };
+    return { lock, digest, first };
   });
+  // Any lock that checks a raw signature by this key (secp256k1 or anyone-can-pay by data hash, another Omnilock
+  // deployment or hash type, …) would accept the account's signature for its own group if that group's signing hash
+  // came out the same, and such inputs aren't counted above. A group's signing hash doesn't depend on its lock, so
+  // another party's input with the same witness layout matches too; only a lock naming this key (its blake160 or
+  // public key in the args) can be opened by its signature, so those may not share a digest the Action signs.
+  const digests = new Set(signed.map(({ digest }) => bytesToHex(digest)));
+  const contains = (haystack, needle) => {
+    for (let i = 0; i + needle.length <= haystack.length; i++) if (equalBytes(haystack.slice(i, i + needle.length), needle)) return true;
+    return false;
+  };
+  const namesKey = (lock) => contains(lock.args, account.blake160) || contains(lock.args, account.publicKey);
+  const others = [];
+  inputLocks.forEach((lock) => { if (namesKey(lock) && !groups.some((group) => sameScript(group.lock, lock)) && !others.some((other) => sameScript(other, lock))) others.push(lock); });
+  for (const lock of others) {
+    // As the chain checks it: that group's first witness with its lock field zeroed, whatever it holds now, since the
+    // signature would be put there afterwards.
+    const first = inputLocks.findIndex((one) => sameScript(one, lock));
+    if (first >= tx.witnesses.length) continue;
+    let witness;
+    try { witness = parseWitnessArgs(tx.witnesses[first]); } catch { continue; }
+    const zeroed = { ...tx, witnesses: tx.witnesses.map((one, i) => i === first && witness.lock ? encodeWitnessArgs({ ...witness, lock: new Uint8Array(witness.lock.length) }) : one) };
+    let digest;
+    try { ({ digest } = sighash(zeroed, inputLocks, lock)); } catch { continue; }
+    if (digests.has(bytesToHex(digest))) throw new Error("Another input's lock would accept this account's signature");
+  }
+  return signed.map(({ lock, digest, first }) => ({ lockHash: bytesToHex(scriptHash(lock)), witnessIndex: first, ...signDigest(account, digest) }));
 }
 
 /** Limit kinds whose code goes to the address bound in the send-limit cell. */

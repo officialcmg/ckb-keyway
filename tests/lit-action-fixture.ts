@@ -28,6 +28,9 @@ export const fakeEthers = {
   },
 };
 
+/** The prefix of block hashes the fixture makes up for committed transactions given no block of their own. */
+const SYNTHETIC_BLOCK = "0xb10c";
+
 export type SentEmail = { to: string[]; text: string; from: string; key: string };
 
 export type ActionModule = {
@@ -58,8 +61,10 @@ export function fakeLit(options: {
   failing?: (method: string) => boolean;
   /** Requests to fail with HTTP 500, by node and methods. */
   failingAt?: (url: string, methods: string[]) => boolean;
-  /** How many blocks a node's indexer is behind its chain tip (0 by default). */
+  /** How many blocks a node's indexer is behind its chain tip (0 by default): it doesn't see the newest that many transactions. */
   indexerLag?: (url: string) => number;
+  /** How old (ms) a node's tip header is (0 by default). */
+  tipAge?: (url: string) => number;
 }) {
   /** Every transaction hash the Action fetched with get_transaction. */
   const fetched: string[] = [];
@@ -101,11 +106,13 @@ export function fakeLit(options: {
     if (url !== "https://api.resend.com/emails") requests.push({ url, methods });
     if (options.failingAt?.(url, methods)) return new Response("node unavailable", { status: 500 });
     if (options.failing && methods.some(options.failing)) return new Response("node unavailable", { status: 500 });
+    // What this node's indexer has seen: all but the newest `indexerLag` transactions.
+    const indexed = () => { const txs = options.transactions(); const lag = options.indexerLag?.(url) ?? 0; return lag > 0 ? txs.slice(0, Math.max(txs.length - lag, 0)) : txs; };
     // Each transaction is in its own block, numbered by its place in `transactions()`.
     const history = (key: { script: { code_hash: string; hash_type: string; args: string }; script_search_mode?: string; filter?: { block_range?: [string, string] } }) => {
       const { script: wanted, script_search_mode: mode, filter } = key;
       const matches = (lock: ccc.Script) => lock.codeHash === wanted.code_hash && lock.hashType === wanted.hash_type && (mode === "exact" ? lock.args === wanted.args : lock.args.startsWith(wanted.args));
-      const all = options.transactions();
+      const all = indexed();
       const byHash = new Map(all.map((tx) => [hashOf(tx), tx]));
       const [from, to] = filter?.block_range ? filter.block_range.map(Number) : [0, Infinity];
       const objects = all.flatMap((tx, block) => block < from || block >= to ? [] : [
@@ -134,7 +141,7 @@ export function fakeLit(options: {
       // As ckb-indexer: the lock's args match by prefix unless the request asks for "exact".
       const argsMatch = (args: string) => mode === "exact" ? args === wanted.args : args.startsWith(wanted.args);
       const typeFilter = filter?.script;
-      const all = options.transactions();
+      const all = indexed();
       const spent = new Set(all.flatMap((tx) => tx.inputs.map((input) => `${input.previousOutput.txHash}:${input.previousOutput.index}`)));
       const objects = all.flatMap((tx, block) => tx.outputs.map((output, index) => ({ tx, output, index, block })))
         .filter(({ tx, output, index }) => !spent.has(`${hashOf(tx)}:${index}`) && output.lock.codeHash === wanted.code_hash && output.lock.hashType === wanted.hash_type && argsMatch(output.lock.args)
@@ -148,14 +155,24 @@ export function fakeLit(options: {
     // indexer may be behind it.
     const tip = options.transactions().length + 100;
     return new Response(JSON.stringify(calls.map(({ id, method, params: [hash, verbosity] }) => {
-      if (method === "get_tip_header") return { id, jsonrpc: "2.0", result: { number: ccc.numToHex(tip), hash: ccc.hexFrom(ccc.numLeToBytes(tip, 32)), timestamp: "0x0" } };
+      if (method === "get_tip_header") return { id, jsonrpc: "2.0", result: { number: ccc.numToHex(tip), hash: ccc.hexFrom(ccc.numLeToBytes(tip, 32)), timestamp: ccc.numToHex(options.tipAge ? Date.now() - options.tipAge(url) : Date.now()) } };
       if (method === "get_indexer_tip") return { id, jsonrpc: "2.0", result: { block_number: ccc.numToHex(tip - (options.indexerLag?.(url) ?? 0)), block_hash: ccc.hexFrom(new Uint8Array(32)) } };
       if (method === "get_header") {
+        // A block this fixture named (a committed transaction given no block of its own): its number, committed now.
+        if (hash.startsWith(SYNTHETIC_BLOCK)) {
+          const number = Number(ccc.numLeFromBytes(ccc.bytesFrom(hash).slice(2)));
+          return { id, jsonrpc: "2.0", result: { hash, number: ccc.numToHex(number), timestamp: ccc.numToHex(Date.now()) } };
+        }
         const timestamp = options.header?.(hash);
-        return { id, jsonrpc: "2.0", result: timestamp === undefined ? null : { hash, timestamp: ccc.numToHex(timestamp) } };
+        if (timestamp === undefined) return { id, jsonrpc: "2.0", result: null };
+        const number = Math.max(options.transactions().findIndex((tx) => options.lookup(hashOf(tx))?.blockHash === hash), 0);
+        return { id, jsonrpc: "2.0", result: { hash, number: ccc.numToHex(number), timestamp: ccc.numToHex(timestamp) } };
       }
       const found = options.lookup(hash);
-      const status = found ? { status: found.status, block_hash: found.blockHash ?? null } : { status: "unknown", block_hash: null };
+      // A committed transaction with no block of its own is in the block numbered by its place in transactions().
+      const position = found && found.status === "committed" && !found.blockHash ? options.transactions().findIndex((tx) => hashOf(tx) === hash) : -1;
+      const blockHash = found?.blockHash ?? (position >= 0 ? ccc.hexFrom(ccc.bytesConcat(ccc.bytesFrom(SYNTHETIC_BLOCK), ccc.numLeToBytes(position, 30))) : null);
+      const status = found ? { status: found.status, block_hash: blockHash } : { status: "unknown", block_hash: null };
       // Verbosity 1 is the status alone, as CKB answers it.
       if (verbosity === "0x1") return { id, jsonrpc: "2.0", result: { transaction: null, tx_status: status } };
       fetched.push(hash);
