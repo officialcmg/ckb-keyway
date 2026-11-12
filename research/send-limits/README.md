@@ -228,8 +228,9 @@ counted send, and fund channels only from there.
   Type ID cell (the cells their creators spent are read in one batch, so one transaction can destroy many). The
   lookup is refused only from 4,096 send-limit-shaped cells at the address (16 full pages of 256): 4,095
   look-alikes on an account with limits, each at least 130 CKB (532,350 CKB, all left at the account's address).
-  Measured with the fake chain, every look-alike in its own block: the heaviest run below that (turning recovery
-  on) makes 36 CKB RPC requests plus the code email, within Lit's 50.
+  Measured with the fake chain, every look-alike in its own block, at 4,094 look-alikes: an ordinary send makes 34
+  CKB RPC requests plus the code email, and turning limits on 35 plus the email (see "Lit's 50-request limit" below
+  for turning recovery on).
 - A lagging indexer: an empty answer counts as "no limits" only from a node whose indexer is within 3 blocks of
   its tip and whose tip is under 10 minutes old; when every node lags, nothing is signed.
 - A send-limit cell passing for a look-alike: only a record on an input at the key's address with the cell's own
