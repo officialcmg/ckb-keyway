@@ -937,3 +937,19 @@ test("a node that exits unexpectedly and loses its slot meanwhile stays counted 
   assert.equal(module.readiness().offline, 1);
   assert.equal(await exists(join(root, "users", A, "keyway-channels-checked")), false);
 });
+
+test("signed funding is neither recorded nor sent if the API gives up while the node starts", async (context) => {
+  const { root, submit, marked, withChannels } = await host(context);
+  // F has a channel waiting for its funding, and its node is stopped and slow to start.
+  await withChannels(F, WAITING_CHANNEL);
+  await writeFile(join(root, "users", F, "keyway-channels-checked"), "");
+  await writeFile(join(root, "users", F, "slow-start"), "");
+  const gone = new AbortController();
+  const handed = submit(F, WAITING_ID, gone.signal);
+  setTimeout(() => gone.abort(), 300);
+  assert.equal(await handed, 502);
+  assert.equal(await exists(join(root, "users", F, "funding-received")), false);
+  assert.equal(await marked(F), false);
+  const record = await readFile(join(root, "users", F, "keyway-funded-channels"), "utf8").catch(() => "");
+  assert.equal(record.includes(WAITING_ID), false);
+});

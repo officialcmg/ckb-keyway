@@ -83,13 +83,13 @@ export async function managedNodeRequest(
         const addresses = await assertKnownPublicPeer(node, peer);
         if (addresses.length === 0) return { done: true };
         // The room check and the dial run one at a time per user, so parallel requests can't both pass it.
-        await serializeMutation(userId, async () => {
+        await serializePeerWork(userId, async () => {
           await assertPeerRoom(node, undefined, addresses.length);
           await connectGraphPeer(node, peer, addresses);
         });
         return { done: true };
       }
-      await serializeMutation(userId, async () => {
+      await serializePeerWork(userId, async () => {
         // Only a dial by key to a peer already connected takes no room: a new address can reach another node.
         await assertPeerRoom(node, typeof params.pubkey === "string" && params.address === undefined ? params.pubkey : undefined);
         await node.call(FIBER_METHODS[method as FiberMethod].rpc, [dial]);
@@ -138,7 +138,7 @@ export async function managedNodeRequest(
     if (!sameScript(params.funding_lock_script, own)) throw new Error("Channels can only be funded from your own KeyWay address");
     params.funding_lock_script = own;
     // One at a time per user, so parallel opens can't all pass the room check.
-    return serializeMutation(userId, async () => {
+    return serializePeerWork(userId, async () => {
       await assertChannelRoom(node);
       await connectManagedPeer(node, params.pubkey);
       return node.openChannelWithExternalFunding(params);
@@ -497,6 +497,24 @@ function object(value: unknown, message: string): Record<string, unknown> {
 function publicNodeInfo<T extends object>(info: T): Omit<T, "addresses" | "default_funding_lock_script"> {
   const { addresses: _addresses, default_funding_lock_script: _lock, ...rest } = info as T & { addresses?: unknown; default_funding_lock_script?: unknown };
   return rest as Omit<T, "addresses" | "default_funding_lock_script">;
+}
+
+// Peer connections and channel opens wait on handshakes (up to 10 s each), so a user may have only this many queued.
+const MAX_QUEUED_PEER_WORK = 3;
+const queuedPeerWork = new Map<string, number>();
+
+/** serializeMutation for peer connections and opens, refusing more once MAX_QUEUED_PEER_WORK are queued. */
+async function serializePeerWork<T>(userId: string, operation: () => Promise<T>): Promise<T> {
+  const queued = queuedPeerWork.get(userId) ?? 0;
+  if (queued >= MAX_QUEUED_PEER_WORK) throw new Error("Too many peer connections in progress. Try again shortly");
+  queuedPeerWork.set(userId, queued + 1);
+  try {
+    return await serializeMutation(userId, operation);
+  } finally {
+    const left = (queuedPeerWork.get(userId) ?? 1) - 1;
+    if (left > 0) queuedPeerWork.set(userId, left);
+    else queuedPeerWork.delete(userId);
+  }
 }
 
 function serializeMutation<T>(userId: string, operation: () => Promise<T>): Promise<T> {

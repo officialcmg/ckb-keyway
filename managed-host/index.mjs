@@ -190,6 +190,8 @@ export function proxyUserRequest(userId, body, signal) {
         if (!fundingId || !(await awaitingFunding(userId, node, fundingId))) {
           throw new Error("This channel isn't waiting for its funding");
         }
+        // Nothing is recorded or sent for a submission the API gave up on while its node started or was checked.
+        if (signal?.aborted) throw new Error("The request was abandoned");
         await markChannels(userId, true);
         await recordFundedChannel(userId, fundingId, fundingInputs(body));
         // A node stopped meanwhile never gets the funding.

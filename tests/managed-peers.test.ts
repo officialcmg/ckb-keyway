@@ -211,6 +211,25 @@ test("a hosted node opens no more channels once it has many unfinished channels 
   assert.equal(await open([...Array(31).fill(pending), ...Array(100).fill(aborted)]), 1);
 });
 
+test("a user's queued peer connections are bounded while handshakes stall", async () => {
+  // A peer whose handshake never completes: each connection waits until it is released.
+  let release: () => void = () => {};
+  const stalled = new Promise<void>((resolve) => { release = resolve; });
+  const node = {
+    listPeers: async () => ({ peers: [] }),
+    call: async () => { await stalled; return {}; },
+  };
+  const connect = (host: number) => managedNodeRequest("queue-user", {
+    operation: "act", method: "connectPeer", params: { address: `/ip4/203.0.113.${host}/tcp/8228` },
+  }, node as never);
+  const queued = [1, 2, 3].map(connect);
+  await assert.rejects(connect(4), /Too many peer connections/);
+  release();
+  await Promise.all(queued);
+  // Once they finish, more may queue again.
+  await connect(5);
+});
+
 test("a hosted node dials only the first few addresses a peer announces", async () => {
   const announced = Array.from({ length: 20 }, (_, index) => `/ip4/203.0.113.${index + 1}/tcp/8228/p2p/Qm1`);
   for (const request of [
