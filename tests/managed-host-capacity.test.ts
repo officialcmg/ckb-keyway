@@ -890,3 +890,25 @@ test("a node with channels whose start fails stops no other node again until it 
   assert.deepEqual(running(), [A, B]);
   assert.equal(module.readiness().offline, 1);
 });
+
+test("back-to-back requests can't keep renewing a node's protection while it serves them", async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const { root, request, running } = await host(context);
+  assert.equal(await request(A), 200);
+  assert.equal(await request(B, "node_info"), 200);
+  assert.equal(await request(B, "connect_peer"), 200);
+  context.mock.timers.tick(61_000);
+  await writeFile(join(root, "users", A, "slow-rpc"), "");
+  // A's user keeps a slow request in flight, each starting right after the last, for well over half a minute.
+  for (let round = 0; round < 3; round++) {
+    const slow = request(A, "open_channel_with_external_funding");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    context.mock.timers.tick(20_000);
+    await slow;
+  }
+  const another = request(A, "open_channel_with_external_funding");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(await request(C), 200);
+  assert.deepEqual(running(), [B, C]);
+  await another;
+});

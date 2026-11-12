@@ -26,6 +26,8 @@ const SETUPS_PER_HOUR = 3;
 // A node serving requests isn't stopped to make room for a node without channels until its user's requests
 // have kept it busy this long, however long Fiber takes to answer them.
 const BUSY_PROTECTION_MS = 30_000;
+// A queue must stay idle this long before a new request starts a new busy period.
+const BUSY_IDLE_MS = 10_000;
 // Nor for this long after it starts, however it is used, so each slot changes hands at most once a minute and
 // no number of accounts can make the host cold-start nodes faster than that.
 const RESIDENCY_MS = 60_000;
@@ -60,8 +62,9 @@ const failedStarts = new Map();
 const setups = new Map();
 const submitting = new Map();
 let bootTimer;
-// When each user's queue of requests last went from idle to busy.
+// When each user's queue of requests last went busy after an idle spell, and when it last went idle.
 const busySince = new Map();
+const idleSince = new Map();
 let noRoomAt = 0;
 // Set from launch until the nodes to start after a restart are known, so /readyz isn't ready before then.
 let booting = false;
@@ -232,6 +235,7 @@ export function proxyUserRequest(userId, body, signal) {
     if (answer && method === "open_channel") await markChannels(userId, true);
     // A channel can also be opened to the node by a peer: it is marked once the node's channels show it.
     if (answer && method === "list_channels" && Array.isArray(answer.result?.channels) &&
+      !(await hasChannelsMarker(userId).catch(() => false)) &&
       await holdsChannels(answer.result.channels, await fundingRecord(userId).catch(() => undefined))) {
       await markChannels(userId, true);
     }
@@ -323,7 +327,12 @@ async function checkChannels(userId, node) {
 }
 
 export async function withUserOperation(userId, operation) {
-  if (!operations.has(userId)) busySince.set(userId, Date.now());
+  // Busy time runs from when the queue last went busy after being idle for BUSY_IDLE_MS, so back-to-back requests
+  // can't renew BUSY_PROTECTION_MS.
+  if (!operations.has(userId) && !(Date.now() - (idleSince.get(userId) ?? -Infinity) < BUSY_IDLE_MS && busySince.has(userId))) {
+    busySince.set(userId, Date.now());
+  }
+  idleSince.delete(userId);
   const previous = operations.get(userId) ?? Promise.resolve();
   const current = previous.catch(() => {}).then(operation);
   operations.set(userId, current);
@@ -332,7 +341,7 @@ export async function withUserOperation(userId, operation) {
   } finally {
     if (operations.get(userId) === current) {
       operations.delete(userId);
-      busySince.delete(userId);
+      idleSince.set(userId, Date.now());
     }
   }
 }
@@ -933,8 +942,10 @@ async function holdsChannels(channels, record) {
   return false;
 }
 
-// Channels found unable ever to be funded: a spent cell stays spent.
+// Channels found unable ever to be funded (a spent cell stays spent), and when others were last found not so.
 const deadFunding = new Set();
+const liveFunding = new Map();
+const UNSPENT_FUNDING_TTL_MS = 60_000;
 const NOT_READY = ["negotiatingfunding", "collaboratingfundingtx", "signingcommitment", "awaitingtxsignatures", "awaitingchannelready"];
 
 /**
@@ -946,6 +957,8 @@ const NOT_READY = ["negotiatingfunding", "collaboratingfundingtx", "signingcommi
 async function fundingDead(channel, record) {
   const id = String(channel?.channel_id).toLowerCase();
   if (deadFunding.has(id)) return true;
+  // A recent "still live" answer is reused for a minute, so repeated checks don't flood CKB.
+  if (Date.now() - (liveFunding.get(id) ?? -Infinity) < UNSPENT_FUNDING_TTL_MS) return false;
   const cells = recordCovers(record, channel) ? record.inputs.get(id) : undefined;
   const outpoint = String(channel?.channel_outpoint ?? "");
   if (!cells?.length || !NOT_READY.includes(stateName(channel)) || !/^0x[0-9a-f]{72}$/i.test(outpoint)) return false;
@@ -955,9 +968,12 @@ async function fundingDead(channel, record) {
       const [tx_hash, index] = cell.split(":");
       if ((await ckbRpc("get_live_cell", [{ tx_hash, index }, false]))?.status === "dead") { spent = true; break; }
     }
-    if (!spent) return false;
-    const status = (await ckbRpc("get_transaction", [outpoint.slice(0, 66)]))?.tx_status?.status;
-    if (status !== "unknown" && status !== "rejected") return false;
+    const status = spent ? (await ckbRpc("get_transaction", [outpoint.slice(0, 66)]))?.tx_status?.status : undefined;
+    if (!spent || (status !== "unknown" && status !== "rejected")) {
+      if (liveFunding.size >= 10_000) liveFunding.clear();
+      liveFunding.set(id, Date.now());
+      return false;
+    }
     if (deadFunding.size >= 10_000) deadFunding.clear();
     deadFunding.add(id);
     return true;
