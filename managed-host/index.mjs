@@ -168,18 +168,20 @@ export function proxyUserRequest(userId, body, signal) {
     // A request the API gave up on while it waited in the queue starts nothing.
     if (signal?.aborted) throw new Error("The request was abandoned");
     const setup = CHANNEL_SETUP.has(method);
-    // A node handing over its user's signed funding is never stopped to make room (see SUBMIT_PROTECTION_MS),
-    // from before it is found or started. It is marked before the funding goes to Fiber, which passes it to the
-    // peer at once: an answer may never come back. Its channels are checked again later.
-    const funding = method === "submit_signed_funding_tx";
-    // While the call is in flight its protection doesn't run out.
-    if (funding) submitting.set(userId, Infinity);
+    // A node handing over its user's signed funding for a channel waiting for it is never stopped to make room
+    // (see SUBMIT_PROTECTION_MS), and it is marked and the channel recorded before the funding goes to Fiber,
+    // which passes it to the peer at once: an answer may never come back. Any other submission gets none of this.
+    const fundingId = method === "submit_signed_funding_tx" ? submittedChannelId(body) : undefined;
+    let funding = false;
     let result;
     try {
       const node = await ensureNode(userId, { provision: PROVISIONING.has(method) });
-      if (funding) {
+      if (fundingId && await awaitingFunding(userId, node, fundingId)) {
+        funding = true;
+        // While the call is in flight its protection doesn't run out.
+        submitting.set(userId, Infinity);
         await markChannels(userId, true);
-        await recordFundedChannel(userId, body);
+        await recordFundedChannel(userId, fundingId);
       }
       const upstream = await fetch(`http://127.0.0.1:${node.port}`, {
         method: "POST",
@@ -203,11 +205,16 @@ export function proxyUserRequest(userId, body, signal) {
     const answer = result.ok ? rpcResult(result.body) : undefined;
     delete result.ok;
     if (answer && setup) hold(userId, node);
-    // Funding Fiber refused leaves the channel as it was, so its marker follows its channels again.
-    if (funding && !answer) await checkChannels(userId, node).catch(logError);
-    // A channel holds funds once they are handed to Fiber: the user's signed funding, or the node's own for
-    // open_channel. An external-funding open alone holds nothing.
-    if (answer && ["open_channel", "submit_signed_funding_tx"].includes(method)) await markChannels(userId, true);
+    // Fiber checks submitted funding before it installs or sends it, so funding it refused went nowhere: the
+    // protection and the record go, and the marker follows the node's channels again.
+    if (funding && !answer) {
+      submitting.delete(userId);
+      await unrecordFundedChannel(userId, fundingId).catch(logError);
+      await checkChannels(userId, node).catch(logError);
+    }
+    // A channel holds funds once they are handed to Fiber: the user's signed funding (marked above), or the
+    // node's own for open_channel. An external-funding open alone holds nothing.
+    if (answer && method === "open_channel") await markChannels(userId, true);
     // A channel can also be opened to the node by a peer: it is marked once the node's channels show it.
     if (answer && method === "list_channels" && Array.isArray(answer.result?.channels) &&
       holdsChannels(answer.result.channels, await fundingRecord(userId).catch(() => undefined))) {
@@ -325,7 +332,9 @@ async function ensureNode(userId, { provision = true } = {}) {
   const failed = failedStarts.get(userId);
   const failing = failed && failed.count >= PRIORITY_FAILED_STARTS && failed.at - failed.since >= 5 * 60_000 &&
     Date.now() - failed.at < 10 * 60_000;
-  const priority = !failing && await mayHoldChannels(userId);
+  // Only a marked node may take the place of a held or busy one: a node merely never checked starts where there
+  // is room, as most of those hold nothing.
+  const priority = !failing && await hasChannelsMarker(userId).catch(() => true);
   // Looked up again after the waits above.
   const again = current();
   if (again) return again;
@@ -412,13 +421,40 @@ async function startFundingRecord(userId) {
   }
 }
 
-async function recordFundedChannel(userId, body) {
+/** The channel ID a submit_signed_funding_tx request names, lower-cased, if it names a valid one. */
+function submittedChannelId(body) {
   let id;
   try { id = JSON.parse(body.toString("utf8"))?.params?.[0]?.channel_id; } catch {}
-  if (typeof id === "string" && /^0x[0-9a-f]{64}$/i.test(id)) {
-    await startFundingRecord(userId);
-    await writeFile(join(managedDataDir(userId), FUNDED_CHANNELS), `${id.toLowerCase()}\n`, { flag: "a", mode: 0o600 });
+  return typeof id === "string" && /^0x[0-9a-f]{64}$/i.test(id) ? id.toLowerCase() : undefined;
+}
+
+/**
+ * Whether the node lists the channel in a state Fiber takes signed funding in (negotiating, waiting for it, or
+ * with only the peer's commitment signed), with no funding recorded for it yet.
+ */
+async function awaitingFunding(userId, node, id) {
+  try {
+    if ((await fundingRecord(userId))?.ids.has(id)) return false;
+    const channel = (await nodeChannels(node))?.find((candidate) => String(candidate?.channel_id).toLowerCase() === id);
+    if (!channel) return false;
+    const flags = new Set(JSON.stringify(channel?.state?.state_flags ?? "").match(/\b[A-Z][A-Z0-9_]*\b/g) ?? []);
+    const name = stateName(channel);
+    return (name === "negotiatingfunding" && flags.has("AWAITING_EXTERNAL_FUNDING")) ||
+      (name === "signingcommitment" && flags.has("THEIR_COMMITMENT_SIGNED_SENT") && !flags.has("OUR_COMMITMENT_SIGNED_SENT"));
+  } catch {
+    return false;
   }
+}
+
+async function recordFundedChannel(userId, id) {
+  await startFundingRecord(userId);
+  await writeFile(join(managedDataDir(userId), FUNDED_CHANNELS), `${id}\n`, { flag: "a", mode: 0o600 });
+}
+
+async function unrecordFundedChannel(userId, id) {
+  const path = join(managedDataDir(userId), FUNDED_CHANNELS);
+  const lines = (await readFile(path, "utf8")).split("\n").filter((line) => line && line !== id);
+  await writeFile(path, `${lines.join("\n")}\n`, { mode: 0o600 });
 }
 
 /** The node's funding record, `{ since, ids }`, or undefined for a node from before it was kept. */
@@ -572,7 +608,11 @@ export async function shutdown() {
   for (const entry of offline.values()) clearTimeout(entry.timer);
   // Each running node is marked by its channels first, so one with a channel a peer opened, never listed, still
   // starts after the restart.
-  await Promise.all([...nodes.entries()].map(([userId, node]) => checkChannels(userId, node).catch(logError)));
+  // Bounded, so the nodes still stop within the platform's grace period.
+  await Promise.race([
+    Promise.all([...nodes.entries()].map(([userId, node]) => checkChannels(userId, node).catch(logError))),
+    new Promise((resolve) => { const timer = setTimeout(resolve, 3_000); timer.unref?.(); }),
+  ]);
   // A node still starting either stops before it spawns or stops itself once it is up (see startNode).
   await Promise.all([
     ...[...nodes.values()].map((node) => waitForExit(node.child).catch(logError)),
@@ -869,6 +909,12 @@ export async function retireUser(userId) {
   // Funding aborted after the user's signed funding was handed over may still be broadcast by the peer, and only
   // this node can co-sign it. For a node from before funding was recorded, any aborted funding that was built.
   const record = await fundingRecord(userId);
+  // Fiber deletes a channel whose funding it aborts, so any channel whose signed funding the node was handed
+  // must still be listed, and finished.
+  for (const id of record?.ids ?? []) {
+    const channel = channels.find((candidate) => String(candidate?.channel_id).toLowerCase() === id);
+    if (!channel || !channelFinished(channel)) throw new Error("A channel's funding was aborted after it was signed; preserve the node database");
+  }
   const abortedAfterFunding = (channel) => /\b(FUNDING_ABORTED|ABANDONED)\b/.test(JSON.stringify(channel?.state?.state_flags ?? "")) &&
     (recordCovers(record, channel) ? record.ids.has(String(channel?.channel_id).toLowerCase()) : Boolean(channel?.channel_outpoint));
   if (channels.some(abortedAfterFunding)) {

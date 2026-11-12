@@ -40,6 +40,10 @@ const server = createServer((request, response) => {
       try { result = { channels: JSON.parse(readFileSync(join(dir, "channels.json"), "utf8")) }; } catch { result = { channels: [] }; }
     }
     if (method === "open_channel_with_external_funding") result = { channel_id: "0x" + "33".repeat(32) };
+    if (method === "submit_signed_funding_tx" && existsSync(join(dir, "refuse-funding"))) {
+      response.writeHead(200, { "content-type": "application/json" });
+      return response.end(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message: "Invalid funding transaction" } }));
+    }
     response.writeHead(200, { "content-type": "application/json" });
     const slow = method === "slow_call" || (existsSync(join(dir, "slow-rpc")) && method !== "list_channels");
     setTimeout(() => response.end(JSON.stringify({ jsonrpc: "2.0", id, result })), slow ? 1_500 : 0);
@@ -60,6 +64,11 @@ const ABORTED_FUNDING = [{ state: { state_name: "Closed", state_flags: "FUNDING_
 const FUNDING_TX = `0x${"77".repeat(32)}`;
 // A creation time after any funding record in these tests began.
 const LATER = `0x${(4_000_000_000_000).toString(16)}`;
+// A channel waiting for its user's signed funding, which `submit` hands over.
+const WAITING_ID = `0x${"44".repeat(32)}`;
+const WAITING_CHANNEL = [{ channel_id: WAITING_ID, created_at: LATER, state: { state_name: "NegotiatingFunding", state_flags: "AWAITING_EXTERNAL_FUNDING" } }];
+// The same channel once its funding was handed over.
+const SUBMITTED_CHANNEL = [{ channel_id: WAITING_ID, created_at: LATER, state: { state_name: "CollaboratingFundingTx", state_flags: "OUR_TX_COMPLETE_SENT|THEIR_TX_COMPLETE_SENT|COLLABORATION_COMPLETED" } }];
 // Past funding negotiation. Unless the node's funding record shows the funding was never submitted (see the
 // tests below), the peer may hold the user's signed funding and broadcast it at any time.
 const COLLABORATED_CHANNEL = [{ state: { state_name: "CollaboratingFundingTx", state_flags: "OUR_TX_COMPLETE_SENT|THEIR_TX_COMPLETE_SENT|COLLABORATION_COMPLETED" } }];
@@ -128,6 +137,9 @@ async function host(context: TestContext) {
   const request = (user: string, method = "node_info", signal?: AbortSignal) => module
     .proxyUserRequest(user, Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: [] })), signal)
     .then(({ status }) => status, () => 502);
+  const submit = (user: string, channelId = WAITING_ID, signal?: AbortSignal) => module
+    .proxyUserRequest(user, Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "submit_signed_funding_tx", params: [{ channel_id: channelId, signed_funding_tx: {} }] })), signal)
+    .then(({ status }) => status, () => 502);
   const running = () => module.runningUsers().sort();
   const marked = (user: string) => stat(join(root, "users", user, "keyway-channels")).then(() => true, () => false);
   const withChannels = async (user: string, channels: unknown[] = OPEN_CHANNEL) => {
@@ -141,7 +153,7 @@ async function host(context: TestContext) {
     await writeFile(join(root, "users", user, "keyway-channels"), "");
   };
   const starts = async () => (await readFile(join(root, "users", "starts.log"), "utf8").catch(() => "")).split("\n").filter(Boolean);
-  return { module, root, chain: ckb.chain, request, running, marked, withChannels, markedNode, starts };
+  return { module, root, chain: ckb.chain, request, submit, running, marked, withChannels, markedNode, starts };
 }
 
 test("at capacity, a node idle for a few minutes makes room for a new user; one with channels or just used is never stopped", async (context) => {
@@ -177,12 +189,13 @@ test("at capacity, a node idle for a few minutes makes room for a new user; one 
 });
 
 test("handing a channel's funding to the node marks it to start first after a restart; opening alone doesn't", async (context) => {
-  const { request, marked } = await host(context);
+  const { request, submit, marked, withChannels } = await host(context);
   assert.equal(await request(A), 200);
   assert.equal(await marked(A), false);
+  await withChannels(A, WAITING_CHANNEL);
   assert.equal(await request(A, "open_channel_with_external_funding"), 200);
   assert.equal(await marked(A), false);
-  assert.equal(await request(A, "submit_signed_funding_tx"), 200);
+  assert.equal(await submit(A), 200);
   assert.equal(await marked(A), true);
 });
 
@@ -218,10 +231,11 @@ test("after a restart, nodes from before channel markers start once and are mark
 
 test("a node making room keeps its channel marker until it has stopped", async (context) => {
   context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
-  const { root, request, running, marked } = await host(context);
+  const { root, request, submit, running, marked, withChannels } = await host(context);
   // A once opened a channel, since closed cooperatively, so it may make room but is still marked.
   assert.equal(await request(A), 200);
-  assert.equal(await request(A, "submit_signed_funding_tx"), 200);
+  await withChannels(A, WAITING_CHANNEL);
+  assert.equal(await submit(A), 200);
   await writeFile(join(root, "users", A, "channels.json"), JSON.stringify(CLOSED_CHANNEL));
   await writeFile(join(root, "users", A, "slow-stop"), "");
   assert.equal(await request(B), 200);
@@ -366,9 +380,10 @@ test("after a restart, nodes with channels start before nodes never checked", as
   await module.startKnownNodes([...unchecked, F]);
   assert.ok(running().includes(F));
   // F is in the first batch, before the second node never checked.
+  // F is in the first batch. The second node never checked has no priority, so it starts only where there is room.
   const order = await starts();
-  assert.ok(order.indexOf(F) < order.indexOf(unchecked[1]), order.join(","));
-  assert.deepEqual(module.readiness().status, "ready");
+  assert.ok(order.includes(F), order.join(","));
+  assert.ok(!order.includes(unchecked[1]) || order.indexOf(F) < order.indexOf(unchecked[1]), order.join(","));
 });
 
 test("a node with channels takes the place of a just-used node without channels", async (context) => {
@@ -510,22 +525,28 @@ test("a node can be retired once its channels are finished and nothing of it is 
   await withChannels(F, [{ ...aborted, created_at: "0x1" }]);
   await assert.rejects(retire(), /aborted after it was signed/);
   const recorded = { ...aborted, created_at: LATER };
+  // Fiber deletes a channel whose funding it aborts: a channel whose funding was handed over must still be
+  // listed, and finished.
   await writeFile(join(root, "users", F, "keyway-funded-channels"), `since 1000\n0x${"55".repeat(32)}\n`);
+  await withChannels(F, SETTLED_REMOTE_CLOSE);
+  await assert.rejects(retire(), /aborted after it was signed/);
   await withChannels(F, [recorded]);
   await assert.rejects(retire(), /aborted after it was signed/);
   // An open the user never funded, aborted after its transaction was built, doesn't block retirement.
-  await withChannels(F, [...SETTLED_REMOTE_CLOSE, { ...recorded, channel_id: `0x${"66".repeat(32)}` }]);
+  await writeFile(join(root, "users", F, "keyway-funded-channels"), `since 1000\n0x${"55".repeat(32)}\n`);
+  await withChannels(F, [{ ...CLOSED_CHANNEL[0], channel_id: `0x${"55".repeat(32)}`, created_at: LATER }, { ...recorded, channel_id: `0x${"66".repeat(32)}` }]);
   assert.deepEqual(await retire(), { retired: true, databasePreserved: true });
   assert.equal(await exists(join(root, "retired", F)), true);
 });
 
 test("a node handing its signed funding to Fiber is never stopped to make room, even for a node with channels", async (context) => {
-  const { module, root, request, running, markedNode } = await host(context);
+  const { module, root, request, submit, running, markedNode, withChannels } = await host(context);
   assert.equal(await request(A), 200);
   assert.equal(await request(B), 200);
+  await withChannels(A, WAITING_CHANNEL);
   await writeFile(join(root, "users", A, "slow-rpc"), "");
   await writeFile(join(root, "users", B, "slow-rpc"), "");
-  const busy = [request(A, "submit_signed_funding_tx"), request(B, "get_payment")];
+  const busy = [submit(A), request(B, "get_payment")];
   await new Promise((resolve) => setTimeout(resolve, 200));
   await markedNode(F);
   await module.startKnownNodes([F]);
@@ -628,12 +649,12 @@ test("a restore that leaves a node with channels stopped has it started", async 
 });
 
 test("once its funding is submitted, a node keeps running and stays marked, even when a node with channels needs room", async (context) => {
-  const { module, request, running, marked, withChannels, markedNode } = await host(context);
-  await withChannels(A, UNFUNDED_CHANNEL);
+  const { module, request, submit, running, marked, withChannels, markedNode } = await host(context);
+  await withChannels(A, WAITING_CHANNEL);
   assert.equal(await request(A), 200);
   assert.equal(await request(B), 200);
-  await withChannels(A, COLLABORATED_CHANNEL);
-  assert.equal(await request(A, "submit_signed_funding_tx"), 200);
+  assert.equal(await submit(A), 200);
+  await withChannels(A, SUBMITTED_CHANNEL);
   // B is used after A, so A is the least recently used.
   assert.equal(await request(B, "list_channels"), 200);
   await markedNode(F);
@@ -681,16 +702,14 @@ test("a node with channels stopped for a snapshot counts as offline until it run
 });
 
 test("a node is marked before its signed funding goes to Fiber, even if no answer comes back", async (context) => {
-  const { root, request, marked } = await host(context);
-  await mkdir(join(root, "users", A), { recursive: true });
-  await writeFile(join(root, "users", A, "channels.json"), JSON.stringify(UNFUNDED_CHANNEL));
+  const { root, request, submit, marked, withChannels } = await host(context);
+  await withChannels(A, WAITING_CHANNEL);
   assert.equal(await request(A), 200);
   await writeFile(join(root, "users", A, "slow-rpc"), "");
-  await writeFile(join(root, "users", A, "channels.json"), JSON.stringify(COLLABORATED_CHANNEL));
   const gone = new AbortController();
-  const submit = request(A, "submit_signed_funding_tx", gone.signal);
+  const handed = submit(A, WAITING_ID, gone.signal);
   setTimeout(() => gone.abort(), 200);
-  assert.equal(await submit, 502);
+  assert.equal(await handed, 502);
   assert.equal(await marked(A), true);
 });
 
@@ -748,13 +767,31 @@ test("a channel whose funding was never submitted counts as unfunded in any stat
 });
 
 test("a node mid-submission keeps its marker through the host's shutdown check", async (context) => {
-  const { module, root, request, marked, withChannels } = await host(context);
-  await withChannels(F, UNFUNDED_CHANNEL);
+  const { module, root, request, submit, marked, withChannels } = await host(context);
+  await withChannels(F, WAITING_CHANNEL);
   assert.equal(await request(F), 200);
   await writeFile(join(root, "users", F, "slow-rpc"), "");
-  const submit = request(F, "submit_signed_funding_tx");
+  const handed = submit(F);
   await until(() => marked(F));
   await module.shutdown();
   assert.equal(await marked(F), true);
-  await submit;
+  await handed;
+});
+
+test("a funding submission for no channel waiting for it, or one Fiber refuses, protects and marks nothing", async (context) => {
+  const { module, root, request, submit, running, marked, withChannels, markedNode } = await host(context);
+  assert.equal(await request(A), 200);
+  assert.equal(await request(B), 200);
+  // A names a channel its node doesn't have; B's is waiting, but Fiber refuses the funding.
+  assert.equal(await submit(A, `0x${"99".repeat(32)}`), 200);
+  await withChannels(B, WAITING_CHANNEL);
+  await writeFile(join(root, "users", B, "refuse-funding"), "");
+  assert.equal(await submit(B), 200);
+  assert.equal(await marked(A), false);
+  assert.equal(await marked(B), false);
+  assert.equal(await readFile(join(root, "users", B, "keyway-funded-channels"), "utf8").then((text) => text.includes(WAITING_ID)), false);
+  // Neither keeps a node with channels from taking its place.
+  await markedNode(F);
+  await module.startKnownNodes([F]);
+  assert.ok(running().includes(F), running().join(","));
 });
