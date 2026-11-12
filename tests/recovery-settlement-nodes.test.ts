@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
-import { NodeBehind, onOneNode, settlementNodes } from "../src/server/recovery.ts";
+import { AdminListAbsent, NodeBehind, onOneNode, settlementNodes, undecidedSettlement } from "../src/server/recovery.ts";
 
 const HASH = `0x${"ab".repeat(32)}`;
 
@@ -56,8 +56,22 @@ test("a change stays pending when the only node that answered was behind, even i
   const behind = { getTransaction: async () => { throw new NodeBehind("behind"); } } as unknown as ccc.Client;
   const unreachable = { getTransaction: async () => { throw new Error("unreachable"); } } as unknown as ccc.Client;
   const read = async (client: ccc.Client) => (await client.getTransaction(HASH))?.status as string;
-  assert.equal(await onOneNode([behind, unreachable], read, "kept"), "kept");
-  assert.equal(await onOneNode([unreachable, behind], read, "kept"), "kept");
+  assert.equal(await onOneNode([behind, unreachable], read, undecidedSettlement(2)), "kept");
+  assert.equal(await onOneNode([unreachable, behind], read, undecidedSettlement(2)), "kept");
   // With no node behind, a node failure is still an error, not a decision.
-  await assert.rejects(onOneNode([unreachable, unreachable], read, "kept"), /unreachable/);
+  await assert.rejects(onOneNode([unreachable, unreachable], read, undecidedSettlement(2)), /unreachable/);
+});
+
+test("a change recorded without its transaction is dropped only when every node shows no recovery list", async () => {
+  const absent = { getTransaction: async () => { throw new AdminListAbsent("absent"); } } as unknown as ccc.Client;
+  const unreachable = { getTransaction: async () => { throw new Error("unreachable"); } } as unknown as ccc.Client;
+  const committed = { getTransaction: async () => ({ status: "committed" }) } as unknown as ccc.Client;
+  const read = async (client: ccc.Client) => (await client.getTransaction(HASH))?.status as string;
+  // One node that is behind can't drop it: the next node, which has it, decides.
+  assert.equal(await onOneNode([absent, committed], read, undecidedSettlement(2)), "committed");
+  // Every node agrees the list isn't there: it can be cleared.
+  assert.equal(await onOneNode([absent, absent], read, undecidedSettlement(2)), "dropped");
+  // A node that couldn't answer leaves it pending.
+  assert.equal(await onOneNode([absent, unreachable], read, undecidedSettlement(2)), "kept");
+  assert.equal(await onOneNode([unreachable, absent], read, undecidedSettlement(2)), "kept");
 });

@@ -448,6 +448,38 @@ test("a recovery change whose send fails stays pending until the chain settles i
     assert.equal(settled.ckbAddress, result.ckbAddress);
   });
 
+  await t.test("a change recorded without its transaction is dropped only when no node shows its AdminList", async () => {
+    const recordedWithout = async () => {
+      const h = await harness();
+      const result = await enable(h, { before: TIMEOUT() });
+      const stored = await readWallet(h.user) as ReadyWallet;
+      const { transaction: _transaction, ...older } = stored.recoveryPending!;
+      await saveWallet(h.user, { ...stored, recoveryPending: older });
+      // A node behind the change's block: it doesn't know the transaction and shows no AdminList.
+      const behind = Object.assign(Object.create(h.client) as ccc.Client, { getTransaction: async () => undefined, getCellLive: async () => undefined });
+      const unreachable = Object.assign(Object.create(h.client) as ccc.Client, { getTransaction: async () => { throw TIMEOUT(); } });
+      return { h, result, behind, unreachable };
+    };
+
+    // Committed: a node that is behind can't drop it, and the next node applies it.
+    const committed = await recordedWithout();
+    committed.h.chain.set(committed.result.transactionHash, { transaction: ccc.Transaction.from(committed.result.transaction), status: "committed" });
+    const applied = await settleRecoveryChange({ ...(await current(committed.h)), nodes: [committed.behind, committed.h.client] }, later(11));
+    assert.equal(applied.recoveryPending, undefined);
+    assert.equal(applied.ckbAddress, committed.result.ckbAddress);
+
+    // Behind, and the other node can't answer: still pending.
+    const unsure = await recordedWithout();
+    const kept = await settleRecoveryChange({ ...(await current(unsure.h)), nodes: [unsure.behind, unsure.unreachable] }, later(11));
+    assert.equal(kept.recoveryPending?.transactionHash, unsure.result.transactionHash);
+
+    // Every node agrees it isn't there: dropped, so a change that never committed doesn't stay pending.
+    const never = await recordedWithout();
+    const dropped = await settleRecoveryChange({ ...(await current(never.h)), nodes: [never.h.client, never.behind] }, later(11));
+    assert.equal(dropped.recoveryPending, undefined);
+    assert.equal(dropped.ckbAddress, never.h.legacyAddress);
+  });
+
   await t.test("one the node reports rejected while its inputs are unspent stays pending, is sent again, and is applied once committed", async () => {
     const h = await harness();
     const result = await enable(h, {});
