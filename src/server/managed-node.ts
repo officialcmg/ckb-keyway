@@ -304,7 +304,7 @@ function openChannelParams(value: unknown): OpenChannelWithExternalFundingParams
     shutdown_script: params.shutdown_script === undefined ? undefined as never : script(params.shutdown_script),
     funding_lock_script: fundingLock,
     funding_lock_script_cell_deps: cellDeps(params.funding_lock_script_cell_deps),
-    funding_fee_rate: fundingFeeRate(optionalHex(params.funding_fee_rate, "Funding fee rate"), fundingLock),
+    funding_fee_rate: fundingFeeRate(minimumFeeRate(optionalHex(params.funding_fee_rate, "Funding fee rate")), fundingLock),
     commitment_fee_rate: optionalHex(params.commitment_fee_rate, "Commitment fee rate"),
   };
 }
@@ -472,6 +472,15 @@ function positiveHex(value: unknown, label: string): `0x${string}` {
 
 function optionalHex(value: unknown, label: string): `0x${string}` | undefined {
   return value === undefined ? undefined : positiveHex(value, label);
+}
+
+// CKB's default minimum fee rate. Funding paying less never confirms, and Fiber keeps rebroadcasting it, so the
+// channel would keep its hosted node running indefinitely.
+const MIN_FUNDING_FEE_RATE = 1_000n;
+
+function minimumFeeRate(rate: `0x${string}` | undefined): `0x${string}` | undefined {
+  if (rate !== undefined && BigInt(rate) < MIN_FUNDING_FEE_RATE) throw new Error(`Funding fee rate must be at least ${MIN_FUNDING_FEE_RATE} shannons/KB`);
+  return rate;
 }
 
 function boolean(value: unknown, label: string): boolean {

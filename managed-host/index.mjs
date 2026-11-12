@@ -466,11 +466,11 @@ function failedStart(userId) {
 }
 
 async function startFundingRecord(userId) {
-  try {
-    await writeFile(join(managedDataDir(userId), FUNDED_CHANNELS), `since ${Date.now()}\n`, { flag: "wx", mode: 0o600 });
-  } catch (error) {
-    if (error?.code !== "EEXIST") throw error;
-  }
+  const path = join(managedDataDir(userId), FUNDED_CHANNELS);
+  if (await fileExists(path)) return;
+  // Written whole and then moved into place, so a crash can't leave a record without its start.
+  await writeFile(`${path}.new`, `since ${Date.now()}\n`, { mode: 0o600 });
+  await rename(`${path}.new`, path);
 }
 
 /** The channel ID a submit_signed_funding_tx request names, lower-cased, if it names a valid one. */
@@ -955,7 +955,7 @@ async function holdsChannels(channels, record) {
 const deadFunding = new Map();
 const DEAD_FUNDING_CONFIRM_MS = 60_000;
 const liveFunding = new Map();
-const UNSPENT_FUNDING_TTL_MS = 60_000;
+const UNSPENT_FUNDING_TTL_MS = 10 * 60_000;
 const NOT_READY = ["negotiatingfunding", "collaboratingfundingtx", "signingcommitment", "awaitingtxsignatures", "awaitingchannelready"];
 
 /**
@@ -970,16 +970,17 @@ async function fundingDead(channel, record) {
   const outpoint = String(channel?.channel_outpoint ?? "");
   // The channel's state as Fiber reports it now comes first: a channel that has become ready is funded.
   if (!cells?.length || !NOT_READY.includes(stateName(channel)) || !/^0x[0-9a-f]{72}$/i.test(outpoint)) return false;
-  // A recent "still live" answer is reused for a minute, so repeated checks don't flood CKB.
+  // A recent "still live" answer is reused for ten minutes, so repeated checks don't flood CKB.
   if (Date.now() - (liveFunding.get(id) ?? -Infinity) < UNSPENT_FUNDING_TTL_MS) return false;
   try {
-    let spent = false;
-    for (const cell of cells) {
+    // The funding's own status first: if CKB knows it, the channel is being funded. Then a few of its cells at once.
+    const status = (await ckbRpc("get_transaction", [outpoint.slice(0, 66)]))?.tx_status?.status;
+    const known = status !== "unknown" && status !== "rejected";
+    const spent = !known && (await Promise.all(cells.slice(0, 4).map((cell) => {
       const [tx_hash, index] = cell.split(":");
-      if ((await ckbRpc("get_live_cell", [{ tx_hash, index }, false]))?.status === "dead") { spent = true; break; }
-    }
-    const status = spent ? (await ckbRpc("get_transaction", [outpoint.slice(0, 66)]))?.tx_status?.status : undefined;
-    if (!spent || (status !== "unknown" && status !== "rejected")) {
+      return ckbRpc("get_live_cell", [{ tx_hash, index }, false]).then((answer) => answer?.status === "dead");
+    }))).includes(true);
+    if (!spent) {
       deadFunding.delete(id);
       if (liveFunding.size >= 10_000) liveFunding.clear();
       liveFunding.set(id, Date.now());

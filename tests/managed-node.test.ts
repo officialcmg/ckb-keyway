@@ -263,3 +263,18 @@ test("a hosted channel is funded only from the account's own lock", async () => 
   await open({ code_hash: `0x${"11".repeat(32)}`.toUpperCase().replace("0X", "0x"), hash_type: "type", args: "0x" });
   assert.deepEqual(opened.map(({ funding_lock_script }) => funding_lock_script), [await ownLock()]);
 });
+
+test("a hosted channel's funding pays at least CKB's minimum fee rate", async () => {
+  const opened: unknown[] = [];
+  const recording = { ...node, openChannelWithExternalFunding: async (params: { funding_fee_rate?: string }) => { opened.push(params.funding_fee_rate); return node.openChannelWithExternalFunding(); } };
+  const open = (funding_fee_rate?: string) => managedNodeRequest("fee-floor-test", {
+    operation: "open-channel",
+    params: { pubkey: "0x02b6d4e3ab86a2ca2fad6fae0ecb2e1e559e0b911939872a90abdda6d20302be71", funding_amount: "0x5f5e100", funding_lock_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" }, ...(funding_fee_rate ? { funding_fee_rate } : {}) },
+  }, recording as never, ownLock);
+  // Funding that can never confirm would keep the node running while Fiber rebroadcasts it.
+  await assert.rejects(open("0x1"), /at least 1000/);
+  await assert.rejects(open("0x3e7"), /at least 1000/);
+  await open("0x3e8");
+  await open();
+  assert.deepEqual(opened, ["0x3e8", undefined]);
+});
