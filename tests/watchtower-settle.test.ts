@@ -7,7 +7,7 @@ import { JsonRpcTransformers } from "@ckb-ccc/core/advanced";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import {
   applyUnlocks, blake160, delayFraction, encodeSettlementWitness, encodeWitnessState, epochDelayPassed, parseCommitmentArgs, parseSettlementWitness,
-  planClaim, settleChannel, settlementMessage, signSettlement, XUDT_COMPATIBLE_WITNESS,
+  planClaim, settleChannel, settlementMessage, signSettlement, trackNodeKeySends, XUDT_COMPATIBLE_WITNESS,
 } from "../src/sdk/browser/watchtower-settle.ts";
 import { openWatchtowerStore, type WatchedChannel } from "../src/sdk/browser/watchtower-store.ts";
 import { COMMITMENT_LOCK } from "../src/sdk/browser/watchtower-settle.ts";
@@ -290,6 +290,11 @@ function fakeChain(options: {
   medianTime?: () => number;
   /** Where the peer's settlement puts its commitment-locked output: 0, where the lock requires the successor. */
   successorAt?: 0 | 1;
+  /**
+   * Sends go through ccc's own `sendTransaction` (and its cache); the node then never mines them unless `mined`
+   * says so, and reports them as `pool` says (unknown, by default: dropped).
+   */
+  cachedSends?: { pool?: (hash: ccc.Hex) => "pending" | undefined };
 } = {}) {
   const { channel, argsFor } = options.tlcs ?? channelFixture();
   const ours = options.tlcs?.theirs ?? encodeSettlementWitness(channel.localSettlement, false, channel.localSettlementKey, channel.remoteSettlementKey);
@@ -375,11 +380,25 @@ function fakeChain(options: {
         return `0x${options.medianTime().toString(16)}`;
       },
     },
-    async sendTransaction(tx: ccc.TransactionLike) {
-      const signed = ccc.Transaction.from(tx);
-      sent.push(signed);
-      return signed.hash();
-    },
+    ...(options.cachedSends ? {
+      async sendTransactionNoCache(tx: ccc.TransactionLike) {
+        const signed = ccc.Transaction.from(tx);
+        sent.push(signed);
+        return signed.hash();
+      },
+      async getTransactionNoCache(hash: ccc.HexLike) {
+        const found = txs.get(ccc.hexFrom(hash));
+        if (found) return { transaction: found.tx, status: "committed", blockHash: found.blockHash, blockNumber: 1n };
+        const pending = sent.find((tx) => tx.hash() === ccc.hexFrom(hash));
+        return pending && options.cachedSends?.pool?.(pending.hash()) ? { transaction: pending, status: "pending" } : undefined;
+      },
+    } : {
+      async sendTransaction(tx: ccc.TransactionLike) {
+        const signed = ccc.Transaction.from(tx);
+        sent.push(signed);
+        return signed.hash();
+      },
+    }),
   };
   const client = new Proxy(base, {
     get: (target, property, receiver) => property in overrides ? overrides[property as string] : Reflect.get(target, property, receiver),
@@ -391,7 +410,7 @@ function fakeChain(options: {
     preimage: async (hash) => options.preimages?.get(hash), now: options.now,
   });
   return {
-    channel, settle, sent, liveCell, ready, funding, commitmentTx,
+    channel, settle, sent, liveCell, ready, funding, commitmentTx, client,
     setTip: (epoch: ccc.EpochLike) => { tip = epoch; },
     reopen: () => live.add(key({ txHash: funding.hash(), index: 0 })),
   };
@@ -558,4 +577,35 @@ test("only the settlement's output 0, the one the commitment lock checks, is fol
   chain.setTip([90, 0, 1]);
   assert.equal((await chain.settle()).status, "settled");
   assert.equal(chain.sent.length, 0);
+});
+
+test("a claim the chain dropped leaves no phantom fee cell: the next pass pays the fee from the real reserve again", async () => {
+  const chain = fakeChain({ peerSettledFirst: true, cachedSends: {} });
+  chain.setTip([90, 0, 1]);
+  const sends = trackNodeKeySends(chain.client);
+  const first = await chain.settle();
+  assert.equal(first.status, "claimed");
+  sends.record(first.txHash!);
+  const reserve = chain.sent[0].inputs[1].previousOutput;
+  // The chain drops the claim: the commitment cell is still live, and the reserve still unspent.
+  await sends.refresh();
+  assert.equal((await chain.settle()).status, "claimed");
+  assert.deepEqual(chain.sent[1].inputs.slice(1).map((input) => input.previousOutput.toHex()), [reserve.toHex()], "not the dropped claim's output");
+});
+
+test("a claim still in the mempool keeps its reserve spent and its output usable across passes", async () => {
+  let inPool = true;
+  const chain = fakeChain({ peerSettledFirst: true, cachedSends: { pool: () => (inPool ? "pending" : undefined) } });
+  chain.setTip([90, 0, 1]);
+  const sends = trackNodeKeySends(chain.client);
+  const first = await chain.settle();
+  sends.record(first.txHash!);
+  const reserve = chain.sent[0].inputs[1].previousOutput;
+  const output = ccc.OutPoint.from({ txHash: first.txHash!, index: 0 });
+  await sends.refresh();
+  assert.equal(await chain.client.cache.isUnusable(reserve), true);
+  assert.ok(await chain.client.cache.getCell(output));
+  inPool = false;
+  await sends.refresh();
+  assert.equal(await chain.client.cache.isUnusable(reserve), false, "dropped: the reserve is usable again");
 });

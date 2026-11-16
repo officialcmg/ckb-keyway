@@ -35,7 +35,7 @@ import { sweepSettlement } from "./settlement-sweep";
 import { fiberWasmFactory } from "./fiber-wasm";
 import { listenForWatchtowerCalls } from "./watchtower-bridge";
 import { openWatchtowerStore } from "./watchtower-store";
-import { settleChannel } from "./watchtower-settle";
+import { settleChannel, trackNodeKeySends } from "./watchtower-settle";
 import { createRemoteWatchtower, remoteWatchUpdate, updatesForStoredChannel } from "./watchtower-remote";
 import { createNodeLifecycle } from "./node-lifecycle";
 import { createChannelOpenings, refuseFundingBeyondRequest, type ChannelOpening } from "./funding-limit";
@@ -271,13 +271,18 @@ export function createKeyWay(options: CreateKeyWayOptions) {
    * derived from the user's Fiber key, and this moves anything there to the user's own address.
    */
   let sweepTimer: ReturnType<typeof setInterval> | undefined;
+  // The node key's claims and sweeps have a client of their own: each watchtower pass rebuilds its cache from what
+  // the chain says (trackNodeKeySends), which must not touch the account's own pending transactions.
+  const nodeKeyClient = new ccc.ClientPublicTestnet();
+  const nodeKeySends = trackNodeKeySends(nodeKeyClient);
   async function sweepNow() {
     if (!node.isRunning || !credential.isUnlocked()) return;
     const key = await credential.getCkbSecretKey();
     try {
       const destination = (await fundingSigner.getRecommendedAddressObj()).script;
       const { channels } = await node.listChannels({ include_closed: true });
-      await sweepSettlement(fundingSigner.client, ccc.hexFrom(key), destination, needsFeeReserve(channels) ? FEE_RESERVE : 0n);
+      const swept = await sweepSettlement(nodeKeyClient, ccc.hexFrom(key), destination, needsFeeReserve(channels) ? FEE_RESERVE : 0n);
+      if (swept) nodeKeySends.record(swept as ccc.Hex);
     } finally {
       key.fill(0);
     }
@@ -312,12 +317,18 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   }
   async function watchOnce() {
     {
+      // A claim or sweep the chain dropped would otherwise stay in ccc's cache, its payout usable and its fee
+      // reserve spent, and break every later claim: start each pass from what the chain says.
+      await nodeKeySends.refresh();
+      if (watchStopped) return;
       // The 10-minute sweep (and the one at start) also picks up claims whose follow-up sweep was missed.
       for (const txHash of [...claimsToSweep]) {
         if (watchStopped) return;
-        const status = (await fundingSigner.client.getTransaction(txHash).catch(() => undefined))?.status;
+        const found = await nodeKeyClient.getTransactionNoCache(txHash).catch(() => null);
         if (watchStopped) return;
-        if (status !== "committed") continue;
+        // A dropped or rejected claim leaves its commitment cell live, so this pass claims it again.
+        if (found === undefined || found?.status === "rejected") claimsToSweep.delete(txHash);
+        if (found?.status !== "committed") continue;
         claimsToSweep.delete(txHash);
         await sweepNow().catch((error) => console.warn("[keyway] could not sweep the claimed funds yet", error));
       }
@@ -341,7 +352,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
           }
           try {
             const result = await settleChannel({
-              client: fundingSigner.client, network, channel, nodeKey: ccc.hexFrom(key),
+              client: nodeKeyClient, network, channel, nodeKey: ccc.hexFrom(key),
               ref: { channelId: channel.channelId, fundingOutPoint: ccc.OutPoint.decode(outpoint) },
               preimage: (paymentHash) => watchtower.preimage(paymentHash),
             });
@@ -350,6 +361,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
               console.info(`[keyway] watchtower: channel ${channel.channelId}: ${result.status}${result.txHash ? ` ${result.txHash}` : ""}`);
             }
             if (result.txHash) {
+              nodeKeySends.record(result.txHash);
               claimsToSweep.add(result.txHash);
             } else if (DONE.has(result.status)) {
               await watchtower.remove(channel.channelId);

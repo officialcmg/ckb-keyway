@@ -521,3 +521,37 @@ export async function settleChannel(options: {
   const signed = await signer.signOnlyTransaction(tx);
   return result("claimed", await (options.dryRun?.submit(signed) ?? client.sendTransaction(signed)));
 }
+
+/**
+ * The claims and sweeps sent with the node's key (`record`), so each watchtower pass can start from what the chain
+ * says (`refresh`). ccc 1.16.1's `sendTransaction` marks a transaction's inputs spent and its outputs usable in the
+ * client's cache, which lets one pass's claims chain on each other's change; but a claim the chain then drops would
+ * leave its payout cached as usable and the real fee reserve as spent for the life of the page, so every later claim
+ * and sweep would spend a cell that doesn't exist. `refresh` clears the cache, then marks again the sends the node
+ * still has in its mempool: all their outputs usable first, then all their inputs spent, so one that spends
+ * another's change keeps it spent whatever order they come in. Sends that are committed, dropped or rejected are
+ * forgotten. Give this client to nothing else: clearing its cache would also forget other sends.
+ */
+export function trackNodeKeySends(client: ccc.Client) {
+  const sent = new Set<ccc.Hex>();
+  return {
+    record(hash: ccc.Hex) {
+      sent.add(hash);
+    },
+    async refresh() {
+      await client.cache.clear();
+      const pending: ccc.Transaction[] = [];
+      for (const hash of [...sent]) {
+        const found = await client.getTransactionNoCache(hash).catch(() => null);
+        // Unreachable: not marked this pass (a claim may then conflict with it and is retried), asked again next.
+        if (found === null) continue;
+        if (found?.status === "pending" || found?.status === "proposed") pending.push(found.transaction);
+        else sent.delete(hash);
+      }
+      for (const tx of pending) {
+        await client.cache.markUsable(tx.outputs.map((cellOutput, index) => ({ cellOutput, outputData: tx.outputsData[index] ?? "0x", outPoint: { txHash: tx.hash(), index } })));
+      }
+      for (const tx of pending) await client.cache.markUnusable(tx.inputs.map((input) => input.previousOutput));
+    },
+  };
+}
