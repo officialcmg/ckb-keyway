@@ -501,8 +501,10 @@ test("codes the Lit Action emailed count toward the day's wrong-code limit; one 
   }
   const signed = await litRequest();
   for (let i = 0; i < 4; i++) await countLitCodeAttempt(user, "transaction", signed);
-  // The twentieth try signs, so it is taken back: one more try is left today.
-  await countLitCodeAttempt(user, "transaction", signed);
+  // The twentieth try signs, so it is taken back, once: one more try is left today.
+  const refund = await countLitCodeAttempt(user, "transaction", signed);
+  await refund();
+  await refund();
   await consumeRequest(user, "transaction", signed);
   const last = await litRequest();
   await countLitCodeAttempt(user, "transaction", last);

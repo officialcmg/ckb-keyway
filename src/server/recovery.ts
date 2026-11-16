@@ -119,9 +119,10 @@ export async function recoverySetup(context: RecoveryContext, body: Record<strin
       if (typeof request.summary.litBinding !== "string") throw new Error("The email code has expired. Request a new one");
       setEmailBinding(planned.transaction, request.summary.litBinding);
       await checkRecoveryTransaction(client, planned.transaction, wallet.litPublicKey, backups);
-      await countLitCodeAttempt(context.user, "recovery", nonce);
+      const refund = await countLitCodeAttempt(context.user, "recovery", nonce);
       await context.recordSigning(context.user.id);
       signed = await signGroups({ ...context, wallet }, planned.transaction, [{ script: planned.secp, kind: "secp256k1" }], client, { email: await context.email(), emailCode, backups });
+      await refund();
       await consumeRequest(context.user, "recovery", nonce);
     } else {
       await verifyCode(context.user, "recovery", nonce, body.emailCode);
@@ -631,9 +632,10 @@ export async function recoveryBackupChange(context: RecoveryContext, body: Recor
       // The Action checks the code it emailed; the request is used up only once it has signed.
       const emailCode = parseLitEmailCode(body.emailCode, request.summary.litTicket);
       await checkBackupChangeTransaction(client, plan.transaction, wallet.recovery, plan.backups);
-      await countLitCodeAttempt(context.user, "recovery", nonce);
+      const refund = await countLitCodeAttempt(context.user, "recovery", nonce);
       await context.recordSigning(context.user.id);
       signed = await signGroups({ ...context, wallet }, plan.transaction, groups, client, { enableTransactionHash, email: await context.email(), emailCode, previousListRecord: plan.previousRecord, backups: litBackups(plan) });
+      await refund();
       await consumeRequest(context.user, "recovery", nonce);
     } else {
       await verifyCode(context.user, "recovery", nonce, body.emailCode);

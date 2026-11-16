@@ -256,3 +256,17 @@ test("a token without an amount of its own sends without a code through the serv
     await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
   });
 });
+
+test("a Lit code that signed isn't counted as wrong when the broadcast after it fails", { skip: !enabled }, async () => {
+  const { world, user, context } = await setUp();
+  const sql = await database();
+  const failures = async () => (await sql<Array<{ count: number }>>`select count(*)::int as count from keyway_v2_step_up_failures where user_id = ${user.id}`)[0].count;
+  const asked = await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (150n * CKB).toString() }) as { confirmationNonce: string };
+  const change = { operation: "set-daily-amount", asset: "ckb", amount: (150n * CKB).toString(), confirmationNonce: asked.confirmationNonce };
+  await assert.rejects(signingSettings(context, { ...change, emailCode: "00000000" }), /isn't right/);
+  assert.equal(await failures(), 1);
+  const down = { ...context, broadcast: async () => { throw new Error("CKB node unreachable"); } };
+  await assert.rejects(signingSettings(down, { ...change, emailCode: codeFrom(world) }), /unreachable/);
+  assert.equal(await failures(), 1, "only the wrong code counts");
+  await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
+});
