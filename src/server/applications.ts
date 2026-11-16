@@ -265,8 +265,8 @@ export async function prepareOtpSend(input: {
     // inbox's absolute limit in this app or everyone's hard limit, only a known network gets a code. Known networks,
     // which strangers can't make, are exempt from every limit counted per network.
     const query = transaction as unknown as DatabaseSql;
-    let known: boolean | undefined;
-    const isKnown = async () => known ??= await knownNetwork(query, context);
+    let known: { network: boolean; source: boolean } | undefined;
+    const isKnown = async () => known ??= await knownAddress(query, context);
     const refused = async () => {
       const shared = limits.app_count >= appLimit || limits.owner_count >= OWNER_OTP_LIMIT_PER_MINUTE
         || limits.global_count >= GLOBAL_OTP_LIMIT_PER_MINUTE || limits.email_count >= OTP_EMAIL_LIMIT;
@@ -275,10 +275,13 @@ export async function prepareOtpSend(input: {
         || limits.network_count >= OTP_NETWORK_HARD_LIMIT
         || (limits.global_count >= GLOBAL_OTP_LIMIT_PER_MINUTE && limits.network_minute_count > 0)
         || (limits.email_count >= OTP_EMAIL_HARD_LIMIT && limits.network_email_count > 0);
+      // The source (IPv6 /64) the owner signed in from skips the per-network inbox cap: neighbours elsewhere in its
+      // /48 can't fill it for them, and the source's own limits above still bound what it can send.
       return limits.email_app_count >= OTP_EMAIL_APP_LIMIT || limits.source_count >= OTP_SOURCE_LIMIT
-        || (limits.network_email_count >= OTP_NETWORK_EMAIL_LIMIT && (limits.network_email_count >= OTP_KNOWN_NETWORK_EMAIL_LIMIT || !await isKnown()))
-        || (shared && limits.source_minute_count > 0) || (busyNetwork && !await isKnown())
-        || (knownOnly && !await isKnown());
+        || (limits.network_email_count >= OTP_NETWORK_EMAIL_LIMIT && !(await isKnown()).source
+          && (limits.network_email_count >= OTP_KNOWN_NETWORK_EMAIL_LIMIT || !(await isKnown()).network))
+        || (shared && limits.source_minute_count > 0) || (busyNetwork && !(await isKnown()).network)
+        || (knownOnly && !(await isKnown()).network);
     };
     const refuse = async () => {
       // At most one record a minute per source and app, and one alert per app every 10 minutes, however many are refused.
@@ -382,8 +385,10 @@ export async function checkOtpFailures(context: OtpContext, challenge: { wrongAt
   const failures = await otpFailures(sql, context);
   if (failures.source >= OTP_FAILURE_LIMIT) throw new Error(OTP_FAILURE_MESSAGE);
   if (failures.day < OTP_FAILURE_PAUSE) return { bypass: false };
+  // A known source (IPv6 /64) keeps its first tries up to its own limit, checked above, whatever its neighbours in
+  // the /48 have tried; a known network up to OTP_FAILURE_LIMIT from all of it.
   const firstTry = failures.network < OTP_BYPASS_NETWORK_LIMIT && failures.bypass < OTP_BYPASS_LIMIT
-    || failures.network < OTP_FAILURE_LIMIT && await knownNetwork(sql, context);
+    || await knownAddress(sql, context).then((known) => known.source || (known.network && failures.network < OTP_FAILURE_LIMIT));
   if (challenge.wrongAttempts === 0 && firstTry) return { bypass: true };
   throw new OtpPausedError(firstTry);
 }
@@ -400,7 +405,7 @@ export async function recordOtpVerification(context: OtpContext, outcome: "verif
     // The session is already issued; not recording the network only costs the owner that exemption later.
     try {
       await sql`insert into keyway_otp_known_networks (app_id, email_hash, network_hash, verified_at)
-        values (${context.appId}, ${context.emailHash}, ${context.networkHash}, now())
+        values (${context.appId}, ${context.emailHash}, ${context.networkHash}, now()), (${context.appId}, ${context.emailHash}, ${context.ipHash}, now())
         on conflict (app_id, email_hash, network_hash) do update set verified_at = now()`;
       await sql`delete from keyway_otp_known_networks where (app_id, email_hash, network_hash) in (
         select app_id, email_hash, network_hash from keyway_otp_known_networks
@@ -426,14 +431,20 @@ export async function recordOtpVerification(context: OtpContext, outcome: "verif
   }
 }
 
-/** Whether this network signed in to this email's account in the app recently. */
-async function knownNetwork(sql: DatabaseSql, context: OtpContext): Promise<boolean> {
-  const rows = await sql`
-    select 1 from keyway_otp_known_networks
-    where app_id = ${context.appId} and email_hash = ${context.emailHash} and network_hash = ${context.networkHash}
+/**
+ * Whether this network, and this source, signed in to this email's account in the app recently. Both are kept in
+ * keyway_otp_known_networks: a source's hash and a network's are keyed differently, so they never match each other.
+ */
+async function knownAddress(sql: DatabaseSql, context: OtpContext): Promise<{ network: boolean; source: boolean }> {
+  const rows = await sql<Array<{ network_hash: string }>>`
+    select network_hash from keyway_otp_known_networks
+    where app_id = ${context.appId} and email_hash = ${context.emailHash} and network_hash in (${context.networkHash}, ${context.ipHash})
       and verified_at > now() - ${`${OTP_KNOWN_NETWORK_DAYS} days`}::interval
   `;
-  return rows.length > 0;
+  return {
+    network: rows.some((row) => row.network_hash === context.networkHash),
+    source: rows.some((row) => row.network_hash === context.ipHash),
+  };
 }
 
 /** Wrong codes for one email in one app in 24 hours: from this source, from this network, from anyone, and while paused. */

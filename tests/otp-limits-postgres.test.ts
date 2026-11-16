@@ -309,11 +309,15 @@ test("while checks are paused, fresh codes' first tries are limited per network 
   await later(sql, 61);
   const again = await sendEmailCode(home, victim);
   assert.ok((await verifyEmailCode(home, again.challengeId, code())).sessionToken);
-  // ...up to 20 wrong codes a day from that network, so others sharing its /48 can't guess on and on.
+  // ...but the rest of that network gets up to 20 wrong codes a day from all of it, so others sharing its /48 can't
+  // guess on and on. The /64 the owner signed in from keeps its own (up to its own 20).
   await pastFailures(sql, appId, victim, ["2001:db8:4:31::1"], 17, 5, true);
   await later(sql, 61);
+  const neighbour = appRequest(appId, origin, "2001:db8:4:32::1");
+  const theirs = await sendEmailCode(neighbour, victim);
+  await assert.rejects(verifyEmailCode(neighbour, theirs.challengeId, code()), /Try again later/);
   const more = await sendEmailCode(home, victim);
-  await assert.rejects(verifyEmailCode(home, more.challengeId, code()), /Try again later/);
+  assert.ok((await verifyEmailCode(home, more.challengeId, code())).sessionToken);
 });
 
 test("a stranger's requests don't hold up the user's own code", { skip }, async () => {
@@ -845,3 +849,28 @@ test("a wrong code that ends its challenge says to request a new code", { skip }
   assert.ok((await verifyEmailCode(elsewhere, third.challengeId, code())).sessionToken);
 });
 
+test("neighbours in the owner's /48 don't shut out the /64 the owner signed in from", { skip }, async () => {
+  const { sql, codes } = await setup();
+  const origin = "https://home.example";
+  const { appId } = await application([origin], 120);
+  const victim = email();
+  const code = () => codes.get(`${appId}:${victim}`)!;
+  const home = appRequest(appId, origin, "2001:db8:91:1::1");
+  const first = await sendEmailCode(home, victim);
+  await verifyEmailCode(home, first.challengeId, code());
+  // Checks are paused, and neighbours in other /64s of the owner's /48 have used up its 20 wrong codes.
+  await pastFailures(sql, appId, victim, [1, 2, 3, 4, 5, 6].map((i) => `198.18.10.${i}`), 5, 10);
+  await pastFailures(sql, appId, victim, ["2001:db8:91:2::1"], 20, 5, true);
+  await later(sql, 61);
+  const neighbour = appRequest(appId, origin, "2001:db8:91:3::1");
+  const theirs = await sendEmailCode(neighbour, victim);
+  await assert.rejects(verifyEmailCode(neighbour, theirs.challengeId, code()), /Try again later/);
+  await later(sql, 61);
+  const mine = await sendEmailCode(home, victim);
+  assert.ok((await verifyEmailCode(home, mine.challengeId, code())).sessionToken);
+  // Neighbours filling the inbox's 100 codes from the /48 don't stop the owner's own /64 asking either.
+  await later(sql, 660);
+  for (let i = 1; i <= 100; i++) await prepareOtpSend({ appId, email: victim, ipAddress: `2001:db8:91:${(i + 0x100).toString(16)}::1` });
+  await assert.rejects(prepareOtpSend({ appId, email: victim, ipAddress: "2001:db8:91:ff00::1" }), /Too many login codes/);
+  await prepareOtpSend({ appId, email: victim, ipAddress: "2001:db8:91:1::2" });
+});
