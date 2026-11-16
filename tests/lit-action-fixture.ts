@@ -84,6 +84,7 @@ export function fakeLit(options: {
   const hashOf = (tx: ccc.Transaction) => { let hash = hashes.get(tx); if (!hash) { hash = tx.hash(); hashes.set(tx, hash); } return hash; };
   const actionKey = options.actionKey ?? secp256k1.utils.randomSecretKey();
   const emails: SentEmail[] = [];
+  const syntheticTimes = new Map<string, number>();
   const script = (s: ccc.Script) => ({ code_hash: s.codeHash, hash_type: s.hashType, args: s.args });
   const rpcTx = (tx: ccc.Transaction) => ({
     version: "0x0",
@@ -166,10 +167,12 @@ export function fakeLit(options: {
       if (method === "get_tip_header") return { id, jsonrpc: "2.0", result: { number: ccc.numToHex(tip), hash: ccc.hexFrom(ccc.numLeToBytes(tip, 32)), timestamp: ccc.numToHex(options.tipAge ? Date.now() - options.tipAge(url) : Date.now()) } };
       if (method === "get_indexer_tip") return { id, jsonrpc: "2.0", result: { block_number: ccc.numToHex(tip - (options.indexerLag?.(url) ?? 0)), block_hash: ccc.hexFrom(new Uint8Array(32)) } };
       if (method === "get_header") {
-        // A block this fixture named (a committed transaction given no block of its own): its number, committed now.
+        // A block this fixture named (a committed transaction given no block of its own): its number, committed when
+        // first asked about. A real block's time never changes, so a later read gives the same time.
         if (hash.startsWith(SYNTHETIC_BLOCK)) {
           const number = Number(ccc.numLeFromBytes(ccc.bytesFrom(hash).slice(2)));
-          return { id, jsonrpc: "2.0", result: { hash, number: ccc.numToHex(number), timestamp: ccc.numToHex(Date.now()) } };
+          if (!syntheticTimes.has(hash)) syntheticTimes.set(hash, Date.now());
+          return { id, jsonrpc: "2.0", result: { hash, number: ccc.numToHex(number), timestamp: ccc.numToHex(syntheticTimes.get(hash)!) } };
         }
         const timestamp = options.header?.(hash);
         if (timestamp === undefined) return { id, jsonrpc: "2.0", result: null };
