@@ -263,24 +263,39 @@ export async function prepareOtpSend(input: {
     // it alone. The inbox's hard limit refuses a network that already had a code for this email in the window. Past the
     // inbox's absolute limit in this app or everyone's hard limit, only a known network gets a code. Known networks,
     // which strangers can't make, are exempt from every limit counted per network.
+    const query = transaction as unknown as DatabaseSql;
     let known: boolean | undefined;
-    const isKnown = async () => known ??= await knownNetwork(transaction as unknown as DatabaseSql, context);
-    const shared = limits.app_count >= appLimit || limits.owner_count >= OWNER_OTP_LIMIT_PER_MINUTE
-      || limits.global_count >= GLOBAL_OTP_LIMIT_PER_MINUTE || limits.email_count >= OTP_EMAIL_LIMIT;
-    const knownOnly = limits.email_app_total >= OTP_EMAIL_ABSOLUTE_LIMIT || limits.global_count >= GLOBAL_OTP_HARD_LIMIT_PER_MINUTE;
-    const busyNetwork = (limits.network_count >= OTP_NETWORK_LIMIT && limits.source_count > 0)
-      || limits.network_count >= OTP_NETWORK_HARD_LIMIT
-      || (limits.global_count >= GLOBAL_OTP_LIMIT_PER_MINUTE && limits.network_minute_count > 0)
-      || (limits.email_count >= OTP_EMAIL_HARD_LIMIT && limits.network_email_count > 0);
-    if (limits.email_app_count >= OTP_EMAIL_APP_LIMIT || limits.source_count >= OTP_SOURCE_LIMIT
-      || (limits.network_email_count >= OTP_NETWORK_EMAIL_LIMIT && (limits.network_email_count >= OTP_KNOWN_NETWORK_EMAIL_LIMIT || !await isKnown()))
-      || (shared && limits.source_minute_count > 0) || (busyNetwork && !await isKnown())
-      || (knownOnly && !await isKnown())) {
+    const isKnown = async () => known ??= await knownNetwork(query, context);
+    const refused = async () => {
+      const shared = limits.app_count >= appLimit || limits.owner_count >= OWNER_OTP_LIMIT_PER_MINUTE
+        || limits.global_count >= GLOBAL_OTP_LIMIT_PER_MINUTE || limits.email_count >= OTP_EMAIL_LIMIT;
+      const knownOnly = limits.email_app_total >= OTP_EMAIL_ABSOLUTE_LIMIT || limits.global_count >= GLOBAL_OTP_HARD_LIMIT_PER_MINUTE;
+      const busyNetwork = (limits.network_count >= OTP_NETWORK_LIMIT && limits.source_count > 0)
+        || limits.network_count >= OTP_NETWORK_HARD_LIMIT
+        || (limits.global_count >= GLOBAL_OTP_LIMIT_PER_MINUTE && limits.network_minute_count > 0)
+        || (limits.email_count >= OTP_EMAIL_HARD_LIMIT && limits.network_email_count > 0);
+      return limits.email_app_count >= OTP_EMAIL_APP_LIMIT || limits.source_count >= OTP_SOURCE_LIMIT
+        || (limits.network_email_count >= OTP_NETWORK_EMAIL_LIMIT && (limits.network_email_count >= OTP_KNOWN_NETWORK_EMAIL_LIMIT || !await isKnown()))
+        || (shared && limits.source_minute_count > 0) || (busyNetwork && !await isKnown())
+        || (knownOnly && !await isKnown());
+    };
+    const refuse = async () => {
       // At most one record a minute per source and app, and one alert per app every 10 minutes, however many are refused.
-      if (limits.source_limited === 0) await insertOtpEvent(transaction as unknown as DatabaseSql, context, "rate_limited");
+      if (limits.source_limited === 0) await insertOtpEvent(query, context, "rate_limited");
       return limits.app_limited === 0 ? "limited-first" : "limited";
+    };
+    if (await refused()) return refuse();
+    // Everyone's per-minute count is shared by requests that hold none of the locks above, so it is counted again,
+    // and the code recorded, one request at a time across all of them. Only requests let through so far get here.
+    await transaction`select pg_advisory_xact_lock(hashtextextended('otp:global', 0))`;
+    const [{ count: global }] = await transaction<Array<{ count: number }>>`
+      select count(*)::int as count from keyway_otp_events where outcome = 'requested' and created_at >= now() - interval '1 minute'
+    `;
+    if (global !== limits.global_count) {
+      limits.global_count = global;
+      if (await refused()) return refuse();
     }
-    await insertOtpEvent(transaction as unknown as DatabaseSql, context, "requested");
+    await insertOtpEvent(query, context, "requested");
     // A shared ceiling only slows sources that asked recently, so the codes it lets through are worth an alert.
     const ceilings: Ceiling[] = [];
     if (limits.global_count + 1 >= GLOBAL_OTP_LIMIT_PER_MINUTE) ceilings.push("global");

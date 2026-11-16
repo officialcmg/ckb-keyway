@@ -808,3 +808,16 @@ test("the sign-in queue is bounded in length and in waiting time", { skip, timeo
   assert.equal(await outcome(withLoginCodeLock(`otp:wait:${crypto.randomUUID()}`, async () => undefined)), "ran");
 });
 
+test("everyone's per-minute ceiling holds when requests with nothing in common decide at once", { skip, timeout: 60_000 }, async () => {
+  const { sql } = await setup();
+  const apps = await Promise.all(Array.from({ length: 12 }, () => application([], 120)));
+  const [{ recent }] = await sql<Array<{ recent: number }>>`select count(*)::int as recent from keyway_otp_events
+    where outcome = 'requested' and created_at >= now() - interval '1 minute'`;
+  await sql`insert into keyway_otp_events (app_id, email_hash, ip_hash, network_hash, outcome)
+    select 'ceiling-fill', md5(random()::text), md5(random()::text), md5(random()::text), 'requested' from generate_series(1, ${999 - recent})`;
+  // One code is left under 1,000 a minute. Twelve requests, each from its own app, network and inbox, ask at once.
+  const outcomes = await Promise.all(apps.map(({ appId }, i) =>
+    prepareOtpSend({ appId, email: email(), ipAddress: `100.73.0.${i + 1}` }).then(() => "sent", (error: Error) => error.message)));
+  assert.equal(outcomes.filter((outcome) => outcome === "sent").length, 1, outcomes.join(", "));
+});
+
