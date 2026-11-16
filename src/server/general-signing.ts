@@ -388,10 +388,7 @@ async function sendLimitSettings(
   const digest = hashText(`daily-amount:${change.asset}:${change.amount?.toString() ?? "off"}`);
   const settings = settingsFromDailyAmounts(next, new Uint8Array(32));
   if (body.confirmationNonce === undefined) {
-    const pending = await listPendingTransactions(context.user.id, nodeStatus(client));
-    const head = await sendLimitHead(client, context.wallet, pending);
-    // Cells the account's pending sends already spent are never picked again (the same as a client does).
-    for (const { transaction, status } of pending) if (status === "pending" || status === "proposed") await client.cache.markTransactions(transaction);
+    let head = await pendingSendLimitHead(context, client);
     // Loosening amounts kept on the server only goes through the server's own code, whose email shows them before
     // and after; turning send limits on would ask only to "turn on" limits, hiding the stricter amounts it replaces.
     if (!head && weakens(current, next)) return undefined;
@@ -410,7 +407,19 @@ async function sendLimitSettings(
       if (!head && error instanceof Error && /pending send/.test(error.message)) throw error;
       throw error;
     }
-    const plan = await planSendLimits(context.wallet, transaction);
+    let plan = await planSendLimits(context.wallet, transaction);
+    // The Lit Action's email shows the cell's amounts as "before". A tightening that never reached the chain (its
+    // broadcast failed) leaves the server, which alone gates hosted payments, stricter than the cell, and the email
+    // would understate what this change gives up. So the server's amounts go on the cell first (a tightening there,
+    // which needs no code), and the change is built on that.
+    if (plan.needsCode && head && !sameSettings(decodeSendLimitSettings(head.outputData), settingsFromDailyAmounts(current, new Uint8Array(32)))) {
+      const synced = await putAmountsOnCell(context, client, head, current);
+      if (synced) {
+        head = synced;
+        transaction = await buildSendLimitChange(client, context.wallet, head, settings);
+        plan = await planSendLimits(context.wallet, transaction);
+      }
+    }
     applySendLimitRecord(transaction, plan);
     const lines = [
       head ? "Change your daily send limits" : "Turn on daily send limits, enforced by KeyWay's Lit Action",
@@ -462,6 +471,31 @@ async function sendLimitSettings(
     await signAndSendSettings(context, client, transaction, { email: await context.email(), emailCode });
     await consumeRequest(context.user, "settings", nonce);
   }) };
+}
+
+/** The account's newest send-limit cell, pending ones included; cells its pending sends spent are never picked again. */
+async function pendingSendLimitHead(context: SigningContext, client: ccc.Client): Promise<SendLimitHead | undefined> {
+  const pending = await listPendingTransactions(context.user.id, nodeStatus(client));
+  const head = await sendLimitHead(client, context.wallet, pending);
+  // The same as a client does.
+  for (const { transaction, status } of pending) if (status === "pending" || status === "proposed") await client.cache.markTransactions(transaction);
+  return head;
+}
+
+/**
+ * Sends a change that puts the server's amounts in the send-limit cell, when that only tightens the cell. Returns the
+ * cell it makes, or undefined when it would need a code (the server is looser than the cell somewhere).
+ */
+async function putAmountsOnCell(context: SigningContext, client: ccc.Client, head: SendLimitHead, amounts: DailyAmounts): Promise<SendLimitHead | undefined> {
+  const transaction = await buildSendLimitChange(client, context.wallet, head, settingsFromDailyAmounts(amounts, new Uint8Array(32)));
+  const plan = await planSendLimits(context.wallet, transaction);
+  if (plan.needsCode) return undefined;
+  applySendLimitRecord(transaction, plan);
+  await lowerToCell(context.user, decodeSendLimitSettings(transaction.outputsData[0]));
+  await signAndSendSettings(context, client, transaction, {});
+  const synced = await pendingSendLimitHead(context, client);
+  if (synced?.outPoint.txHash !== transaction.hash()) throw new Error("Your send limits changed while this was being made. Try again");
+  return synced;
 }
 
 /**

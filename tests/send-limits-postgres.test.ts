@@ -453,6 +453,31 @@ test("a tightening built while a raise of another asset is being sent, and writt
   });
 });
 
+test("after a tightening that never reached the chain, the Lit email for a raise shows the stricter amount as the one before it", { skip: !enabled }, async (t) => {
+  const { world, user, context, sent } = await setUp();
+  const { set, amounts } = await limitsOn(world, context, sent, 150n * CKB);
+  const broadcast = context.broadcast!;
+  context.broadcast = async () => { throw new Error("connection refused"); };
+  await assert.rejects(set(10n * CKB), /connection refused/);
+  assert.deepEqual(await amounts(), { ckb: (10n * CKB).toString() });
+  // The node never had it: it leaves the pending list after the grace period.
+  const sql = await database();
+  await sql`update keyway_v2_pending_transactions set signed_at = now() - interval '10 minutes' where user_id = ${user.id}`;
+  context.broadcast = broadcast;
+  const raise = await set(1_000n * CKB);
+  assert.equal(raise.codeLength, 8);
+  const email = world.lit.emails.at(-1)!.text;
+  assert.match(email, /Your daily amount: 10 CKB a day/);
+  assert.match(email, /New daily amount: 1000 CKB a day/);
+  assert.doesNotMatch(email, /150 CKB/);
+  await set(1_000n * CKB, { confirmationNonce: raise.confirmationNonce, emailCode: codeFrom(world) });
+  assert.deepEqual(cellAmounts(sent.at(-1)!), { ckb: 1_000n * CKB });
+  assert.deepEqual(await amounts(), { ckb: (1_000n * CKB).toString() });
+  t.after(async () => {
+    await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
+  });
+});
+
 test("loosening amounts kept on the server alone goes through the server's code, showing them before and after (audit L13)", { skip: !enabled }, async (t) => {
   const { world, user, context, sent } = await setUp();
   // An amount the account chose while it couldn't afford the send-limit cell, so the server alone keeps it.
