@@ -377,6 +377,82 @@ test("a send-limit change never leaves the server's daily amounts looser than th
   });
 });
 
+/** The amounts in the send-limit cell a settings transaction creates (always its first output). */
+const cellAmounts = (tx: ccc.Transaction) => {
+  const settings = decodeSendLimitSettings(tx.outputsData[0]);
+  return { ckb: settings.ckb, ...Object.fromEntries(settings.tokens) };
+};
+
+test("a tightening of one asset sent while a raise of another is being sent leaves the server no looser than the chain (audit L2)", { skip: !enabled }, async (t) => {
+  const { world, user, context, sent } = await setUp();
+  const { set, amounts } = await limitsOn(world, context, sent, 10n * CKB);
+  const token = `0x${"7a".repeat(32)}`;
+  const setToken = (value: bigint) => signingSettings(context, { operation: "set-daily-amount", asset: token, amount: value.toString() });
+  await setToken(100n);
+  world.add(sent.at(-1)!, "committed");
+  const raise = await set(1_000n * CKB);
+  assert.equal(raise.codeLength, 8);
+  // The raise reaches the node; before the server writes it, a tightening of the token is built on the raise's cell
+  // from the server's amounts (CKB still 10) and sent, so the chain's latest cell is back at 10 CKB.
+  const broadcast = context.broadcast!;
+  context.broadcast = async (tx) => {
+    context.broadcast = broadcast;
+    const hash = await broadcast(tx);
+    await setToken(50n);
+    return hash;
+  };
+  await assert.rejects(set(1_000n * CKB, { confirmationNonce: raise.confirmationNonce, emailCode: codeFrom(world) }), /changed while this was waiting/);
+  assert.deepEqual(cellAmounts(sent.at(-1)!), { ckb: 10n * CKB, [token]: 50n });
+  assert.deepEqual(await amounts(), { ckb: (10n * CKB).toString(), [token]: "50" });
+  t.after(async () => {
+    const sql = await database();
+    await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
+  });
+});
+
+test("a tightening built while a raise of another asset is being sent, and written after it, leaves the server no looser than the chain (audit L2)", { skip: !enabled }, async (t) => {
+  const { world, user, context, sent } = await setUp();
+  const { set, amounts } = await limitsOn(world, context, sent, 10n * CKB);
+  const token = `0x${"7b".repeat(32)}`;
+  const setToken = (value: bigint) => signingSettings(context, { operation: "set-daily-amount", asset: token, amount: value.toString() });
+  await setToken(100n);
+  world.add(sent.at(-1)!, "committed");
+  const raise = await set(1_000n * CKB);
+  // The tightening is built on the raise's cell from the server's amounts (CKB still 10), then waits; the raise is
+  // written on the server; then the tightening is written and sent.
+  const broadcast = context.broadcast!;
+  const planner = sendLimitPlanner.run;
+  t.after(() => { sendLimitPlanner.run = planner; });
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let tightening: Promise<unknown> | undefined;
+  context.broadcast = async (tx) => {
+    context.broadcast = broadcast;
+    const hash = await broadcast(tx);
+    let built!: () => void;
+    const planned = new Promise<void>((resolve) => { built = resolve; });
+    sendLimitPlanner.run = async (params) => {
+      sendLimitPlanner.run = planner;
+      const plan = await planner(params);
+      built();
+      await gate;
+      return plan;
+    };
+    tightening = setToken(50n);
+    await planned;
+    return hash;
+  };
+  await set(1_000n * CKB, { confirmationNonce: raise.confirmationNonce, emailCode: codeFrom(world) });
+  release();
+  await tightening;
+  assert.deepEqual(cellAmounts(sent.at(-1)!), { ckb: 10n * CKB, [token]: 50n });
+  assert.deepEqual(await amounts(), { ckb: (10n * CKB).toString(), [token]: "50" });
+  t.after(async () => {
+    const sql = await database();
+    await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
+  });
+});
+
 test("loosening amounts kept on the server alone goes through the server's code, showing them before and after (audit L13)", { skip: !enabled }, async (t) => {
   const { world, user, context, sent } = await setUp();
   // An amount the account chose while it couldn't afford the send-limit cell, so the server alone keeps it.

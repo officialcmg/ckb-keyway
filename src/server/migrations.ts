@@ -401,4 +401,13 @@ export const migrations: Array<{
     // close reopens it only when it can punish that commitment.
     up: (sql) => sql`alter table keyway_v2_watchtower_channels add column closing_commitment_number numeric(20, 0)`,
   },
+  {
+    version: 23, name: "daily-amount-versions",
+    // Counts writes to each user's daily amounts, so a raise written after its send-limit transaction was sent can
+    // tell whether any other change was written since.
+    up: (sql) => sql`create table keyway_v2_daily_amount_versions (
+      user_id uuid primary key,
+      version bigint not null
+    )`,
+  },
 ];
