@@ -266,8 +266,10 @@ Plainly, after the switch:
 - **Recovery accounts from before the switch.** No binding, so a compromised server can still add one backup per
   transaction to them, without a code. The shape and first-wins rules still apply. To get the binding, these
   users have to turn recovery off and on again; there is no in-place migration yet.
-- **Accounts with recovery off.** A compromised server can turn recovery on for them with its own backup and its
-  own email. That is no worse than what it can already do with a plain send, but it is not prevented.
+- **Accounts with recovery off and no send limits.** A compromised server can turn recovery on for them with its
+  own backup and its own email. That is no worse than what it can already do with a plain send, but it is not
+  prevented. On an account with send limits on, the code for turning recovery on goes only to the address the
+  limits are bound to (`research/send-limits/README.md`), so the server can't pick the email there.
 - **Lit itself.** The TEE network, Chipotle's group check, and the founder's Lit account key, which can register
   any CID.
 - **`LIT_PROVISIONING_API_KEY` on the server.** If it can add Actions to group 1, the server can register an
@@ -298,9 +300,9 @@ You run these locally. The server has no Lit account credentials.
    actions to groups.
 3. **Register the policy Action.**
    1. In the Chipotle dashboard, open **Action Runner** and paste `lit-actions/sign-ckb-transaction.js` exactly.
-   2. Click **Get Lit Action IPFS CID**. It must be `QmXEKyvWa2MwCSY9qMBGUp3aawRrWeSW6xqP4SS2w8x2gd`, the same as
-      `LIT_ACTION_CIDS["sign-ckb-transaction"]` in `src/server/lit-config.ts`. Any other
-      CID means the pasted source differs from this branch.
+   2. Click **Get Lit Action IPFS CID**. It must be the CID in `LIT_ACTION_CIDS["sign-ckb-transaction"]` in
+      `src/server/lit-config.ts` (`tests/lit-action-packaging.test.ts` checks the two match). Any other CID means
+      the pasted source differs from this branch.
    3. Under **IPFS Actions**, register the CID as `keyway-ckb-policy-signer`.
    4. Add the CID to group 1, `CKB Keyway`. The PKPs are already in that group.
 4. **Check it against real Lit.** Run `npm run verify:lit -- --policy`. It should print "policy Action".
@@ -314,11 +316,9 @@ You run these locally. The server has no Lit account credentials.
 
 ## Rollback
 
-1. Re-add the `sign-ckb-digest` CID to group 1.
-2. Set `LIT_SIGNER` back to `"digest"` in `src/server/lit-config.ts` and deploy.
-
-Accounts that turned recovery on under the policy signer keep their on-chain binding. With the digest signer back,
-their list changes use the server's 6-digit code again, as before. Nothing in the database needs undoing.
+None. Step 6 is done: the `sign-ckb-digest` CID is out of group 1, and its source, its CID and the `LIT_SIGNER`
+switch were removed from the code (2026-11-10). The policy Action is the only signer; a fix to it ships as a new
+CID added to the group before the code that pins it.
 
 ## Tests
 
