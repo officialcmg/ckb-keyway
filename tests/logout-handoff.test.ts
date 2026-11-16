@@ -109,6 +109,41 @@ test("a tab that closes before it answers fails the logout, and every logout aft
   await handOffLogout({ scope, tabId: "other-tab", locks, storage });
 });
 
+test("a tab that times out and is then closed doesn't let the next logout through", async () => {
+  const locks = originLocks();
+  const storage = originStorage();
+  // Frozen: it holds its lock but never answers, so the logout times out; then the user closes it, as told.
+  let closeTab!: () => void;
+  void locks.request(`ckb-keyway:logout-handoff:${scope}:frozen-tab`, () => new Promise<void>((resolve) => { closeTab = resolve; }));
+  await assert.rejects(handOffLogout({ scope, tabId: "other-tab", locks, storage, timeoutMs: 50 }), /didn't finish logging out/);
+  closeTab();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await assert.rejects(handOffLogout({ scope, tabId: "other-tab", locks, storage }), /closed before it finished logging out/);
+  // A node that logs out in a tab the logout is handed to settles it too.
+  const node = serveLogoutHandoff({ scope, tabId: "node-tab", locks, storage, handle: async () => ({ nodeLoggedOut: true }) });
+  await handOffLogout({ scope, tabId: "other-tab", locks, storage });
+  node.release();
+  await handOffLogout({ scope, tabId: "other-tab", locks, storage });
+});
+
+test("a tab that answers it finished clears the note even if the tab that asked has gone", async () => {
+  const locks = originLocks();
+  const storage = originStorage();
+  storage.setItem(`ckb-keyway:logout-handoff:${scope}:unfinished`, "1");
+  const node = serveLogoutHandoff({ scope, tabId: "node-tab", locks, storage, handle: async () => ({ nodeLoggedOut: true }) });
+  const channel = new BroadcastChannel(`ckb-keyway:logout-handoff:${scope}`);
+  try {
+    // The logging-out tab sent its request and was closed; the node's tab still finishes.
+    const answered = new Promise<void>((resolve) => { channel.onmessage = (event) => { if ((event.data as { type?: string }).type === "logout-done") resolve(); }; });
+    channel.postMessage({ type: "logout", id: "gone", to: "node-tab" });
+    await answered;
+  } finally {
+    channel.close();
+    node.release();
+  }
+  await handOffLogout({ scope, tabId: "other-tab", locks, storage });
+});
+
 test("a node that logs out in the tab a logout was handed to also clears an earlier unfinished handoff", async () => {
   const locks = originLocks();
   const storage = originStorage();

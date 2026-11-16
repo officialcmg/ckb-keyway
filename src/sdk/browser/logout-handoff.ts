@@ -10,9 +10,10 @@
  * back up, release the device) and waits for its answer (`handOffLogout`).
  *
  * A tab whose lock goes away without an answer was closed or crashed: that proves its node stopped, not that it
- * delivered its newest revocation or backed up. So the logout fails, and stays failing (a note in the origin's
- * storage) until a node has logged out in this browser again: starting one sends KeyWay's watchtower every channel
- * update the node stored, and its logout backs it up.
+ * delivered its newest revocation or backed up. So a note in the origin's storage says a handoff is owed from
+ * before the first tab is asked until every tab answers that it finished; while it stays (a tab closed, or froze
+ * past the deadline and was then closed), logouts fail until a node has logged out in this browser again: starting
+ * one sends KeyWay's watchtower every channel update the node stored, and its logout backs it up.
  */
 
 const PREFIX = "ckb-keyway:logout-handoff:";
@@ -86,6 +87,7 @@ export function serveLogoutHandoff(options: { scope: string; tabId: string; hand
   const env = environment(options);
   if (!env) return { release() {} };
   const channel = env.channel(`${PREFIX}${options.scope}`);
+  const note = unfinishedNote(options.scope, options);
   let releaseLock!: () => void;
   const held = new Promise<void>((resolve) => { releaseLock = resolve; });
   void env.locks.request(`${PREFIX}${options.scope}:${options.tabId}`, () => held).catch(() => undefined);
@@ -112,6 +114,8 @@ export function serveLogoutHandoff(options: { scope: string; tabId: string; hand
         channel.postMessage({ type: "logout-done", id, from: options.tabId, error: error instanceof Error ? error.message : String(error) } satisfies Answer);
         return;
       }
+      // A node of this session has now logged out in this browser: nothing a closed tab left owing remains.
+      if (handled.nodeLoggedOut) note.clear();
       channel.postMessage({ type: "logout-done", id, from: options.tabId, nodeLoggedOut: handled.nodeLoggedOut } satisfies Answer);
       release();
     });
@@ -148,6 +152,10 @@ async function askOtherTabs(
   };
   const tabs = await others();
   if (tabs.length === 0) return;
+  // Written before any tab is asked, and kept unless every one answers that it finished: a tab that closes, or
+  // freezes past the deadline and is then closed, leaves it, so a later logout can't take its silence for success.
+  const owedBefore = note.present();
+  note.set();
   const channel = env.channel(`${PREFIX}${options.scope}`);
   const id = newTabId();
   const answers = new Map<string, Answer>();
@@ -166,20 +174,22 @@ async function askOtherTabs(
     let closedAt: number | undefined;
     for (;;) {
       const failed = [...answers.values()].find((answer) => answer.error);
-      if (failed) throw new Error(`Fiber could not be logged out in another tab: ${failed.error}`);
+      if (failed) {
+        // That tab is still open and keeps its node: the next logout asks it again.
+        if (!owedBefore) note.clear();
+        throw new Error(`Fiber could not be logged out in another tab: ${failed.error}`);
+      }
       const waiting = tabs.filter((tab) => !answers.has(tab));
       if (waiting.length === 0) {
-        if ([...answers.values()].some((answer) => answer.nodeLoggedOut)) note.clear();
+        // An earlier closed tab's debt is settled only by a node logging out.
+        if (!owedBefore || [...answers.values()].some((answer) => answer.nodeLoggedOut)) note.clear();
         return;
       }
       const stillOpen = new Set(await others());
       if (waiting.some((tab) => !stillOpen.has(tab))) {
         // Its answer may still be on its way: a tab answers, then lets its lock go.
         closedAt ??= Date.now();
-        if (Date.now() - closedAt >= LATE_ANSWER_MS) {
-          note.set();
-          throw new Error(UNFINISHED_HANDOFF_ERROR);
-        }
+        if (Date.now() - closedAt >= LATE_ANSWER_MS) throw new Error(UNFINISHED_HANDOFF_ERROR);
       }
       const left = deadline - Date.now();
       if (left <= 0) throw new Error("Fiber is running in another tab that didn't finish logging out; close that tab or try again");
