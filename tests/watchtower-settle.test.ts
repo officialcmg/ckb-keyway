@@ -288,8 +288,11 @@ function fakeChain(options: {
   tlcs?: ReturnType<typeof tlcFixture>; preimages?: Map<string, string>; now?: number;
   /** The chain's median block time (ms), answered to `get_block_median_time`. */
   medianTime?: () => number;
-  /** Where the peer's settlement puts its commitment-locked output: 0, where the lock requires the successor. */
-  successorAt?: 0 | 1;
+  /**
+   * After the peer's settlement, a second one empties the cell (both slots settled, so the lock checks no output) and
+   * also creates an unrelated cell under a lookalike commitment lock at output 1.
+   */
+  bothSettledWithDecoy?: boolean;
   /**
    * Sends go through ccc's own `sendTransaction` (and its cache); the node then never mines them unless `mined`
    * says so, and reports them as `pool` says (unknown, by default: dropped).
@@ -327,13 +330,24 @@ function fakeChain(options: {
       inputs: [{ previousOutput: liveCell }],
       outputs: options.peerTookEverything
         ? [{ capacity: 750n * CKB, lock: plainLock }]
-        : options.successorAt === 1
-          ? [{ capacity: 250n * CKB, lock: plainLock }, { capacity: 500n * CKB, lock: commitmentLock(successorArgs) }]
-          : [{ capacity: 500n * CKB, lock: commitmentLock(successorArgs) }, { capacity: 250n * CKB, lock: plainLock }],
+        : [{ capacity: 500n * CKB, lock: commitmentLock(successorArgs) }, { capacity: 250n * CKB, lock: plainLock }],
       outputsData: options.peerTookEverything ? ["0x"] : ["0x", "0x"],
       witnesses: [ccc.hexFrom(witness)],
     }), [101, 0, 1]);
-    liveCell = { txHash: settlement.hash(), index: options.successorAt ?? 0 };
+    liveCell = { txHash: settlement.hash(), index: 0 };
+    if (options.bothSettledWithDecoy) {
+      const afterPeer = applyUnlocks(parseSettlementWitness(previous)!)!;
+      const last = add(ccc.Transaction.from({
+        inputs: [{ previousOutput: liveCell }],
+        outputs: [
+          { capacity: 500n * CKB, lock: plainLock },
+          { capacity: 100n * CKB, lock: commitmentLock(ccc.bytesConcat(ccc.bytesFrom(argsFor(ours)).slice(0, 36), new Uint8Array(20).fill(9), new Uint8Array([1]))) },
+        ],
+        outputsData: ["0x", "0x"],
+        witnesses: [ccc.hexFrom(ccc.bytesConcat(XUDT_COMPATIBLE_WITNESS, new Uint8Array([1]), encodeWitnessState(afterPeer), new Uint8Array([0xfe, 0]), new Uint8Array(65)))],
+      }), [102, 0, 1]);
+      liveCell = { txHash: last.hash(), index: 1 };
+    }
   }
   let tip: ccc.EpochLike = [100, 0, 1];
   const sent: ccc.Transaction[] = [];
@@ -572,8 +586,9 @@ test("once the peer has settled its share, the next claim takes the whole cell a
 });
 
 test("only the settlement's output 0, the one the commitment lock checks, is followed as the successor", async () => {
-  // The peer's settlement emptied the cell; an unrelated cell with a lookalike commitment lock sits at output 1.
-  const chain = fakeChain({ peerSettledFirst: true, successorAt: 1 });
+  // Both parties have settled, so the last settlement emptied the cell; an unrelated cell under a lookalike
+  // commitment lock (same prefix) sits at its output 1.
+  const chain = fakeChain({ peerSettledFirst: true, bothSettledWithDecoy: true });
   chain.setTip([90, 0, 1]);
   assert.equal((await chain.settle()).status, "settled");
   assert.equal(chain.sent.length, 0);
