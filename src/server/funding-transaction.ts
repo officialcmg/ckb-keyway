@@ -171,6 +171,11 @@ export async function checkTokenFunding(
     if (cellOutput !== fundingOutput && !owns(cellOutput.lock)) throw new Error("Only the channel output and your own change may carry a token");
   }
   const tokenAmount = (cells: typeof typed) => cells.reduce((sum, { outputData }) => sum + ccc.numLeFromBytes(ccc.bytesFrom(outputData).slice(0, 16)), 0n);
+  // A token's owner can issue more of it in any transaction. A funding never needs to, and the amount counted below
+  // (the account's token in, less its change) would miss what was issued, so the outputs may hold no more than the inputs.
+  if (tokenAmount(outputs.filter(({ cellOutput }) => cellOutput.type)) > tokenAmount(inputCells.filter(({ cellOutput }) => cellOutput.type))) {
+    throw new Error("A channel funding can't issue tokens");
+  }
   const amount = tokenAmount(inputCells.filter((cell) => cell.cellOutput.type && owns(cell.cellOutput.lock)))
     - tokenAmount(outputs.filter((cell) => cell.cellOutput.type && cell.cellOutput !== fundingOutput && owns(cell.cellOutput.lock)));
   if (amount <= 0n) throw new Error("A token channel must take the token from the KeyWay wallet");

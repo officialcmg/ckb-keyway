@@ -45,6 +45,15 @@ test("token channel funding: the token goes only into the channel and back to th
   await assert.rejects(() => checkTokenFunding(client, data, [inputs[1]], own, data.outputs[0]), /Unexpected funding output data/);
 });
 
+test("a token channel funding can't issue the token, so the amount counted is all that leaves", async () => {
+  // The account holds 50 and keeps 30 as change, but the channel gets 100: the token's supply grows by 80, which
+  // only its owner (here, the account) can do. Counting inputs less change would see 20.
+  const minted = tx([{ lock: funding, type: rusd, data: amount(100n) }, { lock: own, type: rusd, data: amount(30n) }, { lock: own }]);
+  await assert.rejects(() => checkTokenFunding(client, minted, inputs, own, minted.outputs[0]), /can't issue/);
+  const exact = tx([{ lock: funding, type: rusd, data: amount(20n) }, { lock: own, type: rusd, data: amount(30n) }]);
+  assert.deepEqual(await checkTokenFunding(client, exact, inputs, own, exact.outputs[0]), { asset: rusd.hash(), amount: 20n });
+});
+
 test("token payments are counted in the token, fee included", async () => {
   const typeScript = { code_hash: rusd.codeHash, hash_type: "type", args: rusd.args };
   const described = await describePayment("sendPayment", { invoice: "fibt1x", udt_type_script: typeScript }, {
