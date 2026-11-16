@@ -9,6 +9,7 @@ import { Resend } from "resend";
 import { database, withLoginCodeLock, withLoginCodeSlot } from "./database.ts";
 import { applicationAllowsOrigin, checkOtpFailures, OtpPausedError, otpNetwork, otpSource, otpSubject, prepareOtpSend, recordOtpResult, recordOtpVerification } from "./applications.ts";
 import { authSchemaOptions } from "./auth-options.ts";
+import { LOGIN_CODE_ENDED } from "./auth-messages.ts";
 import { scopedAuthAdapter } from "./scoped-auth-adapter.ts";
 import { createOtpEmailTemplate } from "./email-template.ts";
 import type { User } from "./auth-user.ts";
@@ -240,10 +241,13 @@ export function verifyEmailCode(request: Request, challengeIdInput: string, code
         // used); a rate-limit refusal, a server error, or a code already used up or expired leaves nothing to guess at.
         const [open] = await connection`select 1 from keyway_auth_verifications where identifier = ${identifier}`;
         if (open && response.status === 400) {
-          await connection`update keyway_auth_challenges set wrong_attempts = wrong_attempts + 1,
-            status = case when wrong_attempts + 1 >= ${LOGIN_CODE_ATTEMPTS} then 'failed' else status end
-            where id = ${challengeId}::uuid`;
+          // Its last try, the fifth or the one a code gets while checks are paused, ends the challenge now, and says
+          // so, so the user asks for a new code rather than typing the right one into a challenge that can't pass.
+          const [after] = await connection<Array<{ status: string }>>`update keyway_auth_challenges set wrong_attempts = wrong_attempts + 1,
+            status = case when wrong_attempts + 1 >= ${LOGIN_CODE_ATTEMPTS} or ${bypass} then 'failed' else status end
+            where id = ${challengeId}::uuid returning status`;
           await recordOtpVerification(context, "verify_failed", bypass);
+          if (after?.status === "failed") throw new Error(LOGIN_CODE_ENDED);
         }
         // Its code is used up: later checks are refused before they wait for the lock.
         if (!open) await connection`update keyway_auth_challenges set status = 'failed' where id = ${challengeId}::uuid`;

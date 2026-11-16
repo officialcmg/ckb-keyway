@@ -3,6 +3,7 @@ import { isIP } from "node:net";
 import type { User } from "./auth-user.ts";
 import { database, type DatabaseSql } from "./database";
 import { securityAlertSentWithin, sendSecurityAlert, sendSecurityAlertOnce } from "./security-alerts";
+import { LOGIN_CODE_PAUSED_NEW_CODE } from "./auth-messages.ts";
 
 const APP_ID = /^keyway_[A-Za-z0-9_-]{24}$/;
 const LEGACY_APP_ID = "dashboard";
@@ -361,9 +362,12 @@ function addressPrefix(address: string, prefixGroups: number): string {
   return `${words.slice(0, prefixGroups).map((word) => word.toString(16)).join(":")}::/${prefixGroups * 16}`;
 }
 
-/** A code check refused while the email's checks are paused: the challenge it was for can't be checked again. */
+/**
+ * A code check refused while the email's checks are paused: the challenge it was for can't be checked again. Says
+ * whether a new code would get its first try.
+ */
 export class OtpPausedError extends Error {
-  constructor() { super("Too many incorrect codes for this email. Try again later"); }
+  constructor(newCodeHelps: boolean) { super(newCodeHelps ? LOGIN_CODE_PAUSED_NEW_CODE : "Too many incorrect codes for this email. Try again later"); }
 }
 
 /**
@@ -378,9 +382,10 @@ export async function checkOtpFailures(context: OtpContext, challenge: { wrongAt
   const failures = await otpFailures(sql, context);
   if (failures.source >= OTP_FAILURE_LIMIT) throw new Error(OTP_FAILURE_MESSAGE);
   if (failures.day < OTP_FAILURE_PAUSE) return { bypass: false };
-  if (challenge.wrongAttempts === 0 && (failures.network < OTP_BYPASS_NETWORK_LIMIT && failures.bypass < OTP_BYPASS_LIMIT
-    || failures.network < OTP_FAILURE_LIMIT && await knownNetwork(sql, context))) return { bypass: true };
-  throw new OtpPausedError();
+  const firstTry = failures.network < OTP_BYPASS_NETWORK_LIMIT && failures.bypass < OTP_BYPASS_LIMIT
+    || failures.network < OTP_FAILURE_LIMIT && await knownNetwork(sql, context);
+  if (challenge.wrongAttempts === 0 && firstTry) return { bypass: true };
+  throw new OtpPausedError(firstTry);
 }
 
 export async function recordOtpResult(context: OtpContext, outcome: "sent" | "send_failed"): Promise<void> {

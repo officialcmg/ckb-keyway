@@ -236,13 +236,13 @@ test("strangers' wrong codes pause other checks but not the owner's fresh code",
   const guesser = appRequest(appId, origin, "198.18.2.1");
   const again = await sendEmailCode(guesser, victim);
   await assert.rejects(verifyEmailCode(guesser, again.challengeId, codes.get(`${appId}:${victim}`)!), /Try again later/);
-  // A new source's own fresh code gets its first try, and no more.
+  // A new source's own fresh code gets its first try, and no more: a wrong one ends the challenge, and says so.
   const stranger = appRequest(appId, origin, "198.18.2.8");
   const theirs = await sendEmailCode(stranger, victim);
   const theirCode = codes.get(`${appId}:${victim}`)!;
-  await assert.rejects(verifyEmailCode(stranger, theirs.challengeId, wrong(theirCode)), /Incorrect/);
-  await assert.rejects(verifyEmailCode(stranger, theirs.challengeId, theirCode), /Try again later/);
-  // A tried challenge refused while paused is retired, so later checks of it don't wait for the email's lock.
+  await assert.rejects(verifyEmailCode(stranger, theirs.challengeId, wrong(theirCode)), /Request a new code/);
+  await assert.rejects(verifyEmailCode(stranger, theirs.challengeId, theirCode), /Incorrect or expired code/);
+  // A tried challenge is retired, so later checks of it don't wait for the email's lock.
   const [retired] = await sql<Array<{ status: string }>>`select status from keyway_auth_challenges where id = ${theirs.challengeId}`;
   assert.equal(retired.status, "failed");
   // The owner, from somewhere else, asks for a code and signs in with it, even if the browser checks it from another
@@ -470,7 +470,7 @@ test("checks at the edge of the paused first tries are counted one at a time", {
   await delay(300);
   release();
   await holder;
-  assert.deepEqual((await Promise.all(outcomes)).sort(), ["Incorrect or expired code", "Too many incorrect codes for this email. Try again later"]);
+  assert.deepEqual((await Promise.all(outcomes)).sort(), ["Incorrect code, and it can't be tried again. Request a new code.", "Too many incorrect codes for this email. Try again later"]);
 });
 
 test("codes asked for in another app don't stop an inbox's first code in this one", { skip }, async () => {
@@ -819,5 +819,29 @@ test("everyone's per-minute ceiling holds when requests with nothing in common d
   const outcomes = await Promise.all(apps.map(({ appId }, i) =>
     prepareOtpSend({ appId, email: email(), ipAddress: `100.73.0.${i + 1}` }).then(() => "sent", (error: Error) => error.message)));
   assert.equal(outcomes.filter((outcome) => outcome === "sent").length, 1, outcomes.join(", "));
+});
+
+test("a wrong code that ends its challenge says to request a new code", { skip }, async () => {
+  const { sql, codes } = await setup();
+  const origin = "https://typo.example";
+  const { appId } = await application([origin]);
+  const victim = email();
+  const code = () => codes.get(`${appId}:${victim}`)!;
+  // The fifth wrong code uses a code up.
+  const user = appRequest(appId, origin, "198.18.9.1");
+  const first = await sendEmailCode(user, victim);
+  for (let i = 0; i < 4; i++) await assert.rejects(verifyEmailCode(user, first.challengeId, wrong(code())), /^Error: Incorrect or expired code$/);
+  await assert.rejects(verifyEmailCode(user, first.challengeId, wrong(code())), /Request a new code/);
+  // While strangers' wrong codes pause checks, a fresh code gets one try: a typo there ends it at once.
+  await pastFailures(sql, appId, victim, [1, 2, 3, 4, 5, 6].map((i) => `198.18.8.${i}`), 5, 10);
+  const elsewhere = appRequest(appId, origin, "198.18.9.2");
+  const second = await sendEmailCode(elsewhere, victim);
+  await assert.rejects(verifyEmailCode(elsewhere, second.challengeId, wrong(code())), /Request a new code/);
+  const [retired] = await sql<Array<{ status: string }>>`select status from keyway_auth_challenges where id = ${second.challengeId}`;
+  assert.equal(retired.status, "failed");
+  // A new code then signs in.
+  await later(sql, 61);
+  const third = await sendEmailCode(elsewhere, victim);
+  assert.ok((await verifyEmailCode(elsewhere, third.challengeId, code())).sessionToken);
 });
 

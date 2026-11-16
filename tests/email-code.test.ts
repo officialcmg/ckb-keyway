@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canRetryCode, isRequestExpired, withEmailCode, type RequestEmailCode } from "../src/sdk/browser/email-code.ts";
+import { canRetryCode, isRequestExpired, loginCodeUsedUp, withEmailCode, type RequestEmailCode } from "../src/sdk/browser/email-code.ts";
+import { LOGIN_CODE_ENDED, LOGIN_CODE_PAUSED_NEW_CODE } from "../src/server/auth-messages.ts";
 
 const WRONG = "That email code isn't right";
 const EXPIRED = "This request expired. Start again.";
@@ -68,4 +69,11 @@ test("classifies refusals the user can fix in the same prompt", () => {
   for (const message of [EXPIRED, "Lit signature does not match the KeyWay wallet"]) assert.equal(canRetryCode(message), false, message);
   assert.equal(isRequestExpired(EXPIRED), true);
   assert.equal(isRequestExpired("The email code has expired. Request a new one"), false);
+});
+
+test("the login dialog knows when a code can't be tried again and only a new one helps", () => {
+  assert.equal(loginCodeUsedUp(LOGIN_CODE_ENDED), true);
+  assert.equal(loginCodeUsedUp(LOGIN_CODE_PAUSED_NEW_CODE), true);
+  assert.equal(loginCodeUsedUp("Incorrect or expired code"), false);
+  assert.equal(loginCodeUsedUp("Too many incorrect codes for this email. Try again later"), false);
 });
