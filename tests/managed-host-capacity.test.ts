@@ -1006,7 +1006,7 @@ test("a node isn't stopped to make room if its channels changed while it was che
   assert.deepEqual(running(), [B, F]);
 });
 
-test("a channel a peer opened keeps its node running in every state, as Fiber may fund it from the node's own CKB", async (context) => {
+test("a channel a peer opened keeps its node running once past negotiation, as Fiber may fund it from the node's own CKB", async (context) => {
   const inbound = (channels: Array<Record<string, unknown>>) => channels.map((channel) => ({ ...channel, is_acceptor: true, channel_id: `0x${"66".repeat(32)}`, created_at: LATER }));
   const negotiating = [{ state: { state_name: "NegotiatingFunding", state_flags: "OUR_INIT_SENT|THEIR_INIT_SENT|INIT_SENT" } }];
   for (const channels of [negotiating, COLLABORATED_CHANNEL, COMMITTING_CHANNEL, THEIRS_SIGNED_CHANNEL]) {
@@ -1017,8 +1017,10 @@ test("a channel a peer opened keeps its node running in every state, as Fiber ma
     assert.equal(await request(A), 200);
     context.mock.timers.tick(FEW_MINUTES);
     assert.equal(await request(B), 200, JSON.stringify(channels));
-    assert.deepEqual(running(), [B, F], JSON.stringify(channels));
-    assert.equal(await marked(F), true);
+    // Still negotiating, nothing of the node's is in it yet, so a peer stalling there can't keep the node.
+    const kept = channels !== negotiating;
+    assert.deepEqual(running(), kept ? [B, F] : [A, B], JSON.stringify(channels));
+    assert.equal(await marked(F), kept, JSON.stringify(channels));
     context.mock.timers.reset();
   }
 });

@@ -973,14 +973,15 @@ function stateName(channel) {
  * funding straight to the peer, which may broadcast it at any time, so a submitted channel is open. Without a
  * record that covers the channel, only a channel still negotiating its funding counts as unfunded.
  *
- * Only a channel the node opened can be unfunded. KeyWay opens channels only with external funding, which moves
- * on only once the user's signed funding comes through the host. A channel a peer opened (is_acceptor) Fiber 0.9.1
- * accepts on its own and may fund from the node's own CKB, signing it as the peer's messages arrive with no
- * request through the host, so it is open from the start.
+ * KeyWay opens channels only with external funding, which moves on only once the user's signed funding comes
+ * through the host. A channel a peer opened (is_acceptor, or not known) Fiber 0.9.1 accepts on its own and may fund
+ * from the node's own CKB, signing as the peer's messages arrive with no request through the host. It counts as
+ * unfunded only while still negotiating: from there, before the node signs its funding, the peer must start the
+ * funding transaction, the node must add its own inputs (built against CKB), and both must sign the commitment.
  */
 function channelClass(channel, record) {
   if (channelFinished(channel)) return "finished";
-  if (channel?.is_acceptor !== false) return "open";
+  if (channel?.is_acceptor !== false) return stateName(channel) === "negotiatingfunding" ? "unfunded" : "open";
   const covered = recordCovers(record, channel);
   // Funding handed to the node is with the peer, whatever state Fiber last stored.
   if (covered && record.ids.has(String(channel?.channel_id).toLowerCase())) return "open";
