@@ -6,7 +6,7 @@ import { formatCkbSignature, type ValidatedFunding } from "../src/server/funding
 import { fundingSigning, type FundingContext } from "../src/server/funding-signing.ts";
 import postgres from "postgres";
 import { database } from "../src/server/database.ts";
-import { countLitCodeAttempt, issueRequest, loadRequest, messageSigning, outflowNeedsEmailCode, recordLitCode, reserveOutflow, sendCode, signingSettings, transactionSigning, verifyCode, type SigningContext } from "../src/server/general-signing.ts";
+import { consumeRequest, countLitCodeAttempt, issueRequest, loadRequest, messageSigning, outflowNeedsEmailCode, recordLitCode, reserveOutflow, sendCode, signingSettings, transactionSigning, verifyCode, type SigningContext } from "../src/server/general-signing.ts";
 import type { ValidatedTransaction } from "../src/server/transaction-policy.ts";
 import type { ReadyWallet } from "../src/server/user-wallet.ts";
 
@@ -482,4 +482,40 @@ test("wrong step-up codes add up across codes, to 20 a day per session", { skip:
     const [{ total }] = await sql<Array<{ total: number }>>`select count(*)::int as total from keyway_v2_step_up_failures where user_id = ${context.user.id}`;
     assert.equal(total, 20);
   });
+});
+
+test("codes the Lit Action emailed count toward the day's wrong-code limit; one that signs doesn't", { skip: !enabled }, async () => {
+  process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
+  const sql = await database();
+  const { context, codeFrom } = harness(0n);
+  const user = { ...context.user, sessionId: "lit-session" };
+  // The server can't tell a wrong Lit code from a right one until the Action answers, so each try counts until it signs.
+  const litRequest = async () => {
+    const nonce = await issueRequest(user, "transaction", `digest-${crypto.randomUUID()}`, {}, true);
+    await recordLitCode(user, "transaction", nonce, { litTicket: "v2.ticket" });
+    return nonce;
+  };
+  for (let round = 0; round < 3; round++) {
+    const nonce = await litRequest();
+    for (let i = 0; i < 5; i++) await countLitCodeAttempt(user, "transaction", nonce);
+  }
+  const signed = await litRequest();
+  for (let i = 0; i < 4; i++) await countLitCodeAttempt(user, "transaction", signed);
+  // The twentieth try signs, so it is taken back: one more try is left today.
+  await countLitCodeAttempt(user, "transaction", signed);
+  await consumeRequest(user, "transaction", signed);
+  const last = await litRequest();
+  await countLitCodeAttempt(user, "transaction", last);
+  // Twenty wrong Lit codes: no more tries today, of either kind of code, even with a new Lit code.
+  await assert.rejects(() => countLitCodeAttempt(user, "transaction", last), /Too many wrong email codes today/);
+  await recordLitCode(user, "transaction", last, { litTicket: "v2.again" });
+  await assert.rejects(() => countLitCodeAttempt(user, "transaction", last), /Too many wrong email codes today/);
+  const server = await issueRequest(user, "message", "digest", {}, true);
+  await assert.rejects(() => sendCode({ ...context, user }, "message", server, "Sign a message", []), /today/);
+  const [{ failures }] = await sql<Array<{ failures: number }>>`select count(*)::int as failures from keyway_v2_step_up_failures where user_id = ${user.id}`;
+  assert.equal(failures, 20);
+  // Another session of the same user still gets its own.
+  const owner = { ...context, user: { ...user, sessionId: "owner-session" } };
+  await sendCode(owner, "message", server, "Sign a message", []);
+  await verifyCode(owner.user, "message", server, codeFrom());
 });

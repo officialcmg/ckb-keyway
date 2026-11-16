@@ -526,6 +526,10 @@ export async function consumeRequest(user: User, purpose: Purpose, nonce: string
   const sql = await database();
   const rows = await sql`delete from keyway_v2_signature_requests where user_id = ${user.id} and purpose = ${purpose} and nonce = ${nonce} returning 1`;
   if (!rows[0]) throw new Error(REQUEST_EXPIRED);
+  // A Lit-sent code is used up only once the Action has signed with it, so its last try was right: take it back.
+  await sql`delete from keyway_v2_step_up_failures where id = (
+    select max(id) from keyway_v2_step_up_failures where user_id = ${user.id} and request_nonce = ${nonce}
+  )`;
 }
 
 /**
@@ -568,16 +572,35 @@ export async function recordLitCode(user: User, purpose: Purpose, nonce: string,
   if (!rows[0]) throw new Error(REQUEST_EXPIRED);
 }
 
-/** Counts one try of a Lit-sent code, so this server still stops a browser after five wrong codes. */
+/**
+ * Counts one try of a Lit-sent code, so this server still stops a browser after five wrong codes, and after the
+ * day's wrong codes across all codes. Only the Action knows whether the code is right, so the try is counted as a
+ * wrong code now and taken back when the request is used up after the Action signs (`consumeRequest`).
+ */
 export async function countLitCodeAttempt(user: User, purpose: Purpose, nonce: string): Promise<void> {
   const sql = await database();
-  const [row] = await sql<Array<{ email_attempts: number }>>`
-    update keyway_v2_signature_requests set email_attempts = email_attempts + 1
-    where user_id = ${user.id} and purpose = ${purpose} and nonce = ${nonce} and expires_at > now() and email_code_expires_at > now()
-    returning email_attempts
-  `;
-  if (!row) throw new Error("The email code has expired. Request a new one");
-  if (row.email_attempts > MAX_CODE_ATTEMPTS) throw new Error("Too many wrong codes. Request a new one");
+  if (overFailureLimit(await codeFailures(sql, user))) throw new Error(CODE_FAILURES_MESSAGE);
+  const outcome = await sql.begin(async (tx) => {
+    const query = tx as unknown as DatabaseSql;
+    // The same lock as server-sent codes, so tries at once can't each see room under the day's limit.
+    const [{ locked }] = await query<Array<{ locked: boolean }>>`select pg_try_advisory_xact_lock(hashtextextended(${`step-up-failures:${user.id}`}, 0)) as locked`;
+    if (!locked) return "busy";
+    if (overFailureLimit(await codeFailures(query, user))) return "failures";
+    const [row] = await query<Array<{ email_attempts: number }>>`
+      update keyway_v2_signature_requests set email_attempts = email_attempts + 1
+      where user_id = ${user.id} and purpose = ${purpose} and nonce = ${nonce} and expires_at > now() and email_code_expires_at > now()
+      returning email_attempts
+    `;
+    if (!row) return "expired";
+    if (row.email_attempts > MAX_CODE_ATTEMPTS) return "attempts";
+    await query`insert into keyway_v2_step_up_failures (user_id, session_id, request_nonce) values (${user.id}, ${user.sessionId ?? ""}, ${nonce})`;
+    return "counted";
+  });
+  if (outcome === "busy") throw new Error("Another email code check is in progress. Try again in a moment");
+  if (outcome === "failures") throw new Error(CODE_FAILURES_MESSAGE);
+  if (outcome === "expired") throw new Error("The email code has expired. Request a new one");
+  if (outcome === "attempts") throw new Error("Too many wrong codes. Request a new one");
+  await pruneCodeFailures(sql);
 }
 
 /** Up to 5 emailed codes per user every 10 minutes, across all purposes. */
@@ -623,11 +646,15 @@ export async function verifyCode(user: User, purpose: Purpose, nonce: string, co
   if (outcome === "expired") throw new Error("The email code has expired. Request a new one");
   if (outcome === "attempts") throw new Error("Too many wrong codes. Request a new one");
   if (outcome === "wrong-last") void sendSecurityAlert("step_up_failure_limit", { userId: user.id });
-  // Failures older than a day count for nothing; a few go with each wrong code.
+  await pruneCodeFailures(sql);
+  throw new Error("That email code isn't right");
+}
+
+/** Failures older than a day count for nothing; a few go with each wrong code. */
+async function pruneCodeFailures(sql: DatabaseSql): Promise<void> {
   await sql`delete from keyway_v2_step_up_failures where id in (
     select id from keyway_v2_step_up_failures where created_at < now() - interval '1 day' limit 100
   )`;
-  throw new Error("That email code isn't right");
 }
 
 /** Wrong codes in the last day: from this session, and from all of the user's sessions. */

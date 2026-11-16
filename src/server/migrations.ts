@@ -448,4 +448,10 @@ export const migrations: Array<{
     // When each deduplicated security alert last went out, by kind and hashed subject.
     up: (sql) => sql`create table keyway_security_alert_marks (key text primary key, sent_at timestamptz not null)`,
   },
+  {
+    version: 30, name: "lit-step-up-tries",
+    // A try of a code the Lit Action emailed counts as a wrong code until the request it was for is used up, which
+    // happens only once the Action has signed; this names that request.
+    up: (sql) => sql`alter table keyway_v2_step_up_failures add column request_nonce text`,
+  },
 ];
