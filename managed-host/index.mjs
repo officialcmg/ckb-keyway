@@ -992,10 +992,16 @@ function stateName(channel) {
  * from the node's own CKB, signing as the peer's messages arrive with no request through the host. It counts as
  * unfunded only while still negotiating: from there, before the node signs its funding, the peer must start the
  * funding transaction, the node must add its own inputs (built against CKB), and both must sign the commitment.
+ * Or while collaborating with no step taken: Fiber moves a channel there on a peer's TxComplete before it finds
+ * there is no funding transaction, keeps that state, and then takes only TxComplete, which fails the same way.
  */
 function channelClass(channel, record) {
   if (channelFinished(channel)) return "finished";
-  if (channel?.is_acceptor !== false) return stateName(channel) === "negotiatingfunding" ? "unfunded" : "open";
+  if (channel?.is_acceptor !== false) {
+    const name = stateName(channel);
+    const flags = JSON.stringify(channel?.state?.state_flags ?? "").match(/\b[A-Z][A-Z0-9_]*\b/g) ?? [];
+    return name === "negotiatingfunding" || (name === "collaboratingfundingtx" && flags.length === 0) ? "unfunded" : "open";
+  }
   const covered = recordCovers(record, channel);
   // Funding handed to the node is with the peer, whatever state Fiber last stored.
   if (covered && record.ids.has(String(channel?.channel_id).toLowerCase())) return "open";

@@ -1012,7 +1012,9 @@ test("a node isn't stopped to make room if its channels changed while it was che
 test("a channel a peer opened keeps its node running once past negotiation, as Fiber may fund it from the node's own CKB", async (context) => {
   const inbound = (channels: Array<Record<string, unknown>>) => channels.map((channel) => ({ ...channel, is_acceptor: true, channel_id: `0x${"66".repeat(32)}`, created_at: LATER }));
   const negotiating = [{ state: { state_name: "NegotiatingFunding", state_flags: "OUR_INIT_SENT|THEIR_INIT_SENT|INIT_SENT" } }];
-  for (const channels of [negotiating, COLLABORATED_CHANNEL, COMMITTING_CHANNEL, THEIRS_SIGNED_CHANNEL]) {
+  // Where Fiber leaves a channel after a peer's TxComplete with no funding transaction, which it can't leave.
+  const prematurelyCompleted = [{ state: { state_name: "CollaboratingFundingTx", state_flags: "" } }];
+  for (const channels of [negotiating, prematurelyCompleted, COLLABORATED_CHANNEL, COMMITTING_CHANNEL, THEIRS_SIGNED_CHANNEL]) {
     context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
     const { request, running, marked, withChannels } = await host(context);
     assert.equal(await request(F), 200);
@@ -1020,8 +1022,9 @@ test("a channel a peer opened keeps its node running once past negotiation, as F
     assert.equal(await request(A), 200);
     context.mock.timers.tick(FEW_MINUTES);
     assert.equal(await request(B), 200, JSON.stringify(channels));
-    // Still negotiating, nothing of the node's is in it yet, so a peer stalling there can't keep the node.
-    const kept = channels !== negotiating;
+    // Still negotiating, or stuck before collaborating, nothing of the node's is in it, so a peer stalling there
+    // can't keep the node.
+    const kept = channels !== negotiating && channels !== prematurelyCompleted;
     assert.deepEqual(running(), kept ? [B, F] : [A, B], JSON.stringify(channels));
     assert.equal(await marked(F), kept, JSON.stringify(channels));
     context.mock.timers.reset();
