@@ -324,9 +324,11 @@ async function setDailyAmount(context: SigningContext, body: Record<string, unkn
   const next = new Map(current);
   if (change.amount === null) next.delete(change.asset); else next.set(change.asset, change.amount);
   refuseUnencodable(next, change);
+  let version: bigint | undefined;
   if (!context.signDigest) {
     const onChain = await sendLimitSettings(context, body, current, next, change);
-    if (onChain) return { ...view(onChain.amounts), enforcedByLit: true, ...onChain.response };
+    if (onChain && "serverOnly" in onChain) version = onChain.serverOnly;
+    else if (onChain) return { ...view(onChain.amounts), enforcedByLit: true, ...onChain.response };
   }
   // Below: the amounts live on the server only (the account can't make the cell yet, or a test signs locally).
   const serverOnly = !context.signDigest ? { enforcedByLit: false } : {};
@@ -352,7 +354,7 @@ async function setDailyAmount(context: SigningContext, body: Record<string, unkn
   const from = approvedFrom(request);
   await verifyCode(context.user, "settings", nonce, body.emailCode);
   await consumeRequest(context.user, "settings", nonce);
-  if (!await writeDailyAmount(context.user, change.asset, change.amount, { from })) throw new Error(AMOUNTS_CHANGED);
+  if (!await writeDailyAmount(context.user, change.asset, change.amount, { from, version })) throw new Error(AMOUNTS_CHANGED);
   return { ...view(next), ...serverOnly };
 }
 
@@ -383,7 +385,7 @@ async function sendLimitSettings(
   current: DailyAmounts,
   next: DailyAmounts,
   change: { asset: string; amount: bigint | null },
-): Promise<{ amounts: DailyAmounts; response?: Record<string, unknown> } | undefined> {
+): Promise<{ amounts: DailyAmounts; response?: Record<string, unknown> } | { serverOnly: bigint } | undefined> {
   const client = context.client ?? new ccc.ClientPublicTestnet();
   const digest = hashText(`daily-amount:${change.asset}:${change.amount?.toString() ?? "off"}`);
   const settings = settingsFromDailyAmounts(next, new Uint8Array(32));
@@ -450,10 +452,13 @@ async function sendLimitSettings(
   // A request made while the account had no send-limit cell carries no transaction; the server's code applies, unless
   // limits were turned on since: then the change would apply to the server alone and leave it looser than the cell.
   if (!request.summary.settingsTransaction) {
+    // Read before looking for the cell: a cell made after the look is written to the amounts (lowering them to its
+    // own) after it is recorded, so either the look finds it or the server-only write sees the version move.
+    const version = await readDailyAmountsVersion(context.user);
     if (await sendLimitHead(client, context.wallet, await listPendingTransactions(context.user.id, nodeStatus(client)))) {
       throw new Error("Send limits were turned on since this change was asked for. Start again");
     }
-    return undefined;
+    return { serverOnly: version };
   }
   const transaction = ccc.Transaction.from(request.summary.settingsTransaction as ccc.TransactionLike);
   const from = approvedFrom(request);
@@ -513,8 +518,15 @@ async function serverAmountsAround(user: User, current: DailyAmounts, next: Dail
   if (tightens) await writeDailyAmount(user, change.asset, change.amount, "lower");
   // A loosening approved from an amount that has since changed (a stricter one set meanwhile) isn't sent at all.
   const version = await lowerToCell(user, cell, tightens ? undefined : { asset: change.asset, amount: from });
-  await send();
-  if (!tightens && !await writeDailyAmount(user, change.asset, change.amount, { from, version })) throw new Error(AMOUNTS_CHANGED);
+  try {
+    await send();
+    if (!tightens && !await writeDailyAmount(user, change.asset, change.amount, { from, version })) throw new Error(AMOUNTS_CHANGED);
+  } finally {
+    // Once more after the transaction is recorded as pending (even if sending failed, as it may still have landed): a
+    // server-only raise that looked for the cell before it was recorded is then written either before this, which
+    // lowers it, or after, which the version this moves refuses.
+    await lowerToCell(user, cell);
+  }
   return readDailyAmounts(user);
 }
 
@@ -843,6 +855,11 @@ async function lowerToCell(user: User, cell: Omit<SendLimitSettings, "fingerprin
 /** The per-user lock every write to the daily amounts takes, for the length of its transaction. */
 async function lockDailyAmounts(tx: TransactionSql, user: User): Promise<void> {
   await tx`select pg_advisory_xact_lock(hashtextextended(${`keyway-daily-amounts:${user.id}`}, 0))`;
+}
+
+async function readDailyAmountsVersion(user: User): Promise<bigint> {
+  const sql = await database();
+  return sql.begin((tx) => dailyAmountsVersion(tx, user));
 }
 
 async function dailyAmountsVersion(tx: TransactionSql, user: User): Promise<bigint> {
