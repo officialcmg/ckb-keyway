@@ -11,7 +11,9 @@ import { accountLocks, secp256k1Lock } from "../sdk/browser/account-lock.ts";
 import {
   decodeSendLimitSettings,
   DEFAULT_DAILY_LIMIT_SHANNONS,
+  isSendLimitCell,
   MAX_SEND_LIMIT_TOKENS,
+  SEND_LIMIT_MAGIC,
   SEND_LIMIT_OFFER_MINIMUM,
   SEND_LIMIT_UNLIMITED,
   settingsFromDailyAmounts,
@@ -53,6 +55,7 @@ const MAX_MESSAGE_BYTES = 4096;
 export async function transactionSigning(context: SigningContext, body: Record<string, unknown>): Promise<unknown> {
   const preview = context.preview ?? previewGeneralTransaction;
   const validated = await preview(context.wallet, body.transaction);
+  await refuseSendLimitChange(context.wallet, validated);
   const digest = hashText(JSON.stringify(serializeTransaction(validated.transaction)));
   // With the policy Action signing, Lit enforces the send limits itself; the server plans with the same rules.
   const policy = !context.signDigest;
@@ -118,6 +121,28 @@ export async function transactionSigning(context: SigningContext, body: Record<s
   if (emailCode) await consumeRequest(context.user, "transaction", nonce);
   await recordPendingTransaction(context.user.id, signed);
   return { transaction: serializeTransaction(signed) };
+}
+
+/**
+ * The account's send limits change only through the settings operation, which keeps the server's copy (the only one
+ * hosted Fiber payments check) in step with the cell. A transaction that makes the account's send-limit cell, or
+ * gives it other amounts, isn't signed here: the Lit Action would sign a tightening without a code, and the server's
+ * amounts would stay looser than the chain's. Chaining on the cell unchanged, as every send does, is fine.
+ */
+async function refuseSendLimitChange(wallet: ReadyWallet, validated: ValidatedTransaction): Promise<void> {
+  const { transaction } = validated;
+  // Only send-limit data needs the account's lock looked up.
+  const outputs = transaction.outputs.map((output, index) => ({ output, data: ccc.hexFrom(transaction.outputsData[index] ?? "0x") })).filter(({ data }) => data.startsWith(SEND_LIMIT_MAGIC));
+  if (outputs.length === 0) return;
+  const client = validated.signer.client;
+  const secp = await secp256k1Lock(client, wallet.litPublicKey);
+  const made = outputs.filter(({ output, data }) => isSendLimitCell(output, data, secp));
+  if (made.length === 0) return;
+  const spent = (await Promise.all(transaction.inputs.map((input) => input.getCell(client))))
+    .filter((cell): cell is ccc.Cell => Boolean(cell && isSendLimitCell(cell.cellOutput, cell.outputData, secp)));
+  const unchanged = made.length === 1 && spent.length === 1 && made[0].output.type!.eq(spent[0].cellOutput.type!)
+    && made[0].data === ccc.hexFrom(spent[0].outputData);
+  if (!unchanged) throw new Error("Send limits change only through KeyWay's settings, not in a transaction");
 }
 
 /** Whether Lit will ask for its code before signing this channel funding (the account has send limits on). */

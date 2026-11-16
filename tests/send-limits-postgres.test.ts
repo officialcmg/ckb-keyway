@@ -6,7 +6,7 @@ import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { secp256k1Lock } from "../src/sdk/browser/account-lock.ts";
-import { chainOnSendLimit, decodeSendLimitSettings, DEFAULT_DAILY_LIMIT_SHANNONS, isSendLimitCell, type SendLimitHead } from "../src/sdk/browser/send-limits.ts";
+import { chainOnSendLimit, decodeSendLimitSettings, DEFAULT_DAILY_LIMIT_SHANNONS, encodeSendLimitSettings, isSendLimitCell, type SendLimitHead } from "../src/sdk/browser/send-limits.ts";
 import { database } from "../src/server/database.ts";
 import { fundingCode, fundingNeedsLitCode, hashText, issueFundingCodeRequest, issueRequest, sendCode, sendFundingCode, sendLimitOffer, signingSettings, transactionSigning, type SigningContext } from "../src/server/general-signing.ts";
 import { litPolicyRunner } from "../src/server/lit-policy.ts";
@@ -541,6 +541,33 @@ test("a server-only raise that looked for the cell before turning limits on was 
   await assert.rejects(raise(async () => { release(); await turnOn; }), /changed while this was waiting/);
   assert.deepEqual(cellAmounts(sent.at(-1)!), { ckb: 10n * CKB });
   assert.deepEqual(((await signingSettings(context, { operation: "get" })) as { dailyAmounts: Record<string, string> }).dailyAmounts, { ckb: (10n * CKB).toString() });
+  t.after(async () => {
+    const sql = await database();
+    await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
+  });
+});
+
+test("a transaction that changes the send-limit cell's amounts isn't signed outside the settings", { skip: !enabled }, async (t) => {
+  const { world, secp, user, wallet, context, sent } = await setUp();
+  await limitsOn(world, context, sent, 1_000n * CKB);
+  const head = (await sendLimitHead(context.client!, wallet, await listPendingTransactions(user.id, async () => "committed")))!;
+  const genesis = world.known.get(head.outPoint.txHash)!.tx;
+  const from = ccc.Cell.from({ outPoint: { txHash: genesis.hash(), index: 1 }, cellOutput: genesis.outputs[1], outputData: "0x" });
+  // A send chained on the cell, leaving it as it is, is previewed as usual.
+  const plain = buildSend(secp, from, 100n * CKB, head);
+  assert.equal((await transactionSigning(context, { operation: "preview", transaction: plain }) as { requiresEmailCode: boolean }).requiresEmailCode, false);
+  // The same send giving the cell a stricter amount is refused: the server's 1,000 CKB would stay looser.
+  const stricter = ccc.Transaction.from(plain);
+  const index = stricter.outputs.findIndex((output, i) => isSendLimitCell(output, stricter.outputsData[i], secp));
+  const settings = decodeSendLimitSettings(stricter.outputsData[index]);
+  stricter.outputsData[index] = encodeSendLimitSettings({ ...settings, ckb: 10n * CKB });
+  await assert.rejects(transactionSigning(context, { operation: "preview", transaction: JSON.parse(ccc.stringify(stricter)) }), /only through KeyWay's settings/);
+  // So is one making a second send-limit cell.
+  const second = ccc.Transaction.from(plain);
+  second.outputs.push(ccc.CellOutput.from(second.outputs[index]));
+  second.outputsData.push(second.outputsData[index]);
+  second.outputs[1].capacity -= second.outputs[index].capacity;
+  await assert.rejects(transactionSigning(context, { operation: "preview", transaction: JSON.parse(ccc.stringify(second)) }), /only through KeyWay's settings/);
   t.after(async () => {
     const sql = await database();
     await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
