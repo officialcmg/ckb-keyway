@@ -51,6 +51,7 @@ test("the idempotency-pruning migration never blocks live idempotency writes", {
       if (waiting.length) return;
       await delay(25);
     }
+    assert.fail("the migration never waited on the other session");
   };
 
   await t.test("expired records are still pruned while it waits for a row in use", async () => {
@@ -92,6 +93,46 @@ test("the idempotency-pruning migration never blocks live idempotency writes", {
     } finally {
       await second.end({ timeout: 0 });
     }
+  });
+
+  await t.test("an interrupted run leaves nothing that stops the next one", async () => {
+    await undo();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let inserted!: () => void;
+    const started = new Promise<void>((resolve) => { inserted = resolve; });
+    const writing = other.begin(async (tx) => {
+      await insert(tx as unknown as postgres.Sql, "interrupted-key-0001", "1 day");
+      inserted();
+      await gate;
+    });
+    await started;
+    const migrating = migrateDatabase(sql);
+    try {
+      await migrationWaiting();
+      // Cancelled mid-build, as a deploy that stops or a statement timeout would end it.
+      await writer`
+        select pg_cancel_backend(pid) from pg_stat_activity
+        where datname = current_database() and wait_event_type = 'Lock' and query ilike '%create index%'
+      `;
+      await assert.rejects(migrating);
+    } finally {
+      release();
+      await writing;
+    }
+    const [invalid] = await sql`
+      select 1 from pg_index where indrelid = 'keyway_v2_idempotency_keys'::regclass and not indisvalid
+    `;
+    assert.ok(invalid, "the cancelled build left an invalid index");
+    const [recorded] = await sql`select 1 from keyway_schema_migrations where version = ${MIGRATION.version}`;
+    assert.equal(recorded, undefined, "the migration isn't recorded");
+    assert.ok(await within(migrateDatabase(sql), 10_000), "the next run finishes");
+    const indexes = await sql<Array<{ valid: boolean }>>`
+      select indisvalid as valid from pg_index
+      where indrelid = 'keyway_v2_idempotency_keys'::regclass and indexrelid::regclass::text in ${sql(INDEXES)}
+    `;
+    assert.equal(indexes.length, INDEXES.length);
+    assert.ok(indexes.every((index) => index.valid), "its indexes are rebuilt and valid");
   });
 
   await t.test("new records are stored while it waits for a write in progress", async () => {
