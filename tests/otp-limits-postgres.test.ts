@@ -643,7 +643,10 @@ test("sessions without the origin they were issued at are refused", { skip }, as
   const user = email();
   const { challengeId } = await sendEmailCode(appRequest(appId, origin, "192.0.2.112"), user);
   const { sessionToken } = await verifyEmailCode(appRequest(appId, origin, "192.0.2.112"), challengeId, codes.get(`${appId}:${user}`)!);
-  assert.ok(await sessionForRequest(appRequest(appId, origin, "192.0.2.112", sessionToken)));
+  // The session's ID reaches the signing code, which counts wrong step-up codes per session.
+  const { user: signedIn } = await sessionForRequest(appRequest(appId, origin, "192.0.2.112", sessionToken));
+  const [session] = await sql<Array<{ id: string }>>`select id from keyway_auth_sessions where "scopeId" = ${appId}`;
+  assert.equal(signedIn.sessionId, session.id);
   // As a session from before sessions recorded their origin.
   await sql`update keyway_auth_sessions set "origin" = null where "scopeId" = ${appId}`;
   await assert.rejects(sessionForRequest(appRequest(appId, origin, "192.0.2.112", sessionToken)), /Session/);
