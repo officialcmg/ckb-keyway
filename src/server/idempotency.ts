@@ -33,6 +33,15 @@ export class OutcomeUnknownError extends Error {
   readonly outcomeUnknown = true;
 }
 
+/**
+ * A refusal the caller is told to retry, such as another request holding what this one needs. The mutation either
+ * did nothing or is safe to run again, so its key isn't used up: the record is removed, and a retry with the same
+ * key runs it rather than replaying the refusal.
+ */
+export class RetryableError extends Error {
+  readonly retryable = true;
+}
+
 /** Records a handle on the running request, before the mutation acts, so a later repeat can reconcile it. */
 export type RecordHandle = (handle: unknown) => Promise<void>;
 
@@ -173,6 +182,14 @@ export async function runIdempotentMutation<T>(
   } catch (error) {
     // Its outcome isn't known, so it isn't recorded as failed: repeats reconcile it, or say it's unknown.
     if (error instanceof OutcomeUnknownError) throw error;
+    // A refusal to retry isn't an outcome: the key stays free, so the retry it asks for runs.
+    if (error instanceof RetryableError) {
+      await sql`
+        delete from keyway_v2_idempotency_keys
+        where user_id = ${userId} and operation = ${operation} and idempotency_key = ${key} and status = 'running'
+      `.catch(() => undefined);
+      throw error;
+    }
     // Database and network error text (Postgres errors, Node system errors) isn't replayed to repeats.
     const { name, syscall, errno } = (error ?? {}) as { name?: unknown; syscall?: unknown; errno?: unknown };
     const internal = name === "PostgresError" || typeof syscall === "string" || errno !== undefined;

@@ -376,6 +376,11 @@ test("L5: first-time wallet setup holds no wallet lock while Lit works", { skip 
     const busy = await fresh.call("bootstrap", { deviceIdHash: DEVICE_A, keyCustody: "lit" }, { "Idempotency-Key": "bootstrap-busy-0001" });
     assert.equal(busy.status, 409);
     assert.equal(busy.headers.get("retry-after"), "5");
+    // Once the setup is done, the same request (same key), retried as told, goes through.
+    await sql`delete from keyway_v2_provisioning_claims where user_id = ${fresh.user.id}`;
+    await saveWallet(fresh.user, readyWallet(DEVICE_A));
+    const retried = await fresh.call("bootstrap", { deviceIdHash: DEVICE_A, keyCustody: "lit" }, { "Idempotency-Key": "bootstrap-busy-0001" });
+    assert.equal(retried.status, 200);
   });
 });
 

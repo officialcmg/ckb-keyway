@@ -8,6 +8,7 @@ import { derivePkpIdentity } from "./pkp-identity";
 import { readActiveLease } from "./device-lease";
 import { prepareBackupForDevice } from "./node-backup";
 import { database, withUserLock, type DatabaseSql } from "./database";
+import { RetryableError } from "./idempotency";
 import {
   readWallet,
   rebindProvisioningWallet,
@@ -76,7 +77,7 @@ export async function bootstrap(
     const wallet = await readWallet(user, sql);
     if (wallet?.status === "ready") return { result: await readyResult(user, wallet, deviceIdHash, nodeMode, sql) };
     const claimId = await claimProvisioning(user, sql);
-    if (!claimId) throw new Error("Your KeyWay wallet is still being set up. Try again in a moment");
+    if (!claimId) throw new RetryableError("Your KeyWay wallet is still being set up. Try again in a moment");
     try {
       if (wallet && wallet.primaryDeviceIdHash !== deviceIdHash) {
         await saveWallet(user, rebindProvisioningWallet(wallet, deviceIdHash, (await readActiveLease(user, sql))?.deviceIdHash), sql);
@@ -178,7 +179,7 @@ async function renewProvisioning(user: User, claimId: string, sql: DatabaseSql):
     where user_id = ${user.id} and claim_id = ${claimId}
     returning 1
   `;
-  if (!row) throw new Error("Your KeyWay wallet is still being set up. Try again in a moment");
+  if (!row) throw new RetryableError("Your KeyWay wallet is still being set up. Try again in a moment");
 }
 
 async function releaseProvisioning(user: User, claimId: string, connection?: DatabaseSql): Promise<void> {
