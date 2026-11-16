@@ -41,7 +41,7 @@ const TRANSACTION: TransactionPreview = {
   tokens: [{ id: "0x45b32a…df52", asset: RUSD, standard: "xUDT", amount: "-2500000000", amountText: "-25 RUSD" }],
   nfts: [],
   dao: [],
-  recipients: [{ address: ADDRESS.replace("zda0", "zdb1"), kind: "wallet", walletType: "standard", ckb: "143", tokens: [{ id: "0x45b32a…df52", asset: RUSD, amount: "2500000000", amountText: "25 RUSD" }], nfts: [] }],
+  recipients: [{ address: ADDRESS.replace("zda0", "zdb1"), kind: "wallet", walletType: "standard", ckb: "143", tokens: [{ id: "0x45b32a…df52", asset: RUSD, amount: "2500000000", amountText: "25 RUSD" }], nfts: [], cells: [] }],
   unrecognized: [],
   otherSigners: 0,
   details: {
@@ -62,7 +62,7 @@ const CKB_TRANSACTION: TransactionPreview = {
   ...TRANSACTION,
   sendingCkb: "1,250",
   tokens: [],
-  recipients: [{ address: ADDRESS.replace("zda0", "zdb1"), kind: "wallet", walletType: "standard", ckb: "1,250", tokens: [], nfts: [] }],
+  recipients: [{ address: ADDRESS.replace("zda0", "zdb1"), kind: "wallet", walletType: "standard", ckb: "1,250", tokens: [], nfts: [], cells: [] }],
   requiresEmailCode: false,
 };
 

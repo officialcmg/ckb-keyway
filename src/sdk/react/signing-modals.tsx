@@ -73,7 +73,7 @@ export function KeyWayTransactionModal({ theme, appName, preview, step, answer }
                   {/* The whole address: two look-alike addresses can share their start and their checksum. */}
                   {recipient.address}
                   <span style={{ display: "block", color: palette.muted }}>
-                    {[`${recipient.ckb} CKB`, ...recipient.tokens.map((token) => formatAsset(BigInt(token.amount), token.asset)), ...recipient.nfts].join(" · ")}
+                    {[`${recipient.ckb} CKB`, ...recipient.tokens.map((token) => formatAsset(BigInt(token.amount), token.asset)), ...recipient.nfts, ...recipient.cells.map(({ typeHash, cells }) => `${cells} ${cells === 1 ? "cell" : "cells"} of type ${typeHash}`)].join(" · ")}
                   </span>
                 </>}
               />

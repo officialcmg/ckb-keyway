@@ -44,6 +44,8 @@ export type Recipient = {
   tokens: Array<{ id: string; asset: string; amount: string; amountText: string }>;
   /** "Spore <whole type args>" or "Cluster <whole type args>". */
   nfts: string[];
+  /** Any other typed cells it gets (Nervos DAO, Type ID, scripts KeyWay can't read), per whole type script hash. */
+  cells: Array<{ typeHash: string; cells: number }>;
 };
 export type CellSummary = { lock: string; type?: string; capacityCkb: string; dataBytes: number };
 
@@ -334,6 +336,7 @@ export function describeTransaction(
       ckb: "0",
       tokens: [],
       nfts: [],
+      cells: [],
     } satisfies Recipient;
     recipient.ckb = formatCkb(parseCkb(recipient.ckb) + cell.cellOutput.capacity);
     const kind = typeKind(cell.cellOutput.type);
@@ -346,7 +349,14 @@ export function describeTransaction(
       if (existing) Object.assign(existing, entry);
       else recipient.tokens.push(entry);
     }
-    if (kind === "Spore" || kind === "Cluster") recipient.nfts.push(`${kind} ${cell.cellOutput.type!.args}`);
+    else if (kind === "Spore" || kind === "Cluster") recipient.nfts.push(`${kind} ${cell.cellOutput.type!.args}`);
+    else if (kind !== "none") {
+      // By the whole type script hash, so two such cells going to each other's recipient read differently.
+      const typeHash = cell.cellOutput.type!.hash();
+      const existing = recipient.cells.find((entry) => entry.typeHash === typeHash);
+      if (existing) existing.cells += 1;
+      else recipient.cells.push({ typeHash, cells: 1 });
+    }
     recipients.set(key, recipient);
   }
 
@@ -391,9 +401,9 @@ export function describeTransaction(
 }
 
 /**
- * Lines for the confirmation email, written from the backend's own decoding. What happens to the account's assets
- * comes before the recipients, so a long list of recipients can't push it out of the email. Each recipient is shown
- * by its whole address: the start and the checksum are all two look-alike addresses need to share.
+ * Lines for the confirmation email, written from the backend's own decoding: what happens to the account's assets,
+ * then each recipient with what it gets. Each recipient is shown by its whole address: the start and the checksum are
+ * all two look-alike addresses need to share. The email shows every line or isn't sent (see email-template.ts).
  */
 export function previewSummaryLines(preview: TransactionPreview): string[] {
   const lines = [`Send ${preview.sendingCkb} CKB`, `Network fee ${preview.feeCkb} CKB`, `Network ${preview.network}`];
@@ -403,8 +413,17 @@ export function previewSummaryLines(preview: TransactionPreview): string[] {
   for (const action of preview.dao) lines.push(`Nervos DAO ${action.action}: ${action.amountCkb} CKB`);
   for (const script of preview.unrecognized) lines.push(`Unrecognized script ${script.codeHash} (${script.hashType}, ${script.cells} cells)`);
   if (preview.details.outputs.some(({ type }) => type === RECOVERY_LIST)) lines.push("Writes the account's recovery list");
-  // The amount comes before the address, so an address too long for the email's line can't push it out.
-  for (const recipient of preview.recipients) lines.push(`${recipient.ckb} CKB to ${recipient.address} (${recipient.kind})`);
+  // Each recipient with everything it gets, every asset by its whole ID: the same assets going to each other's
+  // recipient must read differently.
+  for (const recipient of preview.recipients) {
+    const assets = [
+      `${recipient.ckb} CKB`,
+      ...recipient.tokens.map(({ asset, amountText }) => (amountText.includes(asset) ? amountText : `${amountText} (token ${asset})`)),
+      ...recipient.nfts,
+      ...recipient.cells.map(({ typeHash, cells }) => `${cells} ${cells === 1 ? "cell" : "cells"} of type ${typeHash}`),
+    ];
+    lines.push(`${assets.join(", ")} to ${recipient.address} (${recipient.kind})`);
+  }
   return lines;
 }
 

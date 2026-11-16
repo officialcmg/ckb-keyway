@@ -33,6 +33,8 @@ export type TransactionPreview = {
     tokens: Array<{ id: string; asset: string; amount: string; amountText?: string }>;
     /** "Spore <whole type args>" or "Cluster <whole type args>". */
     nfts: string[];
+    /** Any other typed cells it gets (Nervos DAO, Type ID, scripts KeyWay can't read), per whole type script hash. */
+    cells: Array<{ typeHash: string; cells: number }>;
   }>;
   /** Type scripts the backend couldn't explain. Always shown, never hidden. */
   unrecognized: Array<{ codeHash: string; hashType: string; cells: number }>;

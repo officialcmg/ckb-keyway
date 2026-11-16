@@ -187,6 +187,44 @@ test("names NFTs and tokens by their whole ID, and keeps tokens apart that a sho
   assert.ok(lines.every((line) => !line.includes("…")), lines.join("\n"));
 });
 
+test("the confirmation email says which tokens, NFTs and other typed cells go to which recipient", () => {
+  const bob = lock("33");
+  const tokenA = ccc.Script.from({ codeHash: known.xudt.codeHash, hashType: "type", args: `0x${"a1".repeat(32)}` });
+  const tokenB = ccc.Script.from({ codeHash: known.xudt.codeHash, hashType: "type", args: `0x${"b2".repeat(32)}` });
+  const sporeA = ccc.Script.from({ ...spore, args: `0x${"a3".repeat(32)}` });
+  const sporeB = ccc.Script.from({ ...spore, args: `0x${"b4".repeat(32)}` });
+  const typeA = ccc.Script.from({ codeHash: TYPE_ID, hashType: "type", args: `0x${"a5".repeat(32)}` });
+  const typeB = ccc.Script.from({ codeHash: TYPE_ID, hashType: "type", args: `0x${"b6".repeat(32)}` });
+  const mysteryA = ccc.Script.from({ ...mystery, args: "0xa7" });
+  const mysteryB = ccc.Script.from({ ...mystery, args: "0xb8" });
+  const pairs: Array<[ccc.Script, ccc.Script, ccc.Hex, ccc.Hex]> = [
+    [tokenA, tokenB, u128(1_000n), u128(1_000n)],
+    [sporeA, sporeB, "0x01", "0x01"],
+    [typeA, typeB, "0x01", "0x01"],
+    [mysteryA, mysteryB, "0x", "0x"],
+  ];
+  for (const [a, b, dataA, dataB] of pairs) {
+    // The same cells, same capacities, with the two assets going to each other's recipient.
+    const send = (toAlice: [ccc.Script, ccc.Hex], toBob: [ccc.Script, ccc.Hex]) => build(
+      [{ lock: own, capacity: 200n * CKB, type: a, data: dataA }, { lock: own, capacity: 200n * CKB, type: b, data: dataB }, { lock: own, capacity: 500n * CKB }],
+      [
+        { lock: alice, capacity: 200n * CKB, type: toAlice[0], data: toAlice[1] },
+        { lock: bob, capacity: 200n * CKB, type: toBob[0], data: toBob[1] },
+        { lock: own, capacity: 500n * CKB - 5_000n },
+      ],
+    ).preview;
+    const intended = previewSummaryLines(send([a, dataA], [b, dataB]));
+    const swapped = previewSummaryLines(send([b, dataB], [a, dataA]));
+    assert.notDeepEqual(intended, swapped, `${a.codeHash}: ${intended.join("\n")}`);
+    // Each recipient's line names what it gets by its whole ID.
+    const aliceLine = intended.find((line) => line.includes(ccc.Address.fromScript(alice, client).toString()));
+    assert.ok(aliceLine, intended.join("\n"));
+    const id = a === sporeA ? a.args : a.hash();
+    assert.ok(aliceLine.includes(id), aliceLine);
+    assert.ok(!aliceLine.includes(b === sporeB ? b.args : b.hash()), aliceLine);
+  }
+});
+
 test("counts inputs that other people must sign", () => {
   const { preview } = build(
     [{ lock: own, capacity: 200n * CKB }, { lock: alice, capacity: 100n * CKB }],
