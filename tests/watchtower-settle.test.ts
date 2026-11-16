@@ -288,6 +288,8 @@ function fakeChain(options: {
   tlcs?: ReturnType<typeof tlcFixture>; preimages?: Map<string, string>; now?: number;
   /** The chain's median block time (ms), answered to `get_block_median_time`. */
   medianTime?: () => number;
+  /** Where the peer's settlement puts its commitment-locked output: 0, where the lock requires the successor. */
+  successorAt?: 0 | 1;
 } = {}) {
   const { channel, argsFor } = options.tlcs ?? channelFixture();
   const ours = options.tlcs?.theirs ?? encodeSettlementWitness(channel.localSettlement, false, channel.localSettlementKey, channel.remoteSettlementKey);
@@ -320,11 +322,13 @@ function fakeChain(options: {
       inputs: [{ previousOutput: liveCell }],
       outputs: options.peerTookEverything
         ? [{ capacity: 750n * CKB, lock: plainLock }]
-        : [{ capacity: 250n * CKB, lock: plainLock }, { capacity: 500n * CKB, lock: commitmentLock(successorArgs) }],
+        : options.successorAt === 1
+          ? [{ capacity: 250n * CKB, lock: plainLock }, { capacity: 500n * CKB, lock: commitmentLock(successorArgs) }]
+          : [{ capacity: 500n * CKB, lock: commitmentLock(successorArgs) }, { capacity: 250n * CKB, lock: plainLock }],
       outputsData: options.peerTookEverything ? ["0x"] : ["0x", "0x"],
       witnesses: [ccc.hexFrom(witness)],
     }), [101, 0, 1]);
-    liveCell = { txHash: settlement.hash(), index: 1 };
+    liveCell = { txHash: settlement.hash(), index: options.successorAt ?? 0 };
   }
   let tip: ccc.EpochLike = [100, 0, 1];
   const sent: ccc.Transaction[] = [];
@@ -546,4 +550,12 @@ test("once the peer has settled its share, the next claim takes the whole cell a
     assert.equal(decision.claim.preimage, undefined);
     assert.equal(decision.claim.signingKey, channel.localSettlementKey);
   }
+});
+
+test("only the settlement's output 0, the one the commitment lock checks, is followed as the successor", async () => {
+  // The peer's settlement emptied the cell; an unrelated cell with a lookalike commitment lock sits at output 1.
+  const chain = fakeChain({ peerSettledFirst: true, successorAt: 1 });
+  chain.setTip([90, 0, 1]);
+  assert.equal((await chain.settle()).status, "settled");
+  assert.equal(chain.sent.length, 0);
 });

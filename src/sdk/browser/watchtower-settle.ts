@@ -456,11 +456,13 @@ export async function settleChannel(options: {
     const inputIndex = next.inputs.findIndex((input) => input.previousOutput.eq(cell));
     const witness = ccc.bytesFrom(next.witnesses[inputIndex] ?? "0x");
     if (witness.length <= 16 || !equal(witness.slice(0, 16), XUDT_COMPATIBLE_WITNESS)) return result("unexpected settlement witness");
-    const successor = next.outputs.findIndex((o) => isCommitment(o) && equal(ccc.bytesFrom(o.lock.args).slice(0, 36), prefix));
-    if (successor < 0) return result("settled");
+    // The lock requires a settlement that leaves anything behind to put it in output 0 (its successor); any other
+    // commitment-locked output isn't this channel's.
+    const successor = next.outputs[0];
+    if (!isCommitment(successor) || !equal(ccc.bytesFrom(successor.lock.args).slice(0, 36), prefix)) return result("settled");
     previousWitness = witness.slice(16);
-    cell = ccc.OutPoint.from({ txHash: next.hash(), index: successor });
-    output = next.outputs[successor];
+    cell = ccc.OutPoint.from({ txHash: next.hash(), index: 0 });
+    output = successor;
   }
 
   // The first settlement waits for (a share of) the commitment's delay, counted in epochs from its block.
