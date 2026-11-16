@@ -278,5 +278,8 @@ test("dials whose handshake hasn't finished count against a hosted node's peer l
   await managedNodeRequest("graph-pending-user", { operation: "act", method: "connectPeer", params: { pubkey: PEER } }, graph.node as never);
   assert.equal(graph.dialed.length, 4);
   await assert.rejects(connect("graph-pending-user", graph.node, 9), /at most 32 peers/);
+  // Checking again while those handshakes may still finish doesn't free their room.
+  await assert.rejects(connect("graph-pending-user", graph.node, 9), /at most 32 peers/);
+  await assert.rejects(connect("graph-pending-user", graph.node, 9), /at most 32 peers/);
   assert.equal(graph.dialed.length, 4);
 });

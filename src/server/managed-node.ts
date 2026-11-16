@@ -383,7 +383,7 @@ async function assertKnownPublicPeer(node: ManagedNodeClient, peer: string): Pro
 // counts against MAX_PEERS until the peer it named by key is listed, or for PENDING_DIAL_MS. A dial by address may
 // reach any node, so it counts for the whole time.
 const PENDING_DIAL_MS = 60_000;
-const pendingDials = new Map<string, Array<{ peer?: string; until: number }>>();
+const pendingDials = new Map<string, Array<{ peer?: string; until: number; settled?: boolean }>>();
 
 function barePubkey(pubkey: string): string {
   return pubkey.toLowerCase().replace(/^0x/, "");
@@ -394,20 +394,20 @@ function noteDial(userId: string, peer?: string): void {
 }
 
 /**
- * The user's dials that may still add a peer: each a connected peer settles is dropped, one per peer, as the
- * other addresses dialed for it may reach other nodes.
+ * The user's dials that may still add a peer. A connected peer settles one dial that named it, once, and that
+ * dial is kept (not counted) until it expires, so checking again doesn't settle another: the other addresses
+ * dialed for the peer may reach other nodes.
  */
 function pendingDialCount(userId: string, connected: Set<string>): number {
-  const settled = new Set<string>();
-  const pending = (pendingDials.get(userId) ?? []).filter(({ peer, until }) => {
-    if (until <= Date.now()) return false;
-    if (!peer || !connected.has(peer) || settled.has(peer)) return true;
-    settled.add(peer);
-    return false;
-  });
-  if (pending.length > 0) pendingDials.set(userId, pending);
+  const dials = (pendingDials.get(userId) ?? []).filter(({ until }) => until > Date.now());
+  for (const peer of connected) {
+    if (dials.some((dial) => dial.peer === peer && dial.settled)) continue;
+    const open = dials.find((dial) => dial.peer === peer);
+    if (open) open.settled = true;
+  }
+  if (dials.length > 0) pendingDials.set(userId, dials);
   else pendingDials.delete(userId);
-  return pending.length;
+  return dials.filter(({ settled }) => !settled).length;
 }
 
 /** The node, with each dial counted against the user's peer room (see noteDial), as dialing the given peer. */
