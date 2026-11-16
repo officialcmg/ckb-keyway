@@ -28,7 +28,7 @@ import {
 } from "../browser/connect-managed-keyway";
 import { bootstrapKeyWay, type PublicWallet } from "../browser/bootstrap";
 import { createStoppedNodes, recoverFailedLogout } from "../browser/node-migration";
-import { handOffLogout, newTabId, refuseWhileFiberRuns, serveLogoutHandoff, type HandledLogout } from "../browser/logout-handoff";
+import { handOffLogout, logsOutBrowserNode, newTabId, refuseWhileFiberRuns, serveLogoutHandoff, startUnlessLoggingOut, whileLoggingOut, type HandledLogout } from "../browser/logout-handoff";
 import type { ApproveFiberChannelOpen, FiberChannelOpenPreview } from "../browser/remote-ckb-signer";
 import type { ApproveFiberPayment } from "../browser/fiber-payment";
 import type { EmailCodeReason, RequestEmailCode } from "../browser/email-code";
@@ -391,16 +391,21 @@ export function KeyWayProvider({
             approveFiberChannelSettings: (preview) => callbacksRef.current.approveFiberChannelSettings?.(preview) ?? approvalsRef.current.channelSettings.ask(preview),
             settled: fiberSettled,
           }),
-          ...(fiberNode === "browser" ? { onLeaseLost: (leaseError: Error) => {
-            if (run !== runRef.current) return;
-            if (connectionRef.current) stoppedNodes.add(connectionRef.current.keyway);
-            connectionRef.current = undefined;
-            setConnection(undefined);
-            setError(leaseError);
-            setFiberError(leaseError);
-            setStatus("error");
-            callbacksRef.current.onError?.(leaseError);
-          } } : {}),
+          ...(fiberNode === "browser" ? {
+            onLeaseLost: (leaseError: Error) => {
+              if (run !== runRef.current) return;
+              if (connectionRef.current) stoppedNodes.add(connectionRef.current.keyway);
+              connectionRef.current = undefined;
+              setConnection(undefined);
+              setError(leaseError);
+              setFiberError(leaseError);
+              setStatus("error");
+              callbacksRef.current.onError?.(leaseError);
+            },
+            // The node takes the device only while no logout of this session is in progress, and while the session
+            // (kept in the origin's storage, which a logout in any tab clears) is still signed in.
+            ...(user ? { guardClaim: <T,>(claim: () => Promise<T>) => startUnlessLoggingOut(handoffScope(appId, user.id), claim, () => readStoredSession(appId)?.user.id === user.id) } : {}),
+          } : {}),
           onWalletReady: (nextWallet) => {
             if (run === runRef.current) setWallet(nextWallet);
           },
@@ -490,21 +495,27 @@ export function KeyWayProvider({
     const current = connectionRef.current;
     const currentRun = connectionRunRef.current;
     try {
+      const nodeLoggedOutHere = logsOutBrowserNode(current);
       if (current) await current.keyway.stopForLogout();
       await stoppedNodes.logout();
-      // Another tab of this session may run Fiber: it logs out there first, or this logout fails. One that closed in
-      // the middle of an earlier handoff keeps failing logouts until a node has logged out in this browser again
-      // (this one's, if it has a connection: it just stopped, delivered and backed up).
-      if (user) await handOffLogout({ scope: handoffScope(appId, user.id), tabId, nodeLoggedOutHere: Boolean(current) });
-      if (wallet) await refuseWhileFiberRuns(wallet.litPkpId);
-      if (token) await api.logout(token);
+      const endSession = async () => {
+        // Another tab of this session may run Fiber: it logs out there first, or this logout fails. One that closed
+        // in the middle of an earlier handoff keeps failing logouts until a node has logged out in this browser again
+        // (this one's, if it is a browser node: it just stopped, delivered and backed up; a hosted one doesn't count).
+        if (user) await handOffLogout({ scope: handoffScope(appId, user.id), tabId, nodeLoggedOutHere });
+        if (wallet) await refuseWhileFiberRuns(wallet.litPkpId);
+        if (token) await api.logout(token);
+        clearStoredSession(appId);
+      };
+      // Held from before the handoff until the session has ended, so no node starts after the check that none runs.
+      if (user) await whileLoggingOut(handoffScope(appId, user.id), endSession);
+      else await endSession();
       handoffRef.current?.release();
       handoffRef.current = undefined;
       ++runRef.current;
       connectionRef.current = undefined;
       setConnection(undefined);
       setWallet(undefined);
-      clearStoredSession(appId);
       setAuthToken(undefined);
       setExpiresAt(undefined);
       setUser(undefined);
@@ -547,6 +558,7 @@ export function KeyWayProvider({
     await operationRef.current;
     const current = connectionRef.current;
     const currentRun = connectionRunRef.current;
+    const nodeLoggedOut = logsOutBrowserNode(current);
     try {
       if (current) await current.keyway.stopForLogout();
       await stoppedNodes.logout();
@@ -563,7 +575,7 @@ export function KeyWayProvider({
     setConnection(undefined);
     setStatus("idle");
     setFiberStartupStage(undefined);
-    return { nodeLoggedOut: Boolean(current) };
+    return { nodeLoggedOut };
   }
   useEffect(() => () => {
     handoffRef.current?.release();

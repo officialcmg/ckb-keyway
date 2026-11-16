@@ -14,7 +14,12 @@
  * handoff: each is added before it is asked and removed only once it answers that it finished. A tab that fails,
  * times out or closes stays listed; while the note lists a tab that is gone, logouts fail until a node has logged
  * out in this browser again (which clears the note): starting one sends KeyWay's watchtower every channel update the
- * node stored, and its logout backs it up. A listed tab that is still open is simply asked again.
+ * node stored, and its logout backs it up. A listed tab that is still open is simply asked again. Storage that can't
+ * be read counts as owing, and a logout that can't write the note fails before it asks anyone.
+ *
+ * From before the handoff until the session has ended, the logging-out tab holds a second lock for the session on its
+ * own (`whileLoggingOut`). A node's start takes it shared while it claims the device (`startUnlessLoggingOut`), so no
+ * node can start after the last check that none runs and then run on once the session has ended.
  */
 
 const PREFIX = "ckb-keyway:logout-handoff:";
@@ -24,8 +29,10 @@ const ANSWER_TIMEOUT_MS = 90_000;
 const LATE_ANSWER_MS = 2_000;
 export const UNFINISHED_HANDOFF_ERROR = "Fiber in another tab closed before it finished logging out, so its newest channel state may not have reached KeyWay. Connect Fiber in this tab, then log out again";
 
+export type LockOptions = { mode?: "shared" | "exclusive"; ifAvailable?: boolean };
 export type LockManagerLike = {
   request(name: string, callback: (lock: unknown) => Promise<unknown>): Promise<unknown>;
+  request(name: string, options: LockOptions, callback: (lock: unknown) => Promise<unknown>): Promise<unknown>;
   query(): Promise<{ held?: Array<{ name?: string }> }>;
 };
 export type BroadcastChannelLike = {
@@ -47,18 +54,37 @@ type Answer = { type: "logout-done"; id: string; from: string; error?: string; n
 /** What a tab's logout steps report: whether a node of this session stopped, delivered and backed up there. */
 export type HandledLogout = { nodeLoggedOut: boolean };
 
+/**
+ * Whether logging out `connection` stops a browser node that delivers to KeyWay's watchtower and backs up: asked
+ * before its logout, while the node still holds the device. Only that settles a handoff a closed tab left
+ * unfinished. A KeyWay-hosted connection never does: its node runs on KeyWay's servers, so its logout here
+ * delivers and backs up nothing from this browser.
+ */
+export function logsOutBrowserNode(connection: { mode: "browser"; keyway: { holdsDevice(): boolean } } | { mode: "hosted" } | undefined): boolean {
+  return connection?.mode === "browser" && connection.keyway.holdsDevice();
+}
+
 /** The tabs that owe a handed-off logout (see above), kept in the origin's storage for every tab of the session. */
 function owedHandoffs(scope: string, env: HandoffEnvironment) {
-  let storage: StorageLike | undefined;
+  // Storage that is blocked (reading `localStorage` throws) is treated as failing, not as missing: the note could
+  // hold a debt this tab can't see. Only a browser with no storage at all goes without the note.
+  let storage: StorageLike | "unusable" | undefined;
   try {
     storage = env.storage ?? (typeof localStorage !== "undefined" ? localStorage : undefined);
   } catch {
-    storage = undefined;
+    storage = "unusable";
   }
   const key = `${PREFIX}${scope}:unfinished`;
   const read = (): string[] => {
-    let value: string | null | undefined;
-    try { value = storage?.getItem(key); } catch { return []; }
+    if (storage === undefined) return [];
+    let value: string | null;
+    // A note that can't be read may list a tab that is gone: it counts as owed, so the logout fails rather than pass.
+    try {
+      if (storage === "unusable") return ["unknown"];
+      value = storage.getItem(key);
+    } catch {
+      return ["unknown"];
+    }
     if (value == null) return [];
     try {
       const tabs = JSON.parse(value);
@@ -67,21 +93,34 @@ function owedHandoffs(scope: string, env: HandoffEnvironment) {
     return ["unknown"];
   };
   const write = (tabs: string[]) => {
-    try {
-      if (tabs.length === 0) storage?.removeItem(key);
-      else storage?.setItem(key, JSON.stringify(tabs));
-    } catch { /* storage blocked: the logout in progress still fails */ }
+    if (storage === undefined) return;
+    if (storage === "unusable") throw new Error("storage is blocked");
+    if (tabs.length === 0) storage.removeItem(key);
+    else storage.setItem(key, JSON.stringify(tabs));
   };
   return {
     tabs: read,
-    owe(tabs: string[]) { write([...new Set([...read(), ...tabs])]); },
-    settle(tab: string) { write(read().filter((owed) => owed !== tab)); },
-    clear() { write([]); },
+    owe(tabs: string[]) {
+      // Unrecorded, a tab that closed mid-handoff would leave nothing to fail the next logout: so this one fails now,
+      // before it asks any tab (e.g. storage full or blocked).
+      try {
+        write([...new Set([...read(), ...tabs])]);
+      } catch (error) {
+        throw new Error(`Could not note the Fiber logout handed to another tab, so it was not handed off; free up this site's storage and try again (${error instanceof Error ? error.message : String(error)})`);
+      }
+    },
+    // A failed write leaves the note listing the tab, so the next logout fails rather than pass.
+    settle(tab: string) { try { write(read().filter((owed) => owed !== tab)); } catch { /* still owed */ } },
+    clear() { try { write([]); } catch { /* still owed */ } },
   };
 }
 
+function lockManager(env: HandoffEnvironment = {}): LockManagerLike | undefined {
+  return env.locks ?? (typeof navigator !== "undefined" ? (navigator as { locks?: LockManagerLike }).locks : undefined);
+}
+
 function environment(env: HandoffEnvironment = {}): Required<Pick<HandoffEnvironment, "locks" | "channel">> | undefined {
-  const locks = env.locks ?? (typeof navigator !== "undefined" ? (navigator as { locks?: LockManagerLike }).locks : undefined);
+  const locks = lockManager(env);
   const channel = env.channel ?? (typeof BroadcastChannel !== "undefined" ? (name: string) => new BroadcastChannel(name) as BroadcastChannelLike : undefined);
   return locks && channel ? { locks, channel } : undefined;
 }
@@ -227,4 +266,35 @@ export async function refuseWhileFiberRuns(identifier: string, env: HandoffEnvir
   if (held.some((lock) => lock.name === `ckb-keyway:fiber:${identifier}`)) {
     throw new Error("Fiber is still running in another tab; log out there, or close that tab, first");
   }
+}
+
+/** Outside `${PREFIX}${scope}:`, where every lock names a tab to hand the logout to. */
+const sessionLock = (scope: string) => `ckb-keyway:logout:${scope}`;
+export const LOGGING_OUT_ERROR = "Fiber can't start while this account is logging out in another tab, or once it has logged out";
+
+/**
+ * Runs `end` (the handoff, the last check that no node runs, and ending the session) holding the session's logout
+ * lock on its own, so no node of the session starts meanwhile (`startUnlessLoggingOut`). Without Web Locks it just
+ * runs `end`, as before.
+ */
+export async function whileLoggingOut<T>(scope: string, end: () => Promise<T>, env: HandoffEnvironment = {}): Promise<T> {
+  const locks = lockManager(env);
+  if (!locks) return end();
+  return await locks.request(sessionLock(scope), { mode: "exclusive" }, () => end()) as T;
+}
+
+/**
+ * Runs `claim` (taking the node's device lock) holding the session's logout lock shared, and only while no logout of
+ * the session holds it and the session is still signed in (`signedIn`, asked once no logout can end it meanwhile).
+ * Otherwise a node could start after a logout's last check that none runs and run on once the session ended, with
+ * nothing more reaching KeyWay's watchtower. It fails rather than waits: the logout may itself be waiting for this
+ * tab's start to settle before it can finish. Without Web Locks it just runs `claim`, as before.
+ */
+export async function startUnlessLoggingOut<T>(scope: string, claim: () => Promise<T>, signedIn: () => boolean, env: HandoffEnvironment = {}): Promise<T> {
+  const locks = lockManager(env);
+  if (!locks) return claim();
+  return await locks.request(sessionLock(scope), { mode: "shared", ifAvailable: true }, async (lock) => {
+    if (!lock || !signedIn()) throw new Error(LOGGING_OUT_ERROR);
+    return claim();
+  }) as T;
 }

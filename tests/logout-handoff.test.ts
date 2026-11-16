@@ -1,19 +1,55 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { handOffLogout, refuseWhileFiberRuns, serveLogoutHandoff, type LockManagerLike } from "../src/sdk/browser/logout-handoff.ts";
+import {
+  handOffLogout,
+  LOGGING_OUT_ERROR,
+  logsOutBrowserNode,
+  refuseWhileFiberRuns,
+  serveLogoutHandoff,
+  startUnlessLoggingOut,
+  UNFINISHED_HANDOFF_ERROR,
+  whileLoggingOut,
+  type LockManagerLike,
+  type LockOptions,
+} from "../src/sdk/browser/logout-handoff.ts";
 
-/** One origin's lock manager, shared by every "tab" in the test. */
+type LockCallback = (lock: unknown) => Promise<unknown>;
+type LockMode = "shared" | "exclusive";
+
+/** One origin's lock manager, shared by every "tab" in the test: exclusive or shared locks, granted in turn. */
 function originLocks() {
-  const held = new Map<string, number>();
-  const locks: LockManagerLike & { held: Map<string, number> } = {
+  const held = new Map<string, { mode: LockMode; count: number }>();
+  const queued = new Map<string, Array<{ mode: LockMode; grant: () => void }>>();
+  const grantable = (name: string, mode: LockMode) => {
+    const lock = held.get(name);
+    return !lock || (mode === "shared" && lock.mode === "shared");
+  };
+  const take = (name: string, mode: LockMode) => held.set(name, { mode, count: (held.get(name)?.count ?? 0) + 1 });
+  const drop = (name: string) => {
+    const lock = held.get(name)!;
+    if (lock.count > 1) lock.count -= 1; else held.delete(name);
+    const queue = queued.get(name) ?? [];
+    while (queue.length > 0 && grantable(name, queue[0].mode)) {
+      const next = queue.shift()!;
+      take(name, next.mode);
+      next.grant();
+    }
+  };
+  const locks: LockManagerLike & { held: typeof held } = {
     held,
-    async request(name, callback) {
-      held.set(name, (held.get(name) ?? 0) + 1);
+    async request(name: string, optionsOrCallback: LockOptions | LockCallback, maybeCallback?: LockCallback) {
+      const options = typeof optionsOrCallback === "function" ? {} : optionsOrCallback;
+      const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback!;
+      const mode = options.mode ?? "exclusive";
+      const queue = queued.get(name) ?? [];
+      queued.set(name, queue);
+      if (grantable(name, mode) && queue.length === 0) take(name, mode);
+      else if (options.ifAvailable) return callback(null);
+      else await new Promise<void>((grant) => queue.push({ mode, grant }));
       try {
-        return await callback({ name });
+        return await callback({ name, mode });
       } finally {
-        const count = (held.get(name) ?? 1) - 1;
-        if (count) held.set(name, count); else held.delete(name);
+        drop(name);
       }
     },
     async query() {
@@ -221,8 +257,12 @@ test("the provider hands a logout to the session's other tabs, and checks no nod
   assert.ok(logout.indexOf("await refuseWhileFiberRuns(") > 0 && logout.indexOf("await refuseWhileFiberRuns(") < end);
   // A logout whose own node just stopped, delivered and backed up clears a note left by a tab that closed mid-handoff,
   // and a tab answering a handoff says whether a node logged out there.
-  assert.match(logout, /handOffLogout\(\{[^}]*nodeLoggedOutHere: Boolean\(current\)/);
-  assert.match(source, /return \{ nodeLoggedOut: Boolean\(current\) \};/);
+  // Only a browser node counts, asked before its logout: a KeyWay-hosted connection delivers and backs up nothing here.
+  assert.match(logout, /const nodeLoggedOutHere = logsOutBrowserNode\(current\);\s*if \(current\) await current\.keyway\.stopForLogout\(\);/);
+  assert.match(logout, /handOffLogout\(\{[^}]*nodeLoggedOutHere \}/);
+  const handler = source.slice(source.indexOf("  async function logOutNodesHere()"));
+  assert.match(handler, /^[^]*?const nodeLoggedOut = logsOutBrowserNode\(current\);[^]*?return \{ nodeLoggedOut \};/);
+  assert.doesNotMatch(source, /Boolean\(current\)/);
   // A node whose start a logout overtook becomes the connection that logout stops, delivers and backs up; one
   // overtaken otherwise is stopped as one of the stopped nodes.
   assert.match(source, /if \(loggingOutRef\.current > 0 && !connectionRef\.current\) \{[^}]*connectionRef\.current = next;/);
@@ -232,4 +272,115 @@ test("the provider hands a logout to the session's other tabs, and checks no nod
   }
   // A tab that ever ran a node answers other tabs' logouts.
   assert.match(source.slice(source.indexOf("  async function connect() {")), /^[^]*?serveLogoutHandoff\(/);
+});
+
+test("only a browser node that still holds the device counts as logging out here, never a KeyWay-hosted connection", async () => {
+  const browser = (holds: boolean) => ({ mode: "browser" as const, keyway: { holdsDevice: () => holds } });
+  assert.equal(logsOutBrowserNode(browser(true)), true);
+  assert.equal(logsOutBrowserNode(browser(false)), false, "a node that already let go has nothing left to back up");
+  assert.equal(logsOutBrowserNode({ mode: "hosted" }), false, "a hosted node runs on KeyWay's servers: nothing here delivers or backs up");
+  assert.equal(logsOutBrowserNode(undefined), false);
+  // So a hosted connection's logout doesn't clear what a tab that closed mid-handoff left owing.
+  const locks = originLocks();
+  const storage = originStorage();
+  storage.setItem(`ckb-keyway:logout-handoff:${scope}:unfinished`, JSON.stringify(["gone-tab"]));
+  const hostedTab = serveLogoutHandoff({ scope, tabId: "hosted-tab", locks, storage, handle: async () => ({ nodeLoggedOut: logsOutBrowserNode({ mode: "hosted" }) }) });
+  await assert.rejects(handOffLogout({ scope, tabId: "other-tab", locks, storage, nodeLoggedOutHere: logsOutBrowserNode({ mode: "hosted" }) }), /closed before it finished logging out/);
+  hostedTab.release();
+  await handOffLogout({ scope, tabId: "other-tab", locks, storage, nodeLoggedOutHere: logsOutBrowserNode(browser(true)) });
+});
+
+test("a note that can't be read counts as owed, so the logout fails rather than pass", async () => {
+  const locks = originLocks();
+  const unreadable = { getItem: () => { throw new Error("SecurityError"); }, setItem: () => undefined, removeItem: () => undefined };
+  await assert.rejects(handOffLogout({ scope, tabId: "other-tab", locks, storage: unreadable }), (error: Error) => error.message === UNFINISHED_HANDOFF_ERROR);
+  // Storage blocked outright (reading localStorage itself throws) is not the same as a browser without storage.
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, get() { throw new Error("SecurityError"); } });
+  try {
+    await assert.rejects(handOffLogout({ scope, tabId: "other-tab", locks }), (error: Error) => error.message === UNFINISHED_HANDOFF_ERROR);
+  } finally {
+    if (descriptor) Object.defineProperty(globalThis, "localStorage", descriptor);
+    else delete (globalThis as { localStorage?: unknown }).localStorage;
+  }
+  // Without any storage there is no note to read, as before.
+  await handOffLogout({ scope, tabId: "other-tab", locks });
+});
+
+test("a logout that can't note the tabs it hands off to fails before it asks them", async () => {
+  const locks = originLocks();
+  const full = { ...originStorage(), setItem: () => { throw new Error("QuotaExceededError"); } };
+  let asked = 0;
+  const nodeTab = serveLogoutHandoff({ scope, tabId: "node-tab", locks, storage: full, handle: async () => { asked++; return { nodeLoggedOut: true }; } });
+  await assert.rejects(handOffLogout({ scope, tabId: "other-tab", locks, storage: full }), /Could not note the Fiber logout handed to another tab[^]*QuotaExceededError/);
+  assert.equal(asked, 0, "unnoted, a tab that closed mid-handoff would leave nothing to fail the next logout");
+  nodeTab.release();
+});
+
+test("no node starts while a logout ends the session, from before its handoff until after", async () => {
+  const locks = originLocks();
+  let signedIn = true;
+  let claims = 0;
+  const claimDevice = async () => { claims++; return "device lock"; };
+  // Another tab answered the handoff, so the last check finds no node: it then tries to start one before the
+  // session has ended.
+  const answered = serveLogoutHandoff({ scope, tabId: "answered-tab", locks, handle: async () => ({ nodeLoggedOut: true }) });
+  await whileLoggingOut(scope, async () => {
+    await handOffLogout({ scope, tabId: "other-tab", locks });
+    await refuseWhileFiberRuns("0xabc", { locks });
+    await assert.rejects(startUnlessLoggingOut(scope, claimDevice, () => signedIn, { locks }), (error: Error) => error.message === LOGGING_OUT_ERROR);
+    signedIn = false; // the session ends (revoked, and cleared from storage)
+  }, { locks });
+  answered.release();
+  // Once the logout lets go, the session has ended: a start that waited out the logout is refused too.
+  await assert.rejects(startUnlessLoggingOut(scope, claimDevice, () => signedIn, { locks }), (error: Error) => error.message === LOGGING_OUT_ERROR);
+  assert.equal(claims, 0, "no node took the device");
+  // Signed in, with no logout in progress, a node starts; and another session's logout doesn't hold this one's.
+  signedIn = true;
+  await whileLoggingOut(`app:${crypto.randomUUID()}`, async () => {
+    assert.equal(await startUnlessLoggingOut(scope, claimDevice, () => signedIn, { locks }), "device lock");
+  }, { locks });
+  assert.equal(claims, 1);
+  assert.equal(locks.held.size, 0);
+});
+
+test("a logout waits for a node that is taking the device, then finds it running", async () => {
+  const locks = originLocks();
+  let finishClaim!: () => void;
+  let stopNode!: () => void;
+  const claiming = startUnlessLoggingOut(scope, async () => {
+    await new Promise<void>((resolve) => { finishClaim = resolve; });
+    // The node's device lock: held until the node stops.
+    void locks.request("ckb-keyway:fiber:0xabc", () => new Promise<void>((resolve) => { stopNode = resolve; }));
+  }, () => true, { locks });
+  let ended = false;
+  const loggingOut = whileLoggingOut(scope, async () => {
+    await refuseWhileFiberRuns("0xabc", { locks });
+    ended = true;
+  }, { locks });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(ended, false, "the logout's checks wait for the start taking the device");
+  finishClaim();
+  await claiming;
+  await assert.rejects(loggingOut, /still running in another tab/);
+  stopNode();
+});
+
+test("a browser node takes the device only through the provider's logout guard", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const createKeyWay = await readFile(new URL("../src/sdk/browser/create-keyway.ts", import.meta.url), "utf8");
+  assert.match(createKeyWay, /const lockDevice = \(\) => acquireDeviceLock\(options\.identifier\);\s*deviceLock = await \(options\.guardClaim \? options\.guardClaim\(lockDevice\) : lockDevice\(\)\);/);
+  const connectKeyWay = await readFile(new URL("../src/sdk/browser/connect-keyway.ts", import.meta.url), "utf8");
+  assert.match(connectKeyWay, /guardClaim: options\.guardClaim,/);
+  const source = await readFile(new URL("../src/sdk/react/keyway-provider.tsx", import.meta.url), "utf8");
+  const connect = source.slice(source.indexOf("  async function connect() {"), source.indexOf("  async function disconnect() {"));
+  assert.match(connect, /guardClaim: <T,>\(claim: \(\) => Promise<T>\) => startUnlessLoggingOut\(handoffScope\(appId, user\.id\), claim, \(\) => readStoredSession\(appId\)\?\.user\.id === user\.id\)/);
+  // The logout holds the session's logout lock from before the handoff until the session has ended here too.
+  const logout = source.slice(source.indexOf("  async function logoutNow() {"), source.indexOf("handoffHandlerRef.current = async"));
+  const endSession = logout.slice(logout.indexOf("const endSession = async () => {"), logout.indexOf("await whileLoggingOut(handoffScope(appId, user.id), endSession);"));
+  assert.ok(endSession.length > 0);
+  for (const step of ["await handOffLogout(", "await refuseWhileFiberRuns(", "await api.logout(token)", "clearStoredSession(appId)"]) {
+    assert.ok(endSession.includes(step), step);
+  }
+  assert.equal(logout.match(/clearStoredSession\(/g)?.length, 1);
 });

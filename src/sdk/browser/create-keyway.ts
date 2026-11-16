@@ -64,6 +64,11 @@ export type CreateKeyWayOptions = {
   restoreRequired?: boolean;
   onLeaseLost?: (error: Error) => void;
   onFiberStartup?: (stage: BrowserNodeStage) => void;
+  /**
+   * Runs the step that takes the device lock. The provider runs it only while no logout of the session is in
+   * progress and the session is still signed in (`startUnlessLoggingOut`, logout-handoff.ts).
+   */
+  guardClaim?: <T>(claim: () => Promise<T>) => Promise<T>;
 };
 
 export type ChannelOpenStage = "connecting" | "negotiating" | "confirming" | "signing" | "broadcasting" | "waiting";
@@ -214,7 +219,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     node,
     async claim() {
       options.onFiberStartup?.("claiming_device");
-      deviceLock = await acquireDeviceLock(options.identifier);
+      const lockDevice = () => acquireDeviceLock(options.identifier);
+      deviceLock = await (options.guardClaim ? options.guardClaim(lockDevice) : lockDevice());
       deviceLease = await acquireDeviceLease(options.authToken, api, (cause) => {
         const error = cause instanceof Error ? cause : new Error("The active KeyWay device lease expired");
         void stop().finally(() => options.onLeaseLost?.(error));
