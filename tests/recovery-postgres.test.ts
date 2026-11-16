@@ -13,7 +13,6 @@ import { formatCkbSignature } from "../src/server/funding-transaction.ts";
 import { signingSettings } from "../src/server/general-signing.ts";
 import { issueBackupChallenge, recoveryBackupChange, recoverySetup, settleRecoveryChange, type RecoveryContext } from "../src/server/recovery.ts";
 import { readWallet, saveWallet, type ReadyWallet } from "../src/server/user-wallet.ts";
-import { litSignerOverride } from "../src/server/lit-config.ts";
 import { litPolicyRunner } from "../src/server/lit-policy.ts";
 import { fakeLit, litCodeIn } from "./lit-action-fixture.ts";
 
@@ -381,6 +380,105 @@ test("a recovery change whose send fails stays pending until the chain settles i
     await recoverySetup(h.context(dropped), { operation: "preview", backups: [h.sign(evmWallet())] });
   });
 
+  await t.test("past the grace period, one whose input reads spent while the node has it pending again (a reorg) is kept, not dropped", async () => {
+    const h = await harness();
+    const result = await enable(h, { before: TIMEOUT() });
+    const input = ccc.Transaction.from(result.transaction).inputs[0].previousOutput;
+    const { getCellLive, getTransaction } = h.client;
+    // The change's block is rolled back between reads: unknown first, its input spent, then back in the pool.
+    const statuses: ccc.TransactionStatus[] = ["unknown", "pending"];
+    const reorged = Object.assign(Object.create(h.client) as ccc.Client, {
+      getTransaction: async (hash: ccc.HexLike) => ccc.hexFrom(hash) === result.transactionHash
+        ? { transaction: ccc.Transaction.from(result.transaction), status: statuses.shift() ?? "pending" }
+        : getTransaction(hash),
+      getCellLive: async (outPoint: ccc.OutPointLike, withData?: boolean) => ccc.OutPoint.from(outPoint).eq(input) ? undefined : getCellLive(outPoint, withData),
+    });
+    const kept = await settleRecoveryChange({ ...(await current(h)), client: reorged }, later(11));
+    assert.equal(kept.recoveryPending?.transactionHash, result.transactionHash);
+    assert.equal(kept.ckbAddress, h.legacyAddress);
+    h.chain.set(result.transactionHash, { transaction: ccc.Transaction.from(result.transaction), status: "committed" });
+    const settled = await settleRecoveryChange(await current(h), later(12));
+    assert.equal(settled.ckbAddress, result.ckbAddress);
+    assert.equal(settled.recovery?.enableTransactionHash, result.transactionHash);
+  });
+
+  await t.test("past the grace period, one whose AdminList output is live is applied even when the transaction reads unknown", async () => {
+    const h = await harness();
+    const result = await enable(h, { before: TIMEOUT() });
+    // Committed: its input is spent and its AdminList output live. The transaction lookup still answers as a node
+    // that hasn't caught up would.
+    h.chain.set(result.transactionHash, { transaction: ccc.Transaction.from(result.transaction), status: "committed" });
+    const lagging = Object.assign(Object.create(h.client) as ccc.Client, { getTransaction: async () => undefined });
+    const settled = await settleRecoveryChange({ ...(await current(h)), client: lagging }, later(11));
+    assert.equal(settled.recoveryPending, undefined);
+    assert.equal(settled.ckbAddress, result.ckbAddress);
+    assert.equal(settled.recovery?.enableTransactionHash, result.transactionHash);
+    assert.equal(h.emails.filter(({ subject }) => /Account recovery is on/.test(subject)).length, 1);
+    assert.equal(h.broadcasts.length, 0, "not sent again");
+  });
+
+  await t.test("past the grace period, a node that doesn't know the change's inputs can't drop it", async () => {
+    const h = await harness();
+    const result = await enable(h, { before: TIMEOUT() });
+    const inputs = ccc.Transaction.from(result.transaction).inputs.map(({ previousOutput }) => previousOutput.txHash);
+    const { getTransaction } = h.client;
+    // A node behind the block that made the inputs reads them as not live, and doesn't know the change either.
+    const behind = Object.assign(Object.create(h.client) as ccc.Client, {
+      getCellLive: async () => undefined,
+      getTransaction: async (hash: ccc.HexLike) => inputs.includes(ccc.hexFrom(hash)) ? undefined : getTransaction(hash),
+    });
+    const kept = await settleRecoveryChange({ ...(await current(h)), client: behind }, later(11));
+    assert.equal(kept.recoveryPending?.transactionHash, result.transactionHash);
+    assert.equal(kept.ckbAddress, h.legacyAddress);
+    assert.equal(h.broadcasts.length, 0, "not sent to a node that can't place it");
+  });
+
+  await t.test("a change recorded without its transaction is applied, not dropped, when its AdminList output is live", async () => {
+    const h = await harness();
+    const result = await enable(h, { before: TIMEOUT() });
+    const stored = await readWallet(h.user) as ReadyWallet;
+    const { transaction: _transaction, ...older } = stored.recoveryPending!;
+    await saveWallet(h.user, { ...stored, recoveryPending: older });
+    // Committed, though the lookup reads unknown as on a node that hasn't caught up.
+    h.chain.set(result.transactionHash, { transaction: ccc.Transaction.from(result.transaction), status: "committed" });
+    const lagging = Object.assign(Object.create(h.client) as ccc.Client, { getTransaction: async () => undefined });
+    const settled = await settleRecoveryChange({ ...(await current(h)), client: lagging }, later(11));
+    assert.equal(settled.recoveryPending, undefined);
+    assert.equal(settled.ckbAddress, result.ckbAddress);
+  });
+
+  await t.test("a change recorded without its transaction is dropped only when no node shows its AdminList", async () => {
+    const recordedWithout = async () => {
+      const h = await harness();
+      const result = await enable(h, { before: TIMEOUT() });
+      const stored = await readWallet(h.user) as ReadyWallet;
+      const { transaction: _transaction, ...older } = stored.recoveryPending!;
+      await saveWallet(h.user, { ...stored, recoveryPending: older });
+      // A node behind the change's block: it doesn't know the transaction and shows no AdminList.
+      const behind = Object.assign(Object.create(h.client) as ccc.Client, { getTransaction: async () => undefined, getCellLive: async () => undefined });
+      const unreachable = Object.assign(Object.create(h.client) as ccc.Client, { getTransaction: async () => { throw TIMEOUT(); } });
+      return { h, result, behind, unreachable };
+    };
+
+    // Committed: a node that is behind can't drop it, and the next node applies it.
+    const committed = await recordedWithout();
+    committed.h.chain.set(committed.result.transactionHash, { transaction: ccc.Transaction.from(committed.result.transaction), status: "committed" });
+    const applied = await settleRecoveryChange({ ...(await current(committed.h)), nodes: [committed.behind, committed.h.client] }, later(11));
+    assert.equal(applied.recoveryPending, undefined);
+    assert.equal(applied.ckbAddress, committed.result.ckbAddress);
+
+    // Behind, and the other node can't answer: still pending.
+    const unsure = await recordedWithout();
+    const kept = await settleRecoveryChange({ ...(await current(unsure.h)), nodes: [unsure.behind, unsure.unreachable] }, later(11));
+    assert.equal(kept.recoveryPending?.transactionHash, unsure.result.transactionHash);
+
+    // Every node agrees it isn't there: dropped, so a change that never committed doesn't stay pending.
+    const never = await recordedWithout();
+    const dropped = await settleRecoveryChange({ ...(await current(never.h)), nodes: [never.h.client, never.behind] }, later(11));
+    assert.equal(dropped.recoveryPending, undefined);
+    assert.equal(dropped.ckbAddress, never.h.legacyAddress);
+  });
+
   await t.test("one the node reports rejected while its inputs are unspent stays pending, is sent again, and is applied once committed", async () => {
     const h = await harness();
     const result = await enable(h, {});
@@ -535,12 +633,8 @@ test("with the policy Action: Lit emails the code, binds the email on chain, and
   process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
   process.env.LIT_USAGE_API_KEY ??= "test-usage-key";
   process.env.RESEND_API_KEY ??= "re_test_sending_key";
-  const previous = { signer: litSignerOverride.mode, run: litPolicyRunner.run };
-  litSignerOverride.mode = "policy";
-  t.after(() => {
-    litSignerOverride.mode = previous.signer;
-    litPolicyRunner.run = previous.run;
-  });
+  const previous = litPolicyRunner.run;
+  t.after(() => { litPolicyRunner.run = previous; });
 
   const h = await harness();
   const pkpId = ccc.hexFrom(keccak_256(secp256k1.getPublicKey(h.privateKey, false).slice(1)).slice(12));
@@ -630,13 +724,13 @@ test("with the policy Action: Lit emails the code, binds the email on chain, and
   assert.deepEqual(onChainAuths(), await saltedAuths(current));
 
   // A JoyID passkey (the proof the cross-origin-isolated popup or redirect returns) is added through the Action too,
-  // which names it by its key id; the record names neither backup.
+  // which names it by the full JoyID address the user knows; the record names neither backup.
   const joy = await joyIdWallet(h.client);
   const joyBackup = { kind: "joyid" as const, address: joy.address };
   const { challengeNonce } = issueBackupChallenge(h.user);
   const joyProof = { ...joyBackup, challengeNonce, ...joy.sign(recoveryBackupChallenge(h.legacyAddress, joyBackup, challengeNonce)) };
   const added = await changeThroughLit(current, { change: "add", backup: joyProof });
-  assert.match(added.email.text, new RegExp(`Adding: JoyID passkey \\(key id ${ccc.hexFrom(ccc.hashCkbShort(joy.publicKey))}\\)`));
+  assert.ok(added.email.text.includes(`Adding: JoyID ${joy.address}\n`), added.email.text);
   assert.match(added.email.text, /Backups after this change: 3/);
   // The notice once it's on chain names the passkey by its whole address too.
   assert.ok(h.emails.at(-1)!.plaintext.includes(`JoyID ${joy.address}\n`), h.emails.at(-1)!.plaintext);
@@ -654,12 +748,4 @@ test("with the policy Action: Lit emails the code, binds the email on chain, and
   assert.deepEqual(current.recovery!.backups!.map((backup) => backup.kind), ["evm", "joyid"]);
   assert.deepEqual(onChainAuths(), await saltedAuths(current));
 
-  // A request opened under one signer can't be finished under the other: the user is asked to start again.
-  const updated = current;
-  const third = h.sign(evmWallet());
-  litSignerOverride.mode = "digest";
-  const opened = await recoveryBackupChange(context(updated), { operation: "preview", change: "add", backup: third }) as { confirmationNonce: string };
-  litSignerOverride.mode = "policy";
-  await assert.rejects(recoveryBackupChange(context(updated), { operation: "request-email-code", change: "add", backup: third, confirmationNonce: opened.confirmationNonce }), /switched signers/);
-  await assert.rejects(recoveryBackupChange(context(updated), { operation: "apply", change: "add", backup: third, confirmationNonce: opened.confirmationNonce, emailCode: "12345678" }), /switched signers/);
 });
