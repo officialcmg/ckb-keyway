@@ -441,11 +441,12 @@ async function sendLimitSettings(
     // which needs no code), and the change is built on that.
     if (plan.needsCode && head && !sameSettings(decodeSendLimitSettings(head.outputData), settingsFromDailyAmounts(current, new Uint8Array(32)))) {
       const synced = await putAmountsOnCell(context, client, head, current);
-      if (synced) {
-        head = synced;
-        transaction = await buildSendLimitChange(client, context.wallet, head, settings);
-        plan = await planSendLimits(context.wallet, transaction);
-      }
+      // Putting them there needs the Lit code itself (its fee isn't small and the day's amount is reached): asking it
+      // separately keeps every email right, so the user does that first.
+      if (!synced) throw new Error("Your stricter daily amounts haven't reached your send-limit cell yet. Set them again first, then make this change");
+      head = synced;
+      transaction = await buildSendLimitChange(client, context.wallet, head, settings);
+      plan = await planSendLimits(context.wallet, transaction);
     }
     applySendLimitRecord(transaction, plan);
     const lines = [
@@ -480,7 +481,11 @@ async function sendLimitSettings(
     // Read before looking for the cell: a cell made after the look is written to the amounts (lowering them to its
     // own) after it is recorded, so either the look finds it or the server-only write sees the version move.
     const version = await readDailyAmountsVersion(context.user);
-    if (await sendLimitHead(client, context.wallet, await listPendingTransactions(context.user.id, nodeStatus(client)))) {
+    // A genesis the node has: the cell exists even while an indexer doesn't list it yet (and it has left the pending list).
+    const genesis = await genesisTransaction(context.user);
+    const genesisStatus = genesis ? await nodeStatus(client)(genesis) : undefined;
+    if (genesisStatus === "pending" || genesisStatus === "proposed" || genesisStatus === "committed"
+      || await sendLimitHead(client, context.wallet, await listPendingTransactions(context.user.id, nodeStatus(client)))) {
       throw new Error("Send limits were turned on since this change was asked for. Start again");
     }
     return { serverOnly: version };
@@ -521,7 +526,7 @@ async function putAmountsOnCell(context: SigningContext, client: ccc.Client, hea
   const plan = await planSendLimits(context.wallet, transaction);
   if (plan.needsCode) return undefined;
   applySendLimitRecord(transaction, plan);
-  await lowerToCell(context.user, decodeSendLimitSettings(transaction.outputsData[0]));
+  await lowerToCell(context.user, transaction, { sent: false });
   await signAndSendSettings(context, client, transaction, {});
   const synced = await pendingSendLimitHead(context, client);
   if (synced?.outPoint.txHash !== transaction.hash()) throw new Error("Your send limits changed while this was being made. Try again");
@@ -539,10 +544,9 @@ async function putAmountsOnCell(context: SigningContext, client: ccc.Client, hea
  */
 async function serverAmountsAround(user: User, current: DailyAmounts, next: DailyAmounts, change: { asset: string; amount: bigint | null }, from: bigint | undefined, transaction: ccc.Transaction, send: () => Promise<void>): Promise<DailyAmounts> {
   const tightens = !weakens(current, next);
-  const cell = decodeSendLimitSettings(transaction.outputsData[0]);
   if (tightens) await writeDailyAmount(user, change.asset, change.amount, "lower");
   // A loosening approved from an amount that has since changed (a stricter one set meanwhile) isn't sent at all.
-  const version = await lowerToCell(user, cell, tightens ? undefined : { asset: change.asset, amount: from });
+  const version = await lowerToCell(user, transaction, { sent: false, ...(tightens ? {} : { from: { asset: change.asset, amount: from } }) });
   try {
     await send();
     if (!tightens && !await writeDailyAmount(user, change.asset, change.amount, { from, version })) throw new Error(AMOUNTS_CHANGED);
@@ -550,7 +554,7 @@ async function serverAmountsAround(user: User, current: DailyAmounts, next: Dail
     // Once more after the transaction is recorded as pending (even if sending failed, as it may still have landed): a
     // server-only raise that looked for the cell before it was recorded is then written either before this, which
     // lowers it, or after, which the version this moves refuses.
-    await lowerToCell(user, cell);
+    await lowerToCell(user, transaction, { sent: true });
   }
   return readDailyAmounts(user);
 }
@@ -849,32 +853,59 @@ async function writeDailyAmount(user: User, asset: string, amount: bigint | null
 }
 
 /**
- * Lowers the server's daily amounts to those a send-limit transaction puts in the account's cell, before it is sent:
- * the transaction may have been built from amounts that a raise has since replaced, and once it lands the chain holds
- * its amounts, so the server must hold none looser. With `from`, first checks that the asset a raise changes is still
- * at the amount the user approved it from. Returns the version this write leaves, which a raise checks before it
- * writes its own amount after sending.
+ * Lowers the server's daily amounts to those a send-limit transaction puts in the account's cell (always its first
+ * output). Before it is sent (`sent` false): the transaction may have been built from amounts that a change has since
+ * replaced, and once it lands the chain holds its amounts, so the server must hold none looser; an amount the server
+ * no longer has is put back, unless that would take it past the eight tokens the cell holds, when the transaction
+ * isn't sent at all. With `from`, first checks that the asset a raise changes is still at the amount the user
+ * approved it from. A genesis is remembered, so a server-only raise can see the cell exists before any indexer does.
+ * After it is sent (`sent` true): only lowers the amounts the server still has, so an older transaction finishing
+ * late can't bring back an amount a newer change removed. Returns the version this write leaves, which a raise checks
+ * before it writes its own amount after sending.
  */
-async function lowerToCell(user: User, cell: Omit<SendLimitSettings, "fingerprint">, from?: { asset: string; amount: bigint | undefined }): Promise<bigint> {
+async function lowerToCell(user: User, transaction: ccc.Transaction, options: { sent: boolean; from?: { asset: string; amount: bigint | undefined } }): Promise<bigint> {
+  const cell = decodeSendLimitSettings(transaction.outputsData[0]);
+  // Settings KeyWay writes leave tokens without an amount unlimited, as the server does.
+  if (!cell.tokensUnlimited) throw new Error("The send-limit cell holds settings KeyWay doesn't write");
   const sql = await database();
   return sql.begin(async (tx) => {
     await lockDailyAmounts(tx, user);
     const stored = await readDailyAmounts(user, tx);
+    const { from, sent } = options;
     if (from && stored.get(from.asset) !== from.amount) throw new Error(AMOUNTS_CHANGED);
-    // Settings KeyWay writes leave tokens without an amount unlimited, as the server does.
-    if (!cell.tokensUnlimited) throw new Error("The send-limit cell holds settings KeyWay doesn't write");
     const limits = [...(cell.ckb === undefined ? [] : [["ckb", cell.ckb] as const]), ...cell.tokens];
-    for (const [asset, amount] of limits) {
+    const lower = limits.filter(([asset, amount]) => {
       const current = stored.get(asset);
-      if (current !== undefined && current <= amount) continue;
+      return current === undefined ? !sent : current > amount;
+    });
+    const tokens = new Set([...stored.keys(), ...lower.map(([asset]) => asset)].filter((asset) => asset !== "ckb"));
+    if (tokens.size > MAX_SEND_LIMIT_TOKENS && tokens.size > [...stored.keys()].filter((asset) => asset !== "ckb").length) throw new Error(AMOUNTS_CHANGED);
+    for (const [asset, amount] of lower) {
       await tx`
         insert into keyway_v2_daily_amounts (user_id, asset, amount, updated_at)
         values (${user.id}, ${asset}, ${amount.toString()}, now())
         on conflict (user_id, asset) do update set amount = excluded.amount, updated_at = now()
       `;
     }
-    return nextDailyAmountsVersion(tx, user);
+    const version = await nextDailyAmountsVersion(tx, user);
+    if (!sent && isGenesis(transaction)) {
+      await tx`update keyway_v2_daily_amount_versions set genesis_transaction = ${transaction.hash()} where user_id = ${user.id}`;
+    }
+    return version;
   });
+}
+
+/** Whether a send-limit transaction makes the cell: its Type ID comes from its first input. */
+function isGenesis(transaction: ccc.Transaction): boolean {
+  const type = transaction.outputs[0]?.type;
+  return Boolean(type && transaction.inputs[0] && type.args === ccc.hashTypeId(transaction.inputs[0], 0));
+}
+
+/** The last transaction sent to make the account's send-limit cell, if any. */
+async function genesisTransaction(user: User): Promise<ccc.Hex | undefined> {
+  const sql = await database();
+  const [row] = await sql<Array<{ genesis_transaction: string | null }>>`select genesis_transaction from keyway_v2_daily_amount_versions where user_id = ${user.id}`;
+  return row?.genesis_transaction ? ccc.hexFrom(row.genesis_transaction) : undefined;
 }
 
 /** The per-user lock every write to the daily amounts takes, for the length of its transaction. */

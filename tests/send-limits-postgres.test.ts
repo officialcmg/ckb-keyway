@@ -547,6 +547,89 @@ test("a server-only raise that looked for the cell before turning limits on was 
   });
 });
 
+test("a server-only raise is refused once turning limits on has committed, even before an indexer lists the cell", { skip: !enabled }, async (t) => {
+  const { world, user, context, sent } = await setUp();
+  const sql = await database();
+  await sql`insert into keyway_v2_daily_amounts (user_id, asset, amount) values (${user.id}, 'ckb', ${(10n * CKB).toString()})`;
+  const emails: string[] = [];
+  context.sendEmail = async (_to, message) => { emails.push(message.plaintext); };
+  const set = (value: bigint, extra: Record<string, unknown> = {}) => signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: value.toString(), ...extra }) as Promise<Record<string, unknown>>;
+  const genesis = await set(10n * CKB);
+  await set(10n * CKB, { confirmationNonce: genesis.confirmationNonce, emailCode: codeFrom(world) });
+  // The genesis commits (so it leaves the pending list), but the indexer is a block behind and doesn't list it yet.
+  world.add(sent.at(-1)!, "committed");
+  const fetch = sendLimitRpc.fetch;
+  t.after(() => { sendLimitRpc.fetch = fetch; });
+  const committed = () => [...world.known.values()].filter(({ status }) => status === "committed").map(({ tx }) => tx);
+  sendLimitRpc.fetch = fakeLit({ privateKey, pkpId, lookup: (hash) => world.known.get(hash), transactions: committed, indexerLag: () => 1 }).fetch;
+  const asked = await set(1_000n * CKB);
+  assert.equal(asked.enforcedByLit, false, "the indexer shows no cell, so the raise is asked as a server-only one");
+  const code = /\b(\d{6})\b/.exec(emails.at(-1)!)![1];
+  await assert.rejects(set(1_000n * CKB, { confirmationNonce: asked.confirmationNonce, emailCode: code }), /turned on since/);
+  assert.deepEqual(((await signingSettings(context, { operation: "get" })) as { dailyAmounts: Record<string, string> }).dailyAmounts, { ckb: (10n * CKB).toString() });
+  t.after(async () => {
+    await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
+  });
+});
+
+test("a raise isn't asked with an email that shows the cell's looser amount when putting the stricter one there needs a code", { skip: !enabled }, async (t) => {
+  const { world, user, context, sent } = await setUp();
+  const { set, amounts } = await limitsOn(world, context, sent, 150n * CKB);
+  const broadcast = context.broadcast!;
+  context.broadcast = async () => { throw new Error("connection refused"); };
+  await assert.rejects(set(10n * CKB), /connection refused/);
+  const sql = await database();
+  await sql`update keyway_v2_pending_transactions set signed_at = now() - interval '10 minutes' where user_id = ${user.id}`;
+  context.broadcast = broadcast;
+  // The Action asks for its code to put 10 CKB on the cell (as it does once that change's fee isn't small and the
+  // day's amount is reached).
+  const planner = sendLimitPlanner.run;
+  t.after(() => { sendLimitPlanner.run = planner; });
+  sendLimitPlanner.run = async (params) => {
+    const plan = await planner(params) as Record<string, unknown>;
+    const tx = ccc.Transaction.from((params as { transaction: ccc.TransactionLike }).transaction);
+    return decodeSendLimitSettings(tx.outputsData[0]).ckb === 10n * CKB ? { ...plan, needsCode: true } : plan;
+  };
+  const litEmails = world.lit.emails.length;
+  await assert.rejects(set(1_000n * CKB), /haven't reached your send-limit cell yet/);
+  assert.equal(world.lit.emails.length, litEmails, "no email showing 150 CKB as the amount before");
+  assert.deepEqual(await amounts(), { ckb: (10n * CKB).toString() });
+  t.after(async () => {
+    await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
+  });
+});
+
+test("an older settings change finishing late doesn't bring back a token amount a newer change removed", { skip: !enabled }, async (t) => {
+  const { world, user, context, sent } = await setUp();
+  const { amounts } = await limitsOn(world, context, sent, 1_000n * CKB);
+  const tokens = Array.from({ length: 9 }, (_, i) => `0x${(i + 1).toString(16).padStart(2, "0").repeat(32)}`);
+  const setToken = (asset: string, value: bigint | null, extra: Record<string, unknown> = {}) =>
+    signingSettings(context, { operation: "set-daily-amount", asset, amount: value?.toString() ?? null, ...extra }) as Promise<Record<string, unknown>>;
+  for (const asset of tokens.slice(0, 8)) {
+    await setToken(asset, 100n);
+    world.add(sent.at(-1)!, "committed");
+  }
+  // A tightens the second token; its transaction reaches the node, and before A hears back, B removes the first
+  // token (with the Lit code) and C adds a ninth, each chained on the one before.
+  const broadcast = context.broadcast!;
+  context.broadcast = async (tx) => {
+    context.broadcast = broadcast;
+    const hash = await broadcast(tx);
+    const removal = await setToken(tokens[0], null);
+    await setToken(tokens[0], null, { confirmationNonce: removal.confirmationNonce, emailCode: codeFrom(world) });
+    await setToken(tokens[8], 100n);
+    return hash;
+  };
+  await setToken(tokens[1], 50n);
+  const expected: Record<string, string> = Object.fromEntries([["ckb", (1_000n * CKB).toString()], [tokens[1], "50"], ...tokens.slice(2).map((asset) => [asset, "100"])]);
+  assert.deepEqual(cellAmounts(sent.at(-1)!), Object.fromEntries(Object.entries(expected).map(([asset, value]) => [asset, BigInt(value as string)])));
+  assert.deepEqual(await amounts(), expected);
+  t.after(async () => {
+    const sql = await database();
+    await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
+  });
+});
+
 test("a transaction that changes the send-limit cell's amounts isn't signed outside the settings", { skip: !enabled }, async (t) => {
   const { world, secp, user, wallet, context, sent } = await setUp();
   await limitsOn(world, context, sent, 1_000n * CKB);
