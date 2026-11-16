@@ -21,7 +21,7 @@ import { LIT_ACTION_CIDS } from "./lit-config.ts";
 import { wrapFiberKey } from "./lit.ts";
 import { serializeTransaction } from "./funding-transaction.ts";
 import { database, withUserLock } from "./database.ts";
-import { confirmNodeBackupRestored, readClaimedNodeBackup, retireOwnBackups, saveNodeBackup } from "./node-backup.ts";
+import { confirmNodeBackupRestored, readClaimedNodeBackup, retireOwnBackups, saveFencedNodeBackup } from "./node-backup.ts";
 import {
   addApplicationOrigin,
   createApplication,
@@ -227,20 +227,22 @@ async function fiberKeyRequest(request: Request): Promise<Response> {
   if (typeof leaseId !== "string") throw new Error("Device lease is required");
   if (typeof recipientPublicKey !== "string") throw new Error("Update @ckb-keyway/react to 0.2.4 or later");
   // Lit seals the key to the browser's one-time key, so this server only relays ciphertext.
-  const bundle = await fiberKeyAccess(user, deviceIdHash, leaseId, async (wallet) => wrapFiberKey(wallet.encryptedFiberKey, wallet.litPkpId, recipientPublicKey, deviceIdHash, {
+  const { delivered: bundle, keyDelivery } = await fiberKeyAccess(user, deviceIdHash, leaseId, async (wallet) => wrapFiberKey(wallet.encryptedFiberKey, wallet.litPkpId, recipientPublicKey, deviceIdHash, {
     apiKey: requiredEnv("LIT_USAGE_API_KEY"),
     actionCid: LIT_ACTION_CIDS["wrap-fiber-key"],
     actionCode: await loadLitAction("wrap-fiber-key"),
   }));
-  return Response.json(bundle, { headers: { "Cache-Control": "no-store" } });
+  // The delivery's ID goes with the logout's backup, which is accepted only while it is the latest (saveFencedNodeBackup).
+  return Response.json({ ...bundle, keyDelivery }, { headers: { "Cache-Control": "no-store" } });
 }
 
 /**
  * Hands this device its Fiber key (`deliver` wraps it) if it may have it: the wallet's device, holding the lease.
  * Its node runs again once it has the key, so once the key is wrapped for it, every backup it made before stops
- * being restorable elsewhere (see `retireOwnBackups`). A key that couldn't be wrapped retires nothing.
+ * being restorable elsewhere (see `retireOwnBackups`), and so does any upload still on its way from before
+ * (`keyDelivery`, see `saveFencedNodeBackup`). A key that couldn't be wrapped retires nothing.
  */
-export async function fiberKeyAccess<T>(user: User, deviceIdHash: string, leaseId: string, deliver: (wallet: ReadyWallet) => Promise<T>): Promise<T> {
+export async function fiberKeyAccess<T>(user: User, deviceIdHash: string, leaseId: string, deliver: (wallet: ReadyWallet) => Promise<T>): Promise<{ delivered: T; keyDelivery: string }> {
   const wallet = await readWallet(user);
   if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
   if (wallet.primaryDeviceIdHash !== deviceIdHash) throw new Error("Fiber wallet is bound to another device");
@@ -249,6 +251,7 @@ export async function fiberKeyAccess<T>(user: User, deviceIdHash: string, leaseI
   // Wrapping takes a while: the lease may have run out and another device claimed the backups and been bound
   // meanwhile. Under the lock bootstrap claims and rebinds with, this device must still be the wallet's and hold the
   // lease (its row locked until the retire commits); otherwise it gets no key and nothing is retired.
+  const keyDelivery = crypto.randomUUID();
   await withUserLock(user.id, async (sql) => {
     const current = await readWallet(user, sql);
     if (!current || current.status !== "ready" || current.primaryDeviceIdHash !== deviceIdHash) throw new Error("Fiber wallet is bound to another device");
@@ -259,8 +262,12 @@ export async function fiberKeyAccess<T>(user: User, deviceIdHash: string, leaseI
     `;
     if (!lease) throw new Error("An active device lease is required");
     await retireOwnBackups(user, deviceIdHash, sql);
+    await sql`
+      update keyway_v2_device_leases set key_delivery = ${keyDelivery}::uuid
+      where user_id = ${user.id} and device_id_hash = ${deviceIdHash} and lease_id = ${leaseId}
+    `;
   });
-  return delivered;
+  return { delivered, keyDelivery };
 }
 
 async function channelStateRequest(request: Request): Promise<Response> {
@@ -293,9 +300,12 @@ async function deviceLeaseRequest(request: Request): Promise<Response> {
 async function saveNodeBackupRequest(request: Request): Promise<Response> {
   const user = await authenticateUser(request);
   const body = await objectBody(request, "Invalid Fiber node backup request");
-  const { deviceIdHash, leaseId, backup } = body;
+  const { deviceIdHash, leaseId, keyDelivery, backup } = body;
   if (typeof deviceIdHash !== "string" || typeof leaseId !== "string") {
     throw new Error("Device ID hash and lease ID are required");
+  }
+  if (typeof keyDelivery !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(keyDelivery)) {
+    throw new Error("The Fiber key delivery this backup was taken with is required");
   }
   const wallet = await readWallet(user);
   if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
@@ -306,7 +316,7 @@ async function saveNodeBackupRequest(request: Request): Promise<Response> {
     throw new Error("Fiber node backup does not belong to this wallet");
   }
   return Response.json(await versionedMutation(request, user.id, "node-backup:save", body, () =>
-    saveNodeBackup(user, deviceIdHash, parsed),
+    saveFencedNodeBackup(user, deviceIdHash, leaseId, keyDelivery, parsed),
   ));
 }
 

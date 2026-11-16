@@ -11,14 +11,14 @@ import {
   type Script,
   type SendPaymentParams,
 } from "@fiber-pay/sdk/browser";
-import { KeyWayCredentialProvider, type FiberKeyLoader } from "./credential-provider";
+import { KeyWayCredentialProvider } from "./credential-provider";
 import { acquireDeviceLock, type DeviceLock } from "./device-lock";
 import { acquireDeviceLease, type DeviceLease } from "./device-lease";
 import { serializeCccTransactionForRpc } from "./ccc-transaction";
 import { fundingLockCellDeps, FUNDING_LOCK_KNOWN_SCRIPTS, type KeyWayRecovery } from "./account-lock";
 import { getLockBalance } from "./ckb-balance";
 import { RemoteCkbSigner, type ApproveFiberChannelOpen } from "./remote-ckb-signer";
-import { getDeviceIdHash, markChannelOpened } from "./bootstrap";
+import { getDeviceIdHash, markChannelOpened, type FiberKeyDelivery } from "./bootstrap";
 import { ANY_FUNDING, connectChannelPeers, type ChannelPeer } from "./channel-peers";
 import { normalizeFiberPubkey } from "./fiber-pubkey";
 import { KeyWayApiClient } from "./api-client";
@@ -58,7 +58,7 @@ export type CreateKeyWayOptions = {
   approveFiberPayment?: ApproveFiberPayment;
   approvals?: () => FiberActionApprovals;
   requestEmailCode?: RequestEmailCode;
-  loadFiberKey: (leaseId: string) => ReturnType<FiberKeyLoader>;
+  loadFiberKey: (leaseId: string) => Promise<FiberKeyDelivery>;
   network?: "testnet" | "mainnet";
   apiClient?: KeyWayApiClient;
   restoreRequired?: boolean;
@@ -118,9 +118,9 @@ const WATCH_INTERVAL = 60_000;
 
 export function createKeyWay(options: CreateKeyWayOptions) {
   let deviceLease: DeviceLease | undefined;
-  const credential = new KeyWayCredentialProvider(options.identifier, () => {
+  const credential = new KeyWayCredentialProvider(options.identifier, async () => {
     if (!deviceLease) throw new Error("An active device lease is required");
-    return options.loadFiberKey(deviceLease.leaseId);
+    return (await options.loadFiberKey(deviceLease.leaseId)).fiberKey;
   });
   const network = options.network ?? "testnet";
   const databasePrefix = `/wasm-${options.identifier}`;
@@ -403,8 +403,15 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       }
       const lease = deviceLease;
       const deviceIdHash = await getDeviceIdHash();
+      // The backup is accepted only while this is the device's latest key delivery: if its upload stalls and the
+      // node runs again, the upload is refused when it lands (the node has moved past it).
+      let keyDelivery = "";
       await backUpBeforeLogout({
-        loadFiberKey: () => options.loadFiberKey(lease.leaseId),
+        loadFiberKey: async () => {
+          const delivered = await options.loadFiberKey(lease.leaseId);
+          keyDelivery = delivered.keyDelivery;
+          return delivered.fiberKey;
+        },
         // The backup is taken only after the bridge has drained, so it holds every watchtower call.
         stopNode: steps.stopNodeAndDrain,
         // Once the session ends nothing more reaches KeyWay's watchtower from this page, so it must have every
@@ -414,6 +421,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
         saveBackup: (backup) => api.saveNodeBackup(options.authToken, {
           deviceIdHash,
           leaseId: lease.leaseId,
+          keyDelivery,
           backup,
         }),
         releaseOwnership: steps.releaseGuards,
@@ -428,7 +436,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     const deviceIdHash = await getDeviceIdHash();
     const leaseId = deviceLease.leaseId;
     await restoreBeforeStart({
-      loadFiberKey: () => options.loadFiberKey(leaseId),
+      loadFiberKey: async () => (await options.loadFiberKey(leaseId)).fiberKey,
       loadBackup: () => api.loadNodeBackup(options.authToken, { deviceIdHash, leaseId }),
       restoreBackup: (backup, fiberKey) => restoreEncryptedNodeBackup(backup, databasePrefix, fiberKey),
       confirmRestore: (generation) => api.confirmNodeBackup(options.authToken, {

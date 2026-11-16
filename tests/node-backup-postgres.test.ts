@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { database } from "../src/server/database.ts";
 import { acquireLease } from "../src/server/device-lease.ts";
 import { fiberKeyAccess as access } from "../src/server/http.ts";
-import { prepareBackupForDevice, readClaimedNodeBackup, saveNodeBackup } from "../src/server/node-backup.ts";
+import { prepareBackupForDevice, readClaimedNodeBackup, saveFencedNodeBackup, saveNodeBackup } from "../src/server/node-backup.ts";
 import { saveWallet, type ReadyWallet } from "../src/server/user-wallet.ts";
 
 const enabled = Boolean(process.env.KEYWAY_AUTH_TEST_DATABASE_URL);
@@ -113,6 +113,42 @@ test("a node that runs again after its logout saved a backup retires that backup
       return "wrapped key";
     }), /active device lease/);
     assert.equal((await prepareBackupForDevice(user, A, B, undefined, sql)).restoreRequired, true);
+  });
+
+  await t.test("an upload that lands after the node got its key again is refused, so its state can't be restored", async () => {
+    const { user, lease } = await device();
+    // The logout loads the key, then its upload stalls; the client gives up and the node runs again (its key again).
+    const { keyDelivery } = await fiberKeyAccess(user, A, lease.leaseId);
+    await fiberKeyAccess(user, A, lease.leaseId);
+    // The stalled upload lands: the node has moved past what it holds.
+    await assert.rejects(saveFencedNodeBackup(user, A, lease.leaseId, keyDelivery, payload("state at logout")), /ran again/);
+    await lapse(user.id);
+    assert.deepEqual(await prepareBackupForDevice(user, A, B, undefined, sql), { restoreRequired: false, canRebind: false });
+  });
+
+  await t.test("an upload saving while the node gets its key again is retired by it, whichever goes first", async () => {
+    const { user, lease } = await device();
+    const { keyDelivery } = await fiberKeyAccess(user, A, lease.leaseId);
+    const results = await Promise.allSettled([
+      saveFencedNodeBackup(user, A, lease.leaseId, keyDelivery, payload("state at logout")),
+      fiberKeyAccess(user, A, lease.leaseId),
+    ]);
+    assert.equal(results[1].status, "fulfilled");
+    await lapse(user.id);
+    assert.equal((await prepareBackupForDevice(user, A, B, undefined, sql)).restoreRequired, false);
+  });
+
+  await t.test("the logout that took the latest key saves its backup; a delivery under an earlier lease doesn't count", async () => {
+    const { user, lease } = await device();
+    const { keyDelivery } = await fiberKeyAccess(user, A, lease.leaseId);
+    assert.equal((await saveFencedNodeBackup(user, A, lease.leaseId, keyDelivery, payload("state at logout"))).generation, 1);
+    await assert.rejects(saveFencedNodeBackup(user, A, lease.leaseId, crypto.randomUUID(), payload("someone else's")), /ran again/);
+    // A new lease for the same device starts with no key delivered.
+    await lapse(user.id);
+    const again = await acquireLease(user, A);
+    await assert.rejects(saveFencedNodeBackup(user, A, again.leaseId, keyDelivery, payload("old delivery")), /ran again/);
+    await sql`delete from keyway_v2_device_leases where user_id = ${user.id}`;
+    assert.equal((await prepareBackupForDevice(user, A, B, undefined, sql)).restoreRequired, true, "the completed logout's backup");
   });
 
   await t.test("only a device holding the lease gets its key, and nothing is retired otherwise", async () => {

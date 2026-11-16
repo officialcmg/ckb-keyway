@@ -25,7 +25,8 @@ export async function acquireLease(user: User, deviceIdHash: string): Promise<St
     on conflict (user_id) do update set
       device_id_hash = excluded.device_id_hash,
       lease_id = excluded.lease_id,
-      expires_at = excluded.expires_at
+      expires_at = excluded.expires_at,
+      key_delivery = null
     where keyway_v2_device_leases.expires_at <= now()
        or keyway_v2_device_leases.device_id_hash = excluded.device_id_hash
     returning user_id, device_id_hash, lease_id::text, expires_at

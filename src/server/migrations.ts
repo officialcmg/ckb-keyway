@@ -401,4 +401,10 @@ export const migrations: Array<{
     // close reopens it only when it can punish that commitment.
     up: (sql) => sql`alter table keyway_v2_watchtower_channels add column closing_commitment_number numeric(20, 0)`,
   },
+  {
+    version: 23, name: "device-lease-key-delivery",
+    // The device's latest Fiber-key delivery under this lease: a backup is accepted only from the logout that took
+    // that key, so an upload that lands after the node ran again (and got its key again) can't be restored.
+    up: (sql) => sql`alter table keyway_v2_device_leases add column key_delivery uuid`,
+  },
 ];
