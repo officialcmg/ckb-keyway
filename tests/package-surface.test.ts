@@ -68,3 +68,24 @@ test("defaults to managed testnet while retaining an explicit browser-wallet rou
   assert.match(demo, /\/app\?mode=browser/);
   assert.match(view, /Each mode runs its own Fiber node\. Switching doesn&apos;t move open channels\./);
 });
+
+test("the published SDK depends on exactly the versions this repository tests", async () => {
+  const packageJson = JSON.parse(await readFile(new URL("../package.sdk.json", import.meta.url), "utf8"));
+  const lockfile = JSON.parse(await readFile(new URL("../package-lock.json", import.meta.url), "utf8"));
+  assert.equal(packageJson.bundleDependencies ?? packageJson.bundledDependencies, undefined);
+  // React is the app's own, so any supported version is fine; every other dependency is one the SDK runs on.
+  const appProvided = new Set(["react"]);
+  const pinned = ["dependencies", "optionalDependencies", "peerDependencies"]
+    .flatMap((field) => Object.entries((packageJson[field] ?? {}) as Record<string, string>))
+    .filter(([name]) => !appProvided.has(name));
+  assert.ok(pinned.length > 0);
+  for (const [name, range] of pinned) {
+    // An exact version, never a range, tag, URL or workspace link that would let consumers install something else.
+    assert.match(range, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/, `${name} is pinned to an exact version, not "${range}"`);
+    assert.equal(range, lockfile.packages[`node_modules/${name}`]?.version, `${name} is the version package-lock.json installs and tests`);
+  }
+  // A regular dependency, so every package manager installs the tested CCC for KeyWay (a peer is only a warning
+  // under pnpm and yarn, and yarn 1 doesn't install it at all).
+  assert.equal(packageJson.dependencies["@ckb-ccc/core"], "1.16.1");
+  assert.equal(packageJson.peerDependencies?.["@ckb-ccc/core"], undefined);
+});
