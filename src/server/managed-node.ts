@@ -84,14 +84,16 @@ export async function managedNodeRequest(
         if (addresses.length === 0) return { done: true };
         // The room check and the dial run one at a time per user, so parallel requests can't both pass it.
         await serializePeerWork(userId, async () => {
-          await assertPeerRoom(node, undefined, addresses.length);
-          await connectGraphPeer(node, peer, addresses);
+          await assertPeerRoom(userId, node, undefined, addresses.length);
+          await connectGraphPeer(userId, node, peer, addresses);
         });
         return { done: true };
       }
       await serializePeerWork(userId, async () => {
         // Only a dial by key to a peer already connected takes no room: a new address can reach another node.
-        await assertPeerRoom(node, typeof params.pubkey === "string" && params.address === undefined ? params.pubkey : undefined);
+        const byKey = typeof params.pubkey === "string" && params.address === undefined ? params.pubkey : undefined;
+        await assertPeerRoom(userId, node, byKey);
+        noteDial(userId, byKey);
         await node.call(FIBER_METHODS[method as FiberMethod].rpc, [dial]);
       });
       return { done: true };
@@ -140,7 +142,7 @@ export async function managedNodeRequest(
     // One at a time per user, so parallel opens can't all pass the room check.
     return serializePeerWork(userId, async () => {
       await assertChannelRoom(node);
-      await connectManagedPeer(node, params.pubkey);
+      await connectManagedPeer(userId, node, params.pubkey);
       return node.openChannelWithExternalFunding(params);
     });
   }
@@ -376,15 +378,61 @@ async function assertKnownPublicPeer(node: ManagedNodeClient, peer: string): Pro
   throw new Error("This peer isn't in the Fiber network graph yet; connect to it first with connectPeer and its address");
 }
 
+// Fiber 0.9.1 answers connect_peer once it has started the dial, and lists the peer only after the handshake;
+// tentacle 0.7.7, its network library, gives the connection 10 s and then the handshake its own time. So each dial
+// counts against MAX_PEERS until the peer it named by key is listed, or for PENDING_DIAL_MS. A dial by address may
+// reach any node, so it counts for the whole time.
+const PENDING_DIAL_MS = 60_000;
+const pendingDials = new Map<string, Array<{ peer?: string; until: number }>>();
+
+function barePubkey(pubkey: string): string {
+  return pubkey.toLowerCase().replace(/^0x/, "");
+}
+
+function noteDial(userId: string, peer?: string): void {
+  pendingDials.set(userId, [...(pendingDials.get(userId) ?? []), { peer: peer ? barePubkey(peer) : undefined, until: Date.now() + PENDING_DIAL_MS }]);
+}
+
 /**
- * Refuses a connection that could take the node past MAX_PEERS. Each address dialed may reach a different node,
- * so dialing several needs room for each. A peer that is already connected takes no more room.
+ * The user's dials that may still add a peer: each a connected peer settles is dropped, one per peer, as the
+ * other addresses dialed for it may reach other nodes.
  */
-async function assertPeerRoom(node: ManagedNodeClient, peer?: string, dials = 1): Promise<void> {
+function pendingDialCount(userId: string, connected: Set<string>): number {
+  const settled = new Set<string>();
+  const pending = (pendingDials.get(userId) ?? []).filter(({ peer, until }) => {
+    if (until <= Date.now()) return false;
+    if (!peer || !connected.has(peer) || settled.has(peer)) return true;
+    settled.add(peer);
+    return false;
+  });
+  if (pending.length > 0) pendingDials.set(userId, pending);
+  else pendingDials.delete(userId);
+  return pending.length;
+}
+
+/** The node, with each dial counted against the user's peer room (see noteDial), as dialing the given peer. */
+function dialing(userId: string, node: ManagedNodeClient, peer: string): Pick<ManagedNodeClient, "connectPeer" | "listPeers"> {
+  return {
+    connectPeer: (params) => {
+      noteDial(userId, peer);
+      return node.connectPeer(params);
+    },
+    listPeers: () => node.listPeers(),
+  };
+}
+
+/**
+ * Refuses a connection that could take the node past MAX_PEERS, counting dials whose handshake may still be under
+ * way. Each address dialed may reach a different node, so dialing several needs room for each. A peer that is
+ * already connected takes no more room.
+ */
+async function assertPeerRoom(userId: string, node: ManagedNodeClient, peer?: string, dials = 1): Promise<void> {
   const { peers } = await node.listPeers();
-  const bare = peer?.toLowerCase().replace(/^0x/, "");
-  if (bare && peers.some(({ pubkey }) => pubkey.toLowerCase().replace(/^0x/, "") === bare)) return;
-  if (peers.length + dials > MAX_PEERS) throw new Error(`A hosted node can connect to at most ${MAX_PEERS} peers`);
+  const connected = new Set(peers.map(({ pubkey }) => barePubkey(pubkey)));
+  if (peer && connected.has(barePubkey(peer))) return;
+  if (peers.length + pendingDialCount(userId, connected) + dials > MAX_PEERS) {
+    throw new Error(`A hosted node can connect to at most ${MAX_PEERS} peers`);
+  }
 }
 
 /**
@@ -393,33 +441,36 @@ async function assertPeerRoom(node: ManagedNodeClient, peer?: string, dials = 1)
  * the peer counts as connected only once its own key is among the node's peers. Like any peer an app asks
  * for, it isn't saved to the node's permanent peer store.
  */
-async function connectGraphPeer(node: ManagedNodeClient, peer: Pubkey, addresses: string[]): Promise<void> {
-  if ((await connectCandidates(node, [{ pubkey: peer as `0x${string}`, nodeName: "selected peer", addresses, minimumFunding: 0n }], 10_000, 250, false)).length === 0) {
+async function connectGraphPeer(userId: string, node: ManagedNodeClient, peer: Pubkey, addresses: string[]): Promise<void> {
+  if ((await connectCandidates(dialing(userId, node, peer), [{ pubkey: peer as `0x${string}`, nodeName: "selected peer", addresses, minimumFunding: 0n }], 10_000, 250, false)).length === 0) {
     throw new Error("Could not connect to the selected Fiber channel peer");
   }
 }
 
-async function connectManagedPeer(node: ManagedNodeClient, peer: Pubkey): Promise<void> {
+async function connectManagedPeer(userId: string, node: ManagedNodeClient, peer: Pubkey): Promise<void> {
   const candidate = TESTNET_CHANNEL_PEERS.find(({ pubkey }) => pubkey === peer.toLowerCase());
   if (!candidate) {
     // Any public peer: its announced addresses must be public, and the handshake must match its key.
     const addresses = await assertKnownPublicPeer(node, peer);
     if (addresses.length === 0) return;
-    await assertPeerRoom(node, undefined, addresses.length);
-    await connectGraphPeer(node, peer, addresses);
+    await assertPeerRoom(userId, node, undefined, addresses.length);
+    await connectGraphPeer(userId, node, peer, addresses);
     return;
   }
-  await assertPeerRoom(node, peer);
+  await assertPeerRoom(userId, node, peer);
   // Native nodes resolve current TCP addresses from gossip, not browser WSS seeds.
   let addresses: string[] = [];
   try {
+    noteDial(userId, peer);
     await node.connectPeer({ pubkey: peer, addr_type: "tcp", save: true });
   } catch {
     // Bootstrap hints may go stale; the handshake still must match the approved key.
     addresses = candidate.nativeAddresses ?? [];
   }
   const nativeCandidate = { ...candidate, addresses };
-  if ((await connectCandidates(node, [nativeCandidate], 10_000, 250)).length === 0) {
+  // The fallback dials each of its addresses, so it needs room for each.
+  if (addresses.length > 0) await assertPeerRoom(userId, node, peer, addresses.length);
+  if ((await connectCandidates(dialing(userId, node, peer), [nativeCandidate], 10_000, 250)).length === 0) {
     throw new Error("Could not connect to the selected Fiber channel peer");
   }
 }

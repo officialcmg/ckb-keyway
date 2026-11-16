@@ -252,3 +252,31 @@ test("IPv6 spellings of internal addresses are private", () => {
     assert.equal(isPrivateIp(address), false, address);
   }
 });
+
+test("dials whose handshake hasn't finished count against a hosted node's peer limit", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  // Fiber answers connect_peer once it starts dialing; the peer is listed only after the handshake.
+  const others = (count: number) => Array.from({ length: count }, (_, index) => ({ pubkey: `0x02${index.toString(16).padStart(64, "0")}` }));
+  const { node, dialed } = hostedNode([]);
+  node.listPeers = async () => ({ peers: others(31) });
+  const connect = (user: string, client: unknown, host: number) => managedNodeRequest(user, {
+    operation: "act", method: "connectPeer", params: { address: `/ip4/203.0.113.${host}/tcp/8228` },
+  }, client as never);
+  await connect("pending-user", node, 1);
+  await assert.rejects(connect("pending-user", node, 2), /at most 32 peers/);
+  assert.equal(dialed.length, 1);
+  // Once that dial can no longer complete, its room is free again.
+  t.mock.timers.tick(60_000);
+  await connect("pending-user", node, 2);
+  assert.equal(dialed.length, 2);
+
+  // A peer dialed at each address it announces settles one dial once it connects; the others may yet reach other nodes.
+  const announced = Array.from({ length: 4 }, (_, index) => `/ip4/203.0.113.${index + 1}/tcp/8228/p2p/Qm1`);
+  const graph = hostedNode(announced);
+  const listed = graph.node.listPeers;
+  graph.node.listPeers = async () => ({ peers: [...others(28), ...(await listed()).peers] });
+  await managedNodeRequest("graph-pending-user", { operation: "act", method: "connectPeer", params: { pubkey: PEER } }, graph.node as never);
+  assert.equal(graph.dialed.length, 4);
+  await assert.rejects(connect("graph-pending-user", graph.node, 9), /at most 32 peers/);
+  assert.equal(graph.dialed.length, 4);
+});
