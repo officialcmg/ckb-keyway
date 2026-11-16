@@ -488,12 +488,12 @@ async function serverOnlyWithGenesisAsked(world: ReturnType<typeof chain>, user:
   await sql`insert into keyway_v2_daily_amounts (user_id, asset, amount) values (${user.id}, 'ckb', ${(10n * CKB).toString()})`;
   const emails: string[] = [];
   context.sendEmail = async (_to, message) => { emails.push(message.plaintext); };
-  const set = (value: bigint, extra: Record<string, unknown> = {}) => signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: value.toString(), ...extra }) as Promise<Record<string, unknown>>;
+  const set = (value: bigint | null, extra: Record<string, unknown> = {}) => signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: value?.toString() ?? null, ...extra }) as Promise<Record<string, unknown>>;
   const genesis = await set(10n * CKB);
   assert.equal(genesis.codeLength, 8, "turning limits on takes the Lit code");
   const genesisCode = codeFrom(world);
-  const raise = async (during?: () => Promise<void>) => {
-    const asked = await set(1_000n * CKB);
+  const raise = async (during?: () => Promise<void>, value: bigint | null = 1_000n * CKB) => {
+    const asked = await set(value);
     assert.equal(asked.enforcedByLit, false, "a server-only raise");
     const code = /\b(\d{6})\b/.exec(emails.at(-1)!)![1];
     if (during) {
@@ -501,7 +501,7 @@ async function serverOnlyWithGenesisAsked(world: ReturnType<typeof chain>, user:
       // The raise's look for a send-limit cell, after it has read the amounts' version.
       sendLimitRpc.fetch = async (url, init) => { sendLimitRpc.fetch = fetch; await during(); return fetch(url, init); };
     }
-    return set(1_000n * CKB, { confirmationNonce: asked.confirmationNonce, emailCode: code });
+    return set(value, { confirmationNonce: asked.confirmationNonce, emailCode: code });
   };
   const run = litPolicyRunner.run;
   let signing!: () => void;
@@ -523,6 +523,21 @@ test("a server-only raise confirmed while turning limits on is being signed is l
   const { raise, release, turnOn, restore } = await serverOnlyWithGenesisAsked(world, user, context);
   t.after(restore);
   assert.deepEqual((await raise() as { dailyAmounts: Record<string, string> }).dailyAmounts, { ckb: (1_000n * CKB).toString() });
+  release();
+  await turnOn;
+  assert.deepEqual(cellAmounts(sent.at(-1)!), { ckb: 10n * CKB });
+  assert.deepEqual(((await signingSettings(context, { operation: "get" })) as { dailyAmounts: Record<string, string> }).dailyAmounts, { ckb: (10n * CKB).toString() });
+  t.after(async () => {
+    const sql = await database();
+    await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
+  });
+});
+
+test("a server-only removal confirmed while turning limits on is being signed doesn't leave the server without the cell's amount", { skip: !enabled }, async (t) => {
+  const { world, user, context, sent } = await setUp();
+  const { raise, release, turnOn, restore } = await serverOnlyWithGenesisAsked(world, user, context);
+  t.after(restore);
+  assert.deepEqual((await raise(undefined, null) as { dailyAmounts: Record<string, string> }).dailyAmounts, {});
   release();
   await turnOn;
   assert.deepEqual(cellAmounts(sent.at(-1)!), { ckb: 10n * CKB });
@@ -594,6 +609,11 @@ test("a raise isn't asked with an email that shows the cell's looser amount when
   await assert.rejects(set(1_000n * CKB), /haven't reached your send-limit cell yet/);
   assert.equal(world.lit.emails.length, litEmails, "no email showing 150 CKB as the amount before");
   assert.deepEqual(await amounts(), { ckb: (10n * CKB).toString() });
+  // Setting the stricter amount again, as the error says, asks the Lit code to put it on the cell (and isn't refused
+  // the same way): it loosens nothing the server holds.
+  const again = await set(10n * CKB);
+  assert.equal(again.codeLength, 8);
+  assert.equal(world.lit.emails.length, litEmails + 1);
   t.after(async () => {
     await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
   });

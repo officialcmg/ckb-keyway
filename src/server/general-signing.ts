@@ -439,7 +439,9 @@ async function sendLimitSettings(
     // broadcast failed) leaves the server, which alone gates hosted payments, stricter than the cell, and the email
     // would understate what this change gives up. So the server's amounts go on the cell first (a tightening there,
     // which needs no code), and the change is built on that.
-    if (plan.needsCode && head && !sameSettings(decodeSendLimitSettings(head.outputData), settingsFromDailyAmounts(current, new Uint8Array(32)))) {
+    // A change that loosens nothing on the server needs none of this: its email's "before" is the cell's, and it gives up
+    // nothing the server held (and setting the server's own amounts again is how the user puts them on the cell).
+    if (plan.needsCode && head && weakens(current, next) && !sameSettings(decodeSendLimitSettings(head.outputData), settingsFromDailyAmounts(current, new Uint8Array(32)))) {
       const synced = await putAmountsOnCell(context, client, head, current);
       // Putting them there needs the Lit code itself (its fee isn't small and the day's amount is reached): asking it
       // separately keeps every email right, so the user does that first.
@@ -874,9 +876,14 @@ async function lowerToCell(user: User, transaction: ccc.Transaction, options: { 
     const { from, sent } = options;
     if (from && stored.get(from.asset) !== from.amount) throw new Error(AMOUNTS_CHANGED);
     const limits = [...(cell.ckb === undefined ? [] : [["ckb", cell.ckb] as const]), ...cell.tokens];
+    // Once sent, an amount the server no longer has stays removed when a newer change built on this cell removed it
+    // (that change says what the cell holds now). A genesis nothing was built on yet is different: a server-only
+    // removal confirmed while it was being signed (it couldn't see a cell not sent yet) removed it, and hosted
+    // payments would have no limit while the cell has one.
+    const restoreRemoved = !sent || (isGenesis(transaction) && !await builtOn(tx, user, transaction));
     const lower = limits.filter(([asset, amount]) => {
       const current = stored.get(asset);
-      return current === undefined ? !sent : current > amount;
+      return current === undefined ? restoreRemoved : current > amount;
     });
     const tokens = new Set([...stored.keys(), ...lower.map(([asset]) => asset)].filter((asset) => asset !== "ckb"));
     if (tokens.size > MAX_SEND_LIMIT_TOKENS && tokens.size > [...stored.keys()].filter((asset) => asset !== "ckb").length) throw new Error(AMOUNTS_CHANGED);
@@ -893,6 +900,15 @@ async function lowerToCell(user: User, transaction: ccc.Transaction, options: { 
     }
     return version;
   });
+}
+
+/** Whether a transaction KeyWay signed for the account since spends the send-limit cell `transaction` makes. */
+async function builtOn(tx: TransactionSql, user: User, transaction: ccc.Transaction): Promise<boolean> {
+  const hash = transaction.hash();
+  const rows = await tx<Array<{ transaction: ccc.TransactionLike }>>`
+    select transaction from keyway_v2_pending_transactions where user_id = ${user.id} and transaction_hash <> ${hash}
+  `;
+  return rows.some((row) => ccc.Transaction.from(row.transaction).inputs.some(({ previousOutput }) => previousOutput.txHash === hash && previousOutput.index === 0n));
 }
 
 /** Whether a send-limit transaction makes the cell: its Type ID comes from its first input. */
