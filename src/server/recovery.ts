@@ -233,7 +233,8 @@ export async function settleRecoveryChange(context: Pick<RecoveryContext, "user"
   if (settled.notice) {
     const { kind, ckbAddress, recovery, transactionHash } = settled.notice;
     const heading = kind === "enable" ? "Account recovery is on" : kind === "add" ? "A recovery backup was added" : "A recovery backup was removed";
-    await sendRecoveryNotice(context, client, heading, ckbAddress, recovery.backups ?? [], transactionHash);
+    // The notice only formats the backups' addresses, so any testnet client serves.
+    await sendRecoveryNotice(context, context.client ?? new ccc.ClientPublicTestnet(), heading, ckbAddress, recovery.backups ?? [], transactionHash);
   }
   return settled.wallet;
 }
