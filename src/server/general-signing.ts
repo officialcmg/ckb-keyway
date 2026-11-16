@@ -39,9 +39,11 @@ const REQUEST_TTL_MS = 5 * 60_000;
 const CODE_TTL_MS = 10 * 60_000;
 export const REQUEST_EXPIRED = "This request expired. Start again.";
 const MAX_CODE_ATTEMPTS = 5;
-// Wrong six-digit codes in 24 hours, across every code sent. Each code allows five tries and codes can be sent again,
+// Wrong email codes in 24 hours, across every code sent: the server's six-digit codes, and tries of the Lit Action's
+// eight-digit codes that didn't sign (countLitCodeAttempt). Each code allows five tries and codes can be sent again,
 // so without this the tries add up day after day. Only someone signed in can make them, and they are counted per
-// session, so a stolen session can't use up the owner's own: a new session needs a login code from the inbox.
+// session, so a stolen session can't use up the owner's own: a new session needs a login code from the inbox. All of
+// a user's sessions together get 60, counted from when each session began (codeFailures).
 const MAX_CODE_FAILURES_PER_SESSION = 20;
 const MAX_CODE_FAILURES_PER_USER = 60;
 const CODE_FAILURES_MESSAGE = "Too many wrong email codes today. Try again tomorrow";
@@ -657,10 +659,18 @@ async function pruneCodeFailures(sql: DatabaseSql): Promise<void> {
   )`;
 }
 
-/** Wrong codes in the last day: from this session, and from all of the user's sessions. */
+/**
+ * Wrong codes in the last day: from this session, and from all of the user's sessions since this one began. Sessions
+ * that can't sign in again keep counting everything; a session signed in afterwards with a login code from the inbox
+ * starts its own count, so a few stolen sessions using up the day can't shut the owner out.
+ */
 async function codeFailures(sql: DatabaseSql, user: User): Promise<{ session: number; user: number }> {
+  const session = user.sessionId ?? "";
   const [row] = await sql<Array<{ session: number; user: number }>>`
-    select count(*) filter (where session_id = ${user.sessionId ?? ""})::int as session, count(*)::int as user
+    select count(*) filter (where session_id = ${session})::int as session,
+      count(*) filter (where created_at >= coalesce(
+        (select "createdAt" from keyway_auth_sessions where id::text = ${session}), '-infinity'::timestamptz
+      ))::int as user
     from keyway_v2_step_up_failures where user_id = ${user.id} and created_at > now() - interval '1 day'
   `;
   return row;

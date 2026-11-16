@@ -519,3 +519,35 @@ test("codes the Lit Action emailed count toward the day's wrong-code limit; one 
   await sendCode(owner, "message", server, "Sign a message", []);
   await verifyCode(owner.user, "message", server, codeFrom());
 });
+
+test("stolen sessions using up the day's wrong codes don't shut out a session signed in afterwards", { skip: !enabled }, async () => {
+  process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
+  const sql = await database();
+  const wrong = (code: string) => code === "000000" ? "111111" : "000000";
+  const { context, codeFrom } = harness(0n);
+  const [account] = await sql<Array<{ id: string }>>`insert into keyway_auth_users (name, email, "emailVerified")
+    values ('', ${`epoch-${crypto.randomUUID()}@example.com`}, true) returning id`;
+  const session = async () => {
+    const [row] = await sql<Array<{ id: string }>>`insert into keyway_auth_sessions ("expiresAt", token, "updatedAt", "userId", "scopeId", "origin")
+      values (now() + interval '1 day', ${crypto.randomUUID()}, now(), ${account.id}, 'epoch-app', 'https://epoch.example') returning id`;
+    return { ...context, user: { ...context.user, sessionId: row.id } };
+  };
+  const nonce = await issueRequest(context.user, "message", "digest", {}, true);
+  const twenty = async (signing: SigningContext) => {
+    for (let round = 0; round < 4; round++) {
+      await sendCode(signing, "message", nonce, "Sign a message", []);
+      const code = codeFrom();
+      for (let i = 0; i < 5; i++) await assert.rejects(() => verifyCode(signing.user, "message", nonce, wrong(code)), /isn't right/);
+    }
+  };
+  const stolen = [await session(), await session(), await session()];
+  const spare = await session();
+  for (const signing of stolen) await twenty(signing);
+  // Another session from before is refused: the user's 60 are used up.
+  await assert.rejects(() => sendCode(spare, "message", nonce, "Sign a message", []), /today/);
+  // The owner signs in again, with a login code from the inbox, and confirms with the right code.
+  const fresh = await session();
+  await sendCode(fresh, "message", nonce, "Sign a message", []);
+  await verifyCode(fresh.user, "message", nonce, codeFrom());
+  await assert.rejects(() => sendCode(spare, "message", nonce, "Sign a message", []), /today/);
+});
