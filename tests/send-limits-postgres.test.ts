@@ -9,7 +9,6 @@ import { secp256k1Lock } from "../src/sdk/browser/account-lock.ts";
 import { chainOnSendLimit, decodeSendLimitSettings, DEFAULT_DAILY_LIMIT_SHANNONS, isSendLimitCell, type SendLimitHead } from "../src/sdk/browser/send-limits.ts";
 import { database } from "../src/server/database.ts";
 import { fundingCode, fundingNeedsLitCode, hashText, issueFundingCodeRequest, issueRequest, sendCode, sendFundingCode, sendLimitOffer, signingSettings, transactionSigning, type SigningContext } from "../src/server/general-signing.ts";
-import { litSignerOverride } from "../src/server/lit-config.ts";
 import { litPolicyRunner } from "../src/server/lit-policy.ts";
 import { listPendingTransactions } from "../src/server/pending-transactions.ts";
 import { sendLimitHead, sendLimitPlanner, sendLimitRpc } from "../src/server/send-limits.ts";
@@ -86,7 +85,6 @@ async function setUp() {
     outputsData: ["0x", "0x"],
   }));
   const action = await world.lit.load();
-  litSignerOverride.mode = "policy";
   litPolicyRunner.run = async (_config, params) => action.main(params);
   sendLimitPlanner.run = async (params) => action.main(params);
   sendLimitRpc.fetch = world.lit.fetch;
@@ -124,7 +122,6 @@ const codeFrom = (world: ReturnType<typeof chain>) => litCodeIn(world.lit.emails
 
 test("send limits through the server: turning them on, sending under and over the amount, and a channel funding", { skip: !enabled }, async (t) => {
   const { world, secp, funding, user, wallet, context, sent } = await setUp();
-  t.after(() => { litSignerOverride.mode = undefined; });
 
   await t.test("turning limits on builds the genesis, asks for the Lit code and binds only a fingerprint", async () => {
     const asked = await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (150n * CKB).toString() }) as { requiresEmailCode: boolean; codeLength: number; confirmationNonce: string; sentTo: string };
@@ -210,7 +207,6 @@ test("send limits through the server: turning them on, sending under and over th
 
 test("send limits are offered by default to an account that could have them", { skip: !enabled }, async (t) => {
   const { world, user, wallet } = await setUp();
-  t.after(() => { litSignerOverride.mode = undefined; });
   // The indexer's capacity sum over the same committed cells the fake client lists.
   const withCapacity = (plain: bigint) => Object.assign(world.client(), { getCellsCapacity: async () => plain });
   const head = { outPoint: { txHash: `0x${"ab".repeat(32)}`, index: 0 }, cellOutput: { lock: wallet.litPublicKey, capacity: 0n }, outputData: "0x", recordEntriesBytes: 0 } as unknown as SendLimitHead;
@@ -224,14 +220,10 @@ test("send limits are offered by default to an account that could have them", { 
   const sql = await database();
   await sql`insert into keyway_v2_daily_amounts (user_id, asset, amount) values (${user.id}, 'ckb', ${(7_000n * CKB).toString()})`;
   assert.deepEqual(await sendLimitOffer(user, wallet, undefined, withCapacity(2_500n * CKB)), { ckb: 7_000n * CKB });
-
-  litSignerOverride.mode = "digest";
-  assert.equal(await sendLimitOffer(user, wallet, undefined, withCapacity(2_500n * CKB)), undefined, "not without the policy signer, which enforces them");
 });
 
 test("a token without an amount of its own sends without a code through the server and the Action", { skip: !enabled }, async (t) => {
   const { world, secp, user, wallet, context, sent } = await setUp();
-  t.after(() => { litSignerOverride.mode = undefined; });
   const xudt = ccc.Script.from({ codeHash: "0x25c29dc317811a6f6f3985a7a9ebc4838bd388d19d0feeecf0bcd60f6c0975bb", hashType: "type", args: `0x${"ab".repeat(32)}` });
   const asked = await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (1_000n * CKB).toString() }) as { confirmationNonce: string };
   await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (1_000n * CKB).toString(), confirmationNonce: asked.confirmationNonce, emailCode: codeFrom(world) });
@@ -277,7 +269,6 @@ async function limitsOn(world: ReturnType<typeof chain>, context: SigningContext
 
 test("send-limit settings changes are rate limited, and nothing is signed when the cell already holds the amounts (audit M23)", { skip: !enabled }, async (t) => {
   const { world, user, context, sent } = await setUp();
-  t.after(() => { litSignerOverride.mode = undefined; });
   const limited: string[] = [];
   let allow = true;
   context.rateLimit = async (key) => { limited.push(key); return { allowed: allow, retryAfter: allow ? null : 42 }; };
@@ -308,7 +299,6 @@ test("send-limit settings changes are rate limited, and nothing is signed when t
 
 test("a send-limit change never leaves the server's daily amounts looser than the chain's (audit L2)", { skip: !enabled }, async (t) => {
   const { world, user, context, sent } = await setUp();
-  t.after(() => { litSignerOverride.mode = undefined; });
   const { set, amounts } = await limitsOn(world, context, sent, 150n * CKB);
 
   // Lowering it: the node takes the change, then the server goes away before it hears back. The server's amount,
@@ -334,7 +324,6 @@ test("a send-limit change never leaves the server's daily amounts looser than th
 
 test("loosening amounts kept on the server alone goes through the server's code, showing them before and after (audit L13)", { skip: !enabled }, async (t) => {
   const { world, user, context, sent } = await setUp();
-  t.after(() => { litSignerOverride.mode = undefined; });
   // An amount the account chose while it couldn't afford the send-limit cell, so the server alone keeps it.
   const sql = await database();
   await sql`insert into keyway_v2_daily_amounts (user_id, asset, amount) values (${user.id}, 'ckb', ${(10n * CKB).toString()})`;
@@ -357,7 +346,6 @@ test("loosening amounts kept on the server alone goes through the server's code,
 
 test("daily amounts the send-limit cell can't hold are refused, so turning limits on can't fail later (audit M28)", { skip: !enabled }, async (t) => {
   const { world, context, sent } = await setUp();
-  t.after(() => { litSignerOverride.mode = undefined; });
   // The server's own amounts (a test signer, so nothing is built on chain), as an account without the cell keeps them.
   const serverOnly = { ...context, signDigest: async () => "0x" as ccc.Hex };
   const set = (asset: string, amount: bigint | null) => signingSettings(serverOnly, { operation: "set-daily-amount", asset, amount: amount?.toString() ?? null });
@@ -378,7 +366,6 @@ test("daily amounts the send-limit cell can't hold are refused, so turning limit
 
 test("setting the old amount again while a tightening is being signed can't leave the server looser than the chain", { skip: !enabled }, async (t) => {
   const { world, secp, user, context, sent } = await setUp();
-  t.after(() => { litSignerOverride.mode = undefined; });
   const { set, amounts } = await limitsOn(world, context, sent, 150n * CKB);
   // A node: a transaction spending a cell an accepted one already spent is refused.
   const accepted = new Set<string>();
@@ -422,7 +409,6 @@ function newestCellAmount(sent: ccc.Transaction[], secp: ccc.Script): bigint | u
 
 test("a lowering made while a raise is being sent leaves the server no looser than the chain", { skip: !enabled }, async (t) => {
   const { world, secp, user, context, sent } = await setUp();
-  t.after(() => { litSignerOverride.mode = undefined; });
   const { set, amounts } = await limitsOn(world, context, sent, 150n * CKB);
   const raise = await set(1_000n * CKB);
   // The raise reaches the node; before the server hears back, the same session lowers the amount to 50 CKB.
@@ -452,7 +438,6 @@ test("a lowering made while a raise is being sent leaves the server no looser th
 
 test("two token amounts added at once can't take the account past the eight the send-limit cell holds", { skip: !enabled }, async (t) => {
   const { world, context } = await setUp();
-  t.after(() => { litSignerOverride.mode = undefined; });
   const token = (i: number) => `0x${i.toString(16).padStart(2, "0").repeat(32)}`;
   const quick = { ...context, signDigest: async () => "0x" as ccc.Hex };
   for (let i = 1; i <= 7; i++) await signingSettings(quick, { operation: "set-daily-amount", asset: token(i), amount: "1000" });
@@ -469,7 +454,6 @@ test("two token amounts added at once can't take the account past the eight the 
 
 test("raising the server's amount back to the cell's takes the server's code, even when the cell needs no change", { skip: !enabled }, async (t) => {
   const { world, user, context, sent } = await setUp();
-  t.after(() => { litSignerOverride.mode = undefined; });
   const { set, amounts } = await limitsOn(world, context, sent, 150n * CKB);
   const emails: string[] = [];
   context.sendEmail = async (_to, message) => { emails.push(message.plaintext); };
@@ -499,7 +483,6 @@ test("raising the server's amount back to the cell's takes the server's code, ev
 
 test("a change asked for while the account had no send-limit cell can't be confirmed once limits are on", { skip: !enabled }, async (t) => {
   const { world, user, context, sent } = await setUp();
-  t.after(() => { litSignerOverride.mode = undefined; });
   const emails: string[] = [];
   // A server-only raise to 1,000 CKB, asked for before limits were on, then limits turned on at 150 CKB.
   const lines = ["Email confirmation for CKB: once 150 CKB is sent in 24 hours", "Change: once 1000 CKB is sent in 24 hours"];
@@ -519,7 +502,6 @@ test("a change asked for while the account had no send-limit cell can't be confi
 
 test("lowering an amount applies on the server at once, even while turning limits on waits for the Lit code", { skip: !enabled }, async (t) => {
   const { world, user, context, sent } = await setUp();
-  t.after(() => { litSignerOverride.mode = undefined; });
   const sql = await database();
   await sql`insert into keyway_v2_daily_amounts (user_id, asset, amount) values (${user.id}, 'ckb', ${(100n * CKB).toString()})`;
   const asked = await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (50n * CKB).toString() }) as { requiresEmailCode: boolean; confirmationNonce: string };
@@ -532,7 +514,6 @@ test("lowering an amount applies on the server at once, even while turning limit
 
 test("a raise approved with the Lit code isn't sent once a stricter amount was set meanwhile", { skip: !enabled }, async (t) => {
   const { world, user, context, sent } = await setUp();
-  t.after(() => { litSignerOverride.mode = undefined; });
   const { set, amounts } = await limitsOn(world, context, sent, 10n * CKB);
   const raise = await set(100n * CKB);
   assert.equal(raise.requiresEmailCode, true);
@@ -555,7 +536,6 @@ test("a raise approved with the Lit code isn't sent once a stricter amount was s
 
 test("an account already past eight token amounts can only remove them until it is back within the cell's eight", { skip: !enabled }, async (t) => {
   const { user, context } = await setUp();
-  t.after(() => { litSignerOverride.mode = undefined; });
   const serverOnly = { ...context, signDigest: async () => "0x" as ccc.Hex };
   const token = (i: number) => `0x${i.toString(16).padStart(2, "0").repeat(32)}`;
   const sql = await database();

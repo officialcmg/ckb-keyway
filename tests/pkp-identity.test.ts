@@ -28,9 +28,8 @@ test("an identity signature counts only if it is this PKP's, as verify:lit and a
     const recovered = secp256k1.sign(digest, key, { prehash: false, format: "recovered" });
     return { r: `0x${Buffer.from(recovered.slice(1, 33)).toString("hex")}` as const, s: `0x${Buffer.from(recovered.slice(33)).toString("hex")}` as const, recoveryParam: recovered[0] as 0 | 1 };
   };
-  const config = { apiKey: "unused", actionCid: "unused" };
   // A well-formed signature by another key is refused.
-  await assert.rejects(derivePkpIdentity(pkpIdOf(keyOf(7)), config, signer(keyOf(8))), /does not match the Lit PKP/);
-  const identity = await derivePkpIdentity(pkpIdOf(keyOf(7)), config, signer(keyOf(7)));
+  await assert.rejects(derivePkpIdentity(pkpIdOf(keyOf(7)), signer(keyOf(8))), /does not match the Lit PKP/);
+  const identity = await derivePkpIdentity(pkpIdOf(keyOf(7)), signer(keyOf(7)));
   assert.equal(identity.publicKey, `0x${Buffer.from(secp256k1.getPublicKey(keyOf(7), true)).toString("hex")}`);
 });
