@@ -28,7 +28,7 @@ import {
 } from "../browser/connect-managed-keyway";
 import { bootstrapKeyWay, type PublicWallet } from "../browser/bootstrap";
 import { createStoppedNodes, recoverFailedLogout } from "../browser/node-migration";
-import { handOffLogout, newTabId, refuseWhileFiberRuns, serveLogoutHandoff } from "../browser/logout-handoff";
+import { handOffLogout, newTabId, refuseWhileFiberRuns, serveLogoutHandoff, type HandledLogout } from "../browser/logout-handoff";
 import type { ApproveFiberChannelOpen, FiberChannelOpenPreview } from "../browser/remote-ckb-signer";
 import type { ApproveFiberPayment } from "../browser/fiber-payment";
 import type { EmailCodeReason, RequestEmailCode } from "../browser/email-code";
@@ -279,7 +279,7 @@ export function KeyWayProvider({
   // first (logout-handoff.ts), so it can't end the session before this tab's nodes have logged out.
   const [tabId] = useState(newTabId);
   const handoffRef = useRef<{ release(): void } | undefined>(undefined);
-  const handoffHandlerRef = useRef<() => Promise<void>>(async () => undefined);
+  const handoffHandlerRef = useRef<() => Promise<HandledLogout>>(async () => ({ nodeLoggedOut: false }));
   /** Logouts in progress here (this tab's own, or one handed from another tab). */
   const loggingOutRef = useRef(0);
   const operationRef = useRef<Promise<void>>(Promise.resolve());
@@ -492,8 +492,10 @@ export function KeyWayProvider({
     try {
       if (current) await current.keyway.stopForLogout();
       await stoppedNodes.logout();
-      // Another tab of this session may run Fiber: it logs out there first, or this logout fails.
-      if (user) await handOffLogout({ scope: handoffScope(appId, user.id), tabId });
+      // Another tab of this session may run Fiber: it logs out there first, or this logout fails. One that closed in
+      // the middle of an earlier handoff keeps failing logouts until a node has logged out in this browser again
+      // (this one's, if it has a connection: it just stopped, delivered and backed up).
+      if (user) await handOffLogout({ scope: handoffScope(appId, user.id), tabId, nodeLoggedOutHere: Boolean(current) });
       if (wallet) await refuseWhileFiberRuns(wallet.litPkpId);
       if (token) await api.logout(token);
       handoffRef.current?.release();
@@ -534,12 +536,12 @@ export function KeyWayProvider({
   handoffHandlerRef.current = async () => {
     loggingOutRef.current += 1;
     try {
-      await logOutNodesHere();
+      return await logOutNodesHere();
     } finally {
       loggingOutRef.current -= 1;
     }
   };
-  async function logOutNodesHere() {
+  async function logOutNodesHere(): Promise<HandledLogout> {
     const handoffRun = ++runRef.current;
     for (const approval of [funding, channelClose, peer, channelSettings]) approval.dismiss();
     await operationRef.current;
@@ -561,6 +563,7 @@ export function KeyWayProvider({
     setConnection(undefined);
     setStatus("idle");
     setFiberStartupStage(undefined);
+    return { nodeLoggedOut: Boolean(current) };
   }
   useEffect(() => () => {
     handoffRef.current?.release();
