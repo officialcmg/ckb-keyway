@@ -185,6 +185,12 @@ export function proxyUserRequest(userId, body, signal) {
     // an answer may never come back. Any other submission is refused here, and so is one that can't be checked.
     const funding = method === "submit_signed_funding_tx";
     const fundingId = funding ? submittedChannelId(body) : undefined;
+    // Whether this channel's funding was recorded before: an earlier submission that may or may not have reached
+    // Fiber (the host stopped, or the request failed on its way). Fiber still listing the channel as waiting for
+    // its funding means it never installed any, and Fiber 0.9.1 refuses funding it already has ("Signed funding
+    // tx has already been submitted"), so the funding may be sent again; but its record is never undone, as the
+    // earlier attempt may have reached the peer.
+    let retry = false;
     let sent = false;
     let result;
     // While the call is in flight its protection doesn't run out.
@@ -192,16 +198,18 @@ export function proxyUserRequest(userId, body, signal) {
     try {
       const node = await ensureNode(userId, { provision: PROVISIONING.has(method) });
       if (funding) {
-        if (!fundingId || !(await awaitingFunding(userId, node, fundingId))) {
+        // The record must be readable, or whether funding was handed over before can't be told.
+        retry = Boolean(fundingId) && Boolean((await fundingRecord(userId))?.ids.has(fundingId));
+        if (!fundingId || !(await awaitingFunding(node, fundingId))) {
           throw new Error("This channel isn't waiting for its funding");
         }
         // Nothing is recorded or sent for a submission the API gave up on while its node started or was checked.
         if (signal?.aborted) throw new Error("The request was abandoned");
         await markChannels(userId, true);
-        await recordFundedChannel(userId, fundingId, fundingInputs(body));
+        if (!retry) await recordFundedChannel(userId, fundingId, fundingInputs(body));
         // A node stopped meanwhile never gets the funding.
         if (nodes.get(userId) !== node || node.stopping) {
-          await unrecordFundedChannel(userId, fundingId).catch(logError);
+          if (!retry) await unrecordFundedChannel(userId, fundingId).catch(logError);
           throw new Error("The hosted node stopped; try again");
         }
         sent = true;
@@ -232,8 +240,8 @@ export function proxyUserRequest(userId, body, signal) {
     if (answer && setup) hold(userId, node);
     // Funding Fiber refused in its checks before it installs or sends anything went nowhere: the protection and
     // the record go, and the marker follows the node's channels again. After any other error the peer may already
-    // have it, so it stays recorded.
-    if (sent && !answer && refusedBeforeSending(result.body)) {
+    // have it, so it stays recorded; and so does a retry's, which an earlier attempt may have delivered.
+    if (sent && !retry && !answer && refusedBeforeSending(result.body)) {
       submitting.delete(userId);
       await unrecordFundedChannel(userId, fundingId).catch(logError);
       await checkChannels(userId, node).catch(logError);
@@ -500,11 +508,10 @@ function submittedChannelId(body) {
 
 /**
  * Whether the node lists the channel in a state Fiber takes signed funding in (negotiating, waiting for it, or
- * with only the peer's commitment signed), with no funding recorded for it yet.
+ * with only the peer's commitment signed).
  */
-async function awaitingFunding(userId, node, id) {
+async function awaitingFunding(node, id) {
   try {
-    if ((await fundingRecord(userId))?.ids.has(id)) return false;
     const channel = (await nodeChannels(node))?.find((candidate) => String(candidate?.channel_id).toLowerCase() === id);
     if (!channel) return false;
     const flags = new Set(JSON.stringify(channel?.state?.state_flags ?? "").match(/\b[A-Z][A-Z0-9_]*\b/g) ?? []);

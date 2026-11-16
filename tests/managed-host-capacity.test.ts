@@ -12,7 +12,8 @@ import type { AddressInfo } from "node:net";
 // to exit, writing a stopping file once asked to. With a fail-start file it exits at once, noting it in failed-starts.
 // Each start is logged to starts.log beside the data directories, and slow_call (or, with a slow-rpc file, any
 // call but list_channels) answers after 1.5s. With an advance-channels.json file, the channels become those once
-// list_channels has answered, as a peer moving a channel on would.
+// list_channels has answered, as a peer moving a channel on would; with a drop-funding file, a funding submission
+// is cut off before Fiber reads it.
 const FAKE_FNN = `#!${process.execPath}
 const { createServer } = require("node:http");
 const { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } = require("node:fs");
@@ -35,6 +36,7 @@ const server = createServer((request, response) => {
   request.on("data", (chunk) => { body += chunk; });
   request.on("end", () => {
     const { id, method } = JSON.parse(body);
+    if (method === "submit_signed_funding_tx" && existsSync(join(dir, "drop-funding"))) return request.socket.destroy();
     if (method === "submit_signed_funding_tx") writeFileSync(join(dir, "funding-received"), "");
     let result = null;
     if (method === "node_info") result = { pubkey: "02" + "11".repeat(32), version: "fake", default_funding_lock_script: { code_hash: "0x" + "22".repeat(32), hash_type: "type", args: "0x" } };
@@ -1016,4 +1018,29 @@ test("a channel a peer opened keeps its node running in every state, as Fiber ma
     assert.equal(await marked(F), true);
     context.mock.timers.reset();
   }
+});
+
+test("funding recorded but never delivered can be submitted again while Fiber still waits for it, and stays recorded", async (context) => {
+  const { root, request, submit, marked, withChannels } = await host(context);
+  const record = () => readFile(join(root, "users", A, "keyway-funded-channels"), "utf8");
+  await withChannels(A, WAITING_CHANNEL);
+  assert.equal(await request(A), 200);
+  // The connection to Fiber fails after the host recorded the funding: Fiber never got it.
+  await writeFile(join(root, "users", A, "drop-funding"), "");
+  assert.equal(await submit(A), 502);
+  assert.equal(await exists(join(root, "users", A, "funding-received")), false);
+  assert.ok((await record()).includes(WAITING_ID));
+  assert.equal(await marked(A), true);
+  await rm(join(root, "users", A, "drop-funding"));
+  // A retry Fiber refuses in its checks leaves the record, as an earlier attempt may have reached the peer.
+  await writeFile(join(root, "users", A, "refuse-funding"), "");
+  assert.equal(await submit(A), 200);
+  assert.ok((await record()).includes(WAITING_ID));
+  assert.equal(await marked(A), true);
+  await rm(join(root, "users", A, "refuse-funding"));
+  await rm(join(root, "users", A, "funding-received"));
+  // And a retry Fiber takes reaches it, recorded once.
+  assert.equal(await submit(A), 200);
+  assert.equal(await exists(join(root, "users", A, "funding-received")), true);
+  assert.equal((await record()).split("\n").filter((line) => line.startsWith(WAITING_ID)).length, 1);
 });
