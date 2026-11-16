@@ -257,6 +257,61 @@ test("a token without an amount of its own sends without a code through the serv
   });
 });
 
+test("a token counted per cell, with a daily amount, needs the code from both the server and the Action, whatever its balance (audit M30)", { skip: !enabled }, async (t) => {
+  const { world, secp, action, user, wallet, context, sent } = await setUp();
+  await limitsOn(world, context, sent, 1_000n * CKB);
+  // A type KeyWay can't read amounts of, with a daily amount of 5 (per cell, so any single cell is under it).
+  const unread = ccc.Script.from({ codeHash: `0x${"5a".repeat(32)}`, hashType: "type", args: "0x01" });
+  const asset = unread.hash();
+  const set = await signingSettings(context, { operation: "set-daily-amount", asset, amount: "5" }) as { dailyAmounts: Record<string, string>; requiresEmailCode?: boolean };
+  assert.equal(set.requiresEmailCode, undefined, "a new token amount tightens");
+  assert.equal(set.dailyAmounts[asset], "5");
+  const settingsChange = world.add(sent.at(-1)!, "committed");
+  const holding = world.add(ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: `0x${"0d".repeat(32)}`, index: 0 } }],
+    outputs: [{ lock: secp, type: unread, capacity: 200n * CKB }],
+    outputsData: [ccc.hexFrom(ccc.numLeToBytes(10n ** 12n, 16))],
+  }));
+  const head = (await sendLimitHead(context.client!, wallet, await listPendingTransactions(user.id, async () => "committed")))!;
+  assert.equal(head.outPoint.txHash, settingsChange.hash());
+  const token = ccc.Cell.from({ outPoint: { txHash: holding.hash(), index: 0 }, cellOutput: holding.outputs[0], outputData: holding.outputsData[0] });
+  const changeIndex = settingsChange.outputs.findIndex((output) => output.lock.eq(secp) && !output.type);
+  const change = ccc.Cell.from({ outPoint: { txHash: settingsChange.hash(), index: changeIndex }, cellOutput: settingsChange.outputs[changeIndex], outputData: "0x" });
+  // One cell holding the whole balance goes to a stranger.
+  const tx = ccc.Transaction.from({
+    inputs: [token, change].map((cell) => ({ previousOutput: cell.outPoint, cellOutput: cell.cellOutput, outputData: cell.outputData })),
+    outputs: [{ lock: stranger, type: unread, capacity: 200n * CKB }, { lock: secp, capacity: change.cellOutput.capacity - 100_000n }],
+    outputsData: [token.outputData, "0x"],
+  });
+  chainOnSendLimit(tx, head);
+  const witness = tx.getWitnessArgsAt(0) ?? ccc.WitnessArgs.from({});
+  witness.lock = ccc.hexFrom(new Uint8Array(65));
+  tx.setWitnessArgsAt(0, witness);
+  const transaction = JSON.parse(ccc.stringify(tx));
+
+  // The server: a code, and no signature without it.
+  const preview = await transactionSigning(context, { operation: "preview", transaction }) as { requiresEmailCode: boolean; confirmationNonce: string };
+  assert.equal(preview.requiresEmailCode, true);
+  await assert.rejects(transactionSigning(context, { operation: "sign", transaction, confirmationNonce: preview.confirmationNonce }), /code/);
+  // With the Lit code, it's signed.
+  const calls: Record<string, unknown>[] = [];
+  const run = litPolicyRunner.run;
+  litPolicyRunner.run = async (config, params) => { calls.push(params as Record<string, unknown>); return run(config, params); };
+  t.after(() => { litPolicyRunner.run = run; });
+  await transactionSigning(context, { operation: "request-email-code", transaction, confirmationNonce: preview.confirmationNonce });
+  const signed = await transactionSigning(context, { operation: "sign", transaction, confirmationNonce: preview.confirmationNonce, emailCode: codeFrom(world) }) as { transaction: unknown };
+  assert.ok(signed.transaction);
+  // The Action on its own: the same call without the code, as a backend skipping the server's check would make it.
+  const signing = calls.find((params) => params.mode === "transaction" && params.emailCode);
+  assert.ok(signing, "the server signed through the Action with the code");
+  const { email: _email, emailCode: _code, ...uncoded } = signing;
+  await assert.rejects(action.main(uncoded), /eight-digit code/);
+  t.after(async () => {
+    const sql = await database();
+    await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
+  });
+});
+
 /** Turns limits on (genesis committed) at this CKB amount; returns a setter and a reader for the server's amounts. */
 async function limitsOn(world: ReturnType<typeof chain>, context: SigningContext, sent: ccc.Transaction[], amount: bigint) {
   const set = (value: bigint | null, extra: Record<string, unknown> = {}) => signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: value?.toString() ?? null, ...extra }) as Promise<Record<string, unknown>>;
