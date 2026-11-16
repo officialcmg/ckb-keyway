@@ -207,6 +207,10 @@ export function proxyUserRequest(userId, body, signal) {
         if (signal?.aborted) throw new Error("The request was abandoned");
         await markChannels(userId, true);
         if (!retry) await recordFundedChannel(userId, fundingId, fundingInputs(body));
+        // A retry may carry other funding than the attempt recorded (that one never reached Fiber's checks). Then
+        // the recorded cells say nothing about the funding Fiber gets, so the channel keeps none and is never judged
+        // unable to confirm (see fundingDead).
+        else await forgetOtherFundingCells(userId, fundingId, fundingInputs(body));
         // A node stopped meanwhile never gets the funding.
         if (nodes.get(userId) !== node || node.stopping) {
           if (!retry) await unrecordFundedChannel(userId, fundingId).catch(logError);
@@ -538,6 +542,17 @@ function fundingInputs(body) {
 async function recordFundedChannel(userId, id, inputs = []) {
   await startFundingRecord(userId);
   await writeFile(join(managedDataDir(userId), FUNDED_CHANNELS), `${[id, inputs.join(",")].filter(Boolean).join(" ")}\n`, { flag: "a", mode: 0o600 });
+}
+
+/** Keeps a recorded channel but drops its cells, unless they are exactly the given ones. */
+async function forgetOtherFundingCells(userId, id, inputs) {
+  const recorded = (await fundingRecord(userId))?.inputs.get(id) ?? [];
+  if (recorded.length === 0 || [...recorded].sort().join(",") === [...inputs].sort().join(",")) return;
+  const path = join(managedDataDir(userId), FUNDED_CHANNELS);
+  const lines = (await readFile(path, "utf8")).split("\n").filter(Boolean).map((line) => line.split(" ")[0] === id ? id : line);
+  // Replaced whole, so a crash part-way can't lose the channel from the record.
+  await writeFile(`${path}.tmp`, `${lines.join("\n")}\n`, { mode: 0o600 });
+  await rename(`${path}.tmp`, path);
 }
 
 async function unrecordFundedChannel(userId, id) {

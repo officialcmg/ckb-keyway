@@ -1086,3 +1086,30 @@ test("a node whose start fails after Fiber created its store counts as offline; 
   await until(async () => module.readiness().offline === 0);
   assert.ok(module.runningUsers().includes(A));
 });
+
+test("a funding retry spending other cells than the recorded attempt is never judged unable to confirm", async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const { module, root, chain, request, running, marked, withChannels } = await host(context);
+  const submitSpending = (input: string) => module.proxyUserRequest(F, Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "submit_signed_funding_tx", params: [{ channel_id: WAITING_ID, signed_funding_tx: { inputs: [{ previous_output: { tx_hash: input, index: "0x0" }, since: "0x0" }] } }] })))
+    .then(({ status }) => status, () => 502);
+  const other = `0x${"99".repeat(32)}`;
+  await withChannels(F, WAITING_CHANNEL);
+  assert.equal(await request(F), 200);
+  // The first attempt is cut off on its way to Fiber; the retry carries other funding, which Fiber takes.
+  await writeFile(join(root, "users", F, "drop-funding"), "");
+  assert.equal(await submitSpending(other), 502);
+  await rm(join(root, "users", F, "drop-funding"));
+  assert.equal(await submitSpending(FUNDING_INPUT_TX), 200);
+  // The peer withholds its signatures, and the first attempt's cell is spent elsewhere: that says nothing of the
+  // funding Fiber has.
+  await withChannels(F, [{ channel_id: WAITING_ID, is_acceptor: false, created_at: LATER, channel_outpoint: `${FUNDING_TX}00000000`, state: { state_name: "AwaitingTxSignatures", state_flags: "OUR_TX_SIGNATURES_SENT|TX_SIGNATURES_SENT" } }]);
+  chain.dead.add(`${other}:0x0`);
+  assert.equal(await request(A), 200);
+  context.mock.timers.tick(FEW_MINUTES);
+  assert.equal(await request(B), 200);
+  context.mock.timers.tick(61_000);
+  assert.equal(await request(C), 200);
+  assert.deepEqual(running(), [C, F]);
+  assert.equal(await marked(F), true);
+  assert.ok((await readFile(join(root, "users", F, "keyway-funded-channels"), "utf8")).includes(WAITING_ID));
+});
