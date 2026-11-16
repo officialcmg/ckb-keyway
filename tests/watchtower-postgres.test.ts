@@ -453,6 +453,34 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     await sql`delete from keyway_v2_watchtower_channels`;
   });
 
+  await t.test("the shared work before a pass's first penalty doesn't use up the account whose penalty triggered it", async () => {
+    const { user, id, closing } = await revokedChannel(proof.revocationSignature);
+    await sql`update keyway_v2_watchtower_channels set funding_seen = true, checked_at = now() - interval '2 hours' where channel_id = ${id}`;
+    const openId = channelId();
+    await watchtowerRequest(user, watch(openId));
+    await sql`update keyway_v2_watchtower_channels set funding_seen = true, checked_at = now() - interval '1 hour' where channel_id = ${openId}`;
+    const chain: ChainView = {
+      async fundingHistory(lock) {
+        if (lock.args === fundingLockArgs(K1, K2)) return { sawOutput: true };
+        return { sawOutput: true, spend: { txHash: closing.hash(), index: 0 } };
+      },
+      transaction: async (hash) => (hash === closing.hash() ? { tx: closing, committed: true, status: "committed" } : undefined),
+      isLive: async () => true,
+    };
+    // Shaped like penaltySender: its first penalty rebuilds the fee cells' state from every penalty still in flight
+    // (here slow), once per pass.
+    let refreshed: Promise<void> | undefined;
+    const prepare = () => new Promise<void>((resolve) => setTimeout(resolve, 400));
+    const punish = Object.assign(async () => {
+      await (refreshed ??= prepare());
+      return `0x${"cd".repeat(32)}` as ccc.Hex;
+    }, { prepare: () => (refreshed ??= prepare()) });
+    await runWatchtowerPass({ sql, chain, concurrency: 1, accountBudgetMs: 150, log: () => undefined, punish });
+    const [open] = await sql<Array<{ recent: boolean }>>`select checked_at > now() - interval '1 minute' as recent from keyway_v2_watchtower_channels where channel_id = ${openId}`;
+    assert.equal(open.recent, true, "the account's open channel is still checked this pass");
+    await sql`delete from keyway_v2_watchtower_channels`;
+  });
+
   await t.test("an account's closed channel goes first in its turn, ahead of its slow open ones", async () => {
     const { user, id, closing } = await revokedChannel(proof.revocationSignature);
     // Found closed in an earlier pass whose check then failed; the account's open channels are slow to read.

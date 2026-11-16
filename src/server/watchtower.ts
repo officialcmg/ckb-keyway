@@ -693,8 +693,11 @@ export async function assessChannel(
 export type PassDependencies = {
   sql: DatabaseSql;
   chain: ChainView;
-  /** Builds and sends the penalty; returns its hash. */
-  punish(row: Row, commitment: Commitment): Promise<ccc.Hex>;
+  /**
+   * Builds and sends the penalty; returns its hash. `prepare`, if given, is work every penalty of the pass shares
+   * (penaltySender rebuilds the fee cells' state): it runs once, before the first, and isn't charged to any account.
+   */
+  punish: ((row: Row, commitment: Commitment) => Promise<ccc.Hex>) & { prepare?: () => Promise<void> };
   log?: (message: string) => void;
   /** Channels checked at the same time (default `CHECK_CONCURRENCY`). */
   concurrency?: number;
@@ -757,12 +760,20 @@ export async function runWatchtowerPass(passDeps: PassDependencies): Promise<voi
   const rows = [...funded, ...unfunded];
   // Penalties are sent one at a time, so two never pick the same fee cells.
   let sending: Promise<unknown> = Promise.resolve();
-  /** Time each account's checks spent queued behind other penalties: not counted against its share of the pass. */
+  /**
+   * Time each account's checks spent queued behind other penalties, or behind the work the pass's penalties share
+   * (`prepare`): not counted against its share of the pass.
+   */
   const queued = new Map<string, number>();
+  let prepared: Promise<void> | undefined;
   const punish: PassDependencies["punish"] = (row, commitment) => {
     const enqueued = Date.now();
-    const sent = sending.then(() => {
-      queued.set(row.user_id, (queued.get(row.user_id) ?? 0) + Date.now() - enqueued);
+    const sent = sending.then(async () => {
+      try {
+        await (prepared ??= deps.punish.prepare?.() ?? Promise.resolve());
+      } finally {
+        queued.set(row.user_id, (queued.get(row.user_id) ?? 0) + Date.now() - enqueued);
+      }
       return deps.punish(row, commitment);
     });
     sending = sent.catch(() => undefined);
@@ -981,24 +992,44 @@ function storedRevocation(row: Row): Revocation | undefined {
   };
 }
 
+/** Penalties still in flight read before a pass's first penalty: at most this many, so many at a time, in this long. */
+export const IN_FLIGHT_READS = 64;
+const IN_FLIGHT_CONCURRENCY = 8;
+const IN_FLIGHT_BUDGET_MS = 10_000;
+
 /**
  * The penalty, built from a stored row and sent with the watchtower's fee key. Make one per pass: ccc's client cache
  * marks a sent penalty's fee cells spent and its change cell live, which lets the penalties of one pass (sent one at
  * a time) chain on each other, but a penalty the chain dropped would leave that change cell in the cache for good, and
- * every later penalty would spend a cell that doesn't exist. So the first penalty of each sender clears the cache,
- * then marks again the penalties (`inFlight`) the node still has in its mempool.
+ * every later penalty would spend a cell that doesn't exist. So before its first penalty (`prepare`) each sender
+ * clears the cache, then marks again the penalties (`inFlight`, newest first) the node still has in its mempool.
+ * Those reads are bounded: each transaction once, at most IN_FLIGHT_READS of them, several at a time, within
+ * IN_FLIGHT_BUDGET_MS. A pending penalty left unread can only make a new one conflict with it, which is retried.
  */
-export function penaltySender(client: ccc.Client, feeSigner: ccc.Signer, inFlight: () => Promise<string[]> = async () => []) {
+export function penaltySender(
+  client: ccc.Client,
+  feeSigner: ccc.Signer,
+  inFlight: () => Promise<string[]> = async () => [],
+  limits: { reads?: number; budgetMs?: number } = {},
+) {
   let cleared: Promise<void> | undefined;
   // Penalties from earlier passes still in the mempool keep their fee cells spent (the indexer only shows committed
   // cells), so a new penalty chains on them instead of conflicting with them.
   const refresh = async () => {
     await client.cache.clear();
+    const hashes = [...new Set((await inFlight()).map((hash) => hash.toLowerCase()))].slice(0, limits.reads ?? IN_FLIGHT_READS);
+    const deadline = Date.now() + (limits.budgetMs ?? IN_FLIGHT_BUDGET_MS);
     const pending: ccc.Transaction[] = [];
-    for (const hash of await inFlight()) {
-      const found = await client.getTransactionNoCache(hash).catch(() => undefined);
-      if (found && (found.status === "pending" || found.status === "proposed")) pending.push(found.transaction);
-    }
+    await Promise.all(Array.from({ length: Math.min(IN_FLIGHT_CONCURRENCY, hashes.length) }, async () => {
+      for (let hash = hashes.shift(); hash !== undefined && Date.now() < deadline; hash = hashes.shift()) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const found = await Promise.race([
+          client.getTransactionNoCache(hash),
+          new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), Math.max(0, deadline - Date.now())); }),
+        ]).catch(() => undefined).finally(() => clearTimeout(timer));
+        if (found && (found.status === "pending" || found.status === "proposed")) pending.push(found.transaction);
+      }
+    }));
     // Every output first, then every input: a penalty that chained on another's change marks that change spent
     // whatever order they come in (marking a cell usable would undo an earlier "spent").
     for (const tx of pending) {
@@ -1006,13 +1037,14 @@ export function penaltySender(client: ccc.Client, feeSigner: ccc.Signer, inFligh
     }
     for (const tx of pending) await client.cache.markUnusable(tx.inputs.map((input) => input.previousOutput));
   };
-  return async (row: Row, commitment: Commitment) => {
-    await (cleared ??= refresh());
+  const prepare = () => (cleared ??= refresh());
+  return Object.assign(async (row: Row, commitment: Commitment) => {
+    await prepare();
     const revocation = storedRevocation(row);
     if (!revocation) throw new Error("No revocation data");
     const tx = await buildPenaltyTransaction({ client, commitment, revocation, peerKey: row.peer_commitment_key, feeSigner });
     return client.sendTransaction(tx);
-  };
+  }, { prepare });
 }
 
 /**
@@ -1051,8 +1083,10 @@ export function startWatchtower(env: NodeJS.ProcessEnv = process.env): () => Pro
     if (!locked) return;
     if (!lock) console.info(`[watchtower] running; fee address ${await feeSigner.getRecommendedAddress()}`);
     lock = connection;
+    // Newest first: an older penalty has most likely been committed (its row then moves on) or dropped.
     const inFlight = async () => (await sql<Array<{ penalty_tx: string }>>`
       select penalty_tx from keyway_v2_watchtower_channels where state = 'penalty-sent' and penalty_tx is not null
+      group by penalty_tx order by max(updated_at) desc limit ${IN_FLIGHT_READS}
     `).map((row) => row.penalty_tx);
     await runWatchtowerPass({ sql, chain: chainView(client), punish: penaltySender(client, feeSigner, inFlight) });
   };
