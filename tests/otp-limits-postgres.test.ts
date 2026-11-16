@@ -5,7 +5,7 @@ import { Pool } from "pg";
 import { getMigrations } from "better-auth/db/migration";
 import type { User } from "../src/server/auth-user.ts";
 import { authSchemaOptions } from "../src/server/auth-options.ts";
-import { database, withLoginCodeLock, withUserLock } from "../src/server/database.ts";
+import { database, LOGIN_DECISION_SLOTS, loginQueue, withLoginCodeLock, withLoginCodeSlot, withUserLock } from "../src/server/database.ts";
 import { addApplicationOrigin, createApplication, otpSubject, prepareOtpSend, removeApplicationOrigin } from "../src/server/applications.ts";
 import { closeAuthPool, sendEmailCode, sessionForRequest, setAuthDeliveryForTests, verifyEmailCode } from "../src/server/auth.ts";
 import { handleKeyWayRequest } from "../src/server/http.ts";
@@ -745,3 +745,66 @@ test("expired login challenges are removed, and a challenge ID must be a UUID", 
   assert.match((await response.json()).error, /valid OTP challenge/);
   await assert.rejects(verifyEmailCode(appRequest(appId, origin, "192.0.2.152"), `${old.challengeId}0`, "123456"), /Incorrect or expired/);
 });
+
+// Holds `count` login-code locks for emails nobody else uses, as slow sends would, until `release` is called.
+function slowSends(count: number) {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const holders = Array.from({ length: count }, () => withLoginCodeLock(`otp:slow:${crypto.randomUUID()}`, () => held));
+  return { release: async () => { release(); await Promise.all(holders); } };
+}
+
+test("deciding whether to send a code doesn't wait behind slow sends", { skip, timeout: 30_000 }, async () => {
+  await setup();
+  const origin = "https://decide.example";
+  const { appId } = await application([origin]);
+  const victim = email();
+  const stranger = appRequest(appId, origin, "192.0.2.180");
+  await sendEmailCode(stranger, victim);
+  const slow = slowSends(3);
+  await delay(100);
+  try {
+    assert.ok(await within(withLoginCodeSlot(async () => undefined), 300), "A decision runs while every send is slow");
+    // A request refused by the limits is turned away at once, instead of queueing behind the sends.
+    const again = sendEmailCode(stranger, victim).then(() => "sent", (error: Error) => error.message);
+    assert.match(await Promise.race([again, delay(500).then(() => "waiting")]), /Wait 60 seconds/);
+  } finally {
+    await slow.release();
+  }
+});
+
+test("the sign-in queue is bounded in length and in waiting time", { skip, timeout: 30_000 }, async () => {
+  await setup();
+  const saved = { ...loginQueue };
+  Object.assign(loginQueue, { maxWaiting: 4, lockWaitMs: 400, decisionWaitMs: 400 });
+  const outcome = (promise: Promise<unknown>) => promise.then(() => "ran", (error: Error) => error.message);
+  const slow = slowSends(3);
+  let decided: { release: () => void; done: Promise<unknown> } | undefined;
+  try {
+    await delay(100);
+    // Every send slot is taken: four more wait, and the one after them is refused at once.
+    const waiting = Array.from({ length: 4 }, () => outcome(withLoginCodeLock(`otp:wait:${crypto.randomUUID()}`, async () => undefined)));
+    const refused = outcome(withLoginCodeLock(`otp:wait:${crypto.randomUUID()}`, async () => undefined));
+    assert.match(await Promise.race([refused, delay(100).then(() => "waiting")]), /right now/);
+    // Those waiting give up once they have waited too long, instead of waiting without end.
+    const settled = await Promise.race([Promise.all(waiting), delay(2_000).then(() => "still waiting")]);
+    assert.ok(Array.isArray(settled) && settled.every((message) => /right now/.test(message)), String(settled));
+    // Decisions have a bounded queue of their own.
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const running = Array.from({ length: LOGIN_DECISION_SLOTS }, () => withLoginCodeSlot(() => held));
+    decided = { release, done: Promise.all(running) };
+    const queued = Array.from({ length: 4 }, () => outcome(withLoginCodeSlot(async () => undefined)));
+    assert.match(await Promise.race([outcome(withLoginCodeSlot(async () => undefined)), delay(100).then(() => "waiting")]), /right now/);
+    const gaveUp = await Promise.race([Promise.all(queued), delay(2_000).then(() => "still waiting")]);
+    assert.ok(Array.isArray(gaveUp) && gaveUp.every((message) => /right now/.test(message)), String(gaveUp));
+  } finally {
+    decided?.release();
+    await decided?.done;
+    await slow.release();
+    Object.assign(loginQueue, saved);
+  }
+  // With the queue free again, requests run.
+  assert.equal(await outcome(withLoginCodeLock(`otp:wait:${crypto.randomUUID()}`, async () => undefined)), "ran");
+});
+

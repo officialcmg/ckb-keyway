@@ -174,9 +174,9 @@ export function sendEmailCode(request: Request, emailInput: string): Promise<{ c
   const email = emailInput.trim().toLowerCase();
   return withLoginRequest(request, `email:${email}`, async () => {
     const scope = await resolveAuthScope(request);
-    // Decided before the email's lock (the limits take their own locks), so refused requests never queue on it, but in
-    // a login-code slot, so a flood waits here rather than on pool connections. Also applies the 60-second wait between
-    // codes, counted per requester so a stranger's request doesn't delay yours.
+    // Decided before the email's lock (the limits take their own locks), so refused requests never queue on it or
+    // behind sends, but in a decision slot, so a flood waits here rather than on pool connections. Also applies the
+    // 60-second wait between codes, counted per requester so a stranger's request doesn't delay yours.
     const context = await withLoginCodeSlot(() => prepareOtpSend({ appId: scope.id === "dashboard" ? undefined : scope.id, email, ipAddress: requestIp(request) }));
     return withLoginCodeLock(`otp:${scope.id}:${email}`, async (sql) => {
       const challengeId = randomUUID();
