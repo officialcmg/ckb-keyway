@@ -478,7 +478,7 @@ fn webauthn_verifier_rebuilds_the_sdk_text_and_fits_omnilock() {
     let code_hash = [0x24u8; 32];
     let mut accepted = 0;
     let mut max_cycles = 0;
-    for case in cases.iter().step_by(2) {
+    for case in &cases {
         let sighash = unhex(&case.sighash);
         let text = case.text.clone().unwrap_or_else(|| "KeyWay recovery".into());
         let argument = exec_argument(&code_hash, &pubkey_hash, &sighash, &passkey.blob(network_byte(&case.network), &text, 1024));
