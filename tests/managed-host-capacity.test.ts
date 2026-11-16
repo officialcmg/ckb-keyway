@@ -11,10 +11,11 @@ import type { AddressInfo } from "node:net";
 // its pid there; with a slow-start file it takes a while to answer, and with a slow-stop file it takes a while
 // to exit, writing a stopping file once asked to. With a fail-start file it exits at once, noting it in failed-starts.
 // Each start is logged to starts.log beside the data directories, and slow_call (or, with a slow-rpc file, any
-// call but list_channels) answers after 1.5s.
+// call but list_channels) answers after 1.5s. With an advance-channels.json file, the channels become those once
+// list_channels has answered, as a peer moving a channel on would.
 const FAKE_FNN = `#!${process.execPath}
 const { createServer } = require("node:http");
-const { appendFileSync, existsSync, readFileSync, writeFileSync } = require("node:fs");
+const { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } = require("node:fs");
 const { join } = require("node:path");
 const args = process.argv.slice(2);
 const dir = args[args.indexOf("-d") + 1];
@@ -39,6 +40,9 @@ const server = createServer((request, response) => {
     if (method === "node_info") result = { pubkey: "02" + "11".repeat(32), version: "fake", default_funding_lock_script: { code_hash: "0x" + "22".repeat(32), hash_type: "type", args: "0x" } };
     if (method === "list_channels") {
       try { result = { channels: JSON.parse(readFileSync(join(dir, "channels.json"), "utf8")) }; } catch { result = { channels: [] }; }
+      if (existsSync(join(dir, "advance-channels.json"))) {
+        response.once("finish", () => renameSync(join(dir, "advance-channels.json"), join(dir, "channels.json")));
+      }
     }
     if (method === "open_channel_with_external_funding") result = { channel_id: "0x" + "33".repeat(32) };
     // Refused in Fiber's checks before it sends anything, or failing after it has sent the funding to the peer.
@@ -64,7 +68,8 @@ const SETTLING_FORCE_CLOSE = [{ state: { state_name: "Closed", state_flags: "UNC
 const SETTLED_FORCE_CLOSE = [{ state: { state_name: "Closed", state_flags: "UNCOOPERATIVE_LOCAL" } }];
 const SETTLED_REMOTE_CLOSE = [{ state: { state_name: "Closed", state_flags: "UNCOOPERATIVE_REMOTE" } }];
 // Fiber names every flag constant that shares a bit with the value, composite ones included.
-const UNFUNDED_CHANNEL = [{ state: { state_name: "NegotiatingFunding", state_flags: "AWAITING_EXTERNAL_FUNDING" } }];
+// Channels KeyWay opened (with external funding) are listed with is_acceptor false; one a peer opened, true.
+const UNFUNDED_CHANNEL = [{ is_acceptor: false, state: { state_name: "NegotiatingFunding", state_flags: "AWAITING_EXTERNAL_FUNDING" } }];
 const ABORTED_FUNDING = [{ state: { state_name: "Closed", state_flags: "FUNDING_ABORTED" } }];
 const FUNDING_TX = `0x${"77".repeat(32)}`;
 // A creation time after any funding record in these tests began.
@@ -73,16 +78,16 @@ const LATER = `0x${(4_000_000_000_000).toString(16)}`;
 const FUNDING_INPUT_TX = `0x${"88".repeat(32)}`;
 // A channel waiting for its user's signed funding, which `submit` hands over.
 const WAITING_ID = `0x${"44".repeat(32)}`;
-const WAITING_CHANNEL = [{ channel_id: WAITING_ID, created_at: LATER, state: { state_name: "NegotiatingFunding", state_flags: "AWAITING_EXTERNAL_FUNDING" } }];
+const WAITING_CHANNEL = [{ channel_id: WAITING_ID, is_acceptor: false, created_at: LATER, state: { state_name: "NegotiatingFunding", state_flags: "AWAITING_EXTERNAL_FUNDING" } }];
 // The same channel once its funding was handed over.
-const SUBMITTED_CHANNEL = [{ channel_id: WAITING_ID, created_at: LATER, state: { state_name: "CollaboratingFundingTx", state_flags: "OUR_TX_COMPLETE_SENT|THEIR_TX_COMPLETE_SENT|COLLABORATION_COMPLETED" } }];
+const SUBMITTED_CHANNEL = [{ channel_id: WAITING_ID, is_acceptor: false, created_at: LATER, state: { state_name: "CollaboratingFundingTx", state_flags: "OUR_TX_COMPLETE_SENT|THEIR_TX_COMPLETE_SENT|COLLABORATION_COMPLETED" } }];
 // Past funding negotiation. Unless the node's funding record shows the funding was never submitted (see the
 // tests below), the peer may hold the user's signed funding and broadcast it at any time.
-const COLLABORATED_CHANNEL = [{ state: { state_name: "CollaboratingFundingTx", state_flags: "OUR_TX_COMPLETE_SENT|THEIR_TX_COMPLETE_SENT|COLLABORATION_COMPLETED" } }];
-const COMMITTING_CHANNEL = [{ state: { state_name: "SigningCommitment", state_flags: "THEIR_COMMITMENT_SIGNED_SENT|COMMITMENT_SIGNED_SENT" } }];
-const THEIRS_SIGNED_CHANNEL = [{ state: { state_name: "AwaitingTxSignatures", state_flags: "THEIR_TX_SIGNATURES_SENT|TX_SIGNATURES_SENT" }, channel_outpoint: `${FUNDING_TX}00000000` }];
-const SIGNED_CHANNEL = [{ state: { state_name: "AwaitingTxSignatures", state_flags: "OUR_TX_SIGNATURES_SENT|TX_SIGNATURES_SENT" }, channel_outpoint: `${FUNDING_TX}00000000` }];
-const BROADCAST_CHANNEL = [{ state: { state_name: "AwaitingChannelReady", state_flags: "OUR_CHANNEL_READY|CHANNEL_READY" }, channel_outpoint: `${FUNDING_TX}00000000` }];
+const COLLABORATED_CHANNEL = [{ is_acceptor: false, state: { state_name: "CollaboratingFundingTx", state_flags: "OUR_TX_COMPLETE_SENT|THEIR_TX_COMPLETE_SENT|COLLABORATION_COMPLETED" } }];
+const COMMITTING_CHANNEL = [{ is_acceptor: false, state: { state_name: "SigningCommitment", state_flags: "THEIR_COMMITMENT_SIGNED_SENT|COMMITMENT_SIGNED_SENT" } }];
+const THEIRS_SIGNED_CHANNEL = [{ is_acceptor: false, state: { state_name: "AwaitingTxSignatures", state_flags: "THEIR_TX_SIGNATURES_SENT|TX_SIGNATURES_SENT" }, channel_outpoint: `${FUNDING_TX}00000000` }];
+const SIGNED_CHANNEL = [{ is_acceptor: false, state: { state_name: "AwaitingTxSignatures", state_flags: "OUR_TX_SIGNATURES_SENT|TX_SIGNATURES_SENT" }, channel_outpoint: `${FUNDING_TX}00000000` }];
+const BROADCAST_CHANNEL = [{ is_acceptor: false, state: { state_name: "AwaitingChannelReady", state_flags: "OUR_CHANNEL_READY|CHANNEL_READY" }, channel_outpoint: `${FUNDING_TX}00000000` }];
 const exists = (path: string) => stat(path).then(() => true, () => false);
 
 async function until(check: () => Promise<boolean>) {
@@ -854,7 +859,7 @@ test("funding refused because Fiber no longer has the channel is undone", async 
 
 test("a node whose submitted funding can never confirm, as a cell it spends was spent elsewhere, makes room", async (context) => {
   // The peer withheld its signatures and the account spent the funding's cell in another transaction.
-  const stalled = [{ channel_id: WAITING_ID, created_at: LATER, channel_outpoint: `${FUNDING_TX}00000000`, state: { state_name: "AwaitingTxSignatures", state_flags: "OUR_TX_SIGNATURES_SENT|TX_SIGNATURES_SENT" } }];
+  const stalled = [{ channel_id: WAITING_ID, is_acceptor: false, created_at: LATER, channel_outpoint: `${FUNDING_TX}00000000`, state: { state_name: "AwaitingTxSignatures", state_flags: "OUR_TX_SIGNATURES_SENT|TX_SIGNATURES_SENT" } }];
   const ready = [{ ...stalled[0], state: { state_name: "ChannelReady" } }];
   for (const outcome of ["still live", "spent elsewhere", "spent by the funding", "ready after one reading"] as const) {
     context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
@@ -981,4 +986,34 @@ test("a node stopped for a snapshot that may hold a channel nothing listed stays
   await rm(join(root, "users", A, "fail-start"));
   await until(async () => module.readiness().offline === 0);
   assert.ok(running().includes(A));
+});
+
+test("a node isn't stopped to make room if its channels changed while it was checked", async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const { root, request, running } = await host(context);
+  assert.equal(await request(F), 200);
+  assert.equal(await request(A), 200);
+  context.mock.timers.tick(FEW_MINUTES);
+  // F holds nothing when it is checked, but meanwhile a peer opens a channel to it and F sends its funding signatures.
+  const signed = [{ channel_id: `0x${"55".repeat(32)}`, is_acceptor: true, created_at: LATER, channel_outpoint: `${FUNDING_TX}00000000`, state: { state_name: "AwaitingTxSignatures", state_flags: "OUR_TX_SIGNATURES_SENT|TX_SIGNATURES_SENT" } }];
+  await writeFile(join(root, "users", F, "advance-channels.json"), JSON.stringify(signed));
+  assert.equal(await request(B), 200);
+  assert.deepEqual(running(), [B, F]);
+});
+
+test("a channel a peer opened keeps its node running in every state, as Fiber may fund it from the node's own CKB", async (context) => {
+  const inbound = (channels: Array<Record<string, unknown>>) => channels.map((channel) => ({ ...channel, is_acceptor: true, channel_id: `0x${"66".repeat(32)}`, created_at: LATER }));
+  const negotiating = [{ state: { state_name: "NegotiatingFunding", state_flags: "OUR_INIT_SENT|THEIR_INIT_SENT|INIT_SENT" } }];
+  for (const channels of [negotiating, COLLABORATED_CHANNEL, COMMITTING_CHANNEL, THEIRS_SIGNED_CHANNEL]) {
+    context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+    const { request, running, marked, withChannels } = await host(context);
+    assert.equal(await request(F), 200);
+    await withChannels(F, inbound(channels));
+    assert.equal(await request(A), 200);
+    context.mock.timers.tick(FEW_MINUTES);
+    assert.equal(await request(B), 200, JSON.stringify(channels));
+    assert.deepEqual(running(), [B, F], JSON.stringify(channels));
+    assert.equal(await marked(F), true);
+    context.mock.timers.reset();
+  }
 });

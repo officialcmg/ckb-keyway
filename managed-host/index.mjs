@@ -589,9 +589,15 @@ async function makeRoom(userId, priority = false) {
     try { record = await fundingRecord(id); } catch { continue; }
     const idle = !(await holdsChannels(channels, record));
     if (!idle) await markChannels(id, true).catch(logError);
-    // Checked again after the wait, in case the node was stopped or picked up a request meanwhile.
-    if (!idle || nodes.get(id) !== node || !reusable(id, node)) continue;
-    // Stopping marks the node at once, so no request can pick it up in between; its marker goes only once
+    if (!idle) continue;
+    // A peer can move a channel on, or open a new one, while the checks above wait (CKB may be asked about
+    // recorded funding). So the channels are listed once more, last, and the node stops only if they are just as
+    // they were, with nothing awaited between that answer and the stop.
+    let latest;
+    try { latest = await nodeChannels(node); } catch { continue; }
+    // Checked again after the waits, in case the node was stopped or picked up a request meanwhile.
+    if (channelsSnapshot(latest) !== channelsSnapshot(channels) || nodes.get(id) !== node || !reusable(id, node)) continue;
+    // Stopping marks the node at once, so no request can pick it up in between; its markers go only once
     // it has stopped.
     // A node that won't stop leaves no room; that is no failure of the node being admitted.
     try { await stopNode(id); } catch (error) { logError(error); continue; }
@@ -601,6 +607,15 @@ async function makeRoom(userId, priority = false) {
   }
   if (!priority) noRoomAt = Date.now();
   throw new RoomError("Managed node capacity is full");
+}
+
+/** What decides whether a node's channels hold it: each channel's ID, state and funding, in a fixed order. */
+function channelsSnapshot(channels) {
+  if (!Array.isArray(channels)) return undefined;
+  return JSON.stringify(channels.map((channel) => [
+    String(channel?.channel_id), channel?.is_acceptor, channel?.created_at, channel?.channel_outpoint ?? null,
+    channel?.state ?? null,
+  ].map((part) => JSON.stringify(part))).sort());
 }
 
 /**
@@ -941,9 +956,15 @@ function stateName(channel) {
  * to the node, as its funding record shows; Fiber aborts such an open if it stalls. Fiber passes submitted
  * funding straight to the peer, which may broadcast it at any time, so a submitted channel is open. Without a
  * record that covers the channel, only a channel still negotiating its funding counts as unfunded.
+ *
+ * Only a channel the node opened can be unfunded. KeyWay opens channels only with external funding, which moves
+ * on only once the user's signed funding comes through the host. A channel a peer opened (is_acceptor) Fiber 0.9.1
+ * accepts on its own and may fund from the node's own CKB, signing it as the peer's messages arrive with no
+ * request through the host, so it is open from the start.
  */
 function channelClass(channel, record) {
   if (channelFinished(channel)) return "finished";
+  if (channel?.is_acceptor !== false) return "open";
   const covered = recordCovers(record, channel);
   // Funding handed to the node is with the peer, whatever state Fiber last stored.
   if (covered && record.ids.has(String(channel?.channel_id).toLowerCase())) return "open";
