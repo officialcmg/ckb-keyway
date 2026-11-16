@@ -1,7 +1,6 @@
 import { litActionCid } from "./lit-cid.ts";
 
 const CHIPOTLE_ACTION_URL = "https://api.chipotle.litprotocol.com/core/v1/lit_action";
-const HEX_32 = /^0x[0-9a-fA-F]{64}$/;
 const EVM_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 
 export type LitSignature = {
@@ -21,19 +20,6 @@ type LitActionResponse = {
   logs: string;
   response: unknown;
 };
-
-export async function signCkbDigest(
-  digest: string,
-  pkpId: string,
-  config: LitRuntimeConfig,
-): Promise<LitSignature> {
-  if (!HEX_32.test(digest)) throw new Error("CKB digest must be a 0x-prefixed 32-byte hex string");
-  if (!EVM_ADDRESS.test(pkpId)) throw new Error("Lit PKP ID must be a 20-byte EVM address");
-  const signature = await executeAction(config, { pkpId, digest });
-  if (!isSignature(signature)) throw new Error("Lit Action returned an invalid signature");
-
-  return signature;
-}
 
 /** Creates a Fiber key inside Lit and returns only its ciphertext; no server ever holds the key. */
 export async function generateFiberKey(pkpId: string, config: LitRuntimeConfig): Promise<string> {
@@ -138,14 +124,6 @@ function isActionResponse(value: unknown): value is LitActionResponse {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<LitActionResponse>;
   return typeof candidate.has_error === "boolean" && typeof candidate.logs === "string" && "response" in candidate;
-}
-
-function isSignature(value: unknown): value is LitSignature {
-  if (!value || typeof value !== "object") return false;
-  const candidate = value as Partial<LitSignature>;
-  return /^0x[0-9a-fA-F]{64}$/.test(candidate.r ?? "") &&
-    /^0x[0-9a-fA-F]{64}$/.test(candidate.s ?? "") &&
-    (candidate.recoveryParam === 0 || candidate.recoveryParam === 1);
 }
 
 function readApiError(value: unknown, fallback: string): string {

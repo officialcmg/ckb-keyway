@@ -279,7 +279,8 @@ export function fundingLockCellDeps(recovery: Pick<KeyWayRecovery, "omnilock">) 
 
 /**
  * A CCC signer for a KeyWay account's public key that knows its current lock. Without recovery it behaves
- * exactly like CCC's SignerCkbPublicKey. With recovery it reports only the Omnilock address and prepares 85-byte
+ * like CCC's SignerCkbPublicKey, but its only address is the secp256k1 one (never an anyone-can-pay address of
+ * the key, whose cells KeyWay doesn't sign). With recovery it reports only the Omnilock address and prepares 85-byte
  * Omnilock placeholders. The old secp256k1 address isn't one of its addresses, so CCC never picks its cells for
  * a transaction: the sign-in sweep owns them (`recovery.legacyAddress` still names it).
  */
@@ -297,8 +298,12 @@ export class KeyWayAccountSigner extends ccc.SignerCkbPublicKey {
     return ccc.Address.fromScript(await omnilockLock(this.client, this.recovery), this.client);
   }
 
+  /**
+   * Only the account's current lock. CCC's public-key signer also lists any anyone-can-pay lock carrying this
+   * key's hash, which anyone can create cells under; KeyWay never signs those, so CCC must never pick them.
+   */
   async getAddressObjs(): Promise<ccc.Address[]> {
-    return this.recovery ? [await this.getRecommendedAddressObj()] : super.getAddressObjs();
+    return [await this.getRecommendedAddressObj()];
   }
 
   async getRelatedScripts(transactionLike: ccc.TransactionLike): Promise<Array<{ script: ccc.Script; cellDeps: ccc.CellDepInfo[] }>> {

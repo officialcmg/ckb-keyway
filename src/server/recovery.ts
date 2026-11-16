@@ -10,7 +10,7 @@ import { withUserLock } from "./database.ts";
 import { createRecoveryNoticeEmailTemplate } from "./email-template.ts";
 import { serializeTransaction } from "./funding-transaction.ts";
 import { codeLimit, consumeRequest, countLitCodeAttempt, hashText, issueRequest, limit, loadRequest, recordLitCode, REQUEST_EXPIRED, sendCode, signGroups, verifyCode, type SigningContext } from "./general-signing.ts";
-import { litPolicyEnabled, parseLitEmailCode, policySendCode, setEmailBinding } from "./lit-policy.ts";
+import { parseLitEmailCode, policySendCode, setEmailBinding } from "./lit-policy.ts";
 import { recordPendingTransaction } from "./pending-transactions.ts";
 import { feeRateCap, formatCkb } from "./transaction-policy.ts";
 import type { User } from "./auth-user.ts";
@@ -19,6 +19,8 @@ import { readWallet, saveWallet, type PendingRecoveryChange, type ReadyWallet } 
 /** What the recovery service needs beyond signing: a CKB client and a way to broadcast, both replaceable in tests. */
 export type RecoveryContext = SigningContext & {
   client?: ccc.Client;
+  /** The nodes a pending change is settled from, one at a time; replaceable in tests. Default: `settlementNodes()`. */
+  nodes?: ccc.Client[];
   broadcast?: (transaction: ccc.Transaction) => Promise<ccc.Hex>;
 };
 
@@ -72,24 +74,20 @@ export async function recoverySetup(context: RecoveryContext, body: Record<strin
   if (context.wallet.recovery) throw new Error("Account recovery is already on");
   refusePending(context.wallet);
   const backups = parseBackups(body.backups);
-  // One decision for the whole flow, so a plan with the binding's placeholder is only ever signed by the Action.
-  const policy = litPolicyEnabled() && !context.signDigest;
+  // The Action emails and checks the code; only a test that signs locally (`signDigest`) uses the server's own.
+  const policy = !context.signDigest;
   const plan = (wallet: ReadyWallet) => planRecovery(client, wallet, backups, { emailBinding: policy });
   if (body.operation === "preview") {
     await limit(context, "sign", { max: 10, window: 60 });
     await verifyBackups(client, context.user, context.wallet, body.backups as unknown[]);
     const planned = await plan(context.wallet);
-    const confirmationNonce = await issueRequest(context.user, "recovery", planDigest(planned, backups), { lines: recoveryLines(planned.preview), signer: policy ? "policy" : "digest" }, true);
+    const confirmationNonce = await issueRequest(context.user, "recovery", planDigest(planned, backups), { lines: recoveryLines(planned.preview) }, true);
     return { preview: planned.preview, confirmationNonce, requiresEmailCode: true };
   }
   const nonce = requiredNonce(body.confirmationNonce);
   if (body.operation === "request-email-code") {
     const planned = await plan(context.wallet);
-    const request = await loadRequest(context.user, "recovery", nonce, planDigest(planned, backups)).catch((cause) => {
-      // With a different signer the plan differs (the binding's placeholder), so the request can't match.
-      throw cause instanceof Error && cause.message === REQUEST_EXPIRED ? cause : new Error(`${cause instanceof Error ? cause.message : "Signing confirmation is invalid"}. If KeyWay was just updated, start again`);
-    });
-    checkSignerMode(request.summary, policy ? "policy" : "digest");
+    const request = await loadRequest(context.user, "recovery", nonce, planDigest(planned, backups));
     if (policy) {
       // The policy Action emails the code and returns a keyed fingerprint of this address for the chain (never the
       // address itself); the code never comes here.
@@ -112,9 +110,8 @@ export async function recoverySetup(context: RecoveryContext, body: Record<strin
     // The digest binds the approval to this exact transaction; any change in the account's cells refuses it.
     const digest = planDigest(planned, backups);
     const request = await loadRequest(context.user, "recovery", nonce, digest).catch((cause) => {
-      throw cause instanceof Error && cause.message === REQUEST_EXPIRED ? cause : new Error("Your account changed since the preview, or KeyWay was updated. Review turning on recovery again");
+      throw cause instanceof Error && cause.message === REQUEST_EXPIRED ? cause : new Error("Your account changed since the preview. Review turning on recovery again");
     });
-    checkSignerMode(request.summary, policy ? "policy" : "digest");
     let signed: ccc.Transaction;
     if (policy) {
       // The Action checks the code it emailed; the request is used up only once it has signed.
@@ -187,12 +184,12 @@ function neverCommits(error: unknown): boolean {
   return error instanceof ccc.ErrorClientBase && /TransactionFailedToVerify|PoolRejectedMalformedTransaction/.test(`${error.message} ${error.data}`);
 }
 
-/** Which signer a recovery request was issued under. A request finishes under the same one, or not at all. */
-type SignerMode = "policy" | "digest";
-const SIGNER_CHANGED = "KeyWay switched signers while this request was open. Start again.";
-
-function checkSignerMode(summary: Record<string, unknown>, mode: SignerMode): void {
-  if ((summary.signer ?? "digest") !== mode) throw new Error(SIGNER_CHANGED);
+/**
+ * Who emails and checks the code for a backup change: the policy Action, for a list whose email was bound when it
+ * was made, or the server, for a list made before the binding existed (or a test that signs locally).
+ */
+function codeChecker(context: Pick<RecoveryContext, "signDigest">, recovery: KeyWayRecovery): "lit" | "server" {
+  return !context.signDigest && recovery.litEmailBound ? "lit" : "server";
 }
 
 function refusePending(wallet: ReadyWallet): void {
@@ -214,31 +211,24 @@ function recoveryStatus(wallet: ReadyWallet): RecoveryStatus {
  * rejected, or hasn't known for the grace period, is dropped only once it can no longer commit. Called on every
  * sign-in and status check.
  */
-export async function settleRecoveryChange(context: Pick<RecoveryContext, "user" | "client" | "broadcast" | "appName" | "email" | "sendEmail">, now = new Date()): Promise<ReadyWallet> {
-  const client = context.client ?? new ccc.ClientPublicTestnet();
+export async function settleRecoveryChange(context: Pick<RecoveryContext, "user" | "client" | "nodes" | "broadcast" | "appName" | "email" | "sendEmail">, now = new Date()): Promise<ReadyWallet> {
   const settled = await withUserLock(context.user.id, async (sql) => {
     const wallet = await readWallet(context.user, sql);
     if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
     const pending = wallet.recoveryPending;
     if (!pending) return { wallet };
-    const found = await client.getTransaction(pending.transactionHash);
-    const unknown = !found || found.status === "unknown";
-    // A node also reports "rejected" for removals that aren't final (expiry, a full pool), so that is checked the same way.
-    const gone = found?.status === "rejected" || (unknown && now.getTime() - Date.parse(pending.sentAt) > PENDING_GRACE_MS);
-    const stale = gone ? await resendStale(context, client, pending) : undefined;
-    if (stale === "kept") return { wallet };
+    const nodes = context.nodes ?? (context.client ? [context.client] : settlementNodes());
+    const state = await onOneNode(nodes, (client) => pendingState(context, client, pending, now), undecidedSettlement(nodes.length));
+    if (state === "kept") return { wallet };
     const { recoveryPending: _done, ...rest } = wallet;
-    if (found?.status === "committed" || stale === "committed") {
+    if (state === "committed") {
       const updated: ReadyWallet = { ...rest, recovery: pending.recovery, ckbAddress: pending.ckbAddress, updatedAt: now.toISOString() };
       await saveWallet(context.user, updated, sql);
       return { wallet: updated, notice: pending };
     }
-    if (stale === "dropped") {
-      const updated: ReadyWallet = { ...rest, updatedAt: now.toISOString() };
-      await saveWallet(context.user, updated, sql);
-      return { wallet: updated };
-    }
-    return { wallet };
+    const updated: ReadyWallet = { ...rest, updatedAt: now.toISOString() };
+    await saveWallet(context.user, updated, sql);
+    return { wallet: updated };
   });
   if (settled.notice) {
     const { kind, ckbAddress, recovery, transactionHash } = settled.notice;
@@ -248,19 +238,86 @@ export async function settleRecoveryChange(context: Pick<RecoveryContext, "user"
   return settled.wallet;
 }
 
+/** The public testnet nodes a pending change is settled from, each a client of its own with no fallback. */
+const SETTLEMENT_NODES = ["https://testnet.ckb.dev/", "https://testnet.ckbapp.dev/"];
+
+export function settlementNodes(): ccc.Client[] {
+  return SETTLEMENT_NODES.map((url) => new ccc.ClientPublicTestnet({ url, fallbacks: [] }));
+}
+
+/** The node doesn't know a cell the change spends, so it can't say whether that cell is spent: ask another. */
+export class NodeBehind extends Error {}
+
+/**
+ * A change recorded without its transaction whose AdminList output this node doesn't show live. A node that is
+ * behind shows the same, so it is dropped only once every node says so.
+ */
+export class AdminListAbsent extends NodeBehind {}
+
+/**
+ * When no node could decide: dropped if every node answered that the AdminList of a change recorded without its
+ * transaction isn't live; kept (pending) if a node was only behind; otherwise undecided, and the failure is thrown.
+ */
+export function undecidedSettlement(nodeCount: number): (failures: unknown[]) => "kept" | "dropped" | undefined {
+  return (failures) => {
+    if (failures.length === nodeCount && failures.every((failure) => failure instanceof AdminListAbsent)) return "dropped";
+    return failures.some((failure) => failure instanceof NodeBehind) ? "kept" : undefined;
+  };
+}
+
+/**
+ * Runs `read` against one node at a time, so every answer it combines comes from the same node: CCC's fallback
+ * would send a failed request to another node mid-way, and two nodes can disagree (one lagging, one reorged).
+ * If a node fails, the whole read starts again on the next one. When none answers, `undecided` may still settle
+ * it from the failures; otherwise the last failure is thrown.
+ */
+export async function onOneNode<T>(nodes: ccc.Client[], read: (client: ccc.Client) => Promise<T>, undecided?: (failures: unknown[]) => T | undefined): Promise<T> {
+  const failures: unknown[] = [];
+  for (const node of nodes) {
+    try {
+      return await read(node);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  const decided = undecided?.(failures);
+  if (decided !== undefined) return decided;
+  throw failures.at(-1) ?? new Error("No CKB node to read from");
+}
+
+/** Where a pending change stands on this node: committed, dropped for good, or still pending (and sent again if needed). */
+async function pendingState(context: Pick<RecoveryContext, "broadcast">, client: ccc.Client, pending: PendingRecoveryChange, now: Date): Promise<"kept" | "committed" | "dropped"> {
+  const found = await client.getTransaction(pending.transactionHash);
+  if (found?.status === "committed") return "committed";
+  const unknown = !found || found.status === "unknown";
+  // A node also reports "rejected" for removals that aren't final (expiry, a full pool), so that is checked the same way.
+  const gone = found?.status === "rejected" || (unknown && now.getTime() - Date.parse(pending.sentAt) > PENDING_GRACE_MS);
+  return gone ? resendStale(context, client, pending) : "kept";
+}
+
 /**
  * A change the node rejected or hasn't known for the grace period. While all its inputs are unspent the signed
  * transaction can still commit, so it is sent again (no node may have got it, or one dropped it) and stays pending,
  * unless the resend is refused in a way that holds for good. Any other refusal can pass, however long it lasts. Once
- * an input is spent the change is dropped, unless this transaction spent it. A change recorded without its
- * transaction is dropped, as before.
+ * an input is spent, the change's own AdminList output (output 0) being live means it committed. Otherwise the
+ * input counts as spent only if the node knows the transaction that made it (CCC reads a cell the node hasn't seen
+ * as not live too); if it doesn't, the node is behind and another one decides. Then the change is kept while the
+ * node still has it pending, proposed or committed, and dropped otherwise. A change recorded without its
+ * transaction is applied when its AdminList output is live, and dropped only once no node shows it.
  */
 async function resendStale(context: Pick<RecoveryContext, "broadcast">, client: ccc.Client, pending: PendingRecoveryChange): Promise<"kept" | "committed" | "dropped"> {
-  if (!pending.transaction) return "dropped";
+  const adminListLive = async () => Boolean(await client.getCellLive({ txHash: pending.transactionHash, index: 0 }, false));
+  if (!pending.transaction) {
+    if (await adminListLive()) return "committed";
+    throw new AdminListAbsent("This node doesn't show the change's recovery list");
+  }
   const transaction = ccc.Transaction.fromBytes(pending.transaction);
   for (const input of transaction.inputs) {
     if (await client.getCellLive(input.previousOutput, false)) continue;
-    return (await client.getTransaction(pending.transactionHash))?.status === "committed" ? "committed" : "dropped";
+    if (await adminListLive()) return "committed";
+    if ((await client.getTransaction(input.previousOutput.txHash))?.status !== "committed") throw new NodeBehind("The CKB node hasn't caught up with this change's inputs");
+    const status = (await client.getTransaction(pending.transactionHash))?.status;
+    return status === "pending" || status === "proposed" || status === "committed" ? "kept" : "dropped";
   }
   try {
     await send(context, client, transaction);
@@ -341,7 +398,7 @@ const occupied = (output: ccc.CellOutput, data: ccc.HexLike) => ccc.fixedPointFr
  * then each token cell moves as it is, and the rest of the CKB less the fee goes to the new address. Witness 0
  * records the backups' salted auths (`recoveryListRecord`) in its output_type.
  */
-export async function planRecovery(client: ccc.Client, wallet: ReadyWallet, backups: RecoveryBackup[], options: { emailBinding?: boolean } = { emailBinding: litPolicyEnabled() }): Promise<RecoveryPlan> {
+export async function planRecovery(client: ccc.Client, wallet: ReadyWallet, backups: RecoveryBackup[], options: { emailBinding?: boolean } = { emailBinding: true }): Promise<RecoveryPlan> {
   const secp = await secp256k1Lock(client, wallet.litPublicKey);
   const xudt = await client.getKnownScript(ccc.KnownScript.XUdt);
   const cells: ccc.Cell[] = [];
@@ -539,17 +596,14 @@ export async function recoveryBackupChange(context: RecoveryContext, body: Recor
     await limit(context, "sign", { max: 10, window: 60 });
     if (change.change === "add") await verifyBackups(client, context.user, context.wallet, [body.backup]);
     const plan = await planBackupChange(client, context.wallet, change);
-    const mode: SignerMode = litPolicyEnabled() && !context.signDigest && context.wallet.recovery.litEmailBound ? "policy" : "digest";
-    const confirmationNonce = await issueRequest(context.user, "recovery", changeDigest(plan, change), { lines: backupChangeLines(plan.preview), signer: mode }, true);
+    const confirmationNonce = await issueRequest(context.user, "recovery", changeDigest(plan, change), { lines: backupChangeLines(plan.preview) }, true);
     return { preview: plan.preview, confirmationNonce, requiresEmailCode: true };
   }
   const nonce = requiredNonce(body.confirmationNonce);
   if (body.operation === "request-email-code") {
     const plan = await planBackupChange(client, context.wallet, change);
     const request = await loadRequest(context.user, "recovery", nonce, changeDigest(plan, change));
-    const mode: SignerMode = litPolicyEnabled() && !context.signDigest && context.wallet.recovery.litEmailBound ? "policy" : "digest";
-    checkSignerMode(request.summary, mode);
-    if (mode === "policy") {
+    if (codeChecker(context, context.wallet.recovery) === "lit") {
       // The policy Action emails the code only if this address matches the fingerprint bound when recovery was turned on.
       await codeLimit(context);
       const sent = await policySendCode(plan.transaction, context.wallet, { enableTransactionHash: context.wallet.recovery.enableTransactionHash, email: await context.email(), appName: context.appName, backups: litBackups(plan), client });
@@ -572,10 +626,8 @@ export async function recoveryBackupChange(context: RecoveryContext, body: Recor
     });
     const groups = [{ script: plan.listLock, kind: "omnilock" as const }, { script: plan.omnilock, kind: "omnilock" as const }];
     const enableTransactionHash = wallet.recovery.enableTransactionHash;
-    const mode: SignerMode = litPolicyEnabled() && !context.signDigest && wallet.recovery.litEmailBound ? "policy" : "digest";
-    checkSignerMode(request.summary, mode);
     let signed: ccc.Transaction;
-    if (mode === "policy") {
+    if (codeChecker(context, wallet.recovery) === "lit") {
       // The Action checks the code it emailed; the request is used up only once it has signed.
       const emailCode = parseLitEmailCode(body.emailCode, request.summary.litTicket);
       await checkBackupChangeTransaction(client, plan.transaction, wallet.recovery, plan.backups);

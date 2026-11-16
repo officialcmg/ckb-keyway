@@ -6,6 +6,20 @@ icon: PenLine
 
 `useCkbWallet().signer` is a [CCC](https://github.com/ckb-devrel/ccc) signer for the signed-in account. Write the CCC code you already know. KeyWay shows the user what each transaction does and signs only after they approve.
 
+KeyWay is built and tested on `@ckb-ccc/core` 1.16.1 and installs exactly that version. Use the same version for your own CCC code, so your app and KeyWay share one copy of CCC (with another version your app gets a second copy, and TypeScript won't accept the signer in that copy's transactions):
+
+```bash tab="npm"
+npm install --save-exact @ckb-ccc/core@1.16.1
+```
+
+```bash tab="pnpm"
+pnpm add --save-exact @ckb-ccc/core@1.16.1
+```
+
+```bash tab="yarn"
+yarn add --exact @ckb-ccc/core@1.16.1
+```
+
 ```tsx
 import { ccc } from "@ckb-ccc/core";
 import { useCkbWallet } from "@ckb-keyway/react";
@@ -26,7 +40,7 @@ function SendButton({ to }: { to: string }) {
 }
 ```
 
-`signer` is undefined until the account is ready. It doesn't need Fiber. `getAddresses`, `getBalance`, `findCells`, `signMessage` and `verifyMessage` work as they do with any CCC signer. Tokens (xUDT, sUDT, including RUSD on testnet), Spore NFTs and Nervos DAO transactions work too: CCC builds them, and KeyWay signs the user's part.
+`signer` is undefined until the account is ready. It doesn't need Fiber. `getAddresses`, `getBalance`, `findCells`, `signMessage` and `verifyMessage` work as they do with any CCC signer. Tokens (xUDT, sUDT, including RUSD on testnet), Spore NFTs and Nervos DAO transactions work too: CCC builds them, and KeyWay signs the user's part. If you use a CCC add-on package for them (such as `@ckb-ccc/spore` or `@ckb-ccc/udt`), pick a release built on `@ckb-ccc/core` 1.16.1, for the same reason.
 
 ## What the user approves
 
