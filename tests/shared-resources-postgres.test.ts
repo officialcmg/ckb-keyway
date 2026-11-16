@@ -13,7 +13,7 @@ import { closeAuthPool, sendEmailCode, setAuthDeliveryForTests, verifyEmailCode 
 import { bootstrap, type Provisioning } from "../src/server/bootstrap.ts";
 import { acquireLease } from "../src/server/device-lease.ts";
 import { handleKeyWayRequest } from "../src/server/http.ts";
-import { MAX_DAILY_RECORDS, runIdempotentMutation } from "../src/server/idempotency.ts";
+import { MAX_DAILY_RECORDS, RetryableError, runIdempotentMutation } from "../src/server/idempotency.ts";
 import { prepareBackupForDevice, saveNodeBackup } from "../src/server/node-backup.ts";
 import { settleRecoveryChange } from "../src/server/recovery.ts";
 import { alertRetry, recordSigningEvent } from "../src/server/security-alerts.ts";
@@ -193,6 +193,39 @@ test("M13: expired idempotency records keep no response, accounts are bounded, a
     assert.equal(count, MAX_DAILY_RECORDS + 1, "refused requests store nothing");
     // A repeat of a stored key is still answered.
     await assert.rejects(runIdempotentMutation(user.id, "test", "bound-key-00000001", {}, async () => undefined), /another request/);
+  });
+
+  await t.test("requests arriving together at the bound store only up to it", async () => {
+    const userId = crypto.randomUUID();
+    await sql`
+      insert into keyway_v2_idempotency_keys (user_id, operation, idempotency_key, request_digest, status, created_at, expires_at)
+      select ${userId}, 'test', 'edge-key-' || lpad(n::text, 8, '0'), 'digest', 'failed', now() - interval '1 hour', now() + interval '23 hours'
+      from generate_series(1, ${MAX_DAILY_RECORDS - 1}) as n
+    `;
+    const results = await Promise.allSettled(Array.from({ length: 8 }, (_, index) =>
+      runIdempotentMutation(userId, "test", `edge-fresh-key-${String(index).padStart(4, "0")}`, {}, async () => "ran")));
+    assert.equal(results.filter((result) => result.status === "fulfilled").length, 1, "one more record fits");
+    const [{ count }] = await sql<Array<{ count: number }>>`select count(*)::int as count from keyway_v2_idempotency_keys where user_id = ${userId}`;
+    assert.equal(count, MAX_DAILY_RECORDS);
+  });
+
+  await t.test("a repeat waiting on a request that is refused for a retry runs it, rather than hearing the account is full", async () => {
+    const userId = crypto.randomUUID();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let started!: () => void;
+    const running = new Promise<void>((resolve) => { started = resolve; });
+    const first = runIdempotentMutation(userId, "test", "retried-key-000001", {}, async () => {
+      started();
+      await gate;
+      throw new RetryableError("Busy. Try again in a moment");
+    });
+    await running;
+    const repeat = runIdempotentMutation(userId, "test", "retried-key-000001", {}, async () => "ran", { waitMs: 5_000 });
+    await delay(100);
+    release();
+    await assert.rejects(first, /Busy/);
+    assert.equal(await repeat, "ran");
   });
 
   await t.test("loading a claimed node backup stores no copy of it", async () => {

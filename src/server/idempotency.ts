@@ -97,24 +97,38 @@ export async function runIdempotentMutation<T>(
   const sql = await database();
   await pruneExpiredRecords(sql);
   // A new key is stored only while the account is under its daily bound; a repeat finds its record either way.
-  // Concurrent requests can each see room for one more, so the bound can be passed by a few, never by many.
-  const [claimed] = await sql<Array<{ id: number }>>`
-    insert into keyway_v2_idempotency_keys (
-      user_id, operation, idempotency_key, request_digest, status, expires_at
-    )
-    select ${userId}, ${operation}, ${key}, ${digest}, 'running', now() + interval '24 hours'
-    where (
-      select count(*) from (
-        select 1 from keyway_v2_idempotency_keys
-        where user_id = ${userId} and created_at > now() - interval '24 hours'
-        limit ${MAX_DAILY_RECORDS}
-      ) as recent
-    ) < ${MAX_DAILY_RECORDS}
-    on conflict (user_id, operation, idempotency_key) do nothing
-    returning 1 as id
-  `;
+  // The account's admissions take turns, briefly, so requests arriving together can't each take the last place.
+  const admit = () => sql.begin(async (tx): Promise<"claimed" | "exists" | "full"> => {
+    await tx`select pg_advisory_xact_lock(hashtextextended(${`idempotency-records:${userId}`}, 0))`;
+    const [claimed] = await tx`
+      insert into keyway_v2_idempotency_keys (
+        user_id, operation, idempotency_key, request_digest, status, expires_at
+      )
+      select ${userId}, ${operation}, ${key}, ${digest}, 'running', now() + interval '24 hours'
+      where (
+        select count(*) from (
+          select 1 from keyway_v2_idempotency_keys
+          where user_id = ${userId} and created_at > now() - interval '24 hours'
+          limit ${MAX_DAILY_RECORDS}
+        ) as recent
+      ) < ${MAX_DAILY_RECORDS}
+      on conflict (user_id, operation, idempotency_key) do nothing
+      returning 1 as id
+    `;
+    if (claimed) return "claimed";
+    const [existing] = await tx`
+      select 1 from keyway_v2_idempotency_keys
+      where user_id = ${userId} and operation = ${operation} and idempotency_key = ${key}
+    `;
+    return existing ? "exists" : "full";
+  });
 
-  if (!claimed) {
+  // A record can go away after it's found: a refusal to retry removes its own. The key is then free, so it's
+  // admitted again rather than answered from a record that no longer exists.
+  for (let attempt = 1; ; attempt++) {
+    const admitted = await admit();
+    if (admitted === "claimed") break;
+    if (admitted === "full") throw new Error("Too many requests from this account today. Try again later");
     const read = async () => (await sql<StoredResult[]>`
       select request_digest, status, response, error_message,
         updated_at < now() - make_interval(secs => ${staleSeconds}) as stale
@@ -148,7 +162,8 @@ export async function runIdempotentMutation<T>(
         where user_id = ${userId} and operation = ${operation} and idempotency_key = ${key}
       `;
       if (known) throw new Error("Idempotency record expired; use a new key");
-      throw new Error("Too many requests from this account today. Try again later");
+      if (attempt < 3) continue;
+      throw new Error("The request is still in progress");
     }
     if (stored.request_digest !== digest) throw new Error("Idempotency key was already used for another request");
     if (stored.status === "completed") return stored.response as T;
