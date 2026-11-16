@@ -24,8 +24,11 @@ export type TransactionPreview = {
   /** `id` is the NFT's whole type args. */
   nfts: Array<{ kind: "Spore" | "Cluster"; id: string; change: "sent" | "received" | "minted" | "burned" }>;
   dao: Array<{ action: "deposit" | "withdrawal request" | "withdrawal"; amountCkb: string }>;
-  /** The account's other typed cells it spends without getting back unchanged, per whole type script hash. */
-  cellsSpent: Array<{ typeHash: string; cells: number }>;
+  /**
+   * The account's other typed cells, per whole type script hash: how many it gives up, how many it keeps with other
+   * data, and how many it gets.
+   */
+  cellChanges: Array<{ typeHash: string; given: number; changed: number; received: number }>;
   recipients: Array<{
     address: string;
     kind: "wallet" | "contract" | "Fiber channel";

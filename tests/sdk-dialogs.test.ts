@@ -22,7 +22,7 @@ test("channel settings read in people's units", () => {
 test("the transaction dialog shows each recipient's whole address, not just its start and checksum", () => {
   const address = "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqgpqyqszqgpqyqszqgpqyqszqgpqyqszqg4pq2v9";
   const preview = {
-    network: "CKB testnet", sendingCkb: "100", receivingCkb: "0", feeCkb: "0.00001", tokens: [], nfts: [], dao: [], cellsSpent: [],
+    network: "CKB testnet", sendingCkb: "100", receivingCkb: "0", feeCkb: "0.00001", tokens: [], nfts: [], dao: [], cellChanges: [],
     recipients: [{ address, kind: "wallet", walletType: "standard", ckb: "100", tokens: [], nfts: [], cells: [] }],
     unrecognized: [], otherSigners: 0, details: { inputs: [], outputs: [] }, transactionHash: `0x${"ab".repeat(32)}`, requiresEmailCode: false,
   } as unknown as TransactionPreview;
@@ -38,9 +38,11 @@ test("the transaction dialog names NFTs, tokens and other cells KeyWay can't nam
   const sporeId = `0x${"5e".repeat(14)}${"00".repeat(4)}${"5e".repeat(14)}`;
   const typeHash = `0x${"7e".repeat(32)}`;
   const spent = `0x${"8f".repeat(32)}`;
+  const changedType = `0x${"9e".repeat(32)}`;
+  const gotType = `0x${"ad".repeat(32)}`;
   const address = "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqgpqyqszqgpqyqszqgpqyqszqgpqyqszqg4pq2v9";
   const preview = {
-    network: "CKB testnet", sendingCkb: "0", receivingCkb: "0", feeCkb: "0.00001", dao: [], cellsSpent: [{ typeHash: spent, cells: 1 }],
+    network: "CKB testnet", sendingCkb: "0", receivingCkb: "0", feeCkb: "0.00001", dao: [], cellChanges: [{ typeHash: spent, given: 1, changed: 0, received: 0 }, { typeHash: changedType, given: 0, changed: 2, received: 0 }, { typeHash: gotType, given: 0, changed: 0, received: 1 }],
     tokens: [{ id: "0xbdb681…72b5", asset: twinA, standard: "xUDT", amount: "-1000" }, { id: "0xbdb681…72b5", asset: twinB, standard: "xUDT", amount: "-7" }],
     nfts: [{ kind: "Spore", id: sporeId, change: "sent" }],
     recipients: [{ address, kind: "wallet", walletType: "standard", ckb: "600", tokens: [{ id: "0xbdb681…72b5", asset: twinA, amount: "1000" }, { id: "0xbdb681…72b5", asset: twinB, amount: "7" }], nfts: [`Spore ${sporeId}`], cells: [{ typeHash, cells: 2 }] }],
@@ -48,7 +50,8 @@ test("the transaction dialog names NFTs, tokens and other cells KeyWay can't nam
   } as unknown as TransactionPreview;
   const html = renderToStaticMarkup(createElement(KeyWayTransactionModal, { theme: "light", appName: "Acme Pay", preview, answer: () => undefined }));
   const rows = html.slice(0, html.indexOf("<details"));
-  for (const id of [twinA, twinB, sporeId, spent]) assert.ok(rows.includes(id), id);
+  for (const id of [twinA, twinB, sporeId, spent, changedType, gotType]) assert.ok(rows.includes(id), id);
+  for (const label of ["You give up 1 cell of type", "You change the data of 2 cells of type", "You get 1 cell of type"]) assert.ok(rows.includes(label), label);
   // Every typed cell the recipient gets, by its whole type script hash.
   assert.ok(rows.includes(`1000 of token ${twinA} · 7 of token ${twinB} · Spore ${sporeId} · 2 cells of type ${typeHash}`), rows);
   assert.doesNotMatch(rows, /…/);

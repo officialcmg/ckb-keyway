@@ -41,7 +41,7 @@ const TRANSACTION: TransactionPreview = {
   tokens: [{ id: "0x45b32a…df52", asset: RUSD, standard: "xUDT", amount: "-2500000000", amountText: "-25 RUSD" }],
   nfts: [],
   dao: [],
-  cellsSpent: [],
+  cellChanges: [],
   recipients: [{ address: ADDRESS.replace("zda0", "zdb1"), kind: "wallet", walletType: "standard", ckb: "143", tokens: [{ id: "0x45b32a…df52", asset: RUSD, amount: "2500000000", amountText: "25 RUSD" }], nfts: [], cells: [] }],
   unrecognized: [],
   otherSigners: 0,

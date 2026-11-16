@@ -47,6 +47,7 @@ export type Recipient = {
   /** Any other typed cells it gets (Nervos DAO, Type ID, scripts KeyWay can't read), per whole type script hash. */
   cells: Array<{ typeHash: string; cells: number }>;
 };
+export type CellChange = { typeHash: string; given: number; changed: number; received: number };
 export type CellSummary = { lock: string; type?: string; capacityCkb: string; dataBytes: number };
 
 export type TransactionPreview = {
@@ -60,11 +61,11 @@ export type TransactionPreview = {
   nfts: NftEffect[];
   dao: DaoEffect[];
   /**
-   * The account's other typed cells (Type ID, Unique, scripts KeyWay can't read; NFTs only when not already listed)
-   * that it spends without getting back unchanged, per whole type script hash: destroying one of two such cells
-   * must read differently from destroying the other.
+   * The account's other typed cells (Type ID, Unique, scripts KeyWay can't read, and NFTs beyond what `nfts` lists),
+   * per whole type script hash: how many it gives up (sends or destroys), how many it keeps with other data, and how
+   * many it gets. Destroying one cell must read differently from destroying another, or from changing it.
    */
-  cellsSpent: Array<{ typeHash: string; cells: number }>;
+  cellChanges: CellChange[];
   recipients: Recipient[];
   /** By whole code hash and hash type: the same code hash with another hash type is another program. */
   unrecognized: Array<{ codeHash: string; hashType: string; cells: number }>;
@@ -379,11 +380,14 @@ export function describeTransaction(
     };
   };
   const leavingCells = cellsLeaving(ownInputs, ownOutputs, countsPerCell);
-  const nftHashes = new Set<string>(ownInputs.filter((cell) => {
+  // NFTs `nfts` already lists as sent, burned, received or minted aren't counted again; a kept one with new data is.
+  const nftHashes = new Set<string>([...ownInputs, ...ownOutputs].filter((cell) => {
     const key = nftKey(cell);
     return key && nfts.some(({ id }) => id === key.id);
   }).map((cell) => cell.cellOutput.type!.hash()));
-  const cellsSpent = leavingCells.filter(({ asset }) => !nftHashes.has(asset)).map(({ asset, amount }) => ({ typeHash: asset, cells: Number(amount) }));
+  const cellChanges = typedCellChanges(ownInputs, ownOutputs, countsPerCell)
+    .map((change) => (nftHashes.has(change.typeHash) ? { ...change, given: 0, received: 0 } : change))
+    .filter(({ given, changed, received }) => given + changed + received > 0);
 
   return {
     outflowShannons: leaving,
@@ -403,7 +407,7 @@ export function describeTransaction(
       tokens,
       nfts,
       dao,
-      cellsSpent,
+      cellChanges,
       recipients: [...recipients.values()],
       unrecognized,
       otherSigners,
@@ -419,12 +423,17 @@ export function describeTransaction(
  * all two look-alike addresses need to share. The email shows every line or isn't sent (see email-template.ts).
  */
 export function previewSummaryLines(preview: TransactionPreview): string[] {
-  const lines = [`Send ${preview.sendingCkb} CKB`, `Network fee ${preview.feeCkb} CKB`, `Network ${preview.network}`];
+  const lines = [`Send ${preview.sendingCkb} CKB`, ...(preview.receivingCkb !== "0" ? [`Receive ${preview.receivingCkb} CKB`] : []), `Network fee ${preview.feeCkb} CKB`, `Network ${preview.network}`];
   // Tokens and NFTs are named by their whole ID: a shortened one could be ground to match another's.
   for (const token of preview.tokens) lines.push(`Token ${token.amountText} (${token.standard} ${token.asset})`);
   for (const nft of preview.nfts) lines.push(`${nft.kind} ${nft.id}: ${nft.change}`);
   for (const action of preview.dao) lines.push(`Nervos DAO ${action.action}: ${action.amountCkb} CKB`);
-  for (const { typeHash, cells } of preview.cellsSpent) lines.push(`Spends ${cells} ${cells === 1 ? "cell" : "cells"} of type ${typeHash} without getting ${cells === 1 ? "it" : "them"} back unchanged`);
+  const cells = (count: number) => `${count} ${count === 1 ? "cell" : "cells"}`;
+  for (const { typeHash, given, changed, received } of preview.cellChanges) {
+    if (given) lines.push(`Gives up ${cells(given)} of type ${typeHash}`);
+    if (changed) lines.push(`Changes the data of ${cells(changed)} of type ${typeHash} it keeps`);
+    if (received) lines.push(`Gets ${cells(received)} of type ${typeHash}`);
+  }
   for (const script of preview.unrecognized) lines.push(`Unrecognized script ${script.codeHash} (${script.hashType}, ${script.cells} cells)`);
   if (preview.details.outputs.some(({ type }) => type === RECOVERY_LIST)) lines.push("Writes the account's recovery list");
   // Each recipient with everything it gets, every asset by its whole ID: the same assets going to each other's
@@ -473,6 +482,35 @@ function sum(values: readonly bigint[]): bigint {
 
 function maxBig(a: bigint, b: bigint): bigint {
   return a > b ? a : b;
+}
+
+/**
+ * Per type script hash of the account's typed cells that count one per cell (see countsPerCell): how many it gives
+ * up, how many of those it keeps come back with other data, and how many it gets.
+ */
+function typedCellChanges(
+  ownInputs: Array<{ cellOutput: ccc.CellOutput; outputData: ccc.Hex }>,
+  ownOutputs: Array<{ cellOutput: ccc.CellOutput; outputData: ccc.Hex }>,
+  countsPerCell: (cell: { cellOutput: ccc.CellOutput; outputData: ccc.Hex }) => boolean,
+): CellChange[] {
+  const byType = new Map<string, { count: number; byData: Map<string, number> }>();
+  const count = (cell: { cellOutput: ccc.CellOutput; outputData: ccc.Hex }, sign: 1 | -1) => {
+    if (!countsPerCell(cell)) return;
+    const typeHash = cell.cellOutput.type!.hash();
+    const entry = byType.get(typeHash) ?? { count: 0, byData: new Map<string, number>() };
+    entry.count += sign;
+    const data = cell.outputData.toLowerCase();
+    entry.byData.set(data, (entry.byData.get(data) ?? 0) + sign);
+    byType.set(typeHash, entry);
+  };
+  ownInputs.forEach((cell) => count(cell, 1));
+  ownOutputs.forEach((cell) => count(cell, -1));
+  return [...byType].map(([typeHash, { count: left, byData }]) => {
+    // Inputs with no output of the same data: each was given up or came back changed.
+    const unmatched = [...byData.values()].reduce((total, cells) => total + Math.max(cells, 0), 0);
+    const given = Math.max(left, 0);
+    return { typeHash, given, changed: unmatched - given, received: Math.max(-left, 0) };
+  });
 }
 
 /**
