@@ -100,27 +100,30 @@ export async function runIdempotentMutation<T>(
   // The account's admissions take turns, briefly, so requests arriving together can't each take the last place.
   const admit = () => sql.begin(async (tx): Promise<"claimed" | "exists" | "full"> => {
     await tx`select pg_advisory_xact_lock(hashtextextended(${`idempotency-records:${userId}`}, 0))`;
+    // Only the count says the account is full, so a record that goes away meanwhile is never mistaken for that.
+    const [{ recent }] = await tx<Array<{ recent: number }>>`
+      select count(*)::int as recent from (
+        select 1 from keyway_v2_idempotency_keys
+        where user_id = ${userId} and created_at > now() - interval '24 hours'
+        limit ${MAX_DAILY_RECORDS}
+      ) as recent
+    `;
+    if (recent >= MAX_DAILY_RECORDS) {
+      const [existing] = await tx`
+        select 1 from keyway_v2_idempotency_keys
+        where user_id = ${userId} and operation = ${operation} and idempotency_key = ${key}
+      `;
+      return existing ? "exists" : "full";
+    }
     const [claimed] = await tx`
       insert into keyway_v2_idempotency_keys (
         user_id, operation, idempotency_key, request_digest, status, expires_at
-      )
-      select ${userId}, ${operation}, ${key}, ${digest}, 'running', now() + interval '24 hours'
-      where (
-        select count(*) from (
-          select 1 from keyway_v2_idempotency_keys
-          where user_id = ${userId} and created_at > now() - interval '24 hours'
-          limit ${MAX_DAILY_RECORDS}
-        ) as recent
-      ) < ${MAX_DAILY_RECORDS}
+      ) values (${userId}, ${operation}, ${key}, ${digest}, 'running', now() + interval '24 hours')
       on conflict (user_id, operation, idempotency_key) do nothing
       returning 1 as id
     `;
-    if (claimed) return "claimed";
-    const [existing] = await tx`
-      select 1 from keyway_v2_idempotency_keys
-      where user_id = ${userId} and operation = ${operation} and idempotency_key = ${key}
-    `;
-    return existing ? "exists" : "full";
+    // Not stored: the key has a record, which the repeat below reads (and admits again if it has gone).
+    return claimed ? "claimed" : "exists";
   });
 
   // A record can go away after it's found: a refusal to retry removes its own. The key is then free, so it's
