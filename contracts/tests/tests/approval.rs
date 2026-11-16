@@ -477,6 +477,7 @@ fn webauthn_verifier_rebuilds_the_sdk_text_and_fits_omnilock() {
     let pubkey_hash = identity(&joyid_webauthn::blake160(&passkey.public_key()), &cases[0]);
     let code_hash = [0x24u8; 32];
     let mut accepted = 0;
+    let mut refused = 0;
     let mut max_cycles = 0;
     for case in &cases {
         let sighash = unhex(&case.sighash);
@@ -489,9 +490,12 @@ fn webauthn_verifier_rebuilds_the_sdk_text_and_fits_omnilock() {
             max_cycles = max_cycles.max(cycles);
         } else {
             assert_eq!(code, 111);
+            refused += 1;
         }
     }
-    println!("WebAuthn verifier: {accepted} accepted, at most {max_cycles} cycles");
+    // Every random transaction, not a sample of them.
+    assert_eq!((cases.len(), accepted + refused), (160, 160));
+    println!("WebAuthn verifier: {accepted} accepted, {refused} refused, at most {max_cycles} cycles");
 
     // The longest text the builder allows still fits in 1024 bytes with Chrome's extra clientDataJSON key.
     let longest = "x".repeat(keyway_approval::MAX_TEXT);
