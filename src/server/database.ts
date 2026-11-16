@@ -90,26 +90,48 @@ async function withReservedLock<T>(sql: DatabaseSql, userId: string, task: (sql:
 }
 
 export async function migrateDatabase(sql: ReturnType<typeof postgres>): Promise<void> {
-  await sql.begin(async (transaction) => {
-    await transaction`select pg_advisory_xact_lock(hashtext('ckb-keyway-schema'))`;
-    await transaction`
-      create table if not exists keyway_schema_migrations (
-        version integer primary key,
-        name text not null,
-        applied_at timestamptz not null default now()
-      )
-    `;
-    const applied = await transaction<Array<{ version: number }>>`select version from keyway_schema_migrations`;
-    const versions = new Set(applied.map(({ version }) => version));
-    for (const item of migrations) {
-      if (versions.has(item.version)) continue;
-      await item.up(transaction as unknown as DatabaseSql);
-      await transaction`
-        insert into keyway_schema_migrations (version, name)
-        values (${item.version}, ${item.name})
-      `;
+  // One session migrates at a time. Each migration commits on its own, in a transaction unless it can't run in one.
+  const connection = await sql.reserve();
+  try {
+    // Waits for the lock here rather than in Postgres: a session waiting in Postgres keeps a snapshot open, and a
+    // concurrent index build waits for every older snapshot, so it would deadlock with the migrator it waits for.
+    while (!(await connection<Array<{ locked: boolean }>>`select pg_try_advisory_lock(hashtext('ckb-keyway-schema')) as locked`)[0].locked) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
-  });
+    try {
+      await connection`
+        create table if not exists keyway_schema_migrations (
+          version integer primary key,
+          name text not null,
+          applied_at timestamptz not null default now()
+        )
+      `;
+      const applied = await connection<Array<{ version: number }>>`select version from keyway_schema_migrations`;
+      const versions = new Set(applied.map(({ version }) => version));
+      for (const item of migrations) {
+        if (versions.has(item.version)) continue;
+        const record = () => connection`insert into keyway_schema_migrations (version, name) values (${item.version}, ${item.name})`;
+        if (item.transaction === false) {
+          await item.up(connection);
+          await record();
+          continue;
+        }
+        await connection`begin`;
+        try {
+          await item.up(connection);
+          await record();
+          await connection`commit`;
+        } catch (error) {
+          await connection`rollback`.catch(() => undefined);
+          throw error;
+        }
+      }
+    } finally {
+      await connection`select pg_advisory_unlock(hashtext('ckb-keyway-schema'))`.catch(() => undefined);
+    }
+  } finally {
+    connection.release();
+  }
 }
 
 async function verifySchema(sql: DatabaseSql): Promise<void> {

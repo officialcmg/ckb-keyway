@@ -5,6 +5,11 @@ export const migrations: Array<{
   version: number;
   name: string;
   up: (sql: DatabaseSql) => Promise<unknown>;
+  /**
+   * False for a migration that can't run inside a transaction (building an index concurrently). It must be safe to
+   * run again from the start, since it's recorded only once it has finished.
+   */
+  transaction?: false;
 }> = [
   {
     version: 1,
@@ -416,13 +421,21 @@ export const migrations: Array<{
     )`,
   },
   {
-    version: 25, name: "idempotency-pruning",
+    version: 25, name: "idempotency-pruning", transaction: false,
+    // Lets each new record find the expired records still holding a response or error text to drop, and count the
+    // account's records from the last day. Built concurrently, so live writes to the table carry on meanwhile: a
+    // plain index build would hold every new record behind it, and behind any write still in progress. Existing
+    // records are left as they are; new ones prune them in small batches. An interrupted build leaves an invalid
+    // index, so each is dropped first and the migration can simply run again.
     up: async (sql) => {
-      // Node-backup loads are plain reads now, so their stored copies (up to 16 MB each) go; expired records keep
-      // only a tombstone. The partial index lets each new record find expired responses to drop.
-      await sql`delete from keyway_v2_idempotency_keys where operation = 'node-backup:claim'`;
-      await sql`update keyway_v2_idempotency_keys set response = null where expires_at <= now() and response is not null`;
-      await sql`create index keyway_v2_idempotency_keys_unpruned on keyway_v2_idempotency_keys (expires_at) where response is not null`;
+      const indexes = [
+        ["keyway_v2_idempotency_keys_unpruned", "(expires_at) where response is not null or error_message is not null"],
+        ["keyway_v2_idempotency_keys_user_created", "(user_id, created_at)"],
+      ];
+      for (const [name, definition] of indexes) {
+        await sql.unsafe(`drop index concurrently if exists ${name}`);
+        await sql.unsafe(`create index concurrently ${name} on keyway_v2_idempotency_keys ${definition}`);
+      }
     },
   },
 ];
