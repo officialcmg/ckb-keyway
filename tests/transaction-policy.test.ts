@@ -3,7 +3,7 @@ import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { secp256k1Lock, type KeyWayRecovery } from "../src/sdk/browser/account-lock.ts";
-import { formatCkbSignature, previewFundingTransaction, serializeTransaction } from "../src/server/funding-transaction.ts";
+import { calculateFundingSpend, formatCkbSignature, previewFundingTransaction, serializeTransaction } from "../src/server/funding-transaction.ts";
 import { describeTransaction, previewGeneralTransaction, previewSummaryLines, type KnownScripts } from "../src/server/transaction-policy.ts";
 import { parseThreshold } from "../src/server/general-signing.ts";
 import type { ReadyWallet } from "../src/server/user-wallet.ts";
@@ -87,6 +87,34 @@ test("reports token amounts leaving the account and who receives them", () => {
   assert.equal(preview.recipients[0].tokens[0].amount, "250");
   assert.equal(preview.recipients[0].ckb, "143");
   assert.equal(tokensLeaving, true);
+});
+
+test("minting a token the account issued to someone else counts as that token leaving, as in the policy Action", () => {
+  const issued = ccc.Script.from({ codeHash: known.xudt.codeHash, hashType: "type", args: own.hash() });
+  const mint = (to: ccc.Script) => build(
+    [{ lock: own, capacity: 500n * CKB }, { lock: alice, capacity: 200n * CKB }],
+    [{ lock: to, capacity: 200n * CKB, type: issued, data: u128(10n ** 30n) }, { lock: own, capacity: 500n * CKB - 2_000n }],
+  );
+  const away = mint(alice);
+  assert.equal(away.tokensLeaving, true);
+  assert.deepEqual(away.tokenOutflows, [{ asset: issued.hash(), amount: 10n ** 30n }]);
+  // Minted to the account itself, nothing leaves; another issuer's token isn't counted.
+  assert.equal(mint(own).tokensLeaving, false);
+  const foreign = build(
+    [{ lock: own, capacity: 500n * CKB }, { lock: alice, capacity: 200n * CKB }],
+    [{ lock: alice, capacity: 200n * CKB, type: xudt, data: u128(10n ** 30n) }, { lock: own, capacity: 500n * CKB - 2_000n }],
+  );
+  assert.equal(foreign.tokensLeaving, false);
+});
+
+test("a Nervos DAO withdrawal whose interest makes the outputs exceed the inputs is refused, so the server never has it signed", () => {
+  // Phase 2: the withdrawing cell (its deposit block number as data) plus the interest, all sent away.
+  assert.throws(() => build(
+    [{ lock: own, capacity: 10_000n * CKB, type: dao, data: ccc.hexFrom(ccc.numLeToBytes(1234, 8)) }],
+    [{ lock: alice, capacity: 10_050n * CKB }],
+  ), /outputs exceed its inputs/);
+  // A channel funding refuses it too.
+  assert.throws(() => calculateFundingSpend({ ownedInputCapacity: 10_000n * CKB, ownedChangeCapacity: 0n, totalInputCapacity: 10_000n * CKB, totalOutputCapacity: 10_050n * CKB }), /fee exceeds/);
 });
 
 test("recognizes a Nervos DAO deposit", () => {

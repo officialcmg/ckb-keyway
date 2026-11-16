@@ -19,7 +19,6 @@ import { chainOnSendLimit, sendLimitInputIndex, setSendLimitRecord } from "../..
 import { serializeTransaction } from "../../src/server/funding-transaction.ts";
 import { signingSettings, transactionSigning, type SigningContext } from "../../src/server/general-signing.ts";
 import { loadLitAction } from "../../src/server/lit-actions.ts";
-import { litSignerOverride } from "../../src/server/lit-config.ts";
 import { litPolicyRunner } from "../../src/server/lit-policy.ts";
 import { listPendingTransactions, nodeStatus, recordPendingTransaction } from "../../src/server/pending-transactions.ts";
 import { planSendLimits, sendLimitHead } from "../../src/server/send-limits.ts";
@@ -116,7 +115,6 @@ async function turnOn(A: Account) {
 async function main() {
   process.env.LIT_USAGE_API_KEY ??= "live-proof";
   process.env.RESEND_API_KEY ??= "re_live_proof_only";
-  litSignerOverride.mode = "policy";
   const source = await loadLitAction("sign-ckb-transaction");
   const A = account("A");
   const B = account("B");
