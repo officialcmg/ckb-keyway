@@ -246,12 +246,12 @@ type ClaimChannel = Pick<WatchedChannel, "localSettlementKey" | "remoteSettlemen
  * unlock per transaction. `previousWitness` is the settlement witness that created the cell (undefined for the
  * commitment transaction's own output, i.e. the first settlement).
  *
- * Pending TLCs come first, the most urgent first: one the node can unlock with a payment preimage it holds (the
- * peer can take it back once it expires), soonest expiry first, then one that has expired and is the node's to take
- * back. Then the user's own share, only once no TLC may still become the user's (the party that settles second can
- * take the whole cell): first to settle, it leaves a successor for the peer; second, it empties the cell, as Fiber's
- * watchtower does. On the first settlement each
- * unlock also waits for its share of the commitment's delay (`delayPassed`, given the input `since` it needs).
+ * Once the peer has settled its share, the user's claim takes the whole cell at once, as Fiber's does. Otherwise
+ * pending TLCs come first, the most urgent first: one the node can unlock with a payment preimage it holds (the peer
+ * can take it back once it expires), soonest expiry first, then one that has expired and is the node's to take back.
+ * Then the user's own share, only once no TLC may still become the user's (the party that settles second can take
+ * the whole cell), leaving a successor for the peer. On the first settlement each unlock also waits for its share of
+ * the commitment's delay (`delayPassed`, given the input `since` it needs).
  */
 export function planClaim(options: {
   channel: ClaimChannel;
@@ -292,6 +292,24 @@ export function planClaim(options: {
     return { after, args: ccc.hexFrom(concat(args.prefix, blake160(encodeWitnessState(after)), new Uint8Array([1]))) };
   };
 
+  // Which slot is the user's, and whether the peer has already emptied its own.
+  let unlockType: number | undefined;
+  let mine = 0n;
+  let otherSettled = false;
+  if (equal(current.first.pubkeyHash, ours)) { unlockType = UNLOCK_REMOTE_SLOT; mine = current.first.amount; otherSettled = equal(current.second.pubkeyHash, ZERO20); }
+  else if (equal(current.second.pubkeyHash, ours)) { unlockType = UNLOCK_LOCAL_SLOT; mine = current.second.amount; otherSettled = equal(current.first.pubkeyHash, ZERO20); }
+  const since = first ? args.delaySince : 0n;
+  const base = unlockType === undefined ? undefined : { witnessState: encodeWitnessState(current), unlockType, signingKey: ccc.hexFrom(channel.localSettlementKey), since };
+  // The peer has settled its share: settling second, the user's claim empties the cell, pending TLCs and all (the
+  // lock checks no output once both slots are empty), at once, as Fiber 0.9.1's watchtower does
+  // (`two_parties_all_settled`). That secures every payment that may still become the user's in one transaction,
+  // rather than one per pass while the peer can take the others back once they expire, and an outgoing payment
+  // that hasn't expired yet doesn't hold the user's share back.
+  if (base && otherSettled) {
+    if (!delayPassed(since)) return { skip: "waiting for the commitment delay" };
+    return { claim: base };
+  }
+
   // Pending TLCs, most urgent first.
   const tlcs = pendingTlcs(channel, current);
   const preimageOf = (tlc: PendingTlc) => {
@@ -326,36 +344,16 @@ export function planClaim(options: {
   }
   // TLCs the node may still claim: ones it holds the key for, unless it needed a preimage it doesn't have and the
   // TLC has expired (the peer takes those back).
-  const waitingOnes = tlcs.filter((tlc) => tlc.ours && !(tlc.ours.path === "preimage" && !preimageOf(tlc) && now > tlc.expiryMs));
-  const waitingTlcs = waitingOnes.length > 0;
+  const waitingTlcs = tlcs.some((tlc) => tlc.ours && !(tlc.ours.path === "preimage" && !preimageOf(tlc) && now > tlc.expiryMs));
   const waiting = (reason: string) => ({ skip: waitingTlcs ? "waiting for a pending payment to resolve" : reason });
 
-  // The user's own share.
-  let unlockType: number;
-  let mine: bigint;
-  let otherSettled: boolean;
-  if (equal(current.first.pubkeyHash, ours)) { unlockType = UNLOCK_REMOTE_SLOT; mine = current.first.amount; otherSettled = equal(current.second.pubkeyHash, ZERO20); }
-  else if (equal(current.second.pubkeyHash, ours)) { unlockType = UNLOCK_LOCAL_SLOT; mine = current.second.amount; otherSettled = equal(current.first.pubkeyHash, ZERO20); }
-  else return waiting("the user's share is already claimed");
-  // Whoever settles second may take the whole cell, TLCs included (the lock checks no output once both slots are
-  // empty), and Fiber's watchtower does. While the peer's share is unsettled the user's waits, as Fiber's does, until
-  // no TLC may still become the user's: settled first, it would let the peer sweep them. Once the peer has settled,
-  // this differs from Fiber, which takes the whole cell at once: the user's TLCs are claimed one by one first (as
-  // they become claimable), so the peer's still-pending ones aren't taken before their time. A TLC that could only
-  // be claimed alone by leaving a successor too small to exist never could be, so then the whole cell is taken.
-  const stranded = (tlc: PendingTlc) => {
-    const left = cell.capacity - tlc.amount;
-    return left > 0n && left < occupied(successorFor(tlc.index).args);
-  };
-  if (waitingTlcs && !(otherSettled && waitingOnes.every(stranded))) return { skip: "waiting for a pending payment to resolve" };
-  if (mine === 0n && !otherSettled) return { skip: "the user has no share in this channel" };
-  const since = first ? args.delaySince : 0n;
+  // The user's own share, settling first. Whoever settles second may take the whole cell, TLCs included, so it
+  // waits, as Fiber's does, until no TLC may still become the user's.
+  if (!base) return waiting("the user's share is already claimed");
+  if (waitingTlcs) return { skip: "waiting for a pending payment to resolve" };
+  if (mine === 0n) return { skip: "the user has no share in this channel" };
   if (!delayPassed(since)) return { skip: "waiting for the commitment delay" };
-  const base = { witnessState: encodeWitnessState(current), unlockType, signingKey: ccc.hexFrom(channel.localSettlementKey), since };
-  // Settling second, the claim empties the cell, as Fiber's does: what TLCs remain are the peer's to take back,
-  // and Fiber's watchtower claims nothing more once its own slot is empty, so a successor would hold them for good.
-  if (otherSettled) return { claim: base };
-  const { args: successorArgs } = successorFor(unlockType);
+  const { args: successorArgs } = successorFor(base.unlockType);
   const left = cell.capacity - mine;
   if (cell.capacity <= mine) return { skip: "the commitment cell holds less than the user's share" };
   // The peer's part (and any TLCs) stays in a successor cell, which must hold at least its own occupied capacity.

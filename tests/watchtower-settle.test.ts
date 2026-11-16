@@ -218,44 +218,13 @@ test("the user's share waits while a payment may still be the user's, since whoe
   assert.equal(after.pendingTlcs.length, 1);
   assert.equal(hex(ccc.bytesFrom(decision.claim.successor!.args).slice(36, 56)), hex(blake160(encodeWitnessState(after))));
 
-  // The peer settles its share first. Settling second, the user's claim could take the whole cell, so it still waits
-  // while a payment may become the user's.
+  // The peer settles its share first: settling second, the user's claim takes the whole cell at once, payments
+  // and all, as Fiber's does.
   const peerSettled = ccc.bytesConcat(new Uint8Array([1]), f.theirs, new Uint8Array([0xfe, 0]), new Uint8Array(65));
-  const remaining = f.capacity - 250n * CKB;
-  const afterPeer = { capacity: remaining, args: "0x" + "00".repeat(57) };
-  assert.deepEqual(planClaim({ channel: f.channel, cell: afterPeer, previousWitness: peerSettled, now: NOW }), { skip: "waiting for a pending payment to resolve" });
-  // After expiry the outgoing payment comes back first, leaving the rest in a successor.
-  const back = planClaim({ channel: f.channel, cell: afterPeer, previousWitness: peerSettled, now: NOW + 2 * HOUR });
-  assert.ok("claim" in back && back.claim.unlockType === 0 && back.claim.since === 0n);
-  assert.equal(back.claim.successor?.capacity, remaining - 180n * CKB);
-  // Then, with the incoming one past its expiry and no preimage (the peer's to take back), the user's claim empties
-  // the cell, as Fiber's does: Fiber claims nothing once its own slot is empty, so a successor would hold it for good.
-  const thenBack = ccc.bytesConcat(new Uint8Array([1]), encodeWitnessState(applyUnlocks(parseSettlementWitness(peerSettled)!)!), new Uint8Array([0, 0]), new Uint8Array(65));
-  const last = planClaim({ channel: f.channel, cell: { capacity: remaining - 180n * CKB, args: "0x" + "00".repeat(57) }, previousWitness: thenBack, now: NOW + 2 * HOUR });
-  assert.ok("claim" in last && last.claim.unlockType === 0xff);
-  assert.equal(last.claim.successor, undefined);
-});
-
-test("a payment that could never be claimed alone doesn't hold the cell once the peer has settled", () => {
-  // The peer's commitment: the user's 60 CKB, the peer's 250, and two outgoing payments of 60 CKB, not yet expired.
-  const { channel } = channelFixture();
-  const small = (id: string, fill: number) => ({
-    tlc_id: { Offered: id }, hash_algorithm: "CkbHash", payment_amount: `0x${(60n * CKB).toString(16)}`, payment_hash: hex(new Uint8Array(32).fill(fill)),
-    expiry: `0x${(NOW + HOUR).toString(16)}`, local_key: hex(secp256k1.utils.randomSecretKey()).slice(2), remote_key: hex(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true)).slice(2),
-  });
-  const remoteSettlement = { ...channel.remoteSettlement!, local_amount: `0x${(60n * CKB).toString(16)}`, tlcs: [small("0x0", 1), small("0x1", 2)] };
-  const withTlcs = { ...channel, remoteSettlement };
-  const theirs = encodeSettlementWitness(remoteSettlement, true, channel.localSettlementKey, channel.remoteSettlementKey);
-  const peerSettled = ccc.bytesConcat(new Uint8Array([1]), theirs, new Uint8Array([0xfe, 0]), new Uint8Array(65));
-  const plan = (capacity: bigint) => planClaim({ channel: withTlcs, cell: { capacity, args: "0x" + "00".repeat(57) }, previousWitness: peerSettled, now: NOW });
-  // With room for a successor after either payment, the cell waits for them...
-  assert.deepEqual(plan(500n * CKB), { skip: "waiting for a pending payment to resolve" });
-  // ...but in a cell of 150 CKB, taking back either one would leave 90 CKB, below a commitment cell's 98: neither
-  // could ever go alone, so the user's claim takes the cell as a whole.
-  const decision = plan(150n * CKB);
-  assert.ok("claim" in decision);
-  assert.equal(decision.claim.unlockType, 0xff);
-  assert.equal(decision.claim.successor, undefined);
+  const afterPeer = { capacity: f.capacity - 250n * CKB, args: "0x" + "00".repeat(57) };
+  const whole = planClaim({ channel: f.channel, cell: afterPeer, previousWitness: peerSettled, now: NOW });
+  assert.ok("claim" in whole && whole.claim.unlockType === 0xff && whole.claim.since === 0n);
+  assert.equal(whole.claim.successor, undefined);
 });
 
 test("the delay's shares are worked out as the commitment lock does", () => {
@@ -548,4 +517,33 @@ test("payment expiries are judged by the chain's median time, not the browser's 
   median = expiry + 1_000;
   assert.equal((await chain.settle()).status, "claimed");
   assert.equal(chain.sent[0].inputs[1].since, (0x40n << 56n) | BigInt(Math.floor(expiry / 1000)));
+});
+
+test("once the peer has settled its share, the next claim takes the whole cell at once, payments and all", () => {
+  // The peer's commitment with two incoming payments the user holds preimages for, both close to expiry, and an
+  // outgoing one that hasn't expired yet. The peer then settled its own share first.
+  const f = tlcFixture({ offeredExpiry: NOW + HOUR, receivedExpiry: NOW + 60_000 });
+  const secondPreimage = hex(new Uint8Array(32).fill(0x43));
+  const secondIncoming = { ...f.incoming, tlc_id: { Received: "0x1" }, payment_hash: ccc.hashCkb(secondPreimage), payment_amount: `0x${(90n * CKB).toString(16)}` };
+  const remoteSettlement = { ...f.channel.remoteSettlement!, tlcs: [...f.channel.remoteSettlement!.tlcs, secondIncoming] };
+  const channel = { ...f.channel, remoteSettlement };
+  const theirs = encodeSettlementWitness(remoteSettlement, true, channel.localSettlementKey, channel.remoteSettlementKey);
+  const peerSettled = ccc.bytesConcat(new Uint8Array([1]), theirs, new Uint8Array([0xfe, 0]), new Uint8Array(65));
+  const cell = { capacity: f.capacity + 90n * CKB - 250n * CKB, args: "0x" + "00".repeat(57) };
+  const preimages = new Map([[f.incoming.payment_hash, f.incomingPreimage], [secondIncoming.payment_hash, secondPreimage]]);
+  // Settling second, the user's claim may take the whole cell (the lock checks no output once both slots are empty),
+  // as Fiber 0.9.1's watchtower does: one transaction secures both incoming payments and the user's share, instead of
+  // one payment per pass while the peer can take the others back once they expire.
+  for (const decision of [
+    planClaim({ channel, cell, previousWitness: peerSettled, preimages, now: NOW }),
+    // Without preimages, the unexpired outgoing payment doesn't hold the user's share back either.
+    planClaim({ channel, cell, previousWitness: peerSettled, now: NOW }),
+  ]) {
+    assert.ok("claim" in decision, "skip" in decision ? decision.skip : "");
+    assert.equal(decision.claim.unlockType, 0xff, "the user's own slot");
+    assert.equal(decision.claim.since, 0n);
+    assert.equal(decision.claim.successor, undefined, "nothing is left behind");
+    assert.equal(decision.claim.preimage, undefined);
+    assert.equal(decision.claim.signingKey, channel.localSettlementKey);
+  }
 });
