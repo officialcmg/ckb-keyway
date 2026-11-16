@@ -272,10 +272,12 @@ export function createKeyWay(options: CreateKeyWayOptions) {
    */
   let sweepTimer: ReturnType<typeof setInterval> | undefined;
   // The node key's claims and sweeps have a client of their own: each watchtower pass rebuilds its cache from what
-  // the chain says (trackNodeKeySends), which must not touch the account's own pending transactions.
+  // the chain says (trackNodeKeySends), which must not touch the account's own pending transactions. Passes and
+  // sweeps take turns with it, so no send lands while a pass rebuilds the cache.
   const nodeKeyClient = new ccc.ClientPublicTestnet();
   const nodeKeySends = trackNodeKeySends(nodeKeyClient);
-  async function sweepNow() {
+  const sweepNow = () => nodeKeySends.exclusive(sweepWithNodeKey);
+  async function sweepWithNodeKey() {
     if (!node.isRunning || !credential.isUnlocked()) return;
     const key = await credential.getCkbSecretKey();
     try {
@@ -312,7 +314,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   const DONE = new Set(["settled", "the user's share is already claimed", "the user has no share in this channel"]);
   function watchNow(): Promise<void> {
     if (watchPass || watchStopped || !node.isRunning || !credential.isUnlocked()) return watchPass ?? Promise.resolve();
-    watchPass = watchOnce().finally(() => { watchPass = undefined; });
+    watchPass = nodeKeySends.exclusive(watchOnce).finally(() => { watchPass = undefined; });
     return watchPass;
   }
   async function watchOnce() {
@@ -330,7 +332,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
         if (found === undefined || found?.status === "rejected") claimsToSweep.delete(txHash);
         if (found?.status !== "committed") continue;
         claimsToSweep.delete(txHash);
-        await sweepNow().catch((error) => console.warn("[keyway] could not sweep the claimed funds yet", error));
+        // Already this pass's turn with the node key.
+        await sweepWithNodeKey().catch((error) => console.warn("[keyway] could not sweep the claimed funds yet", error));
       }
       if (watchStopped) return;
       const watched = await watchtower.list();

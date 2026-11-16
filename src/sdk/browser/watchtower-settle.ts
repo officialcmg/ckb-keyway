@@ -531,12 +531,23 @@ export async function settleChannel(options: {
  * still has in its mempool: all their outputs usable first, then all their inputs spent, so one that spends
  * another's change keeps it spent whatever order they come in. Sends that are committed, dropped or rejected are
  * forgotten. Give this client to nothing else: clearing its cache would also forget other sends.
+ *
+ * Everything that uses the client (a pass with its refresh and claims, a sweep) runs through `exclusive`, one at a
+ * time: a send that lands while a refresh is rebuilding the cache would otherwise have its spent marks overwritten
+ * (ccc's `markUsable` clears a cell's spent flag), and the next claim would pick a cell that is already spent.
  */
 export function trackNodeKeySends(client: ccc.Client) {
   const sent = new Set<ccc.Hex>();
+  let queue: Promise<unknown> = Promise.resolve();
   return {
     record(hash: ccc.Hex) {
       sent.add(hash);
+    },
+    /** Runs `task` once every earlier one has finished. */
+    exclusive<T>(task: () => Promise<T>): Promise<T> {
+      const run = queue.then(task);
+      queue = run.catch(() => undefined);
+      return run;
     },
     async refresh() {
       await client.cache.clear();

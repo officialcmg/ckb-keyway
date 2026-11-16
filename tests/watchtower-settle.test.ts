@@ -624,3 +624,31 @@ test("a claim still in the mempool keeps its reserve spent and its output usable
   await sends.refresh();
   assert.equal(await chain.client.cache.isUnusable(reserve), false, "dropped: the reserve is usable again");
 });
+
+test("a sweep that lands while a pass rebuilds the cache keeps its spent marks", async () => {
+  // A claim P is pending; a sweep then spends P's payout. The pass's refresh is slow to ask the node about P.
+  let inPoolRead!: () => void;
+  const reading = new Promise<void>((resolve) => { inPoolRead = resolve; });
+  let answer!: () => void;
+  const answered = new Promise<void>((resolve) => { answer = resolve; });
+  const client = new ccc.ClientPublicTestnet({ url: "http://127.0.0.1:9/" });
+  const lock = { codeHash: "0x" + "00".repeat(32), hashType: "data" as const, args: "0x01" };
+  const claim = ccc.Transaction.from({ inputs: [{ previousOutput: { txHash: "0x" + "aa".repeat(32), index: 0 } }], outputs: [{ capacity: 500n * CKB, lock }], outputsData: ["0x"] });
+  Object.assign(client, {
+    async getTransactionNoCache() {
+      inPoolRead();
+      await answered;
+      return { transaction: claim, status: "pending" };
+    },
+  });
+  const sends = trackNodeKeySends(client);
+  sends.record(claim.hash());
+  const payout = ccc.OutPoint.from({ txHash: claim.hash(), index: 0 });
+  const pass = sends.exclusive(() => sends.refresh());
+  await reading;
+  // The sweep is sent now; ccc marks the payout it spends.
+  const sweep = sends.exclusive(async () => { await client.cache.markUnusable(payout); });
+  answer();
+  await Promise.all([pass, sweep]);
+  assert.equal(await client.cache.isUnusable(payout), true, "the next claim must not pick the swept payout");
+});
