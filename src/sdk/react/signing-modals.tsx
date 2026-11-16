@@ -64,6 +64,7 @@ export function KeyWayTransactionModal({ theme, appName, preview, step, answer }
             {preview.tokens.map((token) => <Row key={`t-${token.asset}`} palette={palette} label={token.amount.startsWith("-") ? "You send" : "You receive"} value={tokenText(token)} />)}
             {preview.nfts.map((nft, index) => <Row key={`n-${index}`} palette={palette} label={`${nft.kind} ${nft.change}`} value={nft.id} />)}
             {preview.dao.map((action, index) => <Row key={`d-${index}`} palette={palette} label={`Nervos DAO ${action.action}`} value={`${action.amountCkb} CKB`} />)}
+            {preview.cellsSpent.map(({ typeHash, cells }) => <Row key={`c-${typeHash}`} palette={palette} label={`You spend ${cells} ${cells === 1 ? "cell" : "cells"} of type`} value={typeHash} />)}
             {preview.recipients.map((recipient) => (
               <Row
                 key={recipient.address}

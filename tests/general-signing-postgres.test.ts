@@ -34,7 +34,7 @@ function harness(outflow: bigint, tokenOutflows: Array<{ asset: string; amount: 
       script,
       groups: [{ script, kind: "secp256k1" }],
       preview: {
-        network: "CKB testnet", sendingCkb: "100", receivingCkb: "0", feeCkb: "0.00001", tokens: [], nfts: [], dao: [],
+        network: "CKB testnet", sendingCkb: "100", receivingCkb: "0", feeCkb: "0.00001", tokens: [], nfts: [], dao: [], cellsSpent: [],
         recipients: [{ address: "ckt1qtest", kind: "wallet", walletType: "standard", ckb: "100", tokens: [], nfts: [], cells: [] }],
         unrecognized: [], otherSigners: 0, details: { inputs: [], outputs: [] }, transactionHash: transaction.hash(),
       },

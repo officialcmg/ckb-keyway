@@ -41,7 +41,7 @@ function preview(recipients: number): TransactionPreview {
   return {
     network: "CKB testnet", sendingCkb: "1100", receivingCkb: "0", feeCkb: "0.0001",
     tokens: [{ id: "0x55555555…5555", asset: `0x${"55".repeat(32)}`, standard: "xUDT", amount: "-1000", amountText: `-1000 of token 0x${"55".repeat(32)}` }],
-    nfts: [], dao: [],
+    nfts: [], dao: [], cellsSpent: [],
     recipients: Array.from({ length: recipients }, (_, index) => ({ address: address(index + 1), kind: "wallet" as const, walletType: "standard", ckb: "100", tokens: [], nfts: [], cells: [] })),
     unrecognized: [{ codeHash: `0x${"9f".repeat(32)}`, hashType: "type", cells: 1 }],
     otherSigners: 0, details: { inputs: [], outputs: [] }, transactionHash: `0x${"ab".repeat(32)}`,

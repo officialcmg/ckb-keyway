@@ -59,6 +59,12 @@ export type TransactionPreview = {
   tokens: TokenEffect[];
   nfts: NftEffect[];
   dao: DaoEffect[];
+  /**
+   * The account's other typed cells (Type ID, Unique, scripts KeyWay can't read; NFTs only when not already listed)
+   * that it spends without getting back unchanged, per whole type script hash: destroying one of two such cells
+   * must read differently from destroying the other.
+   */
+  cellsSpent: Array<{ typeHash: string; cells: number }>;
   recipients: Recipient[];
   /** By whole code hash and hash type: the same code hash with another hash type is another program. */
   unrecognized: Array<{ codeHash: string; hashType: string; cells: number }>;
@@ -372,16 +378,22 @@ export function describeTransaction(
       dataBytes: (cell.outputData.length - 2) / 2,
     };
   };
+  const leavingCells = cellsLeaving(ownInputs, ownOutputs, countsPerCell);
+  const nftHashes = new Set<string>(ownInputs.filter((cell) => {
+    const key = nftKey(cell);
+    return key && nfts.some(({ id }) => id === key.id);
+  }).map((cell) => cell.cellOutput.type!.hash()));
+  const cellsSpent = leavingCells.filter(({ asset }) => !nftHashes.has(asset)).map(({ asset, amount }) => ({ typeHash: asset, cells: Number(amount) }));
 
   return {
     outflowShannons: leaving,
-    tokensLeaving: [...tokenTotals.values()].some(({ delta }) => delta < 0n) || cellsLeaving(ownInputs, ownOutputs, countsPerCell).length > 0,
+    tokensLeaving: [...tokenTotals.values()].some(({ delta }) => delta < 0n) || leavingCells.length > 0,
     // Other typed cells (NFTs, Type ID and Unique cells, scripts KeyWay can't read) leave as "tokens" counted per
     // cell (and whenever one doesn't come back unchanged). Like a token, they have no limit unless the user sets an
     // amount for their type script hash, as the Lit Action reads the send-limit cell KeyWay writes.
     tokenOutflows: [
       ...[...tokenTotals].filter(([, { delta }]) => delta < 0n).map(([asset, { delta }]) => ({ asset, amount: -delta })),
-      ...cellsLeaving(ownInputs, ownOutputs, countsPerCell),
+      ...leavingCells,
     ],
     preview: {
       network: "CKB testnet",
@@ -391,6 +403,7 @@ export function describeTransaction(
       tokens,
       nfts,
       dao,
+      cellsSpent,
       recipients: [...recipients.values()],
       unrecognized,
       otherSigners,
@@ -411,6 +424,7 @@ export function previewSummaryLines(preview: TransactionPreview): string[] {
   for (const token of preview.tokens) lines.push(`Token ${token.amountText} (${token.standard} ${token.asset})`);
   for (const nft of preview.nfts) lines.push(`${nft.kind} ${nft.id}: ${nft.change}`);
   for (const action of preview.dao) lines.push(`Nervos DAO ${action.action}: ${action.amountCkb} CKB`);
+  for (const { typeHash, cells } of preview.cellsSpent) lines.push(`Spends ${cells} ${cells === 1 ? "cell" : "cells"} of type ${typeHash} without getting ${cells === 1 ? "it" : "them"} back unchanged`);
   for (const script of preview.unrecognized) lines.push(`Unrecognized script ${script.codeHash} (${script.hashType}, ${script.cells} cells)`);
   if (preview.details.outputs.some(({ type }) => type === RECOVERY_LIST)) lines.push("Writes the account's recovery list");
   // Each recipient with everything it gets, every asset by its whole ID: the same assets going to each other's

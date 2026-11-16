@@ -225,6 +225,42 @@ test("the confirmation email says which tokens, NFTs and other typed cells go to
   }
 });
 
+test("the confirmation email says which of the account's typed cells it spends without getting back unchanged", () => {
+  const typeA = ccc.Script.from({ codeHash: TYPE_ID, hashType: "type", args: `0x${"a5".repeat(32)}` });
+  const typeB = ccc.Script.from({ codeHash: TYPE_ID, hashType: "type", args: `0x${"b6".repeat(32)}` });
+  const mysteryA = ccc.Script.from({ ...mystery, args: "0xa7" });
+  const mysteryB = ccc.Script.from({ ...mystery, args: "0xb8" });
+  for (const [a, b] of [[typeA, typeB], [mysteryA, mysteryB]]) {
+    // Keeps one of the two cells and destroys the other; same capacities, same recipient.
+    const keep = (kept: ccc.Script) => build(
+      [{ lock: own, capacity: 200n * CKB, type: a, data: "0x01" }, { lock: own, capacity: 200n * CKB, type: b, data: "0x01" }, { lock: own, capacity: 500n * CKB }],
+      [{ lock: own, capacity: 200n * CKB, type: kept, data: "0x01" }, { lock: alice, capacity: 100n * CKB }, { lock: own, capacity: 600n * CKB - 5_000n }],
+    ).preview;
+    const destroysB = keep(a);
+    assert.deepEqual(destroysB.cellsSpent, [{ typeHash: b.hash(), cells: 1 }]);
+    const lines = previewSummaryLines(destroysB);
+    assert.ok(lines.includes(`Spends 1 cell of type ${b.hash()} without getting it back unchanged`), lines.join("\n"));
+    assert.notDeepEqual(lines, previewSummaryLines(keep(b)), lines.join("\n"));
+  }
+  // Kept, but with other data: also listed.
+  const changed = build(
+    [{ lock: own, capacity: 200n * CKB, type: typeA, data: "0x01" }, { lock: own, capacity: 500n * CKB }],
+    [{ lock: own, capacity: 200n * CKB, type: typeA, data: "0x02" }, { lock: own, capacity: 500n * CKB - 5_000n }],
+  ).preview;
+  assert.deepEqual(changed.cellsSpent, [{ typeHash: typeA.hash(), cells: 1 }]);
+  // NFTs already listed as sent or burned aren't listed twice; kept unchanged, nothing is.
+  const sent = build(
+    [{ lock: own, capacity: 300n * CKB, type: spore, data: "0x01" }, { lock: own, capacity: 500n * CKB }],
+    [{ lock: alice, capacity: 300n * CKB, type: spore, data: "0x01" }, { lock: own, capacity: 500n * CKB - 5_000n }],
+  ).preview;
+  assert.deepEqual(sent.cellsSpent, []);
+  const kept = build(
+    [{ lock: own, capacity: 200n * CKB, type: typeA, data: "0x01" }, { lock: own, capacity: 500n * CKB }],
+    [{ lock: own, capacity: 200n * CKB, type: typeA, data: "0x01" }, { lock: own, capacity: 500n * CKB - 5_000n }],
+  ).preview;
+  assert.deepEqual(kept.cellsSpent, []);
+});
+
 test("counts inputs that other people must sign", () => {
   const { preview } = build(
     [{ lock: own, capacity: 200n * CKB }, { lock: alice, capacity: 100n * CKB }],
