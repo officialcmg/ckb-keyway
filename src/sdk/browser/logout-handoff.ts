@@ -10,10 +10,11 @@
  * back up, release the device) and waits for its answer (`handOffLogout`).
  *
  * A tab whose lock goes away without an answer was closed or crashed: that proves its node stopped, not that it
- * delivered its newest revocation or backed up. So a note in the origin's storage says a handoff is owed from
- * before the first tab is asked until every tab answers that it finished; while it stays (a tab closed, or froze
- * past the deadline and was then closed), logouts fail until a node has logged out in this browser again: starting
- * one sends KeyWay's watchtower every channel update the node stored, and its logout backs it up.
+ * delivered its newest revocation or backed up. So a note in the origin's storage lists the tabs that owe a
+ * handoff: each is added before it is asked and removed only once it answers that it finished. A tab that fails,
+ * times out or closes stays listed; while the note lists a tab that is gone, logouts fail until a node has logged
+ * out in this browser again (which clears the note): starting one sends KeyWay's watchtower every channel update the
+ * node stored, and its logout backs it up. A listed tab that is still open is simply asked again.
  */
 
 const PREFIX = "ckb-keyway:logout-handoff:";
@@ -46,8 +47,8 @@ type Answer = { type: "logout-done"; id: string; from: string; error?: string; n
 /** What a tab's logout steps report: whether a node of this session stopped, delivered and backed up there. */
 export type HandledLogout = { nodeLoggedOut: boolean };
 
-/** The note that a tab closed in the middle of a handed-off logout, kept until a node logs out in this browser. */
-function unfinishedNote(scope: string, env: HandoffEnvironment) {
+/** The tabs that owe a handed-off logout (see above), kept in the origin's storage for every tab of the session. */
+function owedHandoffs(scope: string, env: HandoffEnvironment) {
   let storage: StorageLike | undefined;
   try {
     storage = env.storage ?? (typeof localStorage !== "undefined" ? localStorage : undefined);
@@ -55,16 +56,27 @@ function unfinishedNote(scope: string, env: HandoffEnvironment) {
     storage = undefined;
   }
   const key = `${PREFIX}${scope}:unfinished`;
+  const read = (): string[] => {
+    let value: string | null | undefined;
+    try { value = storage?.getItem(key); } catch { return []; }
+    if (value == null) return [];
+    try {
+      const tabs = JSON.parse(value);
+      if (Array.isArray(tabs) && tabs.every((tab) => typeof tab === "string")) return tabs;
+    } catch { /* unreadable: owed by a tab no one can name */ }
+    return ["unknown"];
+  };
+  const write = (tabs: string[]) => {
+    try {
+      if (tabs.length === 0) storage?.removeItem(key);
+      else storage?.setItem(key, JSON.stringify(tabs));
+    } catch { /* storage blocked: the logout in progress still fails */ }
+  };
   return {
-    present() {
-      try { return storage?.getItem(key) != null; } catch { return false; }
-    },
-    set() {
-      try { storage?.setItem(key, String(Date.now())); } catch { /* storage blocked: this logout still fails */ }
-    },
-    clear() {
-      try { storage?.removeItem(key); } catch { /* nothing to clear */ }
-    },
+    tabs: read,
+    owe(tabs: string[]) { write([...new Set([...read(), ...tabs])]); },
+    settle(tab: string) { write(read().filter((owed) => owed !== tab)); },
+    clear() { write([]); },
   };
 }
 
@@ -87,7 +99,7 @@ export function serveLogoutHandoff(options: { scope: string; tabId: string; hand
   const env = environment(options);
   if (!env) return { release() {} };
   const channel = env.channel(`${PREFIX}${options.scope}`);
-  const note = unfinishedNote(options.scope, options);
+  const owed = owedHandoffs(options.scope, options);
   let releaseLock!: () => void;
   const held = new Promise<void>((resolve) => { releaseLock = resolve; });
   void env.locks.request(`${PREFIX}${options.scope}:${options.tabId}`, () => held).catch(() => undefined);
@@ -114,8 +126,10 @@ export function serveLogoutHandoff(options: { scope: string; tabId: string; hand
         channel.postMessage({ type: "logout-done", id, from: options.tabId, error: error instanceof Error ? error.message : String(error) } satisfies Answer);
         return;
       }
-      // A node of this session has now logged out in this browser: nothing a closed tab left owing remains.
-      if (handled.nodeLoggedOut) note.clear();
+      // Even if the tab that asked has gone meanwhile. A node of this session has logged out in this browser:
+      // nothing a closed tab left owing remains.
+      if (handled.nodeLoggedOut) owed.clear();
+      else owed.settle(options.tabId);
       channel.postMessage({ type: "logout-done", id, from: options.tabId, nodeLoggedOut: handled.nodeLoggedOut } satisfies Answer);
       release();
     });
@@ -126,23 +140,24 @@ export function serveLogoutHandoff(options: { scope: string; tabId: string; hand
 
 /**
  * Before this tab ends the session: asks every other tab of it that has node work to run its logout, and throws
- * unless each answers that it has finished. A tab that closes without answering fails this logout and every later
+ * unless each answers that it has finished. A tab that closes without finishing fails this logout and every later
  * one until a node logs out in this browser: here (`nodeLoggedOutHere`, this logout's own node stopped, delivered
  * and backed up) or in a tab this logout is handed to.
  */
 export async function handOffLogout(options: { scope: string; tabId: string; timeoutMs?: number; nodeLoggedOutHere?: boolean } & HandoffEnvironment): Promise<void> {
-  const note = unfinishedNote(options.scope, options);
-  if (options.nodeLoggedOutHere) note.clear();
+  const owed = owedHandoffs(options.scope, options);
+  if (options.nodeLoggedOutHere) owed.clear();
   const env = environment(options);
   if (!env) return;
-  await askOtherTabs(options, env, note);
-  if (note.present()) throw new Error(UNFINISHED_HANDOFF_ERROR);
+  await askOtherTabs(options, env, owed);
+  // Every open tab that owed one has just answered; any still listed has gone without finishing.
+  if (owed.tabs().length > 0) throw new Error(UNFINISHED_HANDOFF_ERROR);
 }
 
 async function askOtherTabs(
   options: { scope: string; tabId: string; timeoutMs?: number },
   env: Required<Pick<HandoffEnvironment, "locks" | "channel">>,
-  note: ReturnType<typeof unfinishedNote>,
+  owed: ReturnType<typeof owedHandoffs>,
 ): Promise<void> {
   const others = async () => {
     const { held = [] } = await env.locks.query();
@@ -152,10 +167,9 @@ async function askOtherTabs(
   };
   const tabs = await others();
   if (tabs.length === 0) return;
-  // Written before any tab is asked, and kept unless every one answers that it finished: a tab that closes, or
-  // freezes past the deadline and is then closed, leaves it, so a later logout can't take its silence for success.
-  const owedBefore = note.present();
-  note.set();
+  // Listed before it is asked, and kept until it answers that it finished: a tab that fails, or closes, or freezes
+  // past the deadline and is then closed, stays listed, so a later logout can't take its silence for success.
+  owed.owe(tabs);
   const channel = env.channel(`${PREFIX}${options.scope}`);
   const id = newTabId();
   const answers = new Map<string, Answer>();
@@ -164,6 +178,10 @@ async function askOtherTabs(
     const answer = event.data as Partial<Answer> | null;
     if (!answer || answer.type !== "logout-done" || answer.id !== id || typeof answer.from !== "string") return;
     answers.set(answer.from, answer as Answer);
+    if (!answer.error) {
+      if (answer.nodeLoggedOut) owed.clear();
+      else owed.settle(answer.from);
+    }
     notify?.();
   };
   channel.addEventListener("message", listener);
@@ -174,17 +192,10 @@ async function askOtherTabs(
     let closedAt: number | undefined;
     for (;;) {
       const failed = [...answers.values()].find((answer) => answer.error);
-      if (failed) {
-        // That tab is still open and keeps its node: the next logout asks it again.
-        if (!owedBefore) note.clear();
-        throw new Error(`Fiber could not be logged out in another tab: ${failed.error}`);
-      }
+      // That tab keeps its node, and stays listed: the next logout asks it again if it is still open.
+      if (failed) throw new Error(`Fiber could not be logged out in another tab: ${failed.error}`);
       const waiting = tabs.filter((tab) => !answers.has(tab));
-      if (waiting.length === 0) {
-        // An earlier closed tab's debt is settled only by a node logging out.
-        if (!owedBefore || [...answers.values()].some((answer) => answer.nodeLoggedOut)) note.clear();
-        return;
-      }
+      if (waiting.length === 0) return;
       const stillOpen = new Set(await others());
       if (waiting.some((tab) => !stillOpen.has(tab))) {
         // Its answer may still be on its way: a tab answers, then lets its lock go.

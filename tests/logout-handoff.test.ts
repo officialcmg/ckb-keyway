@@ -126,6 +126,29 @@ test("a tab that times out and is then closed doesn't let the next logout throug
   await handOffLogout({ scope, tabId: "other-tab", locks, storage });
 });
 
+test("a tab that fails its logout and then closes doesn't let the next logout through", async () => {
+  const locks = originLocks();
+  const storage = originStorage();
+  // Its watchtower delivery fails, so it keeps its node and answers with the error; then it is closed.
+  const failing = serveLogoutHandoff({ scope, tabId: "node-tab", locks, storage, handle: async () => { throw new Error("KeyWay's watchtower is unreachable"); } });
+  await assert.rejects(handOffLogout({ scope, tabId: "other-tab", locks, storage }), /unreachable/);
+  failing.release();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(locks.held.size, 0, "the tab is gone");
+  await assert.rejects(handOffLogout({ scope, tabId: "other-tab", locks, storage }), /closed before it finished logging out/);
+  await handOffLogout({ scope, tabId: "other-tab", locks, storage, nodeLoggedOutHere: true });
+});
+
+test("an idle tab that finishes doesn't settle what a closed tab owes", async () => {
+  const locks = originLocks();
+  const storage = originStorage();
+  storage.setItem(`ckb-keyway:logout-handoff:${scope}:unfinished`, JSON.stringify(["gone-tab"]));
+  const idle = serveLogoutHandoff({ scope, tabId: "idle-tab", locks, storage, handle: async () => ({ nodeLoggedOut: false }) });
+  await assert.rejects(handOffLogout({ scope, tabId: "other-tab", locks, storage }), /closed before it finished logging out/);
+  idle.release();
+  assert.deepEqual(JSON.parse(storage.getItem(`ckb-keyway:logout-handoff:${scope}:unfinished`)!), ["gone-tab"]);
+});
+
 test("a tab that answers it finished clears the note even if the tab that asked has gone", async () => {
   const locks = originLocks();
   const storage = originStorage();
