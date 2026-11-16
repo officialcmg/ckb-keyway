@@ -12,7 +12,7 @@ import { closeAuthPool, sendEmailCode, setAuthDeliveryForTests, verifyEmailCode 
 import { bootstrap, type Provisioning } from "../src/server/bootstrap.ts";
 import { acquireLease } from "../src/server/device-lease.ts";
 import { handleKeyWayRequest } from "../src/server/http.ts";
-import { runIdempotentMutation } from "../src/server/idempotency.ts";
+import { MAX_DAILY_RECORDS, runIdempotentMutation } from "../src/server/idempotency.ts";
 import { prepareBackupForDevice, saveNodeBackup } from "../src/server/node-backup.ts";
 import { alertRetry, recordSigningEvent } from "../src/server/security-alerts.ts";
 import { readWallet, saveWallet, type ReadyWallet } from "../src/server/user-wallet.ts";
@@ -121,10 +121,10 @@ test("M3: the paid Fiber key Action is rate limited per user", { skip }, async (
   }
 });
 
-test("M13: expired idempotency records are removed, and node-backup loads aren't stored", { skip }, async (t) => {
+test("M13: expired idempotency records keep no response, accounts are bounded, and node-backup loads aren't stored", { skip }, async (t) => {
   const { sql } = await setup();
 
-  await t.test("a new record drops expired responses and old tombstones, and expired keys stay refused", async () => {
+  await t.test("a new record drops expired responses, keeps the records, and expired keys stay refused", async () => {
     const userId = crypto.randomUUID();
     const others = Array.from({ length: 3 }, () => crypto.randomUUID());
     const insert = (owner: string, key: string, expires: string) => sql`
@@ -144,12 +144,52 @@ test("M13: expired idempotency records are removed, and node-backup loads aren't
     `;
     assert.deepEqual(rows.map((row) => `${row.idempotency_key}:${row.stored}`).sort(), [
       "fresh-idempotency-key:true", "other-current-key:true",
-      "other-expired-key:false", "other-expired-key:false", "other-expired-key:false", "own-expired-key-0001:false",
+      "other-expired-key:false", "other-expired-key:false", "other-expired-key:false", "other-tombstone-key:false", "own-expired-key-0001:false",
     ]);
     // An expired key is still refused, never run again.
     let ran = false;
     await assert.rejects(runIdempotentMutation(userId, "test", "own-expired-key-0001", {}, async () => { ran = true; }), /use a new key/);
     assert.equal(ran, false);
+  });
+
+  await t.test("a key whose record expired long ago is still never run again", async () => {
+    const userId = crypto.randomUUID();
+    // A request whose outcome was never stored, long expired: running it again could repeat its effect.
+    await sql`
+      insert into keyway_v2_idempotency_keys (user_id, operation, idempotency_key, request_digest, status, error_message, created_at, expires_at)
+      values (${userId}, 'test', 'ancient-running-key-01', 'digest', 'running', 'old failure text', now() - interval '400 days', now() - interval '399 days')
+    `;
+    await runIdempotentMutation(crypto.randomUUID(), "test", "prune-trigger-key-0001", {}, async () => ({ ok: true }));
+    let ran = false;
+    await assert.rejects(runIdempotentMutation(userId, "test", "ancient-running-key-01", {}, async () => { ran = true; }), /use a new key/);
+    assert.equal(ran, false);
+    const [kept] = await sql<Array<{ error_message: string | null }>>`
+      select error_message from keyway_v2_idempotency_keys where user_id = ${userId} and idempotency_key = 'ancient-running-key-01'
+    `;
+    assert.equal(kept?.error_message, null, "the tombstone keeps no error text");
+  });
+
+  await t.test("an account can store only a bounded number of new records a day", async () => {
+    const { user, call } = await signedIn();
+    // The account's records from the last day, at the bound; older ones don't count.
+    await sql`
+      insert into keyway_v2_idempotency_keys (user_id, operation, idempotency_key, request_digest, status, created_at, expires_at)
+      select ${user.id}, 'test', 'bound-key-' || lpad(n::text, 8, '0'), 'digest', 'failed', now() - interval '1 hour', now() + interval '23 hours'
+      from generate_series(1, ${MAX_DAILY_RECORDS}) as n
+    `;
+    await sql`
+      insert into keyway_v2_idempotency_keys (user_id, operation, idempotency_key, request_digest, status, created_at, expires_at)
+      values (${user.id}, 'test', 'bound-old-key-0001', 'digest', 'failed', now() - interval '25 hours', now() - interval '1 hour')
+    `;
+    let ran = false;
+    await assert.rejects(runIdempotentMutation(user.id, "test", "bound-fresh-key-0001", {}, async () => { ran = true; }), /too many/i);
+    assert.equal(ran, false);
+    const response = await call("managed-node", { operation: "open-channel" }, { "Idempotency-Key": "bound-fresh-key-0002" });
+    assert.equal(response.status, 429);
+    const [{ count }] = await sql<Array<{ count: number }>>`select count(*)::int as count from keyway_v2_idempotency_keys where user_id = ${user.id}`;
+    assert.equal(count, MAX_DAILY_RECORDS + 1, "refused requests store nothing");
+    // A repeat of a stored key is still answered.
+    await assert.rejects(runIdempotentMutation(user.id, "test", "bound-key-00000001", {}, async () => undefined), /another request/);
   });
 
   await t.test("loading a claimed node backup stores no copy of it", async () => {

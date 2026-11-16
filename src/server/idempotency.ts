@@ -43,35 +43,27 @@ let waitingRepeats = 0;
 export const waitingRepeatCount = () => waitingRepeats;
 
 const STORE_ATTEMPTS = 3;
-/** Expired records pruned per new record, so the table never holds more than a few days of them. */
+/** Expired records pruned per new record, so pruning always keeps up with what new records add. */
 export const PRUNE_BATCH = 100;
 /**
- * How long an expired record stays as a tombstone, its response dropped: a repeat with its key is still refused
- * ("use a new key") rather than run again.
+ * New records one account may store in a day. Every record stays as a small tombstone once its response is dropped,
+ * so this is what bounds the storage one account uses; it's far above any one person's daily use, while each
+ * operation's own rate limits still apply.
  */
-const TOMBSTONE = "7 days";
+export const MAX_DAILY_RECORDS = 5_000;
 
 /**
- * Before a new record is stored, drops the stored responses of up to `PRUNE_BATCH` expired records (anyone's, oldest
- * first) and removes as many tombstones past `TOMBSTONE`. Each new record clears more than it adds, so the table
- * holds responses for at most a day and small tombstones for a week, whatever one account sends.
+ * Before a new record is stored, drops the stored response and error text of up to `PRUNE_BATCH` expired records
+ * (anyone's, oldest first). Each new record clears more than it adds, so responses are kept for about a day. The
+ * record itself stays as a tombstone, so a repeat of its key is refused ("use a new key") and never run again,
+ * however long ago it was first sent.
  */
 async function pruneExpiredRecords(sql: DatabaseSql): Promise<void> {
   await sql`
-    update keyway_v2_idempotency_keys set response = null
+    update keyway_v2_idempotency_keys set response = null, error_message = null
     where (user_id, operation, idempotency_key) in (
       select user_id, operation, idempotency_key from keyway_v2_idempotency_keys
-      where expires_at <= now() and response is not null
-      order by expires_at
-      limit ${PRUNE_BATCH}
-      for update skip locked
-    )
-  `;
-  await sql`
-    delete from keyway_v2_idempotency_keys
-    where (user_id, operation, idempotency_key) in (
-      select user_id, operation, idempotency_key from keyway_v2_idempotency_keys
-      where expires_at <= now() - ${TOMBSTONE}::interval
+      where expires_at <= now() and (response is not null or error_message is not null)
       order by expires_at
       limit ${PRUNE_BATCH}
       for update skip locked
@@ -95,10 +87,20 @@ export async function runIdempotentMutation<T>(
 
   const sql = await database();
   await pruneExpiredRecords(sql);
+  // A new key is stored only while the account is under its daily bound; a repeat finds its record either way.
+  // Concurrent requests can each see room for one more, so the bound can be passed by a few, never by many.
   const [claimed] = await sql<Array<{ id: number }>>`
     insert into keyway_v2_idempotency_keys (
       user_id, operation, idempotency_key, request_digest, status, expires_at
-    ) values (${userId}, ${operation}, ${key}, ${digest}, 'running', now() + interval '24 hours')
+    )
+    select ${userId}, ${operation}, ${key}, ${digest}, 'running', now() + interval '24 hours'
+    where (
+      select count(*) from (
+        select 1 from keyway_v2_idempotency_keys
+        where user_id = ${userId} and created_at > now() - interval '24 hours'
+        limit ${MAX_DAILY_RECORDS}
+      ) as recent
+    ) < ${MAX_DAILY_RECORDS}
     on conflict (user_id, operation, idempotency_key) do nothing
     returning 1 as id
   `;
@@ -131,7 +133,14 @@ export async function runIdempotentMutation<T>(
         waitingRepeats--;
       }
     }
-    if (!stored) throw new Error("Idempotency record expired; use a new key");
+    if (!stored) {
+      const [known] = await sql`
+        select 1 from keyway_v2_idempotency_keys
+        where user_id = ${userId} and operation = ${operation} and idempotency_key = ${key}
+      `;
+      if (known) throw new Error("Idempotency record expired; use a new key");
+      throw new Error("Too many requests from this account today. Try again later");
+    }
     if (stored.request_digest !== digest) throw new Error("Idempotency key was already used for another request");
     if (stored.status === "completed") return stored.response as T;
     if (stored.status === "failed") throw new Error(stored.error_message ?? "The previous request failed");
