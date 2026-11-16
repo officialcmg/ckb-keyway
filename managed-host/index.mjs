@@ -14,6 +14,11 @@ const CHANNELS_MARKER = "keyway-channels";
 // Written once a node's channels have been checked under the marker scheme. A node without it (one from before
 // markers existed) starts after a restart like a marked one, so its channels are found and marked.
 const CHECKED_MARKER = "keyway-channels-checked";
+// Written once a node's process is up and removed only once it has made room for another node with nothing of
+// its own to watch (see makeRoom). A peer can open a channel to a running node without any request through the
+// host, so a node that was running when the host lost it (a crash, a failed start after a snapshot) may hold
+// channels nobody has listed, and starts after a restart like an unchecked one.
+const RUNNING_MARKER = "keyway-running";
 // A node is never stopped to make room for this long after a successful step of a channel setup, so a user's
 // steps that span several requests, such as connecting to a peer, opening a channel and signing its funding,
 // can't lose the node in between. Reads, such as a page polling its node, don't hold a node, and a node serving
@@ -302,16 +307,22 @@ async function channelsChecked(userId) {
 }
 
 /**
- * A marked node, or one never checked under the marker scheme (it may hold channels from before it). A user
- * without a node has none, and a node is recorded as checked when it is created (see startNode).
+ * A marked node, one never checked under the marker scheme (it may hold channels from before it), or one whose
+ * process ran and wasn't stopped by makeRoom (see RUNNING_MARKER). A user without a node has none, and a node is
+ * recorded as checked when it is created (see startNode).
  */
 async function mayHoldChannels(userId) {
   if (!(await fileExists(managedDataDir(userId)).catch(() => true))) return false;
-  const [marked, checked] = await Promise.all([
+  const [marked, checked, ran] = await Promise.all([
     hasChannelsMarker(userId).catch(() => true),
     channelsChecked(userId).catch(() => false),
+    wasRunning(userId).catch(() => true),
   ]);
-  return marked || !checked;
+  return marked || !checked || ran;
+}
+
+async function wasRunning(userId) {
+  return fileExists(join(managedDataDir(userId), RUNNING_MARKER));
 }
 
 async function fileExists(path) {
@@ -585,6 +596,7 @@ async function makeRoom(userId, priority = false) {
     // A node that won't stop leaves no room; that is no failure of the node being admitted.
     try { await stopNode(id); } catch (error) { logError(error); continue; }
     await markChannels(id, false);
+    await rm(join(managedDataDir(id), RUNNING_MARKER), { force: true });
     return;
   }
   if (!priority) noRoomAt = Date.now();
@@ -601,11 +613,13 @@ export async function startKnownNodes(users) {
   const states = await Promise.all(users.map(async (userId) => ({
     marked: await hasChannelsMarker(userId).catch(() => true),
     checked: await channelsChecked(userId).catch(() => false),
+    ran: await wasRunning(userId).catch(() => true),
   })));
-  // Marked nodes, then nodes never checked under the marker scheme (they may hold channels from before it).
+  // Marked nodes, then nodes never checked under the marker scheme (they may hold channels from before it) and
+  // nodes that were running when the host stopped (a peer may have opened a channel nothing listed).
   const withChannels = [
     ...users.filter((_, index) => states[index].marked),
-    ...users.filter((_, index) => !states[index].marked && !states[index].checked),
+    ...users.filter((_, index) => !states[index].marked && (!states[index].checked || states[index].ran)),
   ];
   for (const userId of withChannels) if (!offline.has(userId)) offline.set(userId, {});
   booting = false;
@@ -736,6 +750,13 @@ async function startNode(userId) {
   if (shuttingDown) {
     await waitForExit(child);
     throw new Error("Managed host is shutting down");
+  }
+  // Before anything can use the node, so a host lost while it runs starts it again (see RUNNING_MARKER).
+  try {
+    await writeFile(join(baseDir, RUNNING_MARKER), "", { mode: 0o600 });
+  } catch (error) {
+    await waitForExit(child).catch(logError);
+    throw error;
   }
   // A process that died as its RPC answered is not registered as running.
   if (child.exitCode !== null || child.signalCode !== null) throw new Error("Fiber node exited during startup");

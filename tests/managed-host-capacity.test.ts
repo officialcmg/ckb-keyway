@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -740,10 +740,12 @@ test("a node with a channel nothing has listed is marked as the host shuts down"
 test("a node that no longer may hold channels after a failed restore isn't left counted as offline", async (context) => {
   const { module, root, request, withChannels } = await host(context);
   process.env.KEYWAY_MANAGED_BACKUP_KEY = "07".repeat(32);
-  assert.equal(await request(F), 200);
-  // A snapshot from before F had channels, which can't start (it holds a fail-start file).
+  // A snapshot from before F had channels, of a node checked and not running (a node that was running may hold a
+  // channel nothing listed), which can't start (it holds a fail-start file).
+  await mkdir(join(root, "users", F), { recursive: true });
+  await writeFile(join(root, "users", F, "keyway-channels-checked"), "");
   await writeFile(join(root, "users", F, "fail-start"), "");
-  const { name } = await module.withUserOperation(F, () => module.snapshotUser(F)).catch(async () => (await module.listSnapshots({ userId: F }))[0]);
+  const { name } = await module.createSnapshot({ userId: F });
   await rm(join(root, "users", F, "fail-start"));
   assert.equal(await request(F), 200);
   await withChannels(F);
@@ -952,4 +954,31 @@ test("signed funding is neither recorded nor sent if the API gives up while the 
   assert.equal(await marked(F), false);
   const record = await readFile(join(root, "users", F, "keyway-funded-channels"), "utf8").catch(() => "");
   assert.equal(record.includes(WAITING_ID), false);
+});
+
+test("a node that was running when the host was lost starts after the restart, even with a channel nothing listed", async (context) => {
+  const { module, root, request, running, marked, withChannels } = await host(context);
+  assert.equal(await request(A), 200);
+  assert.equal(await marked(A), false);
+  // A peer opens a channel to A while it runs, with no request through the host, so A is still unmarked.
+  await withChannels(A);
+  // A's data directory as losing the whole host leaves it (no exit handler, no shutdown check), as C's.
+  await cp(join(root, "users", A), join(root, "users", C), { recursive: true });
+  await module.startKnownNodes([C]);
+  assert.ok(running().includes(C), running().join(","));
+  assert.equal(await marked(C), true);
+  assert.equal(module.readiness().status, "ready");
+});
+
+test("a node stopped for a snapshot that may hold a channel nothing listed stays offline until it runs again", async (context) => {
+  const { module, root, request, running, withChannels } = await host(context);
+  process.env.KEYWAY_MANAGED_BACKUP_KEY = "07".repeat(32);
+  assert.equal(await request(A), 200);
+  await withChannels(A);
+  await writeFile(join(root, "users", A, "fail-start"), "");
+  await assert.rejects(module.withUserOperation(A, () => module.snapshotUser(A)));
+  assert.equal(module.readiness().offline, 1);
+  await rm(join(root, "users", A, "fail-start"));
+  await until(async () => module.readiness().offline === 0);
+  assert.ok(running().includes(A));
 });
