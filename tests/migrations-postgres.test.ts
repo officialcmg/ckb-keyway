@@ -22,7 +22,7 @@ test("migrations apply once and drop the unused hosted-node confirmations table"
   assert.equal(kept?.name, "keyway_v2_signature_requests");
 });
 
-test("migrations 26 and 28 sign out sessions without an origin and remove expired challenges", { skip: !enabled }, async (t) => {
+test("migrations 26, 28 and 31 sign out sessions without an origin, remove expired challenges and date rate-limit windows", { skip: !enabled }, async (t) => {
   const admin = postgres(process.env.KEYWAY_AUTH_TEST_DATABASE_URL!, { max: 1 });
   const name = `keyway_migration_${crypto.randomUUID().replaceAll("-", "")}`;
   await admin.unsafe(`create database ${name}`);
@@ -50,7 +50,11 @@ test("migrations 26 and 28 sign out sessions without an origin and remove expire
   await sql`insert into keyway_auth_challenges (id, scope_id, email, expires_at, status) values
     (${expired}, 'dashboard', 'old@example.com', now() - interval '1 minute', 'sent'),
     (${open}, 'dashboard', 'old@example.com', now() + interval '5 minutes', 'sent')`;
+  await sql`insert into keyway_auth_rate_limits (key, count, starts_at) values ('before-expiry', 1, '2026-11-01T00:00:00Z')`;
   await migrateDatabase(sql);
+  // Migration 31: windows from before it end a day after they started, so they can be removed.
+  const [window] = await sql<Array<{ expires_at: Date }>>`select expires_at from keyway_auth_rate_limits where key = 'before-expiry'`;
+  assert.equal(window.expires_at.toISOString(), "2026-11-02T00:00:00.000Z");
   const challenges = await sql<Array<{ id: string }>>`select id from keyway_auth_challenges`;
   assert.deepEqual(challenges.map(({ id }) => id), [open]);
   const sessions = await sql<Array<{ token: string }>>`select token from keyway_auth_sessions order by token`;

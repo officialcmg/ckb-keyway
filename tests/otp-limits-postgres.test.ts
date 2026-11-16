@@ -5,9 +5,10 @@ import { Pool } from "pg";
 import { getMigrations } from "better-auth/db/migration";
 import type { User } from "../src/server/auth-user.ts";
 import { authSchemaOptions } from "../src/server/auth-options.ts";
+import { createHmac } from "node:crypto";
 import { database, LOGIN_DECISION_SLOTS, loginQueue, withLoginCodeLock, withLoginCodeSlot, withUserLock } from "../src/server/database.ts";
 import { addApplicationOrigin, createApplication, otpSubject, prepareOtpSend, removeApplicationOrigin } from "../src/server/applications.ts";
-import { closeAuthPool, sendEmailCode, sessionForRequest, setAuthDeliveryForTests, verifyEmailCode } from "../src/server/auth.ts";
+import { closeAuthPool, consumeRateLimit, sendEmailCode, sessionForRequest, setAuthDeliveryForTests, verifyEmailCode } from "../src/server/auth.ts";
 import { handleKeyWayRequest } from "../src/server/http.ts";
 
 // Login codes, their limits, the per-user lock and app sessions, against a database of their own: some of these
@@ -823,6 +824,21 @@ test("everyone's per-minute ceiling holds when requests with nothing in common d
   const outcomes = await Promise.all(apps.map(({ appId }, i) =>
     prepareOtpSend({ appId, email: email(), ipAddress: `100.73.0.${i + 1}` }).then(() => "sent", (error: Error) => error.message)));
   assert.equal(outcomes.filter((outcome) => outcome === "sent").length, 1, outcomes.join(", "));
+});
+
+test("expired rate-limit windows are removed", { skip, timeout: 30_000 }, async () => {
+  const { sql } = await setup();
+  const hash = (key: string) => createHmac("sha256", process.env.KEYWAY_RATE_LIMIT_SECRET!).update(key).digest("hex");
+  const [old, live, next] = [`old-${crypto.randomUUID()}`, `live-${crypto.randomUUID()}`, `next-${crypto.randomUUID()}`];
+  await consumeRateLimit(old, { max: 5, window: 1 });
+  await consumeRateLimit(live, { max: 5, window: 600 });
+  await delay(1_100);
+  await consumeRateLimit(next, { max: 5, window: 60 });
+  const kept = await sql<Array<{ key: string }>>`select key from keyway_auth_rate_limits where key in ${sql([hash(old), hash(live), hash(next)])}`;
+  assert.deepEqual(kept.map(({ key }) => key).sort(), [hash(live), hash(next)].sort());
+  // A window still running keeps counting.
+  for (let i = 0; i < 4; i++) await consumeRateLimit(live, { max: 5, window: 600 });
+  assert.equal((await consumeRateLimit(live, { max: 5, window: 600 })).allowed, false);
 });
 
 test("a wrong code that ends its challenge says to request a new code", { skip }, async () => {

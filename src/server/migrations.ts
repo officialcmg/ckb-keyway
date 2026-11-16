@@ -454,4 +454,15 @@ export const migrations: Array<{
     // happens only once the Action has signed; this names that request.
     up: (sql) => sql`alter table keyway_v2_step_up_failures add column request_nonce text`,
   },
+  {
+    version: 31, name: "auth-rate-limit-expiry",
+    up: async (sql) => {
+      // When each rate-limit window ends, so ended ones can be removed. Every window in use is 10 minutes or less,
+      // so a day after a window started it has ended.
+      await sql`alter table keyway_auth_rate_limits add column expires_at timestamptz`;
+      await sql`update keyway_auth_rate_limits set expires_at = starts_at + interval '1 day'`;
+      await sql`alter table keyway_auth_rate_limits alter column expires_at set not null`;
+      await sql`create index keyway_auth_rate_limits_expiry on keyway_auth_rate_limits (expires_at)`;
+    },
+  },
 ];

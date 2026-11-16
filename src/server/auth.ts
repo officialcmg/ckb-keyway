@@ -76,19 +76,29 @@ function privateKey(value: string): string {
 
 export async function consumeRateLimit(key: string, rule: { max: number; window: number }) {
   const sql = await database();
-  return sql.begin(async (tx) => {
+  const { result, fresh } = await sql.begin(async (tx) => {
     const hash = privateKey(key);
     await tx`select pg_advisory_xact_lock(hashtextextended(${`auth-rate:${hash}`}, 0))`;
     const [row] = await tx<Array<{ count: number; starts_at: Date }>>`select count, starts_at from keyway_auth_rate_limits where key = ${hash}`;
     const now = Date.now();
     if (row && now - row.starts_at.getTime() < rule.window * 1000 && row.count >= rule.max) {
-      return { allowed: false, retryAfter: Math.ceil((row.starts_at.getTime() + rule.window * 1000 - now) / 1000) };
+      return { result: { allowed: false, retryAfter: Math.ceil((row.starts_at.getTime() + rule.window * 1000 - now) / 1000) }, fresh: false };
     }
     const fresh = !row || now - row.starts_at.getTime() >= rule.window * 1000;
-    await tx`insert into keyway_auth_rate_limits (key, count, starts_at) values (${hash}, 1, now())
-      on conflict (key) do update set count = ${fresh ? 1 : row.count + 1}, starts_at = ${fresh ? new Date(now) : row.starts_at}`;
-    return { allowed: true, retryAfter: null };
+    const startsAt = fresh ? new Date(now) : row.starts_at;
+    const expiresAt = new Date(startsAt.getTime() + rule.window * 1000);
+    await tx`insert into keyway_auth_rate_limits (key, count, starts_at, expires_at) values (${hash}, 1, ${startsAt}, ${expiresAt})
+      on conflict (key) do update set count = ${fresh ? 1 : row.count + 1}, starts_at = ${startsAt}, expires_at = ${expiresAt}`;
+    return { result: { allowed: true, retryAfter: null }, fresh };
   });
+  // Each new window removes up to 100 that have ended, so keys used once (new addresses, new users) don't pile up.
+  // Rows another request is updating are skipped.
+  if (fresh) {
+    await sql`delete from keyway_auth_rate_limits where key in (
+      select key from keyway_auth_rate_limits where expires_at < now() limit 100 for update skip locked
+    )`;
+  }
+  return result;
 }
 
 export async function createScopedAuth(scope: AuthScope) {
