@@ -140,7 +140,7 @@ async function withLock<T>(key: string, budget: LockBudget, task: (sql: Database
     budget.queued -= 1;
     queued = false;
     try {
-      return await withReservedLock(sql, key, task);
+      return await withReservedLock(sql, key, task, deadline);
     } finally {
       release(budget);
     }
@@ -153,18 +153,50 @@ async function withLock<T>(key: string, budget: LockBudget, task: (sql: Database
   }
 }
 
-async function withReservedLock<T>(sql: DatabaseSql, userId: string, task: (sql: DatabaseSql) => Promise<T>): Promise<T> {
-  // The advisory lock still serializes the key across API processes.
-  const connection = await sql.reserve();
-  await connection`select pg_advisory_lock(hashtextextended(${userId}, 0))`;
+async function withReservedLock<T>(sql: DatabaseSql, key: string, task: (sql: DatabaseSql) => Promise<T>, deadline?: number): Promise<T> {
+  // The advisory lock still serializes the key across API processes. With a deadline, getting the connection and
+  // waiting in Postgres for another process's holder stop there too.
+  const connection = deadline === undefined ? await sql.reserve() : await reserveBy(sql, deadline);
+  try {
+    if (deadline === undefined) {
+      await connection`select pg_advisory_lock(hashtextextended(${key}, 0))`;
+    } else {
+      try {
+        await connection`select set_config('lock_timeout', ${String(Math.max(1, deadline - Date.now()))}, false)`;
+        await connection`select pg_advisory_lock(hashtextextended(${key}, 0))`;
+      } catch (error) {
+        if ((error as { code?: string }).code === "55P03") throw new Error(LOGIN_BUSY);
+        throw error;
+      } finally {
+        await connection`reset lock_timeout`;
+      }
+    }
+  } catch (error) {
+    connection.release();
+    throw error;
+  }
   try {
     return await task(connection);
   } finally {
     try {
-      await connection`select pg_advisory_unlock(hashtextextended(${userId}, 0))`;
+      await connection`select pg_advisory_unlock(hashtextextended(${key}, 0))`;
     } finally {
       connection.release();
     }
+  }
+}
+
+/** A reserved connection, or a "try again" once the deadline passes; one that arrives later goes straight back. */
+async function reserveBy(sql: DatabaseSql, deadline: number): Promise<Awaited<ReturnType<DatabaseSql["reserve"]>>> {
+  const reserving = sql.reserve();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([reserving, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(LOGIN_BUSY)), Math.max(0, deadline - Date.now())); })]);
+  } catch (error) {
+    void reserving.then((late) => late.release(), () => undefined);
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
 }
 

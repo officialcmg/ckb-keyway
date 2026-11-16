@@ -816,6 +816,32 @@ test("the sign-in queue is bounded in length and in waiting time", { skip, timeo
   assert.equal(await outcome(withLoginCodeLock(`otp:wait:${crypto.randomUUID()}`, async () => undefined)), "ran");
 });
 
+test("a sign-in request waiting on another API process's lock gives up at its deadline", { skip, timeout: 30_000 }, async () => {
+  const { sql } = await setup();
+  const saved = { ...loginQueue };
+  Object.assign(loginQueue, { lockWaitMs: 400 });
+  const key = `otp:other-process:${crypto.randomUUID()}`;
+  // Another API process holds the email's lock in Postgres, as during a slow send.
+  const other = postgres(process.env.DATABASE_URL!, { max: 1 });
+  const held = await other.reserve();
+  try {
+    await held`select pg_advisory_lock(hashtextextended(${key}, 0))`;
+    const attempt = withLoginCodeLock(key, async () => "ran").catch((error: Error) => error.message);
+    assert.match(await Promise.race([attempt, delay(2_000).then(() => "still waiting")]), /right now/);
+    await held`select pg_advisory_unlock(hashtextextended(${key}, 0))`;
+  } finally {
+    held.release();
+    await other.end({ timeout: 0 });
+    Object.assign(loginQueue, saved);
+  }
+  // Its connection went back to the pool without a lock wait limit left on it, and the key is free again.
+  assert.equal(await withLoginCodeLock(key, async (connection) => {
+    const [{ setting }] = await connection<Array<{ setting: string }>>`select current_setting('lock_timeout') as setting`;
+    return setting;
+  }), "0");
+  assert.ok(await within(sql`select 1`, 500));
+});
+
 test("everyone's per-minute ceiling holds when requests with nothing in common decide at once", { skip, timeout: 60_000 }, async () => {
   const { sql } = await setup();
   const apps = await Promise.all(Array.from({ length: 12 }, () => application([], 120)));
