@@ -402,13 +402,13 @@ export const migrations: Array<{
     up: (sql) => sql`alter table keyway_v2_watchtower_channels add column closing_commitment_number numeric(20, 0)`,
   },
   {
-    version: 23, name: "session-origin-required",
+    version: 26, name: "session-origin-required",
     // Every session issued since version 21 has the origin it was issued at. The older ones have none, so removing an
     // origin could never end them; they are signed out, and sessions without an origin are refused.
     up: (sql) => sql`delete from keyway_auth_sessions where "origin" is null`,
   },
   {
-    version: 24, name: "step-up-code-failures",
+    version: 27, name: "step-up-code-failures",
     up: async (sql) => {
       // Wrong step-up codes per user and session, kept for a day: each code allows five tries, and codes can be sent again.
       await sql`create table keyway_v2_step_up_failures (
@@ -422,7 +422,7 @@ export const migrations: Array<{
     },
   },
   {
-    version: 25, name: "login-code-sources",
+    version: 28, name: "login-code-sources",
     up: async (sql) => {
       // The wrong codes tried on each login challenge, so its owner can still use a fresh code while wrong codes from
       // others pause the email's checks.
@@ -444,7 +444,7 @@ export const migrations: Array<{
     },
   },
   {
-    version: 26, name: "security-alert-marks",
+    version: 29, name: "security-alert-marks",
     // When each deduplicated security alert last went out, by kind and hashed subject.
     up: (sql) => sql`create table keyway_security_alert_marks (key text primary key, sent_at timestamptz not null)`,
   },

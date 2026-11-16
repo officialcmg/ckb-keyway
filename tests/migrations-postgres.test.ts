@@ -22,7 +22,7 @@ test("migrations apply once and drop the unused hosted-node confirmations table"
   assert.equal(kept?.name, "keyway_v2_signature_requests");
 });
 
-test("migrations 23 and 25 sign out sessions without an origin and remove expired challenges", { skip: !enabled }, async (t) => {
+test("migrations 26 and 28 sign out sessions without an origin and remove expired challenges", { skip: !enabled }, async (t) => {
   const admin = postgres(process.env.KEYWAY_AUTH_TEST_DATABASE_URL!, { max: 1 });
   const name = `keyway_migration_${crypto.randomUUID().replaceAll("-", "")}`;
   await admin.unsafe(`create database ${name}`);
