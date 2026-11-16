@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { after, test } from "node:test";
 import postgres from "postgres";
+import type * as ccc from "@ckb-ccc/core";
 import { Pool } from "pg";
 import { getMigrations } from "better-auth/db/migration";
 import type { User } from "../src/server/auth-user.ts";
@@ -14,8 +15,10 @@ import { acquireLease } from "../src/server/device-lease.ts";
 import { handleKeyWayRequest } from "../src/server/http.ts";
 import { MAX_DAILY_RECORDS, runIdempotentMutation } from "../src/server/idempotency.ts";
 import { prepareBackupForDevice, saveNodeBackup } from "../src/server/node-backup.ts";
+import { settleRecoveryChange } from "../src/server/recovery.ts";
 import { alertRetry, recordSigningEvent } from "../src/server/security-alerts.ts";
 import { readWallet, saveWallet, type ReadyWallet } from "../src/server/user-wallet.ts";
+import { anchoredRecovery } from "./recovery-fixture.ts";
 
 // Shared resources (the Lit credit, the database, the lock budget, alerts) against a database of their own: these
 // tests fill the wallet-lock budget and count every signing event, so other test files must not share it.
@@ -305,6 +308,27 @@ test("L5: first-time wallet setup holds no wallet lock while Lit works", { skip 
     } finally {
       release();
       globalThis.fetch = realFetch;
+    }
+  });
+
+  await t.test("three sign-ins settling a recovery change on a slow node don't stall another user's wallet lock", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let reads = 0;
+    // A node that answers only once released, and then says the change is still in its pool.
+    const node = { getTransaction: async () => { reads += 1; await gate; return { status: "pending" }; } } as unknown as ccc.Client;
+    const users = Array.from({ length: 3 }, () => ({ id: crypto.randomUUID() } as User));
+    const { recovery } = await anchoredRecovery(readyWallet(DEVICE_A).litPublicKey);
+    const pending = { kind: "enable" as const, transactionHash: `0x${"34".repeat(32)}`, recovery, ckbAddress: "ckt1pending", sentAt: new Date().toISOString() };
+    for (const user of users) await saveWallet(user, readyWallet(DEVICE_A, { recoveryPending: pending }));
+    try {
+      const settling = users.map((user) => settleRecoveryChange({ user, nodes: [node], appName: "Operations", email: async () => "ops@example.com", sendEmail: async () => undefined }));
+      assert.ok(await within((async () => { while (reads < 3) await delay(20); })(), 5_000), "every sign-in is reading the node");
+      assert.ok(await within(withUserLock(crypto.randomUUID(), async () => "ok"), 2_000), "another user's lock is taken at once");
+      release();
+      for (const wallet of await Promise.all(settling)) assert.equal(wallet.recoveryPending?.transactionHash, pending.transactionHash);
+    } finally {
+      release();
     }
   });
 
