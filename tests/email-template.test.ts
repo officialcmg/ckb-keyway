@@ -71,6 +71,13 @@ test("a summary too long for one email gets no code, rather than a code for what
   assert.equal(confirmationEmailFits("Acme Pay", "Confirm a transaction", lines), false);
   assert.throws(() => createConfirmationEmailTemplate("Acme Pay", "123456", "Confirm a transaction", lines), /too much to show in one confirmation email/);
   assert.equal(confirmationEmailFits("Acme Pay", "Confirm a transaction", previewSummaryLines(preview(13))), true);
+  // Measured in bytes of the escaped HTML: 30,000 characters that each take 3 bytes, or grow to 5 when escaped, don't fit.
+  for (const character of ["€", "&"]) {
+    const line = character.repeat(30_000);
+    assert.equal(confirmationEmailFits("Acme Pay", "Confirm a transaction", [line]), false, character);
+    assert.throws(() => createConfirmationEmailTemplate("Acme Pay", "123456", "Confirm a transaction", [line]), /too much to show/);
+    assert.equal(confirmationEmailFits("Acme Pay", "Confirm a transaction", ["x".repeat(30_000)]), true);
+  }
 });
 
 test("the confirmation email shows each recipient's whole address", () => {

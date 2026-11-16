@@ -5,7 +5,7 @@ import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { formatCkbSignature, type ValidatedFunding } from "../src/server/funding-transaction.ts";
 import { fundingSigning, type FundingContext } from "../src/server/funding-signing.ts";
 import { database } from "../src/server/database.ts";
-import { countLitCodeAttempt, issueRequest, loadRequest, messageSigning, outflowNeedsEmailCode, recordLitCode, reserveOutflow, signingSettings, transactionSigning, type SigningContext } from "../src/server/general-signing.ts";
+import { countLitCodeAttempt, issueRequest, loadRequest, messageSigning, outflowNeedsEmailCode, recordLitCode, reserveOutflow, sendCode, signingSettings, transactionSigning, type SigningContext } from "../src/server/general-signing.ts";
 import type { ValidatedTransaction } from "../src/server/transaction-policy.ts";
 import type { ReadyWallet } from "../src/server/user-wallet.ts";
 
@@ -139,6 +139,23 @@ test("general signing binds approvals, email codes and threshold changes", { ski
     };
     await assert.rejects(() => transactionSigning(context, { operation: "preview", transaction: tx(77) }), /too much to show in one confirmation email/);
     assert.equal(emails.length, 0);
+  });
+
+  await t.test("a code is never stored, counted or sent for a summary too long for one email", async () => {
+    const { context, emails } = harness(100n * CKB);
+    let limited = 0;
+    context.rateLimit = async () => { limited += 1; return { allowed: true, retryAfter: null }; };
+    const lines = Array.from({ length: 600 }, (_, index) => `100 CKB to ckt1qtest${index} (wallet)`);
+    const nonce = await issueRequest(context.user, "transaction", `0x${"cd".repeat(32)}`, { lines }, true);
+    await assert.rejects(() => sendCode(context, "transaction", nonce, "Confirm a transaction", lines), /too much to show in one confirmation email/);
+    const sql = await database();
+    const [row] = await sql<Array<{ email_code_hash: string | null }>>`select email_code_hash from keyway_v2_signature_requests where nonce = ${nonce}`;
+    assert.equal(row.email_code_hash, null);
+    assert.equal(emails.length, 0);
+    assert.equal(limited, 0, "no email allowance used");
+    // The same request with a summary that fits gets its code.
+    await sendCode(context, "transaction", nonce, "Confirm a transaction", lines.slice(0, 10));
+    assert.equal(emails.length, 1);
   });
 
   await t.test("a token with no daily amount of its own has no limit, even with a CKB amount set", async () => {
