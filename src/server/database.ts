@@ -70,7 +70,14 @@ async function withLock<T>(key: string, budget: LockBudget, task: (sql: Database
 async function withReservedLock<T>(sql: DatabaseSql, userId: string, task: (sql: DatabaseSql) => Promise<T>): Promise<T> {
   // The advisory lock still serializes the key across API processes.
   const connection = await sql.reserve();
-  await connection`select pg_advisory_lock(hashtextextended(${userId}, 0))`;
+  try {
+    await connection`select pg_advisory_lock(hashtextextended(${userId}, 0))`;
+  } catch (error) {
+    // A wait that ended in an error (cancelled, or a lock or statement timeout) holds no lock: the connection goes
+    // back to the pool, or each failure would keep one outside the lock budget until the pool ran dry.
+    connection.release();
+    throw error;
+  }
   try {
     return await task(connection);
   } finally {
