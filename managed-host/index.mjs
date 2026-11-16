@@ -199,11 +199,10 @@ export function proxyUserRequest(userId, body, signal) {
     try {
       const node = await ensureNode(userId, { provision: PROVISIONING.has(method) });
       if (funding) {
+        const refused = () => new Error("This channel isn't waiting for its funding");
         // The record must be readable, or whether funding was handed over before can't be told.
-        retry = Boolean(fundingId) && Boolean((await fundingRecord(userId))?.ids.has(fundingId));
-        if (!fundingId || !(await awaitingFunding(node, fundingId))) {
-          throw new Error("This channel isn't waiting for its funding");
-        }
+        retry = Boolean(fundingId) && Boolean((await fundingRecord(userId).catch(() => { throw refused(); }))?.ids.has(fundingId));
+        if (!fundingId || !(await awaitingFunding(node, fundingId))) throw refused();
         // Nothing is recorded or sent for a submission the API gave up on while its node started or was checked.
         if (signal?.aborted) throw new Error("The request was abandoned");
         await markChannels(userId, true);

@@ -834,7 +834,7 @@ test("funding Fiber fails on after sending it to the peer stays recorded and mar
 });
 
 test("a funding submission is refused when the node's channels can't be read", async (context) => {
-  const { root, request, submit, marked, withChannels } = await host(context);
+  const { module, root, request, submit, marked, withChannels } = await host(context);
   assert.equal(await request(A), 200);
   await withChannels(A, WAITING_CHANNEL);
   // The funding record can't be read, so whether the channel was handed funding before can't be checked.
@@ -842,6 +842,9 @@ test("a funding submission is refused when the node's channels can't be read", a
   await mkdir(join(root, "users", A, "keyway-funded-channels"));
   assert.equal(await submit(A), 502);
   assert.equal(await marked(A), false);
+  // Refused as any other submission is, without the host's own error.
+  const refusal = await module.proxyUserRequest(A, Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "submit_signed_funding_tx", params: [{ channel_id: WAITING_ID, signed_funding_tx: {} }] }))).then(() => "", (error: Error) => error.message);
+  assert.equal(refusal, "This channel isn't waiting for its funding");
 });
 
 test("a batch request is refused, so no call can slip past the host's checks", async (context) => {
