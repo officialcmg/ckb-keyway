@@ -760,28 +760,28 @@ export async function runWatchtowerPass(passDeps: PassDependencies): Promise<voi
   const rows = [...funded, ...unfunded];
   // Penalties are sent one at a time, so two never pick the same fee cells.
   let sending: Promise<unknown> = Promise.resolve();
-  /**
-   * Time each account's checks spent queued behind other penalties, or behind the work the pass's penalties share
-   * (`prepare`): not counted against its share of the pass.
-   */
-  const queued = new Map<string, number>();
   let prepared: Promise<void> | undefined;
-  const punish: PassDependencies["punish"] = (row, commitment) => {
+  /**
+   * The penalty sender for one check. `waits.ms` adds up the time that check spent queued behind other penalties, or
+   * behind the work the pass's penalties share (`prepare`): not counted against its account's share of the pass.
+   * Kept per check, so checks of one account running side by side never count each other's waits.
+   */
+  const punisherFor = (waits: { ms: number }): PassDependencies["punish"] => (row, commitment) => {
     const enqueued = Date.now();
     const sent = sending.then(async () => {
       try {
         await (prepared ??= deps.punish.prepare?.() ?? Promise.resolve());
       } finally {
-        queued.set(row.user_id, (queued.get(row.user_id) ?? 0) + Date.now() - enqueued);
+        waits.ms += Date.now() - enqueued;
       }
       return deps.punish(row, commitment);
     });
     sending = sent.catch(() => undefined);
     return sent;
   };
-  const check = async (row: Row, backlogBudgetMs: number) => {
+  const check = async (row: Row, backlogBudgetMs: number, waits = { ms: 0 }) => {
     try {
-      return await checkChannel({ ...deps, punish }, row, log, backlogBudgetMs);
+      return await checkChannel({ ...deps, punish: punisherFor(waits) }, row, log, backlogBudgetMs);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       log(`${row.channel_id}: check failed: ${message}`);
@@ -801,12 +801,11 @@ export async function runWatchtowerPass(passDeps: PassDependencies): Promise<voi
       // Past its share: left unchecked (so least recently checked, and first in its account's turn next pass).
       if ((spent.get(row.user_id) ?? 0) >= accountBudget) continue;
       const started = Date.now();
-      const waitedBefore = queued.get(row.user_id) ?? 0;
+      const waits = { ms: 0 };
       try {
-        if (await check(row, 0)) behind.push(row);
+        if (await check(row, 0, waits)) behind.push(row);
       } finally {
-        const waited = (queued.get(row.user_id) ?? 0) - waitedBefore;
-        spent.set(row.user_id, (spent.get(row.user_id) ?? 0) + Math.max(0, Date.now() - started - waited));
+        spent.set(row.user_id, (spent.get(row.user_id) ?? 0) + Math.max(0, Date.now() - started - waits.ms));
       }
     }
   }));

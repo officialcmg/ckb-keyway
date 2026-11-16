@@ -453,6 +453,43 @@ test("browser-node watchtower storage and passes", { skip: !enabled }, async (t)
     await sql`delete from keyway_v2_watchtower_channels`;
   });
 
+  await t.test("one account's penalties checked side by side don't cancel each other's time", async () => {
+    const { user, id, closing } = await revokedChannel(proof.revocationSignature);
+    // A second revoked channel of the same account (a copy of the first), and an ordinary open one.
+    const secondId = channelId();
+    await sql.begin(async (tx) => {
+      await tx`create temp table copy on commit drop as select * from keyway_v2_watchtower_channels where channel_id = ${id}`;
+      await tx`update copy set channel_id = ${secondId}`;
+      await tx`insert into keyway_v2_watchtower_channels select * from copy`;
+    });
+    const openId = channelId();
+    await watchtowerRequest(user, watch(openId));
+    await sql`update keyway_v2_watchtower_channels set funding_seen = true where user_id = ${user.id}`;
+    for (const [channel, hours] of [[id, 3], [secondId, 2], [openId, 1]] as const) {
+      await sql`update keyway_v2_watchtower_channels set checked_at = now() - ${`${hours} hours`}::interval where channel_id = ${channel}`;
+    }
+    const chain: ChainView = {
+      async fundingHistory(lock) {
+        if (lock.args === fundingLockArgs(K1, K2)) return { sawOutput: true };
+        return { sawOutput: true, spend: { txHash: closing.hash(), index: 0 } };
+      },
+      transaction: async (hash) => (hash === closing.hash() ? { tx: closing, committed: true, status: "committed" } : undefined),
+      isLive: async () => true,
+    };
+    // Each penalty takes 300 ms to send: the first check spends that, the second waits it out first (not its own
+    // time) and then spends its own. The account's 250 ms share is used up before the open channel's turn.
+    await runWatchtowerPass({
+      sql, chain, concurrency: 2, accountBudgetMs: 250, log: () => undefined,
+      punish: async (row) => {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        return ccc.hexFrom(ccc.hashCkb(ccc.bytesFrom(row.channel_id)));
+      },
+    });
+    const [open] = await sql<Array<{ recent: boolean }>>`select checked_at > now() - interval '1 minute' as recent from keyway_v2_watchtower_channels where channel_id = ${openId}`;
+    assert.equal(open.recent, false, "the open channel waits for the next pass");
+    await sql`delete from keyway_v2_watchtower_channels`;
+  });
+
   await t.test("the shared work before a pass's first penalty doesn't use up the account whose penalty triggered it", async () => {
     const { user, id, closing } = await revokedChannel(proof.revocationSignature);
     await sql`update keyway_v2_watchtower_channels set funding_seen = true, checked_at = now() - interval '2 hours' where channel_id = ${id}`;
