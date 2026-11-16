@@ -31,24 +31,20 @@ export function createOtpEmailTemplate(appName: string, codeVariable: string) {
 }
 
 /**
- * A confirmation code for an action the user must approve from their inbox, such as a large transaction.
- * The summary lines are written by the backend from its own decoding, never from browser input.
+ * The largest confirmation email KeyWay sends, in bytes of HTML: below the 102 KB past which Gmail clips a message
+ * and hides the rest behind a link, so every line of the summary is on screen next to the code.
  */
-export function createConfirmationEmailTemplate(appName: string, code: string, heading: string, summary: string[]) {
-  const name = appName.trim().slice(0, 64);
-  if (!name || !/^\d{6}$/.test(code) || !heading.trim()) throw new Error("Application name, heading and a six-digit code are required");
+const MAX_CONFIRMATION_HTML_BYTES = 90_000;
+export const CONFIRMATION_TOO_LONG = "This does too much to show in one confirmation email, so no code can be sent for it. Split it into smaller transactions.";
+
+function confirmationEmail(name: string, code: string, heading: string, summary: string[]) {
   const safeName = escapeHtml(name);
   const safeHeading = escapeHtml(heading);
-  // Up to 16 lines, enough for turning recovery on with all 8 backups; past that the last one says how many more
-  // there are, so nothing is left out unannounced.
-  const shown = summary.length > 16 ? [...summary.slice(0, 15), `…and ${summary.length - 15} more not shown here. If you didn't start this, don't enter the code.`] : summary;
-  // Long enough for a whole address, which the email shows rather than its start and checksum. A longer line
-  // (an address with unusually long lock args) ends in "…" so the reader knows it was cut.
-  const lines = shown.map((line) => (line.length > 240 ? `${line.slice(0, 239)}…` : line));
-  const rows = lines.map((line) => `<tr><td style="padding:6px 0;border-top:1px solid #e5e7eb;font-size:14px;line-height:20px;text-align:left;overflow-wrap:anywhere;word-break:break-all">${escapeHtml(line)}</td></tr>`).join("");
+  // Every line, whole: a code is only ever sent for exactly what the email shows.
+  const rows = summary.map((line) => `<tr><td style="padding:6px 0;border-top:1px solid #e5e7eb;font-size:14px;line-height:20px;text-align:left;overflow-wrap:anywhere;word-break:break-all">${escapeHtml(line)}</td></tr>`).join("");
   return {
     subject: `${heading} in ${name}`,
-    plaintext: `${heading} in ${name}\n\n${lines.join("\n")}\n\nYour confirmation code is ${code}\n\nThis code expires in 10 minutes. Only enter it if you started this action. If you didn't, don't share the code, and sign in to ${name} to check your account.\n\nSecured by CKB KeyWay`,
+    plaintext: `${heading} in ${name}\n\n${summary.join("\n")}\n\nYour confirmation code is ${code}\n\nThis code expires in 10 minutes. Only enter it if you started this action. If you didn't, don't share the code, and sign in to ${name} to check your account.\n\nSecured by CKB KeyWay`,
     html: `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${safeHeading}</title></head>
 <body style="margin:0;padding:0;background:#f3f4f6;color:#111827;font-family:Arial,Helvetica,sans-serif">
@@ -66,6 +62,27 @@ export function createConfirmationEmailTemplate(appName: string, code: string, h
 <p style="margin:20px 0 0;color:#6b7280;font-size:12px">Secured by <strong>CKB KeyWay</strong></p>
 </td></tr></table></body></html>`,
   };
+}
+
+const fits = (email: { html: string }) => new TextEncoder().encode(email.html).length <= MAX_CONFIRMATION_HTML_BYTES;
+
+/** Whether a confirmation email with this summary shows all of it; if not, no code may be sent for it. */
+export function confirmationEmailFits(appName: string, heading: string, summary: string[]): boolean {
+  return fits(confirmationEmail(appName.trim().slice(0, 64), "000000", heading, summary));
+}
+
+/**
+ * A confirmation code for an action the user must approve from their inbox, such as a large transaction.
+ * The summary lines are written by the backend from its own decoding, never from browser input. Every line is shown
+ * whole; a summary too long for one email is refused rather than shortened, so a code never approves anything the
+ * email leaves out.
+ */
+export function createConfirmationEmailTemplate(appName: string, code: string, heading: string, summary: string[]) {
+  const name = appName.trim().slice(0, 64);
+  if (!name || !/^\d{6}$/.test(code) || !heading.trim()) throw new Error("Application name, heading and a six-digit code are required");
+  const email = confirmationEmail(name, code, heading, summary);
+  if (!fits(email)) throw new Error(CONFIRMATION_TOO_LONG);
+  return email;
 }
 
 /** Where a recovery account's backups can move its funds without KeyWay. */

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
-import { createConfirmationEmailTemplate, createOtpEmailTemplate, createRecoveryNoticeEmailTemplate } from "../src/server/email-template";
+import { confirmationEmailFits, createConfirmationEmailTemplate, createOtpEmailTemplate, createRecoveryNoticeEmailTemplate } from "../src/server/email-template";
 import { previewSummaryLines, type TransactionPreview } from "../src/server/transaction-policy.ts";
 import { recoveryLines } from "../src/server/recovery.ts";
 
@@ -48,17 +48,29 @@ function preview(recipients: number): TransactionPreview {
   };
 }
 
-test("the confirmation email never drops what a transaction does to the account's assets", () => {
-  const lines = previewSummaryLines(preview(13));
+test("the confirmation email never drops an asset or a recipient, however they're ordered", () => {
+  // Junk tokens first, as an attacker ordering the outputs would put them, then thirteen recipients.
+  const base = preview(13);
+  const junk = Array.from({ length: 12 }, (_, index) => {
+    const asset = `0x${(index + 0x30).toString(16).repeat(32)}`;
+    return { id: "", asset, standard: "xUDT" as const, amount: "-1", amountText: `-1 of token ${asset}` };
+  });
+  const lines = previewSummaryLines({ ...base, tokens: [...junk, ...base.tokens] });
   const email = createConfirmationEmailTemplate("Acme Pay", "123456", "Confirm a transaction", lines);
   for (const body of [email.plaintext, email.html]) {
-    assert.ok(body.includes(`Token -1000 of token 0x${"55".repeat(32)} (xUDT 0x${"55".repeat(32)})`));
+    for (const token of [...junk, ...base.tokens]) assert.ok(body.includes(token.asset), token.asset);
+    for (const recipient of base.recipients) assert.ok(body.includes(`100 CKB to ${recipient.address}`), recipient.address);
     assert.ok(body.includes(`Unrecognized script 0x${"9f".repeat(32)} (type, 1 cells)`));
-    // Whatever doesn't fit is said to be missing, not silently left out.
-    assert.match(body, /and \d+ more/);
+    assert.doesNotMatch(body, /more not shown/);
   }
-  const short = createConfirmationEmailTemplate("Acme Pay", "123456", "Confirm a transaction", previewSummaryLines(preview(1)));
-  assert.doesNotMatch(short.plaintext, /more/);
+  for (const line of lines) assert.ok(email.plaintext.includes(`${line}\n`), line);
+});
+
+test("a summary too long for one email gets no code, rather than a code for what the email doesn't show", () => {
+  const lines = previewSummaryLines(preview(400));
+  assert.equal(confirmationEmailFits("Acme Pay", "Confirm a transaction", lines), false);
+  assert.throws(() => createConfirmationEmailTemplate("Acme Pay", "123456", "Confirm a transaction", lines), /too much to show in one confirmation email/);
+  assert.equal(confirmationEmailFits("Acme Pay", "Confirm a transaction", previewSummaryLines(preview(13))), true);
 });
 
 test("the confirmation email shows each recipient's whole address", () => {
@@ -73,21 +85,16 @@ test("the confirmation email shows each recipient's whole address", () => {
   }
 });
 
-test("a recipient line too long for the email keeps its amount and is marked as cut", () => {
+test("a recipient with an unusually long address is shown whole, never cut", () => {
   const long = ccc.Address.fromScript(ccc.Script.from({
     codeHash: "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8", hashType: "type", args: `0x${"cd".repeat(200)}`,
   }), client).toString();
   const base = preview(1);
   const lines = previewSummaryLines({ ...base, recipients: [{ ...base.recipients[0], address: long, ckb: "4321" }] });
   const email = createConfirmationEmailTemplate("Acme Pay", "123456", "Confirm a transaction", lines);
-  const shown = email.plaintext.split("\n").find((line) => line.includes(long.slice(0, 40)));
-  assert.ok(shown, "the recipient line is in the email");
-  assert.match(shown, /4321 CKB/);
-  assert.ok(shown.endsWith("…") && shown.length === 240, shown);
-  assert.ok(email.html.includes(shown));
-  // A line that fits is left as it is.
-  const short = createConfirmationEmailTemplate("Acme Pay", "123456", "Confirm a transaction", previewSummaryLines(preview(1)));
-  assert.doesNotMatch(short.plaintext, /…$/m);
+  assert.ok(email.plaintext.includes(`4321 CKB to ${long} (wallet)\n`));
+  assert.ok(email.html.includes(`4321 CKB to ${long} (wallet)`));
+  assert.doesNotMatch(email.plaintext, /…/);
 });
 
 test("turning recovery on with all 8 backups emails every backup and every amount", () => {

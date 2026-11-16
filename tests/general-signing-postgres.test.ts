@@ -127,6 +127,20 @@ test("general signing binds approvals, email codes and threshold changes", { ski
     assert.ok(signed);
   });
 
+  await t.test("a transaction too long to show in one confirmation email is refused before any code", async () => {
+    const { context, emails } = harness(100n * CKB);
+    await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (100n * CKB).toString() });
+    const previewOf = context.preview!;
+    context.preview = async (wallet, input) => {
+      const validated = await previewOf(wallet, input);
+      const [recipient] = validated.preview.recipients;
+      validated.preview.recipients = Array.from({ length: 600 }, (_, index) => ({ ...recipient, address: `ckt1qtest${index}` }));
+      return validated;
+    };
+    await assert.rejects(() => transactionSigning(context, { operation: "preview", transaction: tx(77) }), /too much to show in one confirmation email/);
+    assert.equal(emails.length, 0);
+  });
+
   await t.test("a token with no daily amount of its own has no limit, even with a CKB amount set", async () => {
     const { context } = harness(1n * CKB, [{ asset: RUSD, amount: 5n }]);
     await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (1_000n * CKB).toString() });
