@@ -55,6 +55,8 @@ test("migrations 26, 28 and 31 sign out sessions without an origin, remove expir
   // Migration 31: windows from before it end a day after they started, so they can be removed.
   const [window] = await sql<Array<{ expires_at: Date }>>`select expires_at from keyway_auth_rate_limits where key = 'before-expiry'`;
   assert.equal(window.expires_at.toISOString(), "2026-11-02T00:00:00.000Z");
+  // The API from before it, which doesn't set the expiry, can still record windows until it is replaced.
+  await sql`insert into keyway_auth_rate_limits (key, count, starts_at) values ('old-api', 1, now())`;
   const challenges = await sql<Array<{ id: string }>>`select id from keyway_auth_challenges`;
   assert.deepEqual(challenges.map(({ id }) => id), [open]);
   const sessions = await sql<Array<{ token: string }>>`select token from keyway_auth_sessions order by token`;

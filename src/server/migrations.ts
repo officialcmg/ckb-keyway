@@ -461,7 +461,8 @@ export const migrations: Array<{
       // so a day after a window started it has ended.
       await sql`alter table keyway_auth_rate_limits add column expires_at timestamptz`;
       await sql`update keyway_auth_rate_limits set expires_at = starts_at + interval '1 day'`;
-      await sql`alter table keyway_auth_rate_limits alter column expires_at set not null`;
+      // The default keeps the API from before this migration working until the new one replaces it.
+      await sql`alter table keyway_auth_rate_limits alter column expires_at set default now() + interval '1 day', alter column expires_at set not null`;
       await sql`create index keyway_auth_rate_limits_expiry on keyway_auth_rate_limits (expires_at)`;
     },
   },
