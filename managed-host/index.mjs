@@ -14,10 +14,11 @@ const CHANNELS_MARKER = "keyway-channels";
 // Written once a node's channels have been checked under the marker scheme. A node without it (one from before
 // markers existed) starts after a restart like a marked one, so its channels are found and marked.
 const CHECKED_MARKER = "keyway-channels-checked";
-// Written once a node's process is up and removed only once it has made room for another node with nothing of
-// its own to watch (see makeRoom). A peer can open a channel to a running node without any request through the
-// host, so a node that was running when the host lost it (a crash, a failed start after a snapshot) may hold
-// channels nobody has listed, and starts after a restart like an unchecked one.
+// Written before a node's process spawns and removed only once it has made room for another node with nothing of
+// its own to watch (see makeRoom), or its start failed before Fiber created its store. A peer can open a channel
+// to a running node without any request through the host, so a node that was running when the host lost it (a
+// crash, a failed start after a snapshot) may hold channels nobody has listed, and starts after a restart like an
+// unchecked one.
 const RUNNING_MARKER = "keyway-running";
 // A node is never stopped to make room for this long after a successful step of a channel setup, so a user's
 // steps that span several requests, such as connecting to a peer, opening a channel and signing its funding,
@@ -740,6 +741,21 @@ async function startNode(userId) {
   await createCkbKey(join(ckbDir, "key"));
   // The host may have begun shutting down while this admission waited, for room or for the steps above.
   if (shuttingDown) throw new Error("Managed host is shutting down");
+  // Fiber 0.9.1 opens its store (<data dir>/fiber/store) and starts its network before its RPC answers, so a peer
+  // can open a channel to the node from soon after it spawns: it counts as running from before then.
+  await writeFile(join(baseDir, RUNNING_MARKER), "", { mode: 0o600 });
+  try {
+    return await spawnNode(userId, baseDir, port);
+  } catch (error) {
+    // A start that failed before Fiber created its store can hold no channel.
+    if (!(await fileExists(join(baseDir, "fiber", "store")).catch(() => true))) {
+      await rm(join(baseDir, RUNNING_MARKER), { force: true }).catch(logError);
+    }
+    throw error;
+  }
+}
+
+async function spawnNode(userId, baseDir, port) {
   const child = spawn(required("FNN_PATH", "/usr/local/bin/fnn"), [
     "-d", baseDir,
     "-c", required("FIBER_CONFIG_TEMPLATE", "/usr/local/share/fiber/config/testnet/config.yml"),
@@ -772,13 +788,6 @@ async function startNode(userId) {
   if (shuttingDown) {
     await waitForExit(child);
     throw new Error("Managed host is shutting down");
-  }
-  // Before anything can use the node, so a host lost while it runs starts it again (see RUNNING_MARKER).
-  try {
-    await writeFile(join(baseDir, RUNNING_MARKER), "", { mode: 0o600 });
-  } catch (error) {
-    await waitForExit(child).catch(logError);
-    throw error;
   }
   // A process that died as its RPC answered is not registered as running.
   if (child.exitCode !== null || child.signalCode !== null) throw new Error("Fiber node exited during startup");

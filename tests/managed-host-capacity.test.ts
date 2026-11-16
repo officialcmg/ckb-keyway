@@ -7,20 +7,23 @@ import { createServer } from "node:http";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 
-// A stand-in for fnn: answers node_info, and list_channels from channels.json in its data directory. It writes
-// its pid there; with a slow-start file it takes a while to answer, and with a slow-stop file it takes a while
-// to exit, writing a stopping file once asked to. With a fail-start file it exits at once, noting it in failed-starts.
+// A stand-in for fnn: answers node_info, and list_channels from channels.json in its data directory. It creates
+// its store there (fiber/store) and writes its pid; with a slow-start file it takes a while to answer, and with a
+// slow-stop file it takes a while to exit, writing a stopping file once asked to. With a fail-start file it exits at
+// once, before creating its store, noting it in failed-starts.
 // Each start is logged to starts.log beside the data directories, and slow_call (or, with a slow-rpc file, any
 // call but list_channels) answers after 1.5s. With an advance-channels.json file, the channels become those once
 // list_channels has answered, as a peer moving a channel on would; with a drop-funding file, a funding submission
 // is cut off before Fiber reads it.
 const FAKE_FNN = `#!${process.execPath}
 const { createServer } = require("node:http");
-const { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } = require("node:fs");
+const { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } = require("node:fs");
 const { join } = require("node:path");
 const args = process.argv.slice(2);
 const dir = args[args.indexOf("-d") + 1];
 if (existsSync(join(dir, "fail-start"))) { appendFileSync(join(dir, "failed-starts"), "x"); process.exit(1); }
+// Like Fiber, which opens its store before it starts its network or RPC.
+mkdirSync(join(dir, "fiber", "store"), { recursive: true });
 const port = Number(args.find((arg) => arg.startsWith("--rpc-listening-addr=")).split(":").pop());
 const parent = process.ppid;
 writeFileSync(join(dir, "pid"), String(process.pid));
@@ -1043,4 +1046,38 @@ test("funding recorded but never delivered can be submitted again while Fiber st
   assert.equal(await submit(A), 200);
   assert.equal(await exists(join(root, "users", A, "funding-received")), true);
   assert.equal((await record()).split("\n").filter((line) => line.startsWith(WAITING_ID)).length, 1);
+});
+
+test("a node lost while it starts counts as running, as Fiber's network is up before its RPC", async (context) => {
+  const { module, root, request, running, marked, withChannels } = await host(context);
+  // A was checked earlier and holds nothing; its start is slow to answer RPC.
+  await mkdir(join(root, "users", A), { recursive: true });
+  await writeFile(join(root, "users", A, "keyway-channels-checked"), "");
+  await writeFile(join(root, "users", A, "slow-start"), "");
+  const started = request(A);
+  await until(() => exists(join(root, "users", A, "pid")));
+  // Meanwhile a peer opens a channel to it, and the host is lost: A's data directory as that leaves it, as C's.
+  await withChannels(A);
+  await cp(join(root, "users", A), join(root, "users", C), { recursive: true });
+  assert.equal(await started, 200);
+  await module.startKnownNodes([C]);
+  assert.ok(running().includes(C), running().join(","));
+  assert.equal(await marked(C), true);
+});
+
+test("a node whose start fails after Fiber created its store counts as offline; one that failed before doesn't", async (context) => {
+  const { module, root, request } = await host(context);
+  for (const user of [A, B]) {
+    await mkdir(join(root, "users", user), { recursive: true });
+    await writeFile(join(root, "users", user, "keyway-channels-checked"), "");
+    await writeFile(join(root, "users", user, "fail-start"), "");
+  }
+  // A's store exists, so its network may have run before it failed; B's doesn't.
+  await mkdir(join(root, "users", A, "fiber", "store"), { recursive: true });
+  assert.equal(await request(A), 502);
+  assert.equal(await request(B), 502);
+  assert.equal(module.readiness().offline, 1);
+  await rm(join(root, "users", A, "fail-start"));
+  await until(async () => module.readiness().offline === 0);
+  assert.ok(module.runningUsers().includes(A));
 });
