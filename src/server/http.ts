@@ -180,6 +180,9 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
       request.headers.get("idempotency-key") ?? "",
       body,
       () => managedNodeRequest(user.id, body, undefined, () => ownLockScript(user), (hash) => signedTransaction(user.id, hash)),
+      // Releasing an opening is checked afresh each time and changes nothing unless it succeeds, so a failure
+      // (the node being unreachable, say) never stays this key's answer.
+      { retryFailures: operation === "cancel-channel-opening" },
     )
     : await managedNodeRequest(user.id, body);
   return Response.json(result, {

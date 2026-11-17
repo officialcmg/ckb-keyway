@@ -228,6 +228,18 @@ test("M13: expired idempotency records keep no response, accounts are bounded, a
     assert.equal(await repeat, "ran");
   });
 
+  await t.test("a mutation marked safe to run again keeps no failure: the same key runs it again, and replays its success", async () => {
+    const userId = crypto.randomUUID();
+    const failing = async () => { throw new Error("The node can't be reached"); };
+    // Without the mark the failure is the key's answer, and the mutation never runs again.
+    await assert.rejects(runIdempotentMutation(userId, "test", "kept-failure-00001", {}, failing), /can't be reached/);
+    await assert.rejects(runIdempotentMutation(userId, "test", "kept-failure-00001", {}, async () => "ran"), /can't be reached/);
+    // With it the failure is reported, the key is freed, and its eventual success is what repeats hear.
+    await assert.rejects(runIdempotentMutation(userId, "test", "freed-failure-0001", {}, failing, { retryFailures: true }), /can't be reached/);
+    assert.equal(await runIdempotentMutation(userId, "test", "freed-failure-0001", {}, async () => "ran", { retryFailures: true }), "ran");
+    assert.equal(await runIdempotentMutation(userId, "test", "freed-failure-0001", {}, async () => "ran twice", { retryFailures: true }), "ran");
+  });
+
   await t.test("loading a claimed node backup stores no copy of it", async () => {
     const { user, call } = await signedIn();
     await saveWallet(user, readyWallet(DEVICE_A));
