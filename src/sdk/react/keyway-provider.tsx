@@ -30,7 +30,7 @@ import { bootstrapKeyWay, type PublicWallet } from "../browser/bootstrap";
 import { createStoppedNodes, recoverFailedLogout } from "../browser/node-migration";
 import type { ApproveFiberChannelOpen, FiberChannelOpenPreview } from "../browser/remote-ckb-signer";
 import type { ApproveFiberPayment } from "../browser/fiber-payment";
-import type { EmailCodeReason, RequestEmailCode } from "../browser/email-code";
+import { loginCodeUsedUp, type EmailCodeReason, type RequestEmailCode } from "../browser/email-code";
 import { friendlyKeyWayError } from "../browser/friendly-error";
 import { changeRecoveryBackup, createJoyIdBackup as createJoyIdBackupWithSigner, enableRecovery, recoveryAccountAddress, requestBackupChallenge, type ApproveBackupChange, type ApproveRecovery, type BackupChanged, type BackupChangePreview, type RecoveryEnabled, type RecoveryPreview } from "../browser/account-recovery";
 import type { RecoveryBackup, RecoveryBackupProof } from "../browser/recovery-backups";
@@ -991,6 +991,8 @@ export function KeyWayLoginModal({
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string>();
   const [verificationState, setVerificationState] = useState<"idle" | "success" | "error">("idle");
+  // The code can't be tried again (its last try was wrong): only a new code helps.
+  const [usedUp, setUsedUp] = useState(false);
   const codeInputRef = useRef<HTMLInputElement>(null);
 
   async function submit() {
@@ -1007,12 +1009,14 @@ export function KeyWayLoginModal({
       await new Promise((resolve) => setTimeout(resolve, 900));
       authenticated({ authToken: result.sessionToken, user: result.user, expiresAt: result.expiresAt });
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Could not complete email login");
+      const message = cause instanceof Error ? cause.message : "Could not complete email login";
+      setError(message);
       if (challengeId) {
-        // A wrong code is cleared so the next one can be typed straight away.
+        // A wrong code is cleared so the next one can be typed straight away, unless this code can't be tried again.
         setVerificationState("error");
         setCode("");
-        requestAnimationFrame(() => codeInputRef.current?.focus());
+        if (loginCodeUsedUp(message)) setUsedUp(true);
+        else requestAnimationFrame(() => codeInputRef.current?.focus());
       }
     } finally {
       setPending(false);
@@ -1025,11 +1029,12 @@ export function KeyWayLoginModal({
     const next = await api.sendCode(email);
     setChallengeId(next.challengeId);
     setCode("");
+    setUsedUp(false);
     codeInputRef.current?.focus();
   }
 
   useEffect(() => {
-    if (challengeId && code.length === 6 && !pending && verificationState !== "success") void submit();
+    if (challengeId && code.length === 6 && !pending && !usedUp && verificationState !== "success") void submit();
   }, [code, challengeId]);
 
   // The email field is gone once the code is sent, so focus moves to the code.
@@ -1048,6 +1053,7 @@ export function KeyWayLoginModal({
               setCode("");
               setError(undefined);
               setVerificationState("idle");
+              setUsedUp(false);
             }}><ArrowLeftIcon /></button>
           )}
           <div style={{ ...modalIcon, background: palette.surface, color: palette.muted }}><MailIcon /></div>
@@ -1058,7 +1064,7 @@ export function KeyWayLoginModal({
             : `Use your email to continue to ${appName}.`}</p>
           <form onSubmit={(event) => {
             event.preventDefault();
-            if (!challengeId || code.length === 6) void submit();
+            if (!challengeId || (code.length === 6 && !usedUp)) void submit();
           }}>
             {!challengeId ? (
               <label style={{ ...modalLabel, color: palette.muted }}>
@@ -1080,7 +1086,7 @@ export function KeyWayLoginModal({
                 value={code}
                 inputRef={codeInputRef}
                 label="One-time code"
-                readOnly={pending || verificationState === "success"}
+                readOnly={pending || usedUp || verificationState === "success"}
                 state={verificationState}
                 describedBy={error ? "keyway-login-error" : undefined}
                 onChange={(next) => {
@@ -1098,7 +1104,7 @@ export function KeyWayLoginModal({
                 {pending ? "Sending code…" : "Continue"}
               </button>
             ) : (
-              <ResendLine palette={palette} resend={resend} waitSeconds={60} disabled={pending || verificationState === "success"} prompt="Didn't get an email?" style={{ margin: "22px 0 0", textAlign: "center" }} />
+              <ResendLine palette={palette} resend={resend} waitSeconds={60} disabled={pending || verificationState === "success"} prompt={usedUp ? undefined : "Didn't get an email?"} style={{ margin: "22px 0 0", textAlign: "center" }} />
             )}
           </form>
           <p style={{ ...modalFootnote, color: palette.subtle }}>Secured by <strong>CKB KeyWay</strong></p>

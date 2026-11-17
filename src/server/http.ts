@@ -14,6 +14,7 @@ import {
   sessionEmail,
   sendTransactionalEmail,
   consumeRateLimit,
+  CHALLENGE_ID,
 } from "./auth.ts";
 import { acquireLease, heartbeatLease, releaseLease, requireLease } from "./device-lease.ts";
 import { loadLitAction } from "./lit-actions.ts";
@@ -35,7 +36,7 @@ import { runIdempotentMutation } from "./idempotency.ts";
 import { recordSigningEvent } from "./security-alerts.ts";
 import { fundingSigning, type FundingContext } from "./funding-signing.ts";
 import { messageSigning, sendLimitOffer, signingSettings, transactionSigning, type SigningContext } from "./general-signing.ts";
-import { listPendingTransactions, nodeStatus } from "./pending-transactions.ts";
+import { listPendingTransactions, nodeStatus, signedTransaction } from "./pending-transactions.ts";
 import { sendLimitHead } from "./send-limits.ts";
 import { recoveryBackupChange, recoverySetup, settleRecoveryChange } from "./recovery.ts";
 import { sweepLegacyAfterSignIn } from "./legacy-sweep.ts";
@@ -49,13 +50,10 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
     return Response.json({ status: "ok" }, { headers: cors });
   }
   if (request.method === "GET" && new URL(request.url).pathname === "/readyz") {
-    const sql = await database();
-    await sql`select 1`;
-    return Response.json({ status: "ready" }, { headers: cors });
+    return readiness("database", async () => { const sql = await database(); await sql`select 1`; }, cors);
   }
   if (request.method === "GET" && new URL(request.url).pathname === "/managed-readyz") {
-    await managedNodeReady();
-    return Response.json({ status: "ready" }, { headers: cors });
+    return readiness("managed-fiber", managedNodeReady, cors);
   }
   if (request.method !== "POST") return jsonError("Not found", 404, cors);
 
@@ -90,14 +88,70 @@ export async function handleKeyWayRequest(request: Request): Promise<Response> {
     for (const [name, value] of cors) response.headers.set(name, value);
     return response;
   } catch (error) {
+    // Database, network and DNS failures name internal hosts: callers get one plain sentence, operators a code.
+    // A Postgres data or constraint error (SQLSTATE class 22 or 23) comes from the request's own input.
+    if (isInputError(error)) {
+      console.error("[keyway] request failed", { status: 400, cause: "input", code: errorCode(error) });
+      return jsonError("The request is invalid", 400, cors);
+    }
+    if (isInternalError(error)) {
+      console.error("[keyway] request failed", { status: 503, cause: "internal", code: errorCode(error) });
+      return jsonError("KeyWay is temporarily unavailable. Try again in a moment.", 503, cors);
+    }
     const message = error instanceof Error ? error.message : "KeyWay request failed";
     const unauthorized = /session|bearer/i.test(message);
     const rateLimited = /too many/i.test(message);
+    // Another request is setting this account's wallet up; the client can try again shortly.
+    const busy = /still being set up/i.test(message);
+    const status = unauthorized ? 401 : rateLimited ? 429 : busy ? 409 : 400;
     // A sanitized cause for operators: Lit refuses everything once the account's credit runs out.
     const cause = /payment_required|HTTP 402/i.test(message) ? "lit-out-of-credit" : PROVIDER_ERROR.test(message) ? "provider" : undefined;
-    console.error("[keyway] request failed", { status: unauthorized ? 401 : rateLimited ? 429 : 400, ...(cause ? { cause } : {}) });
-    return jsonError(publicErrorMessage(message), unauthorized ? 401 : rateLimited ? 429 : 400, cors);
+    console.error("[keyway] request failed", { status, ...(cause ? { cause } : {}) });
+    const response = jsonError(publicErrorMessage(message), status, cors);
+    if (busy) response.headers.set("Retry-After", "5");
+    return response;
   }
+}
+
+/**
+ * A readiness check for anonymous callers: ready or unavailable, never why. The cause goes to the operator's log
+ * as an error code only, since database, DNS and hosted-node errors name internal hosts.
+ */
+async function readiness(check: string, probe: () => Promise<unknown>, cors: Headers): Promise<Response> {
+  try {
+    await probe();
+    return Response.json({ status: "ready" }, { headers: cors });
+  } catch (error) {
+    console.error("[keyway] readiness check failed", { check, code: errorCode(error) });
+    return Response.json({ status: "unavailable" }, { status: 503, headers: cors });
+  }
+}
+
+const INTERNAL_CODE = /^(CONNECT_TIMEOUT|CONNECTION_[A-Z_]+|E[A-Z]+|[0-9A-Z]{5})$/;
+const INTERNAL_MESSAGE = /CONNECT_TIMEOUT|CONNECTION_(CLOSED|ENDED|DESTROYED)|ECONN|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|getaddrinfo|DATABASE_URL/;
+
+export function isInputError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const { name, code } = error as { name?: unknown; code?: unknown };
+  return name === "PostgresError" && typeof code === "string" && /^2[23][0-9A-Z]{3}$/.test(code);
+}
+
+/**
+ * A database, network or DNS error rather than one of KeyWay's own: a Postgres error, a Node system error, a
+ * postgres.js connection error, or a message naming one.
+ */
+export function isInternalError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const { name, code, syscall, errno, message } = error as { name?: unknown; code?: unknown; syscall?: unknown; errno?: unknown; message?: unknown };
+  if (name === "PostgresError" || typeof syscall === "string" || errno !== undefined) return true;
+  if (typeof code === "string" && INTERNAL_CODE.test(code)) return true;
+  return typeof message === "string" && INTERNAL_MESSAGE.test(message);
+}
+
+/** A short code for an error (ECONNREFUSED, 28P01, ...) that names no host, address or account. */
+export function errorCode(error: unknown): string {
+  const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+  return typeof code === "string" && /^[A-Za-z0-9_]{1,40}$/.test(code) ? code : "unknown";
 }
 
 async function managedNodeHttpRequest(request: Request): Promise<Response> {
@@ -108,13 +162,10 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
   if (operation === "status" || operation === "list-channels" || operation === "call") {
     sweepHostedSettlement(user.id, () => ownLockScript(user));
   }
-  if (operation === "call") {
-    const limit = await consumeRateLimit(`fiber-call:${user.id}`, { max: 120, window: 60 });
-    if (!limit.allowed) throw new Error(`Too many Fiber node requests. Try again in ${limit.retryAfter ?? 60} seconds`);
-  }
-  if (operation === "act") {
-    const limit = await consumeRateLimit(`fiber-act:${user.id}`, { max: 30, window: 60 });
-    if (!limit.allowed) throw new Error(`Too many Fiber node changes. Try again in ${limit.retryAfter ?? 60} seconds`);
+  const rateLimit = managedNodeRateLimit(operation);
+  if (rateLimit) {
+    const limit = await consumeRateLimit(`${rateLimit.key}:${user.id}`, rateLimit.rule);
+    if (!limit.allowed) throw new Error(`${rateLimit.message}. Try again in ${limit.retryAfter ?? 60} seconds`);
   }
   if (operation === "pay") {
     const scope = await resolveAuthScope(request);
@@ -128,12 +179,23 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
       `managed:${operation}`,
       request.headers.get("idempotency-key") ?? "",
       body,
-      () => managedNodeRequest(user.id, body, undefined, () => ownLockScript(user)),
+      () => managedNodeRequest(user.id, body, undefined, () => ownLockScript(user), (hash) => signedTransaction(user.id, hash)),
     )
     : await managedNodeRequest(user.id, body);
   return Response.json(result, {
     headers: { "Cache-Control": "no-store" },
   });
+}
+
+/**
+ * Per-user limits on hosted-node requests: free calls, changes such as peers, channel opens and their funding,
+ * and every other read (status and the fee reserve also start the node). Payments have limits of their own.
+ */
+export function managedNodeRateLimit(operation: string): { key: string; rule: { max: number; window: number }; message: string } | undefined {
+  if (operation === "pay") return undefined;
+  if (operation === "call") return { key: "fiber-call", rule: { max: 120, window: 60 }, message: "Too many Fiber node requests" };
+  if (["act", "open-channel", "submit-channel-funding"].includes(operation)) return { key: "fiber-act", rule: { max: 30, window: 60 }, message: "Too many Fiber node changes" };
+  return { key: "fiber-read", rule: { max: 120, window: 60 }, message: "Too many Fiber node requests" };
 }
 
 /**
@@ -178,7 +240,9 @@ async function legacyCleanupRequest(request: Request): Promise<Response> {
 
 async function verifyCodeRequest(request: Request): Promise<Response> {
   const { challengeId, code } = await objectBody(request, "Invalid email OTP verification");
-  if (typeof challengeId !== "string" || !challengeId) throw new Error("OTP challenge is required");
+  if (typeof challengeId !== "string" || !CHALLENGE_ID.test(challengeId)) {
+    throw new Error("A valid OTP challenge is required");
+  }
   if (typeof code !== "string" || !/^\d{6}$/.test(code)) throw new Error("Enter the six-digit code");
   return Response.json(await verifyEmailCode(request, challengeId, code));
 }
@@ -195,6 +259,9 @@ async function logoutRequest(request: Request): Promise<Response> {
 
 async function bootstrapRequest(request: Request): Promise<Response> {
   const user = await authenticateUser(request);
+  // Every sign-in bootstraps; this bounds what one account can queue (old-address sweeps, idempotency records).
+  const limit = await consumeRateLimit(`bootstrap:${user.id}`, { max: 30, window: 60 });
+  if (!limit.allowed) throw new Error(`Too many sign-in requests. Try again in ${limit.retryAfter ?? 60} seconds`);
   const body = await objectBody(request, "Invalid bootstrap request");
   const { deviceIdHash, nodeMode, keyCustody } = body;
   if (typeof deviceIdHash !== "string") throw new Error("Device ID hash is required");
@@ -222,6 +289,9 @@ async function bootstrapRequest(request: Request): Promise<Response> {
 
 async function fiberKeyRequest(request: Request): Promise<Response> {
   const user = await authenticateUser(request);
+  // Each request runs a paid Lit Action on the operator's shared credit; a node needs its key once per start.
+  const limit = await consumeRateLimit(`fiber-key:${user.id}`, { max: 5, window: 60 });
+  if (!limit.allowed) throw new Error(`Too many Fiber key requests. Try again in ${limit.retryAfter ?? 60} seconds`);
   const { deviceIdHash, leaseId, recipientPublicKey } = await objectBody(request, "Invalid Fiber key request");
   if (typeof deviceIdHash !== "string") throw new Error("Device ID hash is required");
   if (typeof leaseId !== "string") throw new Error("Device lease is required");
@@ -299,9 +369,8 @@ async function loadNodeBackupRequest(request: Request): Promise<Response> {
     throw new Error("Fiber wallet is bound to another device");
   }
   await requireLease(user, deviceIdHash, leaseId);
-  const backup = await versionedMutation(request, user.id, "node-backup:claim", body, () =>
-    readClaimedNodeBackup(user, deviceIdHash),
-  );
+  // A plain read, safe to repeat: it isn't run as an idempotent mutation, which would store the whole backup again.
+  const backup = await readClaimedNodeBackup(user, deviceIdHash);
   const { sourceDeviceIdHash: _source, status: _status, claimedDeviceIdHash: _claimed, ...publicBackup } = backup;
   return Response.json(publicBackup, { headers: { "Cache-Control": "no-store" } });
 }
