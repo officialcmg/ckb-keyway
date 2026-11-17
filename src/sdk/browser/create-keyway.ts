@@ -2,7 +2,6 @@ import * as ccc from "@ckb-ccc/core";
 import {
   createCccExternalFundingResolver,
   FiberBrowserNode,
-  openChannelWithExternalFundingFlow,
   shouldDiagnoseFundingAbortError,
   type Channel,
   type ChannelId,
@@ -12,6 +11,7 @@ import {
   type SendPaymentParams,
 } from "@fiber-pay/sdk/browser";
 import { KeyWayCredentialProvider } from "./credential-provider";
+import { openFundingFlow } from "./funding-flow";
 import { acquireDeviceLock, type DeviceLock } from "./device-lock";
 import { acquireDeviceLease, type DeviceLease } from "./device-lease";
 import { serializeCccTransactionForRpc } from "./ccc-transaction";
@@ -22,7 +22,8 @@ import { getDeviceIdHash, markChannelOpened, type FiberKeyDelivery } from "./boo
 import { ANY_FUNDING, connectChannelPeers, type ChannelPeer } from "./channel-peers";
 import { normalizeFiberPubkey } from "./fiber-pubkey";
 import { KeyWayApiClient } from "./api-client";
-import { createEncryptedNodeBackup, restoreEncryptedNodeBackup } from "./node-backup";
+import { createEncryptedNodeBackup } from "./node-backup";
+import { createNodeStorage } from "./node-storage";
 import { backUpBeforeLogout, restoreBeforeStart, stopBeforeLogout } from "./node-migration";
 import { toKeyWayError, type KeyWayError } from "./keyway-error";
 import { freeFiberParams, fundingFeeRate, paymentFiberParams } from "./fiber-methods";
@@ -128,10 +129,12 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     return (await options.loadFiberKey(deviceLease.leaseId)).fiberKey;
   });
   const network = options.network ?? "testnet";
-  const databasePrefix = `/wasm-${options.identifier}`;
+  const canonicalPrefix = `/wasm-${options.identifier}`;
+  const storage = createNodeStorage(canonicalPrefix, localStorage);
+  let databasePrefix = storage.current();
   // Fiber's browser build has no watchtower, so its watchtower events come to the page (watchtower-bridge.ts).
   const watchtowerChannel = `keyway-watchtower-${ccc.hexFrom(crypto.getRandomValues(new Uint8Array(16))).slice(2)}`;
-  const watchtower = openWatchtowerStore(databasePrefix);
+  let watchtower = openWatchtowerStore(databasePrefix);
   let stopWatchtowerBridge: (() => Promise<void>) | undefined;
   /** Once the node has stopped it sends no more events: finish storing the ones already received, then close. */
   let bridgeDrain: Promise<void> | undefined;
@@ -148,6 +151,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     network,
     credential,
     wasmFactory: fiberWasmFactory(network, { watchtowerChannel }),
+    nodeConfig: { get databasePrefix() { return databasePrefix; } },
   });
   let deviceLock: DeviceLock | undefined;
   const api = options.apiClient ?? new KeyWayApiClient();
@@ -196,7 +200,13 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       }
     },
   });
-  const paymentLog = createPaymentLog(databasePrefix);
+  let paymentLog = createPaymentLog(databasePrefix);
+  function useDatabases(prefix: string) {
+    watchtower.close();
+    databasePrefix = prefix;
+    watchtower = openWatchtowerStore(prefix);
+    paymentLog = createPaymentLog(prefix);
+  }
   let restoreRequired = options.restoreRequired ?? false;
   // KeyWay's watchtower punishes a peer that publishes a revoked commitment while this tab is closed. It gets the
   // funding keys and the newest revocation only (watchtower-remote.ts); the keys stay here.
@@ -225,6 +235,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
         const error = cause instanceof Error ? cause : new Error("The active KeyWay device lease expired");
         void stop().finally(() => options.onLeaseLost?.(error));
       });
+      useDatabases(storage.current());
       if (restoreRequired) {
         options.onFiberStartup?.("restoring_channels");
         await restoreClaimedBackup();
@@ -438,7 +449,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
         // Once the session ends nothing more reaches KeyWay's watchtower from this page, so it must have every
         // revocation first; until then the logout fails and the user stays signed in.
         flushWatchtower: () => remoteWatchtower.deliver(10_000),
-        createBackup: (fiberKey) => createEncryptedNodeBackup(databasePrefix, fiberKey),
+        createBackup: (fiberKey) => createEncryptedNodeBackup(databasePrefix, fiberKey, canonicalPrefix),
         saveBackup: (backup) => api.saveNodeBackup(options.authToken, {
           deviceIdHash,
           leaseId: lease.leaseId,
@@ -459,7 +470,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     await restoreBeforeStart({
       loadFiberKey: async () => (await options.loadFiberKey(leaseId)).fiberKey,
       loadBackup: () => api.loadNodeBackup(options.authToken, { deviceIdHash, leaseId }),
-      restoreBackup: (backup, fiberKey) => restoreEncryptedNodeBackup(backup, databasePrefix, fiberKey),
+      restoreBackup: async (backup, fiberKey) => useDatabases(await storage.restore(backup, fiberKey)),
       confirmRestore: (generation) => api.confirmNodeBackup(options.authToken, {
         deviceIdHash,
         leaseId,
@@ -483,7 +494,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     opening.withReserve = await feeReserve.needed();
     const funding = await resolveExternalFunding(undefined);
     opening.request = { fundingAmount: BigInt(params.funding_amount), udtTypeScript: params.funding_udt_type_script, shutdownScript: funding.shutdownScript };
-    const result = await openChannelWithExternalFundingFlow({
+    const result = await openFundingFlow({
       node,
       params: {
         ...params,
@@ -493,7 +504,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
         funding_lock_script_cell_deps: funding.fundingLockScriptCellDeps,
       },
       signFundingTx: funding.signFundingTx,
-    });
+    }, (channelId) => node.abandonChannel({ channel_id: channelId }));
     await markChannelOpened(options.authToken, api);
     const feeReserveTxHash = opening.withReserve ? await feeReserve.send(result.fundingTxHash) : undefined;
     return { ...result, ...(feeReserveTxHash ? { feeReserveTxHash } : {}) };

@@ -7,6 +7,7 @@ import {
   importNodeDatabases,
   restoreEncryptedNodeBackup,
 } from "../src/sdk/browser/node-backup.ts";
+import { createNodeStorage } from "../src/sdk/browser/node-storage.ts";
 
 const PREFIX = "/wasm-wallet-test";
 const FIBER_KEY = new Uint8Array(32).fill(17);
@@ -83,6 +84,43 @@ test("refuses to overwrite Fiber state that already exists on this device", asyn
   await cleanup();
 });
 
+test("a returning device restores into fresh databases and retains its old channel state", async () => {
+  await cleanup();
+  const db = await openDatabase(`${PREFIX}-fiber`, 1, target => target.createObjectStore("records"));
+  const write = db.transaction("records", "readwrite");
+  write.objectStore("records").put({ commitment: 2 }, "channel");
+  await transactionDone(write);
+  db.close();
+  const latest = await createEncryptedNodeBackup(PREFIX, FIBER_KEY);
+  const old = await request(indexedDB.open(`${PREFIX}-fiber`));
+  const replace = old.transaction("records", "readwrite");
+  replace.objectStore("records").put({ commitment: 1 }, "channel");
+  await transactionDone(replace);
+  old.close();
+  const pointers = new Map<string, string>();
+  const local = { getItem: (key: string) => pointers.get(key) ?? null, setItem: (key: string, value: string) => { pointers.set(key, value); } };
+  const storage = createNodeStorage(PREFIX, local);
+  assert.equal(storage.current(), PREFIX);
+  const restored = await storage.restore(latest, FIBER_KEY);
+  assert.equal(createNodeStorage(PREFIX, local).current(), restored, "the selected namespace survives a reload");
+  assert.deepEqual((await exportNodeDatabases(PREFIX)).databases[0].stores[0].records[0].value, { commitment: 1 });
+  assert.deepEqual((await exportNodeDatabases(restored)).databases[0].stores[0].records[0].value, { commitment: 2 });
+
+  // The next logout carries only the active state, in canonical names the server and another device accept.
+  const next = await createEncryptedNodeBackup(restored, FIBER_KEY, PREFIX);
+  assert.equal(next.databasePrefix, PREFIX);
+  const other = await storage.restore(next, FIBER_KEY);
+  assert.notEqual(other, restored);
+  assert.deepEqual((await exportNodeDatabases(other)).databases[0].stores[0].records[0].value, { commitment: 2 });
+  assert.equal((await exportNodeDatabases(other)).databases.length, 1, "retained snapshots are never included in the new backup");
+  await assert.rejects(storage.restore({ ...next, digest: "00".repeat(32) }, FIBER_KEY), /corrupted/);
+  assert.equal(storage.current(), other, "failed restores never switch the active pointer");
+  await assert.rejects(createNodeStorage(PREFIX, { ...local, setItem: () => { throw new Error("storage full"); } }).restore(next, FIBER_KEY), /storage full/);
+  assert.equal(storage.current(), other, "a failed pointer write keeps the prior state available");
+  assert.throws(() => createNodeStorage(PREFIX, { ...local, getItem: () => "/wasm-another-wallet" }).current(), /pointer is invalid/);
+  await cleanup();
+});
+
 test("rejects corrupted ciphertext and the wrong wallet prefix", async () => {
   await cleanup();
   const database = await openDatabase(`${PREFIX}-empty`, 1, (target) => target.createObjectStore("records"));
@@ -131,7 +169,7 @@ test("validates all schemas before import and removes only a failed import's new
 
 async function cleanup() {
   for (const database of await indexedDB.databases()) {
-    if (database.name?.startsWith(PREFIX) || database.name === "/wasm-another-wallet-fiber") {
+    if (database.name?.startsWith(PREFIX) || database.name?.startsWith(`/keyway-restored-${encodeURIComponent(PREFIX)}-`) || database.name === "/wasm-another-wallet-fiber") {
       await deleteDatabase(database.name);
     }
   }

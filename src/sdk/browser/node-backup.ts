@@ -33,8 +33,11 @@ export type EncryptedNodeBackup = {
 export async function createEncryptedNodeBackup(
   databasePrefix: string,
   fiberKey: Uint8Array,
+  /** Backups use the wallet's canonical names even when this device restored into a fresh namespace. */
+  backupPrefix = databasePrefix,
 ): Promise<EncryptedNodeBackup> {
   const archive = await exportNodeDatabases(databasePrefix);
+  for (const database of archive.databases) database.name = backupPrefix + database.name.slice(databasePrefix.length);
   const salt = crypto.getRandomValues(new Uint8Array(32));
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const key = await deriveBackupKey(fiberKey, salt);
@@ -47,7 +50,7 @@ export async function createEncryptedNodeBackup(
     ));
     return {
       formatVersion: BACKUP_FORMAT_VERSION,
-      databasePrefix,
+      databasePrefix: backupPrefix,
       salt: bytesToBase64(salt),
       iv: bytesToBase64(iv),
       ciphertext: bytesToBase64(ciphertext),
@@ -64,13 +67,14 @@ export async function restoreEncryptedNodeBackup(
   backup: EncryptedNodeBackup,
   expectedPrefix: string,
   fiberKey: Uint8Array,
+  targetPrefix = expectedPrefix,
 ): Promise<void> {
   if (backup.formatVersion !== BACKUP_FORMAT_VERSION || backup.databasePrefix !== expectedPrefix) {
     throw new Error("Fiber node backup does not belong to this wallet");
   }
   const ciphertext = base64ToBytes(backup.ciphertext);
   if (await sha256Hex(ciphertext) !== backup.digest) throw new Error("Fiber node backup is corrupted");
-  if ((await existingNodeDatabases(expectedPrefix)).length > 0) {
+  if ((await existingNodeDatabases(targetPrefix)).length > 0) {
     throw new Error("This device already holds local Fiber state; refusing to overwrite it");
   }
   const salt = base64ToBytes(backup.salt);
@@ -85,6 +89,7 @@ export async function restoreEncryptedNodeBackup(
     ));
     const archive = decode(plaintext) as NodeArchive;
     validateArchive(archive, expectedPrefix);
+    for (const database of archive.databases) database.name = targetPrefix + database.name.slice(expectedPrefix.length);
     await importNodeDatabases(archive);
   } catch (error) {
     throw new Error("Could not decrypt or restore the Fiber node backup", { cause: error });

@@ -1,7 +1,7 @@
 import * as ccc from "@ckb-ccc/core";
+import { openFundingFlow } from "./funding-flow";
 import {
   createCccExternalFundingResolver,
-  openChannelWithExternalFundingFlow,
   type Channel,
   type ChannelId,
   type GetInvoiceParams,
@@ -169,7 +169,7 @@ export function createManagedKeyWay(options: {
     opening.withReserve = await feeReserve.needed();
     const funding = await resolveExternalFunding(undefined);
     opening.request = { fundingAmount: BigInt(params.funding_amount), udtTypeScript: params.funding_udt_type_script, shutdownScript: funding.shutdownScript };
-    const result = await openChannelWithExternalFundingFlow({
+    const result = await openFundingFlow({
       node: { openChannelWithExternalFunding, submitSignedFundingTx },
       params: {
         ...params,
@@ -179,7 +179,7 @@ export function createManagedKeyWay(options: {
         funding_lock_script_cell_deps: funding.fundingLockScriptCellDeps,
       },
       signFundingTx: funding.signFundingTx,
-    });
+    }, (channelId) => api.managedNode(options.authToken, { operation: "cancel-channel-opening", channelId }, crypto.randomUUID()));
     const feeReserveTxHash = opening.withReserve ? await feeReserve.send(result.fundingTxHash) : undefined;
     return { ...result, ...(feeReserveTxHash ? { feeReserveTxHash } : {}) };
   }

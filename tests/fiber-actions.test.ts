@@ -8,6 +8,33 @@ import { managedNodeRequest } from "../src/server/managed-node.ts";
 const id = `0x${"ab".repeat(32)}`;
 const channel = { channel_id: id, pubkey: `0x02${"cd".repeat(32)}`, local_balance: "0x2540be400", remote_balance: "0x0", state: { state_name: "CHANNEL_READY" }, is_public: true, enabled: true, tlc_fee_proportional_millionths: "0x3e8" };
 
+test("internal cancellation only accepts the user's unsigned external-funding opening", async () => {
+  let current: Record<string, unknown> = { ...channel, is_acceptor: false, channel_outpoint: null, state: { state_name: "NEGOTIATING_FUNDING", state_flags: "AWAITING_EXTERNAL_FUNDING" } };
+  const calls: string[] = [];
+  let nativeFailure: Error | undefined;
+  const node = { listChannels: async () => ({ channels: [current] }), call: async (method: string) => { calls.push(method); if (nativeFailure) throw nativeFailure; } };
+  const cancel = () => managedNodeRequest("cancel-test", { operation: "cancel-channel-opening", channelId: id }, node as never);
+  await cancel();
+  assert.deepEqual(calls, ["abandon_channel"]);
+  const unsigned = current;
+  // Observed in Fiber 0.10.1 while the approval dialog is still open: a proposed outpoint is not funding.
+  current = { ...unsigned, channel_outpoint: `${id}00000000`, state: { state_name: "SigningCommitment", state_flags: "COMMITMENT_SIGNED_SENT" } };
+  await cancel();
+  nativeFailure = new Error("Channel has released a signed external funding transaction and cannot be abandoned");
+  await assert.rejects(cancel, /released a signed external funding/);
+  nativeFailure = undefined;
+  for (const changes of [
+    { is_acceptor: true },
+    { state: { state_name: "CHANNEL_READY", state_flags: "" } },
+    { state: { state_name: "AwaitingTxSignatures", state_flags: "OUR_TX_SIGNATURES_SENT" } },
+    { state: { state_name: "AwaitingChannelReady", state_flags: "" } },
+  ]) {
+    current = { ...unsigned, ...changes };
+    await assert.rejects(cancel, /Only an opening/);
+  }
+  assert.deepEqual(calls, ["abandon_channel", "abandon_channel", "abandon_channel"]);
+});
+
 test("dialog methods: KeyWay keeps the scripts, caps fees, and never saves peers", () => {
   assert.throws(() => approveFiberParams("openChannelWithExternalFunding", { pubkey: channel.pubkey, funding_amount: "0x1", shutdown_script: {} }), /user's own account/);
   assert.throws(() => approveFiberParams("shutdownChannel", { channel_id: id, close_script: {} }), /close_script/);

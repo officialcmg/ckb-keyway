@@ -173,7 +173,7 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
     const result = await fiberPayment(context, managedFiberNode(user.id), body, request.headers.get("idempotency-key") || undefined);
     return Response.json(result, { headers: { "Cache-Control": "no-store" } });
   }
-  const result = ["open-channel", "submit-channel-funding"].includes(operation)
+  const result = ["open-channel", "submit-channel-funding", "cancel-channel-opening"].includes(operation)
     ? await runIdempotentMutation(
       user.id,
       `managed:${operation}`,
@@ -194,7 +194,7 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
 export function managedNodeRateLimit(operation: string): { key: string; rule: { max: number; window: number }; message: string } | undefined {
   if (operation === "pay") return undefined;
   if (operation === "call") return { key: "fiber-call", rule: { max: 120, window: 60 }, message: "Too many Fiber node requests" };
-  if (["act", "open-channel", "submit-channel-funding"].includes(operation)) return { key: "fiber-act", rule: { max: 30, window: 60 }, message: "Too many Fiber node changes" };
+  if (["act", "open-channel", "submit-channel-funding", "cancel-channel-opening"].includes(operation)) return { key: "fiber-act", rule: { max: 30, window: 60 }, message: "Too many Fiber node changes" };
   return { key: "fiber-read", rule: { max: 120, window: 60 }, message: "Too many Fiber node requests" };
 }
 
