@@ -146,3 +146,60 @@ test("an indexer behind its chain isn't believed: the search moves to the next n
   both.add(genesis(other.secp, ccc.OutPoint.from({ txHash: other.funding.hash(), index: 0 })));
   await assert.rejects(sendLimitHead(both.client, { litPublicKey: publicKey }, []), /indexer is behind/);
 });
+
+test("a genesis with a record-shaped witness on someone else's input is still the account's send-limit cell", async () => {
+  const world = chain();
+  const { secp, funding } = await account(world);
+  const theirs = world.add(ccc.Transaction.from({ inputs: [outside()], outputs: [{ lock: stranger, capacity: 100n * CKB }], outputsData: ["0x"] }));
+  // The account's plain cell as input 0 (which names the Type ID), a co-signer's input after it: its witness isn't
+  // covered by the account's signature, so the co-signer can put a record-shaped one there once the account signed.
+  const made = genesis(secp, ccc.OutPoint.from({ txHash: funding.hash(), index: 0 }));
+  made.inputs.push(ccc.CellInput.from({ previousOutput: { txHash: theirs.hash(), index: 0 } }));
+  made.outputs.push(ccc.CellOutput.from({ lock: stranger, capacity: 100n * CKB }));
+  made.outputsData.push("0x");
+  setSendLimitRecord(made, 1, RECORD);
+
+  const pending = await sendLimitHead(world.client, { litPublicKey: publicKey }, [{ transaction: made, status: "pending" }]);
+  assert.equal(pending?.outPoint.txHash, made.hash());
+  assert.equal(pending?.recordEntriesBytes, 0, "a genesis has no record");
+  world.add(made);
+  const committed = await sendLimitHead(world.client, { litPublicKey: publicKey }, []);
+  assert.equal(committed?.outPoint.txHash, made.hash());
+  assert.equal(committed?.recordEntriesBytes, 0);
+});
+
+test("the record is read only from the account's own send-limit input, never a co-signer's witness (audit L12)", async () => {
+  // A co-signer's witness isn't covered by the account's signature: a smaller record-shaped one there would shrink
+  // the room later sends reserve for the record.
+  const SMALL = "0x4b5753520100";
+  const world = chain();
+  const { secp, funding } = await account(world);
+  const made = world.add(genesis(secp, ccc.OutPoint.from({ txHash: funding.hash(), index: 0 })));
+  const theirs = world.add(ccc.Transaction.from({ inputs: [outside()], outputs: [{ lock: stranger, capacity: 100n * CKB }], outputsData: ["0x"] }));
+  const change = ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: theirs.hash(), index: 0 } }, { previousOutput: { txHash: made.hash(), index: 0 } }],
+    outputs: [{ lock: stranger, capacity: 100n * CKB }, { ...made.outputs[0], capacity: 174n * CKB - 1_000n }],
+    outputsData: ["0x", settings],
+  });
+  setSendLimitRecord(change, 0, SMALL);
+  setSendLimitRecord(change, 1, RECORD);
+
+  // Pending (from the account's own list) and committed (found on chain): the same record either way.
+  const pending = await sendLimitHead(world.client, { litPublicKey: publicKey }, [{ transaction: change, status: "pending" }]);
+  assert.equal(pending?.outPoint.txHash, change.hash());
+  assert.equal(pending?.recordEntriesBytes, recordEntriesBytes(RECORD), "the send-limit input's record, not input 0's");
+  world.add(change);
+  const committed = await sendLimitHead(world.client, { litPublicKey: publicKey }, []);
+  assert.equal(committed?.outPoint.txHash, change.hash());
+  assert.equal(committed?.recordEntriesBytes, recordEntriesBytes(RECORD));
+
+  // A record only on someone else's input: the Action won't chain on this cell, so it isn't taken as one.
+  const orphan = ccc.Transaction.from({
+    inputs: [{ previousOutput: { txHash: world.add(ccc.Transaction.from({ inputs: [outside()], outputs: [{ lock: stranger, capacity: 100n * CKB }], outputsData: ["0x"] })).hash(), index: 0 } }, { previousOutput: { txHash: change.hash(), index: 1 } }],
+    outputs: [{ lock: stranger, capacity: 100n * CKB }, { ...change.outputs[1], capacity: 174n * CKB - 2_000n }],
+    outputsData: ["0x", settings],
+  });
+  setSendLimitRecord(orphan, 0, RECORD);
+  world.add(orphan);
+  await assert.rejects(sendLimitHead(world.client, { litPublicKey: publicKey }, []), /isn't one this account made/);
+});

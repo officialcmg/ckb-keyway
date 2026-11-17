@@ -29,10 +29,15 @@ export function tokenChannelReservedCkb(udtTypeScript: FiberScript, shutdownScri
  * Refuses a funding whose share from the account is more than the app asked for, before it is shown for approval.
  * Fiber puts exactly funding_amount of CKB into a CKB channel; a token channel takes funding_amount of the token
  * and its CKB reserve. The network fee is shown apart and is not part of the amount; the fee reserve is a separate
- * transaction sent after the channel opens.
+ * transaction sent after the channel opens. Change the account gets back under a token script that could keep it
+ * (one with extension scripts) is never part of what was asked for.
  */
-export function refuseFundingBeyondRequest(preview: { amountCkb: string; token?: { amount: string } }, request: FundingRequest | undefined): void {
+export function refuseFundingBeyondRequest(preview: { amountCkb: string; token?: { amount: string }; heldUnderScriptsCkb?: string }, request: FundingRequest | undefined): void {
   if (!request) throw new Error("This channel funding wasn't requested through KeyWay");
+  // Change put under a token script that could keep it is CKB the app never asked for.
+  if (preview.heldUnderScriptsCkb !== undefined && ccc.fixedPointFrom(preview.heldUnderScriptsCkb) > 0n) {
+    throw new Error("The channel funding puts more of the account's CKB under the token's script than was requested");
+  }
   const amount = ccc.fixedPointFrom(preview.amountCkb);
   if (!request.udtTypeScript) {
     if (preview.token || amount > request.fundingAmount) throw new Error("The channel funding takes more from the account than was requested");

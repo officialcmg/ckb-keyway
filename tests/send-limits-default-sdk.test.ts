@@ -43,7 +43,7 @@ function chain(cells: ccc.Cell[]) {
  * KeyWay's server, as far as these flows go: it lists what it signed with the newest send-limit cell, or the offer
  * when there is none; turning limits on asks for the code, then "sends" a genesis that spends the oldest cell.
  */
-function server(secp: ccc.Script, funds: ccc.Cell, options: { offer?: boolean; head?: SendLimitHead; settingsError?: string } = {}) {
+function server(secp: ccc.Script, funds: ccc.Cell, options: { offer?: boolean; head?: SendLimitHead; settingsError?: string; serverOnlyFirst?: boolean } = {}) {
   const signed: ccc.Transaction[] = [];
   const settingsCalls: Array<Record<string, unknown>> = [];
   let head = options.head;
@@ -55,6 +55,11 @@ function server(secp: ccc.Script, funds: ccc.Cell, options: { offer?: boolean; h
     signingSettings: async (_token: string, body: Record<string, unknown>) => {
       settingsCalls.push(body);
       if (options.settingsError) throw new Error(options.settingsError);
+      // Raising an amount the server alone keeps: its own six-digit code, then the amount is written, limits still off.
+      if (options.serverOnlyFirst && settingsCalls.length <= 2) {
+        if (body.confirmationNonce === undefined) return { requiresEmailCode: true, confirmationNonce: "server", sentTo: "u***@example.com", enforcedByLit: false };
+        return { dailyAmounts: { ckb: String(body.amount) }, enforcedByLit: false };
+      }
       if (body.confirmationNonce === undefined) return { requiresEmailCode: true, confirmationNonce: "nonce", sentTo: "u***@example.com", codeLength: 8 };
       const data = encodeSendLimitSettings({ fingerprint: `0x${"11".repeat(32)}`, tokensUnlimited: false, ckb: BigInt(String(body.amount)), tokens: new Map() });
       const genesis = ccc.Transaction.from({
@@ -120,6 +125,17 @@ test("the first send asks for the daily limit once, turns limits on with the amo
   // Limits are on: the next send doesn't ask again.
   await send(signer, 10n * CKB);
   assert.equal(offers.length, 1);
+});
+
+test("raising an amount the server alone kept takes the server's code, then still turns limits on before the send (audit L13)", async () => {
+  const { secp, funds } = await account();
+  const keyway = server(secp, funds, { offer: true, serverOnlyFirst: true });
+  const { handlers: h, codes } = handlers(() => 150_000n * CKB);
+  const signer = new KeyWaySigner("token", publicKey, h, chain([funds]), keyway.api);
+  const sent = await send(signer, 100n * CKB);
+  assert.deepEqual(codes, ["settings", "settings"], "the server's code for the raise, then the Lit code for the cell");
+  assert.equal(decodeSendLimitSettings(keyway.head()!.outputData).ckb, 150_000n * CKB);
+  assert.notEqual(sendLimitInputIndex(sent, keyway.head()!), -1, "the send chains on the new send-limit cell");
 });
 
 test("without an app dialog, the offered amount is used as it is", async () => {

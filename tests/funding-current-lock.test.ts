@@ -153,4 +153,6 @@ test("the SDK refuses a funding preview that takes more than the app asked Fiber
   assert.throws(() => refuseFundingBeyondRequest({ amountCkb: "180", token: { amount: "21" } }, token), /more of the token/);
   assert.throws(() => refuseFundingBeyondRequest({ amountCkb: "180" }, token), /more of the token/);
   assert.throws(() => refuseFundingBeyondRequest({ amountCkb: "180.1", token: { amount: "20" } }, token), /more CKB than a token channel reserves/);
+  // Change under the token's script, when that script could keep it, is more than the app asked for.
+  assert.throws(() => refuseFundingBeyondRequest({ amountCkb: "180", token: { amount: "20" }, heldUnderScriptsCkb: "800" }, token), /under the token's script/);
 });

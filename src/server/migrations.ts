@@ -509,4 +509,15 @@ export const migrations: Array<{
     // that key, so an upload that lands after the node ran again (and got its key again) can't be restored.
     up: (sql) => sql`alter table keyway_v2_device_leases add column key_delivery uuid`,
   },
+  {
+    version: 33, name: "daily-amount-versions",
+    // Counts writes to each user's daily amounts, so a raise written after its send-limit transaction was sent can
+    // tell whether any other change was written since; and the last transaction sent to make the send-limit cell, so a
+    // server-only raise can tell the cell exists before an indexer lists it.
+    up: (sql) => sql`create table keyway_v2_daily_amount_versions (
+      user_id uuid primary key,
+      version bigint not null,
+      genesis_transaction text check (genesis_transaction ~ '^0x[0-9a-f]{64}$')
+    )`,
+  },
 ];
