@@ -88,7 +88,9 @@ try {
       if (expectedAddress) assert.equal(address, expectedAddress); else expectedAddress = address;
       await page.waitForFunction(() => window.probe.account.balance !== undefined, undefined, { timeout: 60_000 });
       await page.evaluate(() => window.probe.fiber.start());
-      const node = await page.evaluate(() => window.probe.fiber.connection.node.pubkey);
+      // useFiber gives the node once the page has re-rendered as running; its public key comes from Fiber's node_info.
+      await page.waitForFunction(() => window.probe.fiber.status === "running" && window.probe.fiber.node, undefined, { timeout: 60_000 });
+      const node = await page.evaluate(async () => (await window.probe.fiber.node.nodeInfo()).pubkey);
       assert.equal(typeof node, "string");
       assert.ok(node.length > 60);
       if (expectedNode) assert.equal(node, expectedNode); else expectedNode = node;
