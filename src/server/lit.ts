@@ -90,15 +90,25 @@ async function executeAction(config: LitRuntimeConfig, js_params: Record<string,
       const message = readApiError(body, `Lit returned HTTP ${response.status}`);
       if (NOT_GRANTED.test(message)) throw new LitTransientError("Lit has not granted this wallet to the Action yet", "not-granted");
       if ([429, 502, 503, 504].includes(response.status)) throw new LitTransientError(`Lit returned HTTP ${response.status}`, "unavailable");
-      throw new Error(message);
+      throw new Error(emailCodeError(message) ?? message);
     }
     if (!isActionResponse(body)) throw new Error("Lit returned an invalid Action response");
     if (body.has_error) {
       if (NOT_GRANTED.test(body.logs)) throw new LitTransientError("Lit has not granted this wallet to the Action yet", "not-granted");
-      throw new Error(`Lit Action failed${body.logs ? `: ${body.logs}` : ""}`);
+      throw new Error(emailCodeError(body.logs) ?? `Lit Action failed${body.logs ? `: ${body.logs}` : ""}`);
     }
     return body.response;
   });
+}
+
+/** Only known user-correctable code errors leave the provider wrapper; never expose provider logs. */
+function emailCodeError(message: string): string | undefined {
+  return [
+    "That email code isn't right",
+    "The email code has expired. Request a new one",
+    "The email code ticket is invalid",
+    "Enter the eight-digit code from your email",
+  ].find((error) => message.includes(`Error: ${error}`) || message === error);
 }
 
 type RetryOptions = { budgetMs?: number; sleep?: (ms: number) => Promise<void>; now?: () => number };
