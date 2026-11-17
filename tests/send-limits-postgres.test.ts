@@ -10,7 +10,7 @@ import { chainOnSendLimit, decodeSendLimitSettings, DEFAULT_DAILY_LIMIT_SHANNONS
 import { database } from "../src/server/database.ts";
 import { fundingCode, fundingNeedsLitCode, hashText, issueFundingCodeRequest, issueRequest, sendCode, sendFundingCode, sendLimitOffer, signingSettings, transactionSigning, type SigningContext } from "../src/server/general-signing.ts";
 import { litPolicyRunner } from "../src/server/lit-policy.ts";
-import { listPendingTransactions } from "../src/server/pending-transactions.ts";
+import { listPendingTransactions, recordPendingTransaction } from "../src/server/pending-transactions.ts";
 import { sendLimitHead, sendLimitPlanner, sendLimitRpc } from "../src/server/send-limits.ts";
 import { previewGeneralTransaction } from "../src/server/transaction-policy.ts";
 import type { ReadyWallet } from "../src/server/user-wallet.ts";
@@ -542,6 +542,53 @@ test("a server-only removal confirmed while turning limits on is being signed do
   await turnOn;
   assert.deepEqual(cellAmounts(sent.at(-1)!), { ckb: 10n * CKB });
   assert.deepEqual(((await signingSettings(context, { operation: "get" })) as { dailyAmounts: Record<string, string> }).dailyAmounts, { ckb: (10n * CKB).toString() });
+  t.after(async () => {
+    const sql = await database();
+    await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
+  });
+});
+
+/** Records, as turning limits on is broadcast, a transaction KeyWay signed on top of the new cell, leaving it `data`. */
+function builtOnGenesisAsSent(context: SigningContext, user: { id: string }, secp: ccc.Script, data: (genesis: ccc.Transaction) => ccc.Hex) {
+  const broadcast = context.broadcast!;
+  context.broadcast = async (tx) => {
+    context.broadcast = broadcast;
+    const hash = await broadcast(tx);
+    const genesis = ccc.Transaction.from(tx);
+    const head = { outPoint: { txHash: genesis.hash(), index: 0 }, cellOutput: genesis.outputs[0], outputData: data(genesis), recordEntriesBytes: 0 } as unknown as SendLimitHead;
+    const from = ccc.Cell.from({ outPoint: { txHash: genesis.hash(), index: 1 }, cellOutput: genesis.outputs[1], outputData: "0x" });
+    await recordPendingTransaction(user.id, ccc.Transaction.from(buildSend(secp, from, 100n * CKB, head)));
+    return hash;
+  };
+}
+
+test("a plain send built on the new cell doesn't stop the cell's amount coming back after a removal made while turning limits on", { skip: !enabled }, async (t) => {
+  const { world, secp, user, context, sent } = await setUp();
+  const { raise, release, turnOn, restore } = await serverOnlyWithGenesisAsked(world, user, context);
+  t.after(restore);
+  assert.deepEqual((await raise(undefined, null) as { dailyAmounts: Record<string, string> }).dailyAmounts, {});
+  // A send signed on top of the cell before turning limits on hears back: it leaves the cell's amounts as they are.
+  builtOnGenesisAsSent(context, user, secp, (genesis) => genesis.outputsData[0]);
+  release();
+  await turnOn;
+  assert.deepEqual(cellAmounts(sent.at(-1)!), { ckb: 10n * CKB });
+  assert.deepEqual(((await signingSettings(context, { operation: "get" })) as { dailyAmounts: Record<string, string> }).dailyAmounts, { ckb: (10n * CKB).toString() });
+  t.after(async () => {
+    const sql = await database();
+    await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;
+  });
+});
+
+test("an amount a newer change built on the new cell removed isn't put back when turning limits on finishes", { skip: !enabled }, async (t) => {
+  const { world, secp, user, context } = await setUp();
+  const { raise, release, turnOn, restore } = await serverOnlyWithGenesisAsked(world, user, context);
+  t.after(restore);
+  assert.deepEqual((await raise(undefined, null) as { dailyAmounts: Record<string, string> }).dailyAmounts, {});
+  // The newest transaction on top of the cell leaves it with no CKB amount.
+  builtOnGenesisAsSent(context, user, secp, (genesis) => ccc.hexFrom(encodeSendLimitSettings({ ...decodeSendLimitSettings(genesis.outputsData[0]), ckb: undefined })));
+  release();
+  await turnOn;
+  assert.deepEqual(((await signingSettings(context, { operation: "get" })) as { dailyAmounts: Record<string, string> }).dailyAmounts, {});
   t.after(async () => {
     const sql = await database();
     await sql`delete from keyway_v2_pending_transactions where user_id = ${user.id}`;

@@ -102,6 +102,11 @@ async function recordOf(
   if (records.length === 0) return undefined;
   const spent = await cellsAt(records.map(({ index }) => transaction.inputs[index].previousOutput));
   const own = records.filter((_, i) => Boolean(spent[i]?.lock.eq(cell.lock) && cell.type && spent[i]?.type?.eq(cell.type)));
+  // A genesis spends no earlier send-limit cell, so it has no record of its own: the record-shaped witnesses are all
+  // on other parties' inputs, and are ignored. A chained cell with none on the account's own input still fails.
+  const first = transaction.inputs[0];
+  const genesis = Boolean(first && cell.type && transaction.outputs.some((_, i) => cell.type!.args === ccc.hashTypeId(first, i)));
+  if (own.length === 0 && genesis) return undefined;
   if (own.length !== 1) throw new Error("The send-limit cell isn't one this account made");
   return own[0].record;
 }

@@ -147,6 +147,27 @@ test("an indexer behind its chain isn't believed: the search moves to the next n
   await assert.rejects(sendLimitHead(both.client, { litPublicKey: publicKey }, []), /indexer is behind/);
 });
 
+test("a genesis with a record-shaped witness on someone else's input is still the account's send-limit cell", async () => {
+  const world = chain();
+  const { secp, funding } = await account(world);
+  const theirs = world.add(ccc.Transaction.from({ inputs: [outside()], outputs: [{ lock: stranger, capacity: 100n * CKB }], outputsData: ["0x"] }));
+  // The account's plain cell as input 0 (which names the Type ID), a co-signer's input after it: its witness isn't
+  // covered by the account's signature, so the co-signer can put a record-shaped one there once the account signed.
+  const made = genesis(secp, ccc.OutPoint.from({ txHash: funding.hash(), index: 0 }));
+  made.inputs.push(ccc.CellInput.from({ previousOutput: { txHash: theirs.hash(), index: 0 } }));
+  made.outputs.push(ccc.CellOutput.from({ lock: stranger, capacity: 100n * CKB }));
+  made.outputsData.push("0x");
+  setSendLimitRecord(made, 1, RECORD);
+
+  const pending = await sendLimitHead(world.client, { litPublicKey: publicKey }, [{ transaction: made, status: "pending" }]);
+  assert.equal(pending?.outPoint.txHash, made.hash());
+  assert.equal(pending?.recordEntriesBytes, 0, "a genesis has no record");
+  world.add(made);
+  const committed = await sendLimitHead(world.client, { litPublicKey: publicKey }, []);
+  assert.equal(committed?.outPoint.txHash, made.hash());
+  assert.equal(committed?.recordEntriesBytes, 0);
+});
+
 test("the record is read only from the account's own send-limit input, never a co-signer's witness (audit L12)", async () => {
   // A co-signer's witness isn't covered by the account's signature: a smaller record-shaped one there would shrink
   // the room later sends reserve for the record.
