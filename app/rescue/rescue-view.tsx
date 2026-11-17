@@ -259,6 +259,7 @@ export function RescueView() {
                 <div key={`${token.typeHash}:${index}`}><dt>Token</dt><dd>{token.amountText} <span className="rescue-muted">in a cell holding {ckb(token.capacity)}</span></dd></div>
               ))}
               <div><dt>Network fee</dt><dd>{ckb(plan.fee)}</dd></div>
+              {plan.plainLeft > 0n && <div><dt>CKB staying</dt><dd>{ckb(plan.plainLeft)} <span className="rescue-muted">too little for a cell of its own at the destination; send more CKB to this address and rescue it later</span></dd></div>}
               <div><dt>Signed by</dt><dd>{plan.entry.backup.kind === "evm" ? "EVM wallet" : "JoyID"} <span className="mono">{plan.entry.backup.address}</span></dd></div>
               <div><dt>Network</dt><dd>{RESCUE_NETWORKS[network].label}</dd></div>
             </dl>

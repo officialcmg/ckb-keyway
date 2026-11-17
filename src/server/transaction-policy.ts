@@ -26,9 +26,13 @@ const CLUSTER_CODE_HASHES = new Set([
 
 /**
  * A token's net change for the account: `amount` is signed raw units, `amountText` is for people ("-25 RUSD"),
- * `id` is a short form of `asset`, the token's type script hash.
+ * `id` is a short form of `asset`, the token's type script hash, for keys only: people are shown `asset` whole.
  */
 export type TokenEffect = { id: string; asset: string; standard: "xUDT" | "sUDT"; amount: string; amountText: string };
+/**
+ * A Spore or Cluster cell's change for the account. `id` is its whole type args, the NFT's ID: a shortened one could
+ * be ground to match another NFT's.
+ */
 export type NftEffect = { kind: "Spore" | "Cluster"; id: string; change: "sent" | "received" | "minted" | "burned" };
 export type DaoEffect = { action: "deposit" | "withdrawal request" | "withdrawal"; amountCkb: string };
 export type Recipient = {
@@ -36,9 +40,14 @@ export type Recipient = {
   kind: "wallet" | "contract" | "Fiber channel";
   walletType?: string;
   ckb: string;
-  tokens: Array<{ id: string; amount: string; amountText: string }>;
+  /** Per token, by `asset`, its whole type script hash (`id` is a short form of it, for keys only). */
+  tokens: Array<{ id: string; asset: string; amount: string; amountText: string }>;
+  /** "Spore <whole type args>" or "Cluster <whole type args>". */
   nfts: string[];
+  /** Any other typed cells it gets (Nervos DAO, Type ID, scripts KeyWay can't read), per whole type script hash. */
+  cells: Array<{ typeHash: string; cells: number }>;
 };
+export type CellChange = { typeHash: string; given: number; changed: number; received: number };
 export type CellSummary = { lock: string; type?: string; capacityCkb: string; dataBytes: number };
 
 export type TransactionPreview = {
@@ -51,8 +60,15 @@ export type TransactionPreview = {
   tokens: TokenEffect[];
   nfts: NftEffect[];
   dao: DaoEffect[];
+  /**
+   * The account's other typed cells (Type ID, Unique, scripts KeyWay can't read, and NFTs beyond what `nfts` lists),
+   * per whole type script hash: how many it gives up (sends or destroys), how many it keeps with other data, and how
+   * many it gets. Destroying one cell must read differently from destroying another, or from changing it.
+   */
+  cellChanges: CellChange[];
   recipients: Recipient[];
-  unrecognized: Array<{ codeHash: string; cells: number }>;
+  /** By whole code hash and hash type: the same code hash with another hash type is another program. */
+  unrecognized: Array<{ codeHash: string; hashType: string; cells: number }>;
   otherSigners: number;
   details: { inputs: CellSummary[]; outputs: CellSummary[] };
   transactionHash: string;
@@ -280,13 +296,13 @@ export function describeTransaction(
   const nfts: NftEffect[] = [];
   for (const { key } of inputNfts.filter((item) => item.own)) {
     const after = outputNfts.find((item) => item.key!.id === key!.id);
-    if (!after) nfts.push({ kind: key!.kind, id: shortHash(key!.id), change: "burned" });
-    else if (!after.own) nfts.push({ kind: key!.kind, id: shortHash(key!.id), change: "sent" });
+    if (!after) nfts.push({ kind: key!.kind, id: key!.id, change: "burned" });
+    else if (!after.own) nfts.push({ kind: key!.kind, id: key!.id, change: "sent" });
   }
   for (const { key } of outputNfts.filter((item) => item.own)) {
     if (inputNfts.some((item) => item.own && item.key!.id === key!.id)) continue;
     const existed = inputNfts.some((item) => item.key!.id === key!.id);
-    nfts.push({ kind: key!.kind, id: shortHash(key!.id), change: existed ? "received" : "minted" });
+    nfts.push({ kind: key!.kind, id: key!.id, change: existed ? "received" : "minted" });
   }
 
   // Nervos DAO: deposit cells hold 8 zero bytes; withdrawal requests hold the deposit block number.
@@ -302,14 +318,17 @@ export function describeTransaction(
     }
   }
 
-  // Anything carrying a type script we can't explain, on the account's cells or on any output.
-  const unrecognizedCounts = new Map<string, number>();
+  // Anything carrying a type script we can't explain, on the account's cells or on any output, by its whole code
+  // hash: two scripts can share a short form.
+  const unrecognizedCounts = new Map<string, { codeHash: string; hashType: string; cells: number }>();
   for (const cell of [...ownInputs, ...outputs]) {
     if (typeKind(cell.cellOutput.type) !== "unknown") continue;
-    const codeHash = shortHash(cell.cellOutput.type!.codeHash);
-    unrecognizedCounts.set(codeHash, (unrecognizedCounts.get(codeHash) ?? 0) + 1);
+    const { codeHash, hashType } = cell.cellOutput.type!;
+    const entry = unrecognizedCounts.get(`${codeHash}:${hashType}`) ?? { codeHash, hashType, cells: 0 };
+    entry.cells += 1;
+    unrecognizedCounts.set(`${codeHash}:${hashType}`, entry);
   }
-  const unrecognized = [...unrecognizedCounts].map(([codeHash, cells]) => ({ codeHash, cells }));
+  const unrecognized = [...unrecognizedCounts.values()];
 
   // Recipients: every other lock that receives an output.
   const recipients = new Map<string, Recipient>();
@@ -324,44 +343,61 @@ export function describeTransaction(
       ckb: "0",
       tokens: [],
       nfts: [],
+      cells: [],
     } satisfies Recipient;
     recipient.ckb = formatCkb(parseCkb(recipient.ckb) + cell.cellOutput.capacity);
     const kind = typeKind(cell.cellOutput.type);
     if (kind === "xUDT" || kind === "sUDT") {
+      // One row per token by its whole type script hash: two tokens can share a short form.
       const asset = cell.cellOutput.type!.hash();
-      const id = shortHash(asset);
-      const existing = recipient.tokens.find((token) => token.id === id);
+      const existing = recipient.tokens.find((token) => token.asset === asset);
       const amount = udtAmount(cell.outputData) + BigInt(existing?.amount ?? 0);
-      const entry = { id, amount: amount.toString(), amountText: formatAsset(amount, asset) };
+      const entry = { id: shortHash(asset), asset, amount: amount.toString(), amountText: formatAsset(amount, asset) };
       if (existing) Object.assign(existing, entry);
       else recipient.tokens.push(entry);
     }
-    if (kind === "Spore" || kind === "Cluster") recipient.nfts.push(`${kind} ${shortHash(cell.cellOutput.type!.args)}`);
+    else if (kind === "Spore" || kind === "Cluster") recipient.nfts.push(`${kind} ${cell.cellOutput.type!.args}`);
+    else if (kind !== "none") {
+      // By the whole type script hash, so two such cells going to each other's recipient read differently.
+      const typeHash = cell.cellOutput.type!.hash();
+      const existing = recipient.cells.find((entry) => entry.typeHash === typeHash);
+      if (existing) existing.cells += 1;
+      else recipient.cells.push({ typeHash, cells: 1 });
+    }
     recipients.set(key, recipient);
   }
 
   const summarize = (cell: { cellOutput: ccc.CellOutput; outputData: ccc.Hex }): CellSummary => {
     const kind = typeKind(cell.cellOutput.type);
     return {
-      lock: isOwn(cell) ? "you" : shortHash(cell.cellOutput.lock.hash()),
+      lock: isOwn(cell) ? "you" : cell.cellOutput.lock.hash(),
       ...(cell.cellOutput.type ? {
         type: isRecoveryList(cell.cellOutput.type) ? RECOVERY_LIST
-          : kind === "unknown" || kind === "quiet" ? shortHash(cell.cellOutput.type.codeHash) : kind === "dao" ? "Nervos DAO" : kind,
+          : kind === "unknown" || kind === "quiet" ? `${cell.cellOutput.type.codeHash} (${cell.cellOutput.type.hashType})` : kind === "dao" ? "Nervos DAO" : kind,
       } : {}),
       capacityCkb: formatCkb(cell.cellOutput.capacity),
       dataBytes: (cell.outputData.length - 2) / 2,
     };
   };
+  const leavingCells = cellsLeaving(ownInputs, ownOutputs, countsPerCell);
+  // NFTs `nfts` already lists as sent, burned, received or minted aren't counted again; a kept one with new data is.
+  const nftHashes = new Set<string>([...ownInputs, ...ownOutputs].filter((cell) => {
+    const key = nftKey(cell);
+    return key && nfts.some(({ id }) => id === key.id);
+  }).map((cell) => cell.cellOutput.type!.hash()));
+  const cellChanges = typedCellChanges(ownInputs, ownOutputs, countsPerCell)
+    .map((change) => (nftHashes.has(change.typeHash) ? { ...change, given: 0, received: 0 } : change))
+    .filter(({ given, changed, received }) => given + changed + received > 0);
 
   return {
     outflowShannons: leaving,
-    tokensLeaving: [...tokenTotals.values()].some(({ delta }) => delta < 0n) || cellsLeaving(ownInputs, ownOutputs, countsPerCell).length > 0,
+    tokensLeaving: [...tokenTotals.values()].some(({ delta }) => delta < 0n) || leavingCells.length > 0,
     // Other typed cells (NFTs, Type ID and Unique cells, scripts KeyWay can't read) leave as "tokens" counted per
     // cell (and whenever one doesn't come back unchanged). Like a token, they have no limit unless the user sets an
     // amount for their type script hash, as the Lit Action reads the send-limit cell KeyWay writes.
     tokenOutflows: [
       ...[...tokenTotals].filter(([, { delta }]) => delta < 0n).map(([asset, { delta }]) => ({ asset, amount: -delta })),
-      ...cellsLeaving(ownInputs, ownOutputs, countsPerCell),
+      ...leavingCells,
     ],
     preview: {
       network: "CKB testnet",
@@ -371,6 +407,7 @@ export function describeTransaction(
       tokens,
       nfts,
       dao,
+      cellChanges,
       recipients: [...recipients.values()],
       unrecognized,
       otherSigners,
@@ -381,19 +418,35 @@ export function describeTransaction(
 }
 
 /**
- * Lines for the confirmation email, written from the backend's own decoding. What happens to the account's assets
- * comes before the recipients, so a long list of recipients can't push it out of the email. Each recipient is shown
- * by its whole address: the start and the checksum are all two look-alike addresses need to share.
+ * Lines for the confirmation email, written from the backend's own decoding: what happens to the account's assets,
+ * then each recipient with what it gets. Each recipient is shown by its whole address: the start and the checksum are
+ * all two look-alike addresses need to share. The email shows every line or isn't sent (see email-template.ts).
  */
 export function previewSummaryLines(preview: TransactionPreview): string[] {
-  const lines = [`Send ${preview.sendingCkb} CKB`, `Network fee ${preview.feeCkb} CKB`, `Network ${preview.network}`];
-  for (const token of preview.tokens) lines.push(`Token ${token.amountText} (${token.standard} ${token.id})`);
+  const lines = [`Send ${preview.sendingCkb} CKB`, ...(preview.receivingCkb !== "0" ? [`Receive ${preview.receivingCkb} CKB`] : []), `Network fee ${preview.feeCkb} CKB`, `Network ${preview.network}`];
+  // Tokens and NFTs are named by their whole ID: a shortened one could be ground to match another's.
+  for (const token of preview.tokens) lines.push(`Token ${token.amountText} (${token.standard} ${token.asset})`);
   for (const nft of preview.nfts) lines.push(`${nft.kind} ${nft.id}: ${nft.change}`);
   for (const action of preview.dao) lines.push(`Nervos DAO ${action.action}: ${action.amountCkb} CKB`);
-  for (const script of preview.unrecognized) lines.push(`Unrecognized script ${script.codeHash} (${script.cells} cells)`);
+  const cells = (count: number) => `${count} ${count === 1 ? "cell" : "cells"}`;
+  for (const { typeHash, given, changed, received } of preview.cellChanges) {
+    if (given) lines.push(`Gives up ${cells(given)} of type ${typeHash}`);
+    if (changed) lines.push(`Changes the data of ${cells(changed)} of type ${typeHash} it keeps`);
+    if (received) lines.push(`Gets ${cells(received)} of type ${typeHash}`);
+  }
+  for (const script of preview.unrecognized) lines.push(`Unrecognized script ${script.codeHash} (${script.hashType}, ${script.cells} cells)`);
   if (preview.details.outputs.some(({ type }) => type === RECOVERY_LIST)) lines.push("Writes the account's recovery list");
-  // The amount comes before the address, so an address too long for the email's line can't push it out.
-  for (const recipient of preview.recipients) lines.push(`${recipient.ckb} CKB to ${recipient.address} (${recipient.kind})`);
+  // Each recipient with everything it gets, every asset by its whole ID: the same assets going to each other's
+  // recipient must read differently.
+  for (const recipient of preview.recipients) {
+    const assets = [
+      `${recipient.ckb} CKB`,
+      ...recipient.tokens.map(({ asset, amountText }) => (amountText.includes(asset) ? amountText : `${amountText} (token ${asset})`)),
+      ...recipient.nfts,
+      ...recipient.cells.map(({ typeHash, cells }) => `${cells} ${cells === 1 ? "cell" : "cells"} of type ${typeHash}`),
+    ];
+    lines.push(`${assets.join(", ")} to ${recipient.address} (${recipient.kind})`);
+  }
   return lines;
 }
 
@@ -429,6 +482,35 @@ function sum(values: readonly bigint[]): bigint {
 
 function maxBig(a: bigint, b: bigint): bigint {
   return a > b ? a : b;
+}
+
+/**
+ * Per type script hash of the account's typed cells that count one per cell (see countsPerCell): how many it gives
+ * up, how many of those it keeps come back with other data, and how many it gets.
+ */
+function typedCellChanges(
+  ownInputs: Array<{ cellOutput: ccc.CellOutput; outputData: ccc.Hex }>,
+  ownOutputs: Array<{ cellOutput: ccc.CellOutput; outputData: ccc.Hex }>,
+  countsPerCell: (cell: { cellOutput: ccc.CellOutput; outputData: ccc.Hex }) => boolean,
+): CellChange[] {
+  const byType = new Map<string, { count: number; byData: Map<string, number> }>();
+  const count = (cell: { cellOutput: ccc.CellOutput; outputData: ccc.Hex }, sign: 1 | -1) => {
+    if (!countsPerCell(cell)) return;
+    const typeHash = cell.cellOutput.type!.hash();
+    const entry = byType.get(typeHash) ?? { count: 0, byData: new Map<string, number>() };
+    entry.count += sign;
+    const data = cell.outputData.toLowerCase();
+    entry.byData.set(data, (entry.byData.get(data) ?? 0) + sign);
+    byType.set(typeHash, entry);
+  };
+  ownInputs.forEach((cell) => count(cell, 1));
+  ownOutputs.forEach((cell) => count(cell, -1));
+  return [...byType].map(([typeHash, { count: left, byData }]) => {
+    // Inputs with no output of the same data: each was given up or came back changed.
+    const unmatched = [...byData.values()].reduce((total, cells) => total + Math.max(cells, 0), 0);
+    const given = Math.max(left, 0);
+    return { typeHash, given, changed: unmatched - given, received: Math.max(-left, 0) };
+  });
 }
 
 /**

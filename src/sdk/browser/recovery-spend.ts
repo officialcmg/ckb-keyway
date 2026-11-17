@@ -1,7 +1,7 @@
 import * as ccc from "@ckb-ccc/core";
 import type { OmnilockDeployment } from "./account-lock";
 import type { EthereumProvider } from "./account-recovery";
-import { approvalNetworkByte, recoveryApprovalText, rescueApproval } from "./recovery-approval";
+import { approvalNetworkByte, recoveryApprovalText, rescueApproval, type RescueInputCell } from "./recovery-approval";
 import { accountSalt, evmApprovalSignature, EVM_APPROVAL_SIGNATURE_LENGTH, evmPersonalSignAddress, evmPreimage, execAuth, joyIdMainKey, joyIdPreimage, normalizeEvmAddress, omnilockAdminWitnessLock, verifierCellDep } from "./recovery-backups";
 import type { RecoveryListEntry } from "./recovery-list";
 import { whitelistTree } from "./recovery-smt";
@@ -12,7 +12,8 @@ import { MAX_WEBAUTHN_SIGNATURE, parseJoyIdSignature, verifyWebAuthn, webAuthnSi
  * account's Omnilock `lock`, `auths` is the account's backup list (`readRecoveryList`), `entry` the backup that
  * signs (`recoveryListEntry`), its identity salted with the account's salt (the AdminList type hash in `lock`). The witness carries the backup's identity and its SMT proof against the list, so the AdminList must be
  * a cell dep (it is added if missing). The backup signs the readable approval (`recoveryApprovalText`), which its
- * verifier rebuilds from the transaction, so the transaction must be a rescue: every output to one address.
+ * verifier rebuilds from the transaction, so the transaction must be a rescue: every output to one address, and
+ * the account's token cells moved there unchanged.
  */
 export type RecoverySpend = {
   client: ccc.Client;
@@ -24,8 +25,8 @@ export type RecoverySpend = {
   entry: RecoveryListEntry;
   /** The AdminList cell's out point, added as a cell dep. */
   adminList: ccc.OutPointLike;
-  /** The inputs' total capacity, from cells checked against the transactions that created them. */
-  inputCapacity: bigint;
+  /** The transaction's input cells in order, checked against the transactions that created them. */
+  inputCells: readonly RescueInputCell[];
 };
 
 /** The signature length each kind of backup fills: one passkey prompt always fits Omnilock's 1024 bytes. */
@@ -52,7 +53,7 @@ export async function prepareRecoverySpend(transactionLike: ccc.TransactionLike,
   const lock = ccc.Script.from(spend.lock);
   const info = await transaction.getSignHashInfo(lock, spend.client);
   if (!info) throw new Error("The transaction spends nothing from this account");
-  const text = recoveryApprovalText(spend.client, rescueApproval(transaction, lock, spend.inputCapacity), info.message);
+  const text = recoveryApprovalText(spend.client, rescueApproval(transaction, lock, spend.inputCells), info.message);
   return { transaction, text, sighash: info.message, position: info.position };
 }
 

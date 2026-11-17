@@ -35,8 +35,8 @@ function harness(outflow: bigint, tokenOutflows: Array<{ asset: string; amount: 
       script,
       groups: [{ script, kind: "secp256k1" }],
       preview: {
-        network: "CKB testnet", sendingCkb: "100", receivingCkb: "0", feeCkb: "0.00001", tokens: [], nfts: [], dao: [],
-        recipients: [{ address: "ckt1qtest", kind: "wallet", walletType: "standard", ckb: "100", tokens: [], nfts: [] }],
+        network: "CKB testnet", sendingCkb: "100", receivingCkb: "0", feeCkb: "0.00001", tokens: [], nfts: [], dao: [], cellChanges: [],
+        recipients: [{ address: "ckt1qtest", kind: "wallet", walletType: "standard", ckb: "100", tokens: [], nfts: [], cells: [] }],
         unrecognized: [], otherSigners: 0, details: { inputs: [], outputs: [] }, transactionHash: transaction.hash(),
       },
       outflowShannons: outflow,
@@ -126,6 +126,37 @@ test("general signing binds approvals, email codes and threshold changes", { ski
     await assert.rejects(() => transactionSigning(context, { operation: "sign", transaction: tx(3), confirmationNonce: preview.confirmationNonce, emailCode: wrong }), /isn't right/);
     const signed = await transactionSigning(context, { operation: "sign", transaction: tx(3), confirmationNonce: preview.confirmationNonce, emailCode: codeFrom() });
     assert.ok(signed);
+  });
+
+  await t.test("a transaction too long to show in one confirmation email is refused before any code", async () => {
+    const { context, emails } = harness(100n * CKB);
+    await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (100n * CKB).toString() });
+    const previewOf = context.preview!;
+    context.preview = async (wallet, input) => {
+      const validated = await previewOf(wallet, input);
+      const [recipient] = validated.preview.recipients;
+      validated.preview.recipients = Array.from({ length: 600 }, (_, index) => ({ ...recipient, address: `ckt1qtest${index}` }));
+      return validated;
+    };
+    await assert.rejects(() => transactionSigning(context, { operation: "preview", transaction: tx(77) }), /too much to show in one confirmation email/);
+    assert.equal(emails.length, 0);
+  });
+
+  await t.test("a code is never stored, counted or sent for a summary too long for one email", async () => {
+    const { context, emails } = harness(100n * CKB);
+    let limited = 0;
+    context.rateLimit = async () => { limited += 1; return { allowed: true, retryAfter: null }; };
+    const lines = Array.from({ length: 600 }, (_, index) => `100 CKB to ckt1qtest${index} (wallet)`);
+    const nonce = await issueRequest(context.user, "transaction", `0x${"cd".repeat(32)}`, { lines }, true);
+    await assert.rejects(() => sendCode(context, "transaction", nonce, "Confirm a transaction", lines), /too much to show in one confirmation email/);
+    const sql = await database();
+    const [row] = await sql<Array<{ email_code_hash: string | null }>>`select email_code_hash from keyway_v2_signature_requests where nonce = ${nonce}`;
+    assert.equal(row.email_code_hash, null);
+    assert.equal(emails.length, 0);
+    assert.equal(limited, 0, "no email allowance used");
+    // The same request with a summary that fits gets its code.
+    await sendCode(context, "transaction", nonce, "Confirm a transaction", lines.slice(0, 10));
+    assert.equal(emails.length, 1);
   });
 
   await t.test("a token with no daily amount of its own has no limit, even with a CKB amount set", async () => {

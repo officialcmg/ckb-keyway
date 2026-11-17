@@ -132,7 +132,10 @@ test("parses backup lists", () => {
   assert.throws(() => parseBackups([{ kind: "ckb", address }]), /EVM wallet or a JoyID/);
   assert.throws(() => parseBackups([{ kind: "evm", address: "0x1234" }]), /20-byte/);
   assert.throws(() => parseBackups(Array.from({ length: 9 }, () => ({ kind: "evm", address: evmWallet().address }))), /At most 8/);
-  assert.match(describeBackup({ kind: "evm", address }), /^EVM wallet 0x[0-9a-f]{8}…[0-9a-f]{6}$/);
+  // Named by the whole address, never a start and checksum someone could grind a look-alike to match.
+  assert.equal(describeBackup({ kind: "evm", address }), `EVM wallet ${address}`);
+  const joy = "ckt1qrfrwcdnvssswdwpn3s9v8fp87emat306ctjwsm3nmlkjg8qyza2cqgqqxhnyynqdn0w3ukfvnlz44tgcusk2p6ecurrdqmx";
+  assert.equal(describeBackup({ kind: "joyid", address: joy }), `JoyID ${joy}`);
 });
 
 test("accepts an EVM backup only with its EIP-191 signature over this account's challenge", async () => {

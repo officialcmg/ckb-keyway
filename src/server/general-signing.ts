@@ -5,7 +5,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import type { User } from "./auth-user.ts";
 import type { TransactionSql } from "postgres";
 import { database, type DatabaseSql } from "./database.ts";
-import { createConfirmationEmailTemplate } from "./email-template.ts";
+import { CONFIRMATION_TOO_LONG, confirmationEmailFits, createConfirmationEmailTemplate } from "./email-template.ts";
 import { serializeTransaction, signAccountGroups, signingGroups, type SigningGroup } from "./funding-transaction.ts";
 import { accountLocks, secp256k1Lock } from "../sdk/browser/account-lock.ts";
 import { DEFAULT_DAILY_LIMIT_SHANNONS, SEND_LIMIT_OFFER_MINIMUM, settingsFromDailyAmounts, type SendLimitHead } from "../sdk/browser/send-limits.ts";
@@ -64,6 +64,8 @@ export async function transactionSigning(context: SigningContext, body: Record<s
     // Lit's rule, or the server's own (which also counts Fiber payments): either one asks for the code.
     const requiresEmailCode = Boolean(plan?.needsCode) || await outflowNeedsEmailCode(context.user, transactionOutflow(validated));
     const summary = { lines: previewSummaryLines(validated.preview), ...(plan ? { sendLimits: { kind: plan.limits, litCode, ...(plan.record ? { record: plan.record, recordIndex: plan.recordIndex } : {}) } } : {}) };
+    // KeyWay's code is only sent for a summary the email shows whole: refused now, rather than when the code is asked for.
+    if (requiresEmailCode && !litCode && !confirmationEmailFits(context.appName, "Confirm a transaction", summary.lines)) throw new Error(CONFIRMATION_TOO_LONG);
     const confirmationNonce = await issueRequest(context.user, "transaction", digest, summary, requiresEmailCode);
     return { preview: validated.preview, confirmationNonce, requiresEmailCode };
   }
@@ -439,8 +441,9 @@ export function weakens(before: DailyAmounts, after: DailyAmounts): boolean {
   });
 }
 
+/** A token by its whole ID (type script hash): a shortened one could be ground to match another token's. */
 function assetName(asset: string): string {
-  return asset === "ckb" ? "CKB" : `token ${asset.slice(0, 10)}…${asset.slice(-6)}`;
+  return asset === "ckb" ? "CKB" : `token ${asset}`;
 }
 
 function describeAmount(amounts: DailyAmounts, asset: string): string {
@@ -541,10 +544,12 @@ export async function consumeRequest(user: User, purpose: Purpose, nonce: string
  * email limit bounds how often that can happen.
  */
 export async function sendCode(context: Pick<SigningContext, "user" | "appName" | "email" | "sendEmail" | "rateLimit">, purpose: Purpose, nonce: string, heading: string, lines: string[], options: { limited?: boolean } = {}): Promise<string> {
+  const code = randomInt(0, 1_000_000).toString().padStart(6, "0");
+  // Built first: a summary too long for one email is refused here, before the request gets a code.
+  const template = createConfirmationEmailTemplate(context.appName, code, heading, lines);
   const sql = await database();
   if (overFailureLimit(await codeFailures(sql, context.user))) throw new Error(CODE_FAILURES_MESSAGE);
   if (!options.limited) await codeLimit(context);
-  const code = randomInt(0, 1_000_000).toString().padStart(6, "0");
   const rows = await sql`
     update keyway_v2_signature_requests
     set email_code_hash = ${codeHash(nonce, code)}, email_code_expires_at = now() + ${`${CODE_TTL_MS} milliseconds`}::interval, email_attempts = 0,
@@ -553,7 +558,6 @@ export async function sendCode(context: Pick<SigningContext, "user" | "appName" 
   `;
   if (!rows[0]) throw new Error(REQUEST_EXPIRED);
   const to = await context.email();
-  const template = createConfirmationEmailTemplate(context.appName, code, heading, lines);
   await context.sendEmail(to, template, `keyway-step-up/${nonce}/${Date.now()}`);
   return to;
 }

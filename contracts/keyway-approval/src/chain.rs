@@ -1,6 +1,6 @@
 //! Reading the rescue the text describes from the transaction being verified. Omnilock execs the verifier in
 //! the same script group, so the running script is the account's Omnilock.
-use crate::{account_salt, approval_text, parse_script, ApprovalError, Network, Rescue};
+use crate::{account_salt, approval_text, parse_script, ApprovalError, Network, Rescue, MAX_TOKEN_CELLS};
 use ckb_std::ckb_constants::{CellField, Source};
 use ckb_std::error::SysError;
 use ckb_std::syscalls::{load_cell_by_field, load_cell_data, load_script, load_script_hash};
@@ -39,7 +39,28 @@ pub fn running_account_salt() -> Result<[u8; 32], ApprovalError> {
     account_salt(parsed.args)
 }
 
+
+/// A cell's type script hash and data hash, or None when it has no type script.
+fn token_key(index: usize, source: Source) -> Result<Option<[u8; 64]>, ApprovalError> {
+    let mut key = [0u8; 64];
+    match load_cell_by_field(&mut key[..32], 0, index, source, CellField::TypeHash) {
+        Ok(_) => {}
+        Err(SysError::ItemMissing) => return Ok(None),
+        Err(_) => return Err(ApprovalError::Syscall),
+    }
+    load_cell_by_field(&mut key[32..], 0, index, source, CellField::DataHash).map_err(|_| ApprovalError::Syscall)?;
+    Ok(Some(key))
+}
+
 /// Builds the approval text for this transaction into `out`, refusing anything that isn't a rescue.
+///
+/// The text counts token cells rather than naming them, so the token cells must be exactly the account's own,
+/// moved unchanged: each output with a type script has the type script hash and data hash of a distinct input of
+/// the account, each of the account's inputs with a type script is one of them, and the outputs of each kind
+/// (same type script hash and data hash) hold no more CKB than the account's inputs of that kind did. Anything
+/// else (a token cell changed, left behind to be burned, made under a type script the account didn't hold, or
+/// given more CKB than it held, which its type script could then keep) is refused (111). The rescued CKB beyond
+/// what the token cells held goes to plain cells, which nothing but the destination's lock controls.
 pub fn rescue_text(network: Network, sighash: &[u8; 32], out: &mut [u8]) -> Result<usize, ApprovalError> {
     let mut account = [0u8; 32];
     load_script_hash(&mut account, 0).map_err(|_| ApprovalError::Syscall)?;
@@ -48,7 +69,12 @@ pub fn rescue_text(network: Network, sighash: &[u8; 32], out: &mut [u8]) -> Resu
         return Err(ApprovalError::Shape);
     }
     let mut ckb = 0u128;
-    let mut token_cells = 0u64;
+    let mut tokens = [[0u8; 64]; MAX_TOKEN_CELLS];
+    // Each token output's capacity, and the capacity of the account's input it was matched with (0 until then).
+    let mut put = [0u64; MAX_TOKEN_CELLS];
+    let mut held = [0u64; MAX_TOKEN_CELLS];
+    let mut moved = [false; MAX_TOKEN_CELLS];
+    let mut token_cells = 0;
     let mut index = 0;
     while let Some(value) = capacity(index, Source::Output)? {
         let mut lock_hash = [0u8; 32];
@@ -57,15 +83,20 @@ pub fn rescue_text(network: Network, sighash: &[u8; 32], out: &mut [u8]) -> Resu
             return Err(ApprovalError::Shape);
         }
         ckb += value as u128;
-        let mut type_hash = [0u8; 32];
-        match load_cell_by_field(&mut type_hash, 0, index, Source::Output, CellField::TypeHash) {
-            Ok(_) => token_cells += 1,
-            Err(SysError::ItemMissing) => match load_cell_data(&mut [], 0, index, Source::Output) {
+        match token_key(index, Source::Output)? {
+            Some(key) => {
+                if token_cells == MAX_TOKEN_CELLS {
+                    return Err(ApprovalError::Shape);
+                }
+                tokens[token_cells] = key;
+                put[token_cells] = value;
+                token_cells += 1;
+            }
+            None => match load_cell_data(&mut [], 0, index, Source::Output) {
                 Ok(0) => {}
                 Ok(_) | Err(SysError::LengthNotEnough(_)) => return Err(ApprovalError::Shape),
                 Err(_) => return Err(ApprovalError::Syscall),
             },
-            Err(_) => return Err(ApprovalError::Syscall),
         }
         index += 1;
     }
@@ -73,11 +104,37 @@ pub fn rescue_text(network: Network, sighash: &[u8; 32], out: &mut [u8]) -> Resu
     let mut index = 0;
     while let Some(value) = capacity(index, Source::Input)? {
         inputs += value as u128;
+        let mut lock_hash = [0u8; 32];
+        field(&mut lock_hash, index, Source::Input, CellField::LockHash)?;
+        if lock_hash == account {
+            if let Some(key) = token_key(index, Source::Input)? {
+                let found = (0..token_cells).find(|&at| !moved[at] && tokens[at] == key).ok_or(ApprovalError::Shape)?;
+                moved[found] = true;
+                held[found] = value;
+            }
+        }
         index += 1;
+    }
+    if moved[..token_cells].iter().any(|&done| !done) {
+        return Err(ApprovalError::Shape);
+    }
+    // Per kind of token cell, from its first output: the outputs hold no more CKB than the inputs did.
+    for first in 0..token_cells {
+        if (0..first).any(|at| tokens[at] == tokens[first]) {
+            continue;
+        }
+        let (mut outputs, mut inputs) = (0u128, 0u128);
+        for at in (first..token_cells).filter(|&at| tokens[at] == tokens[first]) {
+            outputs += put[at] as u128;
+            inputs += held[at] as u128;
+        }
+        if outputs > inputs {
+            return Err(ApprovalError::Shape);
+        }
     }
     let fee = inputs.checked_sub(ckb).ok_or(ApprovalError::Shape)?;
     let mut script = [0u8; MAX_SCRIPT];
     let length = field(&mut script, 0, Source::Output, CellField::Lock)?.ok_or(ApprovalError::Shape)?;
     let destination = parse_script(&script[..length]).ok_or(ApprovalError::Shape)?;
-    approval_text(network, &Rescue { destination, ckb, token_cells, fee }, sighash, out)
+    approval_text(network, &Rescue { destination, ckb, token_cells: token_cells as u64, fee }, sighash, out)
 }
