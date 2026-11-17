@@ -23,6 +23,15 @@ export async function recordPendingTransaction(userId: string, transaction: ccc.
   `;
 }
 
+/** A transaction KeyWay signed for this account, by its hash (which leaves out witnesses), if it is still kept. */
+export async function signedTransaction(userId: string, hash: string): Promise<ccc.TransactionLike | undefined> {
+  const sql = await database();
+  const [row] = await sql<Array<{ transaction: ccc.TransactionLike }>>`
+    select transaction from keyway_v2_pending_transactions where user_id = ${userId} and transaction_hash = ${hash}
+  `;
+  return row?.transaction;
+}
+
 export type TransactionStatus = "pending" | "proposed" | "committed" | "rejected" | "unknown" | string;
 export type StatusOf = (hash: string) => Promise<TransactionStatus | undefined>;
 

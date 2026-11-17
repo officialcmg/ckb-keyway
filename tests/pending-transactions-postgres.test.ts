@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
 import { database } from "../src/server/database.ts";
-import { listPendingTransactions, recordPendingTransaction, UNSENT_GRACE_MS } from "../src/server/pending-transactions.ts";
+import { listPendingTransactions, recordPendingTransaction, signedTransaction, UNSENT_GRACE_MS } from "../src/server/pending-transactions.ts";
 
 const enabled = Boolean(process.env.KEYWAY_AUTH_TEST_DATABASE_URL);
 const lock = ccc.Script.from({ codeHash: `0x${"9b".repeat(32)}`, hashType: "type", args: "0x" });
@@ -33,5 +33,20 @@ test("pending transactions are listed in signing order until the node reports th
   assert.equal((await listPendingTransactions(user, async (hash) => status.get(hash), later)).length, 1);
   // A node that can't answer keeps the entry.
   assert.equal((await listPendingTransactions(user, async () => { throw new Error("node down"); })).length, 1);
+  t.after(async () => { await sql`delete from keyway_v2_pending_transactions where user_id in (${user}, ${other})`; });
+});
+
+test("a signed transaction is found by its hash for its own account only, with the witnesses KeyWay signed", { skip: !enabled }, async (t) => {
+  process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
+  const sql = await database();
+  const user = crypto.randomUUID();
+  const other = crypto.randomUUID();
+  const signed = ccc.Transaction.from({ ...tx(7), witnesses: ["0xabcd"] });
+  await recordPendingTransaction(user, signed);
+  // The hash leaves out witnesses, so a copy with other witnesses finds KeyWay's.
+  const found = await signedTransaction(user, ccc.Transaction.from({ ...tx(7), witnesses: ["0xdead"] }).hash());
+  assert.deepEqual(ccc.Transaction.from(found!).witnesses, ["0xabcd"]);
+  assert.equal(await signedTransaction(other, signed.hash()), undefined);
+  assert.equal(await signedTransaction(user, tx(8).hash()), undefined);
   t.after(async () => { await sql`delete from keyway_v2_pending_transactions where user_id in (${user}, ${other})`; });
 });

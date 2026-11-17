@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import * as ccc from "@ckb-ccc/core";
+import { normalizeCkbTransactionForCcc } from "@fiber-pay/sdk/browser";
 import { managedNodeRequest, parseManagedNodeAssignments } from "../src/server/managed-node.ts";
 
 const ownLock = async () => ({ code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" }) as never;
@@ -122,6 +124,7 @@ test("managed funding strips older SDK input caches before native RPC submission
       outputData: "0x",
     }],
   };
+  const signed = ccc.Transaction.from(normalizeCkbTransactionForCcc(cached) as never);
   await managedNodeRequest("older-sdk-test", {
     operation: "submit-channel-funding",
     params: { channel_id: `0x${"33".repeat(32)}`, signed_funding_tx: cached },
@@ -132,7 +135,30 @@ test("managed funding strips older SDK input caches before native RPC submission
       assert.deepEqual(params.signed_funding_tx.witnesses, ["0x1234"]);
       return node.submitSignedFundingTx();
     },
-  } as never);
+  } as never, undefined, async (hash) => hash === signed.hash() ? signed : undefined);
+});
+
+test("only channel funding KeyWay signed for the account reaches the node, exactly as KeyWay signed it", async () => {
+  const unsigned = {
+    version: "0x0", cell_deps: [], header_deps: [], outputs: [], outputs_data: [], witnesses: ["0x"],
+    inputs: [{ since: "0x0", previous_output: { tx_hash: `0x${"11".repeat(32)}`, index: "0x0" } }],
+  };
+  // What KeyWay signed: the same transaction, with the account's real witness.
+  const signed = ccc.Transaction.from({ ...normalizeCkbTransactionForCcc(unsigned), witnesses: ["0xabcd"] } as never);
+  const submitted: Array<{ witnesses: string[] }> = [];
+  const recording = { ...node, submitSignedFundingTx: async (params: { signed_funding_tx: { witnesses: string[] } }) => { submitted.push(params.signed_funding_tx); return node.submitSignedFundingTx(); } };
+  const submit = (transaction: unknown, signedFunding?: (hash: string) => Promise<ccc.Transaction | undefined>) => managedNodeRequest("signed-funding-test", {
+    operation: "submit-channel-funding",
+    params: { channel_id: `0x${"33".repeat(32)}`, signed_funding_tx: transaction },
+  }, recording as never, undefined, signedFunding);
+  const kept = async (hash: string) => hash === signed.hash() ? signed : undefined;
+  // Without KeyWay's record, or for a transaction KeyWay never signed, nothing is submitted.
+  await assert.rejects(submit(unsigned), /as KeyWay signed it/);
+  await assert.rejects(submit({ ...unsigned, outputs_data: ["0x"], outputs: [{ capacity: "0x1", lock: { code_hash: `0x${"22".repeat(32)}`, hash_type: "type", args: "0x" } }] }, kept), /Only channel funding KeyWay signed/);
+  assert.equal(submitted.length, 0);
+  // With garbage witnesses, KeyWay's signed witnesses are what the node gets.
+  await submit({ ...unsigned, witnesses: ["0xdeadbeef"] }, kept);
+  assert.deepEqual(submitted.map(({ witnesses }) => witnesses), [["0xabcd"]]);
 });
 
 test("managed channels can only close to the user's own lock", async () => {
@@ -216,6 +242,39 @@ test("hosted channels from an Omnilock account fund at 1500 shannons/KB; others 
   await managedNodeRequest("fee-rate-test", { operation: "open-channel", params }, recording as never, ownLock);
   await managedNodeRequest("fee-rate-test", { operation: "open-channel", params: { ...params, funding_fee_rate: "0x7d0" } }, recording as never, ownLock);
   const omnilock = { code_hash: "0xf329effd1c475a2978453c8600e1eaf0bc2087ee093c3ee64cc96ec6847752cb", hash_type: "type", args: `0x00${"11".repeat(20)}01${"22".repeat(32)}` };
-  await managedNodeRequest("fee-rate-test", { operation: "open-channel", params: { ...params, funding_lock_script: omnilock } }, recording as never, ownLock);
+  await managedNodeRequest("fee-rate-test", { operation: "open-channel", params: { ...params, funding_lock_script: omnilock } }, recording as never, async () => omnilock as never);
   assert.deepEqual(rates, [undefined, "0x7d0", "0x5dc"]);
+});
+
+test("a hosted channel is funded only from the account's own lock", async () => {
+  const opened: Array<{ funding_lock_script: unknown }> = [];
+  const recording = { ...node, openChannelWithExternalFunding: async (params: { funding_lock_script: unknown }) => { opened.push(params); return node.openChannelWithExternalFunding(); } };
+  const open = (funding_lock_script: unknown) => managedNodeRequest("funding-lock-test", {
+    operation: "open-channel",
+    params: { pubkey: "0x02b6d4e3ab86a2ca2fad6fae0ecb2e1e559e0b911939872a90abdda6d20302be71", funding_amount: "0x5f5e100", funding_lock_script },
+  }, recording as never, ownLock);
+  // A lock nobody will sign for would leave the channel waiting for funding that never comes.
+  for (const other of [
+    { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x99" },
+    { code_hash: `0x${"22".repeat(32)}`, hash_type: "type", args: "0x" },
+    { code_hash: `0x${"11".repeat(32)}`, hash_type: "data1", args: "0x" },
+  ]) await assert.rejects(open(other), /funded from your own KeyWay address/);
+  assert.equal(opened.length, 0);
+  await open({ code_hash: `0x${"11".repeat(32)}`.toUpperCase().replace("0X", "0x"), hash_type: "type", args: "0x" });
+  assert.deepEqual(opened.map(({ funding_lock_script }) => funding_lock_script), [await ownLock()]);
+});
+
+test("a hosted channel's funding pays at least CKB's minimum fee rate", async () => {
+  const opened: unknown[] = [];
+  const recording = { ...node, openChannelWithExternalFunding: async (params: { funding_fee_rate?: string }) => { opened.push(params.funding_fee_rate); return node.openChannelWithExternalFunding(); } };
+  const open = (funding_fee_rate?: string) => managedNodeRequest("fee-floor-test", {
+    operation: "open-channel",
+    params: { pubkey: "0x02b6d4e3ab86a2ca2fad6fae0ecb2e1e559e0b911939872a90abdda6d20302be71", funding_amount: "0x5f5e100", funding_lock_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" }, ...(funding_fee_rate ? { funding_fee_rate } : {}) },
+  }, recording as never, ownLock);
+  // Funding that can never confirm would keep the node running while Fiber rebroadcasts it.
+  await assert.rejects(open("0x1"), /at least 1000/);
+  await assert.rejects(open("0x3e7"), /at least 1000/);
+  await open("0x3e8");
+  await open();
+  assert.deepEqual(opened, ["0x3e8", undefined]);
 });
