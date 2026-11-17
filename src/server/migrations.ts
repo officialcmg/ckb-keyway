@@ -503,4 +503,10 @@ export const migrations: Array<{
       await sql`create index keyway_auth_rate_limits_expiry on keyway_auth_rate_limits (expires_at)`;
     },
   },
+  {
+    version: 32, name: "device-lease-key-delivery",
+    // The device's latest Fiber-key delivery under this lease: a backup is accepted only from the logout that took
+    // that key, so an upload that lands after the node ran again (and got its key again) can't be restored.
+    up: (sql) => sql`alter table keyway_v2_device_leases add column key_delivery uuid`,
+  },
 ];

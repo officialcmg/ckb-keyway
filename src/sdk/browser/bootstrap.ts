@@ -56,6 +56,9 @@ export async function getDeviceIdHash(): Promise<string> {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+/** A Fiber key handed to this device, and the ID of that delivery (a logout's backup quotes it). */
+export type FiberKeyDelivery = { fiberKey: Uint8Array; keyDelivery: string };
+
 /**
  * Unlocks the Fiber key for this device's lease. Lit seals it to a one-time key made here, so KeyWay's
  * server only relays ciphertext; the bundle opens only for this wallet, this device and this request.
@@ -65,12 +68,14 @@ export async function loadFiberKey(
   leaseId: string,
   pkpId: string,
   api = new KeyWayApiClient(),
-): Promise<Uint8Array> {
+): Promise<FiberKeyDelivery> {
   if (!authToken) throw new Error("Authenticated KeyWay session is required");
   const deviceIdHash = await getDeviceIdHash();
   const recipient = await createFiberKeyRecipient();
   const bundle = await api.loadFiberKey(authToken, { deviceIdHash, leaseId, recipientPublicKey: recipient.publicKey });
-  return recipient.unwrap(bundle, { pkpId, deviceIdHash });
+  const keyDelivery = (bundle as { keyDelivery?: unknown } | null)?.keyDelivery;
+  if (typeof keyDelivery !== "string") throw new Error("KeyWay returned an invalid Fiber key bundle");
+  return { fiberKey: await recipient.unwrap(bundle, { pkpId, deviceIdHash }), keyDelivery };
 }
 
 export async function markChannelOpened(authToken: string, api = new KeyWayApiClient()): Promise<void> {

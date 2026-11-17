@@ -1,6 +1,6 @@
 import type { ListPeersResult, NodeInfoResult } from "@fiber-pay/sdk/browser";
 import { bootstrapKeyWay, loadFiberKey, type PublicWallet } from "./bootstrap";
-import { createKeyWay, type KeyWay } from "./create-keyway";
+import { createKeyWay, type CreateKeyWayOptions, type KeyWay } from "./create-keyway";
 import type { ApproveFiberChannelOpen } from "./remote-ckb-signer";
 import type { ApproveFiberPayment } from "./fiber-payment";
 import type { RequestEmailCode } from "./email-code";
@@ -44,6 +44,7 @@ export async function connectKeyWay(options: {
   onLeaseLost?: (error: Error) => void;
   onWalletReady?: (wallet: PublicWallet) => void;
   onFiberStartup?: (event: FiberStartupEvent) => void;
+  guardClaim?: CreateKeyWayOptions["guardClaim"];
 }): Promise<ConnectedKeyWay> {
   const startedAt = Date.now();
   const stage = (next: FiberStartupStage) => options.onFiberStartup?.({
@@ -69,6 +70,7 @@ export async function connectKeyWay(options: {
     restoreRequired,
     onLeaseLost: options.onLeaseLost,
     onFiberStartup: stage,
+    guardClaim: options.guardClaim,
   });
 
   try {

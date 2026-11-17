@@ -11,14 +11,14 @@ import {
   type Script,
   type SendPaymentParams,
 } from "@fiber-pay/sdk/browser";
-import { KeyWayCredentialProvider, type FiberKeyLoader } from "./credential-provider";
+import { KeyWayCredentialProvider } from "./credential-provider";
 import { acquireDeviceLock, type DeviceLock } from "./device-lock";
 import { acquireDeviceLease, type DeviceLease } from "./device-lease";
 import { serializeCccTransactionForRpc } from "./ccc-transaction";
 import { fundingLockCellDeps, FUNDING_LOCK_KNOWN_SCRIPTS, type KeyWayRecovery } from "./account-lock";
 import { getLockBalance } from "./ckb-balance";
 import { RemoteCkbSigner, type ApproveFiberChannelOpen } from "./remote-ckb-signer";
-import { getDeviceIdHash, markChannelOpened } from "./bootstrap";
+import { getDeviceIdHash, markChannelOpened, type FiberKeyDelivery } from "./bootstrap";
 import { ANY_FUNDING, connectChannelPeers, type ChannelPeer } from "./channel-peers";
 import { normalizeFiberPubkey } from "./fiber-pubkey";
 import { KeyWayApiClient } from "./api-client";
@@ -35,10 +35,10 @@ import { sweepSettlement } from "./settlement-sweep";
 import { fiberWasmFactory } from "./fiber-wasm";
 import { listenForWatchtowerCalls } from "./watchtower-bridge";
 import { openWatchtowerStore } from "./watchtower-store";
-import { settleChannel } from "./watchtower-settle";
+import { settleChannel, trackNodeKeySends } from "./watchtower-settle";
 import { createRemoteWatchtower, remoteWatchUpdate, updatesForStoredChannel } from "./watchtower-remote";
 import { createNodeLifecycle } from "./node-lifecycle";
-import { refuseFundingBeyondRequest, type FundingRequest } from "./funding-limit";
+import { createChannelOpenings, refuseFundingBeyondRequest, type ChannelOpening } from "./funding-limit";
 import { createFeeReserve, FEE_RESERVE, needsFeeReserve } from "./fee-reserve";
 import type { RequestEmailCode } from "./email-code";
 
@@ -58,12 +58,17 @@ export type CreateKeyWayOptions = {
   approveFiberPayment?: ApproveFiberPayment;
   approvals?: () => FiberActionApprovals;
   requestEmailCode?: RequestEmailCode;
-  loadFiberKey: (leaseId: string) => ReturnType<FiberKeyLoader>;
+  loadFiberKey: (leaseId: string) => Promise<FiberKeyDelivery>;
   network?: "testnet" | "mainnet";
   apiClient?: KeyWayApiClient;
   restoreRequired?: boolean;
   onLeaseLost?: (error: Error) => void;
   onFiberStartup?: (stage: BrowserNodeStage) => void;
+  /**
+   * Runs the step that takes the device lock. The provider runs it only while no logout of the session is in
+   * progress and the session is still signed in (`startUnlessLoggingOut`, logout-handoff.ts).
+   */
+  guardClaim?: <T>(claim: () => Promise<T>) => Promise<T>;
 };
 
 export type ChannelOpenStage = "connecting" | "negotiating" | "confirming" | "signing" | "broadcasting" | "waiting";
@@ -118,9 +123,9 @@ const WATCH_INTERVAL = 60_000;
 
 export function createKeyWay(options: CreateKeyWayOptions) {
   let deviceLease: DeviceLease | undefined;
-  const credential = new KeyWayCredentialProvider(options.identifier, () => {
+  const credential = new KeyWayCredentialProvider(options.identifier, async () => {
     if (!deviceLease) throw new Error("An active device lease is required");
-    return options.loadFiberKey(deviceLease.leaseId);
+    return (await options.loadFiberKey(deviceLease.leaseId)).fiberKey;
   });
   const network = options.network ?? "testnet";
   const databasePrefix = `/wasm-${options.identifier}`;
@@ -146,22 +151,20 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   });
   let deviceLock: DeviceLock | undefined;
   const api = options.apiClient ?? new KeyWayApiClient();
-  let activationProgress: ChannelOpenProgress | undefined;
-  let openingPeer: string | undefined;
-  let openingWithReserve = false;
-  let openingRequest: FundingRequest | undefined;
+  const openings = createChannelOpenings();
   let preparedPeers: Promise<ChannelPeer[]> | undefined;
   let preparedFundingAmount: bigint | undefined;
   const fundingSigner = new RemoteCkbSigner(options.authToken, options.ckbPublicKey, async (preview) => {
+    const opening = openings.current();
     // The account's share may not exceed what the app asked Fiber for, whatever the peer did to the transaction.
-    refuseFundingBeyondRequest(preview, openingRequest);
-    activationProgress?.("confirming");
+    refuseFundingBeyondRequest(preview, opening?.request);
+    opening?.progress?.("confirming");
     const approved = await options.approveFiberChannelOpen({
       ...preview,
-      ...(openingPeer ? { peer: openingPeer } : {}),
-      ...(openingWithReserve ? { feeReserveCkb: ccc.fixedPointToString(FEE_RESERVE) } : {}),
+      ...(opening?.peer ? { peer: opening.peer } : {}),
+      ...(opening?.withReserve ? { feeReserveCkb: ccc.fixedPointToString(FEE_RESERVE) } : {}),
     });
-    if (approved) activationProgress?.("signing");
+    if (approved) opening?.progress?.("signing");
     return approved;
   }, undefined, api, options.recovery, (error) => options.approvals?.().settled?.("funding", error), options.requestEmailCode);
   const resolveCccFunding = createCccExternalFundingResolver({
@@ -216,7 +219,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     node,
     async claim() {
       options.onFiberStartup?.("claiming_device");
-      deviceLock = await acquireDeviceLock(options.identifier);
+      const lockDevice = () => acquireDeviceLock(options.identifier);
+      deviceLock = await (options.guardClaim ? options.guardClaim(lockDevice) : lockDevice());
       deviceLease = await acquireDeviceLease(options.authToken, api, (cause) => {
         const error = cause instanceof Error ? cause : new Error("The active KeyWay device lease expired");
         void stop().finally(() => options.onLeaseLost?.(error));
@@ -273,13 +277,20 @@ export function createKeyWay(options: CreateKeyWayOptions) {
    * derived from the user's Fiber key, and this moves anything there to the user's own address.
    */
   let sweepTimer: ReturnType<typeof setInterval> | undefined;
-  async function sweepNow() {
+  // The node key's claims and sweeps have a client of their own: each watchtower pass rebuilds its cache from what
+  // the chain says (trackNodeKeySends), which must not touch the account's own pending transactions. Passes and
+  // sweeps take turns with it, so no send lands while a pass rebuilds the cache.
+  const nodeKeyClient = new ccc.ClientPublicTestnet();
+  const nodeKeySends = trackNodeKeySends(nodeKeyClient);
+  const sweepNow = () => nodeKeySends.exclusive(sweepWithNodeKey);
+  async function sweepWithNodeKey() {
     if (!node.isRunning || !credential.isUnlocked()) return;
     const key = await credential.getCkbSecretKey();
     try {
       const destination = (await fundingSigner.getRecommendedAddressObj()).script;
       const { channels } = await node.listChannels({ include_closed: true });
-      await sweepSettlement(fundingSigner.client, ccc.hexFrom(key), destination, needsFeeReserve(channels) ? FEE_RESERVE : 0n);
+      const swept = await sweepSettlement(nodeKeyClient, ccc.hexFrom(key), destination, needsFeeReserve(channels) ? FEE_RESERVE : 0n);
+      if (swept) nodeKeySends.record(swept as ccc.Hex);
     } finally {
       key.fill(0);
     }
@@ -309,19 +320,26 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   const DONE = new Set(["settled", "the user's share is already claimed", "the user has no share in this channel"]);
   function watchNow(): Promise<void> {
     if (watchPass || watchStopped || !node.isRunning || !credential.isUnlocked()) return watchPass ?? Promise.resolve();
-    watchPass = watchOnce().finally(() => { watchPass = undefined; });
+    watchPass = nodeKeySends.exclusive(watchOnce).finally(() => { watchPass = undefined; });
     return watchPass;
   }
   async function watchOnce() {
     {
+      // A claim or sweep the chain dropped would otherwise stay in ccc's cache, its payout usable and its fee
+      // reserve spent, and break every later claim: start each pass from what the chain says.
+      await nodeKeySends.refresh();
+      if (watchStopped) return;
       // The 10-minute sweep (and the one at start) also picks up claims whose follow-up sweep was missed.
       for (const txHash of [...claimsToSweep]) {
         if (watchStopped) return;
-        const status = (await fundingSigner.client.getTransaction(txHash).catch(() => undefined))?.status;
+        const found = await nodeKeyClient.getTransactionNoCache(txHash).catch(() => null);
         if (watchStopped) return;
-        if (status !== "committed") continue;
+        // A dropped or rejected claim leaves its commitment cell live, so this pass claims it again.
+        if (found === undefined || found?.status === "rejected") claimsToSweep.delete(txHash);
+        if (found?.status !== "committed") continue;
         claimsToSweep.delete(txHash);
-        await sweepNow().catch((error) => console.warn("[keyway] could not sweep the claimed funds yet", error));
+        // Already this pass's turn with the node key.
+        await sweepWithNodeKey().catch((error) => console.warn("[keyway] could not sweep the claimed funds yet", error));
       }
       if (watchStopped) return;
       const watched = await watchtower.list();
@@ -343,14 +361,16 @@ export function createKeyWay(options: CreateKeyWayOptions) {
           }
           try {
             const result = await settleChannel({
-              client: fundingSigner.client, network, channel, nodeKey: ccc.hexFrom(key),
+              client: nodeKeyClient, network, channel, nodeKey: ccc.hexFrom(key),
               ref: { channelId: channel.channelId, fundingOutPoint: ccc.OutPoint.decode(outpoint) },
+              preimage: (paymentHash) => watchtower.preimage(paymentHash),
             });
             if (watchStatus.get(channel.channelId) !== result.status) {
               watchStatus.set(channel.channelId, result.status);
               console.info(`[keyway] watchtower: channel ${channel.channelId}: ${result.status}${result.txHash ? ` ${result.txHash}` : ""}`);
             }
             if (result.txHash) {
+              nodeKeySends.record(result.txHash);
               claimsToSweep.add(result.txHash);
             } else if (DONE.has(result.status)) {
               await watchtower.remove(channel.channelId);
@@ -404,8 +424,15 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       }
       const lease = deviceLease;
       const deviceIdHash = await getDeviceIdHash();
+      // The backup is accepted only while this is the device's latest key delivery: if its upload stalls and the
+      // node runs again, the upload is refused when it lands (the node has moved past it).
+      let keyDelivery = "";
       await backUpBeforeLogout({
-        loadFiberKey: () => options.loadFiberKey(lease.leaseId),
+        loadFiberKey: async () => {
+          const delivered = await options.loadFiberKey(lease.leaseId);
+          keyDelivery = delivered.keyDelivery;
+          return delivered.fiberKey;
+        },
         // The backup is taken only after the bridge has drained, so it holds every watchtower call.
         stopNode: steps.stopNodeAndDrain,
         // Once the session ends nothing more reaches KeyWay's watchtower from this page, so it must have every
@@ -415,6 +442,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
         saveBackup: (backup) => api.saveNodeBackup(options.authToken, {
           deviceIdHash,
           leaseId: lease.leaseId,
+          keyDelivery,
           backup,
         }),
         releaseOwnership: steps.releaseGuards,
@@ -429,7 +457,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     const deviceIdHash = await getDeviceIdHash();
     const leaseId = deviceLease.leaseId;
     await restoreBeforeStart({
-      loadFiberKey: () => options.loadFiberKey(leaseId),
+      loadFiberKey: async () => (await options.loadFiberKey(leaseId)).fiberKey,
       loadBackup: () => api.loadNodeBackup(options.authToken, { deviceIdHash, leaseId }),
       restoreBackup: (backup, fiberKey) => restoreEncryptedNodeBackup(backup, databasePrefix, fiberKey),
       confirmRestore: (generation) => api.confirmNodeBackup(options.authToken, {
@@ -441,13 +469,20 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     restoreRequired = false;
   }
 
-  /** Opens a channel funded from the account, recording the request so its funding preview can be checked against it. */
-  async function openFundedChannel(params: KeyWayFundingParams) {
+  /**
+   * Opens a channel funded from the account, recording the request so its funding preview can be checked against it.
+   * Opens run one at a time (see `createChannelOpenings`).
+   */
+  function openFundedChannel(params: KeyWayFundingParams, progress?: ChannelOpenProgress) {
+    return openings.run((opening) => openFundedChannelNow(opening, params, progress));
+  }
+  async function openFundedChannelNow(opening: ChannelOpening, params: KeyWayFundingParams, progress?: ChannelOpenProgress) {
     if (!node.isRunning) throw new Error("Start the Fiber node before opening a channel");
-    openingPeer = params.pubkey;
-    openingWithReserve = await feeReserve.needed();
+    opening.peer = params.pubkey;
+    opening.progress = progress;
+    opening.withReserve = await feeReserve.needed();
     const funding = await resolveExternalFunding(undefined);
-    openingRequest = { fundingAmount: BigInt(params.funding_amount), udtTypeScript: params.funding_udt_type_script, shutdownScript: funding.shutdownScript };
+    opening.request = { fundingAmount: BigInt(params.funding_amount), udtTypeScript: params.funding_udt_type_script, shutdownScript: funding.shutdownScript };
     const result = await openChannelWithExternalFundingFlow({
       node,
       params: {
@@ -460,7 +495,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       signFundingTx: funding.signFundingTx,
     });
     await markChannelOpened(options.authToken, api);
-    const feeReserveTxHash = openingWithReserve ? await feeReserve.send(result.fundingTxHash) : undefined;
+    const feeReserveTxHash = opening.withReserve ? await feeReserve.send(result.fundingTxHash) : undefined;
     return { ...result, ...(feeReserveTxHash ? { feeReserveTxHash } : {}) };
   }
 
@@ -482,39 +517,34 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     const config: OpenKeyWayChannelOptions = typeof input === "bigint" ? { fundingAmount: input } : input;
     if (config.udtTypeScript && config.fundingAmount === undefined) throw new Error("A token channel needs a fundingAmount");
     const fundingAmount = config.fundingAmount ?? DEFAULT_CHANNEL_FUNDING;
-    activationProgress = onProgress;
-    activationProgress?.("connecting");
-    try {
-      const candidates = config.peer
-        ? [{ pubkey: normalizeFiberPubkey(config.peer), nodeName: "selected peer" }]
-        // The official peers' minimums are in CKB, so any of them will do for a token channel.
-        : await prepareCkbChannel(config.udtTypeScript ? ANY_FUNDING : fundingAmount);
-      let lastAbort: unknown;
-      for (const candidate of candidates) {
-        try {
-          activationProgress?.("negotiating");
-          const result = await openFundedChannel({
-            pubkey: normalizeFiberPubkey(candidate.pubkey),
-            funding_amount: `0x${fundingAmount.toString(16)}`,
-            public: config.public ?? true,
-            ...(config.udtTypeScript ? { funding_udt_type_script: config.udtTypeScript } : {}),
-            funding_fee_rate: config.fundingFeeRate === undefined ? undefined : toHex(config.fundingFeeRate),
-            commitment_fee_rate: config.commitmentFeeRate === undefined ? undefined : toHex(config.commitmentFeeRate),
-          });
-          activationProgress?.("broadcasting");
-          return result;
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          if (!shouldDiagnoseFundingAbortError(message)) throw error;
-          lastAbort = error;
-        }
+    onProgress?.("connecting");
+    const candidates = config.peer
+      ? [{ pubkey: normalizeFiberPubkey(config.peer), nodeName: "selected peer" }]
+      // The official peers' minimums are in CKB, so any of them will do for a token channel.
+      : await prepareCkbChannel(config.udtTypeScript ? ANY_FUNDING : fundingAmount);
+    let lastAbort: unknown;
+    for (const candidate of candidates) {
+      try {
+        onProgress?.("negotiating");
+        const result = await openFundedChannel({
+          pubkey: normalizeFiberPubkey(candidate.pubkey),
+          funding_amount: `0x${fundingAmount.toString(16)}`,
+          public: config.public ?? true,
+          ...(config.udtTypeScript ? { funding_udt_type_script: config.udtTypeScript } : {}),
+          funding_fee_rate: config.fundingFeeRate === undefined ? undefined : toHex(config.fundingFeeRate),
+          commitment_fee_rate: config.commitmentFeeRate === undefined ? undefined : toHex(config.commitmentFeeRate),
+        }, onProgress);
+        onProgress?.("broadcasting");
+        return result;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!shouldDiagnoseFundingAbortError(message)) throw error;
+        lastAbort = error;
       }
-      preparedPeers = undefined;
-      preparedFundingAmount = undefined;
-      throw new Error("Available Fiber peers declined the channel funding request", { cause: lastAbort });
-    } finally {
-      activationProgress = undefined;
     }
+    preparedPeers = undefined;
+    preparedFundingAmount = undefined;
+    throw new Error("Available Fiber peers declined the channel funding request", { cause: lastAbort });
   }
 
   async function getCkbBalance(): Promise<bigint> {

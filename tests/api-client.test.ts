@@ -69,7 +69,7 @@ test("uploads and confirms encrypted node backups through authenticated endpoint
     ciphertext: "ciphertext",
     digest: "ab".repeat(32),
   };
-  await api.saveNodeBackup("session", { deviceIdHash: "00".repeat(32), leaseId: "lease", backup });
+  await api.saveNodeBackup("session", { deviceIdHash: "00".repeat(32), leaseId: "lease", keyDelivery: crypto.randomUUID(), backup });
   await api.confirmNodeBackup("session", {
     deviceIdHash: "00".repeat(32),
     leaseId: "lease",
