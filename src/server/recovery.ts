@@ -211,17 +211,24 @@ function recoveryStatus(wallet: ReadyWallet): RecoveryStatus {
  * settings (and, when turning recovery on, the new address) and the notice email goes out. One the node reports
  * rejected, or hasn't known for the grace period, is dropped only once it can no longer commit. Called on every
  * sign-in and status check.
+ *
+ * The nodes are asked with no wallet lock held, so slow nodes never hold a share of the lock budget every sign-in
+ * needs. Both outcomes are final, and the lock is then taken only to apply one, if the same change is still pending.
  */
 export async function settleRecoveryChange(context: Pick<RecoveryContext, "user" | "client" | "nodes" | "broadcast" | "appName" | "email" | "sendEmail">, now = new Date()): Promise<ReadyWallet> {
+  const wallet = await readWallet(context.user);
+  if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
+  const pending = wallet.recoveryPending;
+  if (!pending) return wallet;
+  const nodes = context.nodes ?? (context.client ? [context.client] : settlementNodes());
+  const state = await onOneNode(nodes, (client) => pendingState(context, client, pending, now), undecidedSettlement(nodes.length));
+  if (state === "kept") return wallet;
   const settled = await withUserLock(context.user.id, async (sql) => {
-    const wallet = await readWallet(context.user, sql);
-    if (!wallet || wallet.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
-    const pending = wallet.recoveryPending;
-    if (!pending) return { wallet };
-    const nodes = context.nodes ?? (context.client ? [context.client] : settlementNodes());
-    const state = await onOneNode(nodes, (client) => pendingState(context, client, pending, now), undecidedSettlement(nodes.length));
-    if (state === "kept") return { wallet };
-    const { recoveryPending: _done, ...rest } = wallet;
+    const current = await readWallet(context.user, sql);
+    if (!current || current.status !== "ready") throw new Error("KeyWay wallet is not provisioned");
+    // Another sign-in settled it meanwhile.
+    if (current.recoveryPending?.transactionHash !== pending.transactionHash) return { wallet: current };
+    const { recoveryPending: _done, ...rest } = current;
     if (state === "committed") {
       const updated: ReadyWallet = { ...rest, recovery: pending.recovery, ckbAddress: pending.ckbAddress, updatedAt: now.toISOString() };
       await saveWallet(context.user, updated, sql);

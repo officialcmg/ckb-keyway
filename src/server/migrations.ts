@@ -5,6 +5,11 @@ export const migrations: Array<{
   version: number;
   name: string;
   up: (sql: DatabaseSql) => Promise<unknown>;
+  /**
+   * False for a migration that can't run inside a transaction (building an index concurrently). It must be safe to
+   * run again from the start, since it's recorded only once it has finished.
+   */
+  transaction?: false;
 }> = [
   {
     version: 1,
@@ -400,6 +405,38 @@ export const migrations: Array<{
     // The commitment number of the peer's commitment that closed a channel, so a revocation that arrives after the
     // close reopens it only when it can punish that commitment.
     up: (sql) => sql`alter table keyway_v2_watchtower_channels add column closing_commitment_number numeric(20, 0)`,
+  },
+  {
+    version: 23, name: "security-alert-state",
+    // When each kind of alert last went out, so concurrent signings raise one alert per window between them.
+    up: (sql) => sql`create table keyway_security_alert_state (kind text primary key, alerted_at timestamptz not null, claim_id uuid not null)`,
+  },
+  {
+    version: 24, name: "wallet-provisioning-claims",
+    // The one request setting up a new account's wallet, so its Lit calls run without holding the wallet lock.
+    up: (sql) => sql`create table keyway_v2_provisioning_claims (
+      user_id text primary key,
+      claim_id uuid not null,
+      claimed_at timestamptz not null default now()
+    )`,
+  },
+  {
+    version: 25, name: "idempotency-pruning", transaction: false,
+    // Lets each new record find the expired records still holding a response or error text to drop, and count the
+    // account's records from the last day. Built concurrently, so live writes to the table carry on meanwhile: a
+    // plain index build would hold every new record behind it, and behind any write still in progress. Existing
+    // records are left as they are; new ones prune them in small batches. An interrupted build leaves an invalid
+    // index, so each is dropped first and the migration can simply run again.
+    up: async (sql) => {
+      const indexes = [
+        ["keyway_v2_idempotency_keys_unpruned", "(expires_at) where response is not null or error_message is not null"],
+        ["keyway_v2_idempotency_keys_user_created", "(user_id, created_at)"],
+      ];
+      for (const [name, definition] of indexes) {
+        await sql.unsafe(`drop index concurrently if exists ${name}`);
+        await sql.unsafe(`create index concurrently ${name} on keyway_v2_idempotency_keys ${definition}`);
+      }
+    },
   },
   {
     version: 26, name: "session-origin-required",

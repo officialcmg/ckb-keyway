@@ -1,5 +1,11 @@
 export function managedUserId(userId: string): string;
 export function requireClosedChannels(channels: unknown): void;
+export function channelFinished(channel: unknown): boolean;
+export function retireUser(userId: string): Promise<{ retired: boolean; databasePreserved: boolean }>;
+export function restoreUser(userId: string, name: string): Promise<{ restored: boolean; name: string; digest: string }>;
+export function bootKnownNodes(attempt?: number): Promise<void>;
+export function snapshotUser(userId: string): Promise<{ name: string; createdAt: string; bytes: number; digest: string }>;
+export function readiness(): { status: "ready" | "degraded"; nodes: number; maxNodes: number; offline: number };
 export function purgeRetiredUser(userId: string, roots?: { dataRoot?: string; backupRoot?: string; retiredRoot?: string }): Promise<{ purged: boolean; userId: string }>;
 export function authorizationMatches(header: string | undefined, token: string): boolean;
 export function createCkbKey(path: string): Promise<void>;
@@ -30,7 +36,7 @@ export function restoreSnapshot(input: {
   name: string;
   encryptionKey?: Buffer;
 }): Promise<{ restored: boolean; name: string; digest: string }>;
-export function proxyUserRequest(userId: string, body: Buffer): Promise<{ status: number; contentType: string; body: Buffer }>;
+export function proxyUserRequest(userId: string, body: Buffer, signal?: AbortSignal): Promise<{ status: number; contentType: string; body: Buffer }>;
 export function startKnownNodes(users: string[]): Promise<void>;
 export function runningUsers(): string[];
 export function shutdown(): Promise<void>;

@@ -10,16 +10,21 @@ export async function database() {
   const url = process.env.DATABASE_URL;
   if (!url) throw new Error("DATABASE_URL is required");
   client ??= postgres(url, { max: 10, idle_timeout: 20 });
-  migration ??= process.env.NODE_ENV === "production" ? verifySchema(client) : migrateDatabase(client);
+  // A failed first connection (the database not up yet) isn't kept, so the next call tries again.
+  migration ??= (process.env.NODE_ENV === "production" ? verifySchema(client) : migrateDatabase(client))
+    .catch((error: unknown) => { migration = undefined; throw error; });
   await migration;
   return client;
 }
 
 // Lock holders keep a pool connection each, and work done inside a lock still takes more from the pool, so holders
-// never get more than 6 of its 10. Login-code locks and wallet locks each have their own 3: slow first-time wallet
-// setup (Lit and CKB calls) can't hold up anyone's sign-in, and a flood of sign-in requests can't hold up wallets.
+// never get more than 6 of its 10. Login-code locks and wallet locks each have their own 3: a flood of sign-in
+// requests can't hold up wallets, and slow Lit and CKB calls run outside wallet locks where they can.
 // Deciding whether to send a login code takes no lock and is quick, so it has 2 slots of its own: a request the
 // limits refuse is turned away without waiting behind sends, which can each take seconds.
+// Outside these budgets, the watchtower keeps 1 connection and old-address sweeps at most 1 (legacy-sweep.ts); sweeps
+// run every query on their own connection and never wait on the pool while holding one. That leaves at least two
+// connections for the work inside locks and everything else, so the pool can't deadlock.
 const MAX_RESERVED_LOCKS = 3;
 export const LOGIN_DECISION_SLOTS = 2;
 // Sign-in requests waiting in this process for login-code work (decisions and locks each), and how long one waits
@@ -172,6 +177,8 @@ async function withReservedLock<T>(sql: DatabaseSql, key: string, task: (sql: Da
       }
     }
   } catch (error) {
+    // A wait that ended in an error (cancelled, or a lock or statement timeout) holds no lock: the connection goes
+    // back to the pool, or each failure would keep one outside the lock budget until the pool ran dry.
     connection.release();
     throw error;
   }
@@ -201,26 +208,48 @@ async function reserveBy(sql: DatabaseSql, deadline: number): Promise<Awaited<Re
 }
 
 export async function migrateDatabase(sql: ReturnType<typeof postgres>): Promise<void> {
-  await sql.begin(async (transaction) => {
-    await transaction`select pg_advisory_xact_lock(hashtext('ckb-keyway-schema'))`;
-    await transaction`
-      create table if not exists keyway_schema_migrations (
-        version integer primary key,
-        name text not null,
-        applied_at timestamptz not null default now()
-      )
-    `;
-    const applied = await transaction<Array<{ version: number }>>`select version from keyway_schema_migrations`;
-    const versions = new Set(applied.map(({ version }) => version));
-    for (const item of migrations) {
-      if (versions.has(item.version)) continue;
-      await item.up(transaction as unknown as DatabaseSql);
-      await transaction`
-        insert into keyway_schema_migrations (version, name)
-        values (${item.version}, ${item.name})
-      `;
+  // One session migrates at a time. Each migration commits on its own, in a transaction unless it can't run in one.
+  const connection = await sql.reserve();
+  try {
+    // Waits for the lock here rather than in Postgres: a session waiting in Postgres keeps a snapshot open, and a
+    // concurrent index build waits for every older snapshot, so it would deadlock with the migrator it waits for.
+    while (!(await connection<Array<{ locked: boolean }>>`select pg_try_advisory_lock(hashtext('ckb-keyway-schema')) as locked`)[0].locked) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
-  });
+    try {
+      await connection`
+        create table if not exists keyway_schema_migrations (
+          version integer primary key,
+          name text not null,
+          applied_at timestamptz not null default now()
+        )
+      `;
+      const applied = await connection<Array<{ version: number }>>`select version from keyway_schema_migrations`;
+      const versions = new Set(applied.map(({ version }) => version));
+      for (const item of migrations) {
+        if (versions.has(item.version)) continue;
+        const record = () => connection`insert into keyway_schema_migrations (version, name) values (${item.version}, ${item.name})`;
+        if (item.transaction === false) {
+          await item.up(connection);
+          await record();
+          continue;
+        }
+        await connection`begin`;
+        try {
+          await item.up(connection);
+          await record();
+          await connection`commit`;
+        } catch (error) {
+          await connection`rollback`.catch(() => undefined);
+          throw error;
+        }
+      }
+    } finally {
+      await connection`select pg_advisory_unlock(hashtext('ckb-keyway-schema'))`.catch(() => undefined);
+    }
+  } finally {
+    connection.release();
+  }
 }
 
 async function verifySchema(sql: DatabaseSql): Promise<void> {
