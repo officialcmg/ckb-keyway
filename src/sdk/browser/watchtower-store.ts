@@ -77,7 +77,8 @@ export function applyWatchtowerCall(existing: WatchedChannel | undefined, call: 
       return {
         ...existing,
         channelId: hex32(p.channel_id, "channel id"),
-        channelFeatures: parseChannelFeatures(p.channel_features),
+        // A repeated create that leaves the features out must not turn a stored V2 channel back into a legacy one.
+        channelFeatures: p.channel_features === undefined ? (existing?.channelFeatures ?? 0) : parseChannelFeatures(p.channel_features),
         fundingUdtTypeScript: p.funding_udt_type_script ?? null,
         localSettlementKey: hex32(p.local_settlement_key, "settlement key"),
         remoteSettlementKey: pubkey(p.remote_settlement_key, "remote settlement key"),

@@ -142,6 +142,14 @@ async function fixture(page) {
   await page.route(`${origin}/__sdk-fixture.js`, route => route.fulfill({ contentType: "text/javascript", headers: isolation, body: Buffer.from(bundle.outputFiles[0].contents) }));
   await page.goto(`${origin}/__sdk-verification?app=${encodeURIComponent(appId)}${browserMode ? "&browser" : ""}`, { waitUntil: "domcontentloaded", timeout: 120_000 });
 }
+/** Sends this page's signing requests through the configured proxy, when one is set. Every page needs it. */
+async function routeSigning(page) {
+  if (!process.env.KEYWAY_TEST_SIGNING_PROXY) return;
+  await page.route(`${api}/sign-transaction`, async route => {
+    const response = await route.fetch({ url: `${process.env.KEYWAY_TEST_SIGNING_PROXY}/api/v1/keyway/sign-transaction` });
+    await route.fulfill({ response });
+  });
+}
 function observeRuntime(page) {
   page.on("pageerror", error => console.log("Browser runtime error:", error.message.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[disposable email]")));
   page.on("console", message => { if (/panicked at|Uncaught RuntimeError/.test(message.text())) console.log("WASM diagnostic:", message.text().slice(0, 2000)); });
@@ -161,6 +169,7 @@ async function restoreFunded(entry, index) {
     : await browser.newContext();
   const page = await context.newPage();
   page.setDefaultTimeout(120_000);
+  await routeSigning(page);
   observeRuntime(page);
   Object.assign(entry, { page, context });
   allPages.push({ ...entry });
@@ -239,12 +248,7 @@ try {
         : await browser.newContext();
       const page = await context.newPage();
       page.setDefaultTimeout(120_000);
-      if (process.env.KEYWAY_TEST_SIGNING_PROXY) {
-        await page.route(`${api}/sign-transaction`, async route => {
-          const response = await route.fetch({ url: `${process.env.KEYWAY_TEST_SIGNING_PROXY}/api/v1/keyway/sign-transaction` });
-          await route.fulfill({ response });
-        });
-      }
+      await routeSigning(page);
       observeRuntime(page);
       allPages.push({ page, context, mailbox });
       const calls = [];
@@ -329,11 +333,14 @@ try {
       await record("PASS faucet funded disposable wallet", { address });
       if (!verifyChannels) continue;
       if (process.env.VERIFY_CANCELLED_OPENING === "1" && entry === activePages[0]) {
+        // A resumed account may already hold channels; only one made by this attempt counts.
+        const existing = new Set(await page.evaluate(async () => (await window.probe.fiber.refreshChannels()).map(channel => channel.id)));
         await assert.rejects(
           () => approved(page, mailbox, () => window.probe.fiber.openChannel({ fundingAmount: 100_000_000_000n, public: true }), undefined, ["Cancel"]),
           /not approved/,
         );
-        const unfinished = await page.evaluate(async () => (await window.probe.fiber.refreshChannels()).filter(channel => channel.status !== "closed"));
+        const open = await page.evaluate(async () => (await window.probe.fiber.refreshChannels()).filter(channel => channel.status !== "closed").map(channel => channel.id));
+        const unfinished = open.filter(id => !existing.has(id));
         assert.equal(unfinished.length, 0, "Declining funding must release the unsigned opening");
         await record("PASS declined funding releases unsigned opening");
       }

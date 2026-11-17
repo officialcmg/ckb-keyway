@@ -121,8 +121,11 @@ try{
  await evidence("PASS actual app transactional logout");
 }catch(e){await evidence("FAIL actual app verification",{error:e.message.replaceAll(account.email,"[disposable email]"),headings:await page.getByRole("heading").allTextContents(),alerts:(await page.getByRole("alert").allTextContents()).map(text=>text.replaceAll(account.email,"[disposable email]"))});throw e;}
 finally{
- if(await page.getByRole("button",{name:"Sign out",exact:true}).isVisible().catch(()=>false)){
-  await page.keyboard.press("Escape");await page.getByRole("button",{name:"Sign out",exact:true}).click();await page.getByRole("button",{name:"Sign in with email",exact:true}).waitFor({timeout:180000});
+ try{
+  if(await page.getByRole("button",{name:"Sign out",exact:true}).isVisible().catch(()=>false)){
+   await page.keyboard.press("Escape");await page.getByRole("button",{name:"Sign out",exact:true}).click();await page.getByRole("button",{name:"Sign in with email",exact:true}).waitFor({timeout:180000});
+  }
+ }finally{
+  await context.close();
  }
- await context.close();
 }

@@ -109,6 +109,11 @@ test("the watchtower retains V2 features across settlement updates and defaults 
   assert.ok(v2 !== "remove" && v2.channelFeatures === 1);
   const updated = applyWatchtowerCall(v2, { method: "update_local_settlement", params: create.params })!;
   assert.ok(updated !== "remove" && updated.channelFeatures === 1);
+  // A repeated create without the field keeps what is stored; one that states it is believed.
+  const repeated = applyWatchtowerCall(v2, create)!;
+  assert.ok(repeated !== "remove" && repeated.channelFeatures === 1);
+  const stated = applyWatchtowerCall(legacy, { ...create, params: { ...create.params, channel_features: "0x1" } })!;
+  assert.ok(stated !== "remove" && stated.channelFeatures === 1);
 });
 
 test("a repeated create_watch_channel keeps the peer's settlement and revocation data", () => {
