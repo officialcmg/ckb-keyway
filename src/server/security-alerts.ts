@@ -56,6 +56,26 @@ export async function recordSigningEvent(userId: string, connection?: DatabaseSq
   }).catch(() => console.error("[keyway-security] couldn't release an undelivered alert"));
 }
 
+/**
+ * Sends an alert at most once per `windowMinutes` for one kind and subject, however many callers reach it at once.
+ * Waits only for the database; the alert itself goes out in the background.
+ */
+export async function sendSecurityAlertOnce(kind: string, subject: string, windowMinutes: number, details: Record<string, string | number>): Promise<void> {
+  const sql = await database();
+  const key = alertKey(kind, subject);
+  const rows = await sql`
+    insert into keyway_security_alert_marks (key, sent_at) values (${key}, now())
+    on conflict (key) do update set sent_at = now()
+    where keyway_security_alert_marks.sent_at < now() - ${`${windowMinutes} minutes`}::interval
+    returning 1
+  `;
+  if (!rows[0]) return;
+  void sendSecurityAlert(kind, details);
+  await sql`delete from keyway_security_alert_marks where key in (
+    select key from keyway_security_alert_marks where sent_at < now() - interval '1 day' limit 100
+  )`;
+}
+
 /** Logs an alert and sends it to the configured webhook, retrying a failed delivery. Resolves whether it was delivered. */
 export async function sendSecurityAlert(kind: string, details: Record<string, string | number>): Promise<boolean> {
   console.warn("[keyway-security]", JSON.stringify({ kind, ...details }));
@@ -90,4 +110,15 @@ export async function sendSecurityAlert(kind: string, details: Record<string, st
 function positiveInteger(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/** Whether `sendSecurityAlertOnce` sent this alert in the last `windowMinutes`. */
+export async function securityAlertSentWithin(kind: string, subject: string, windowMinutes: number): Promise<boolean> {
+  const sql = await database();
+  const rows = await sql`select 1 from keyway_security_alert_marks where key = ${alertKey(kind, subject)} and sent_at >= now() - ${`${windowMinutes} minutes`}::interval`;
+  return rows.length > 0;
+}
+
+function alertKey(kind: string, subject: string): string {
+  return `${kind}:${createHash("sha256").update(subject).digest("hex")}`;
 }
