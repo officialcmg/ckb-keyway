@@ -40,3 +40,4 @@ export function proxyUserRequest(userId: string, body: Buffer, signal?: AbortSig
 export function startKnownNodes(users: string[]): Promise<void>;
 export function runningUsers(): string[];
 export function shutdown(): Promise<void>;
+export function approvedFiberMigration(message: string, backedUp: boolean): boolean;

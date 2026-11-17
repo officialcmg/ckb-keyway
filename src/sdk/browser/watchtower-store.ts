@@ -15,6 +15,8 @@ export type SettlementDataJson = { local_amount: string; remote_amount: string; 
 /** What the in-page watchtower knows about one channel. */
 export type WatchedChannel = {
   channelId: string;
+  /** Absent in snapshots from legacy channels; V2 uses full 32-byte payment hashes. */
+  channelFeatures?: 0 | 1;
   fundingUdtTypeScript: unknown | null;
   /** The channel's settlement private key from Fiber; it signs the claim of the user's share. */
   localSettlementKey: string;
@@ -75,6 +77,7 @@ export function applyWatchtowerCall(existing: WatchedChannel | undefined, call: 
       return {
         ...existing,
         channelId: hex32(p.channel_id, "channel id"),
+        channelFeatures: parseChannelFeatures(p.channel_features),
         fundingUdtTypeScript: p.funding_udt_type_script ?? null,
         localSettlementKey: hex32(p.local_settlement_key, "settlement key"),
         remoteSettlementKey: pubkey(p.remote_settlement_key, "remote settlement key"),
@@ -95,6 +98,12 @@ export function applyWatchtowerCall(existing: WatchedChannel | undefined, call: 
     default:
       return existing;
   }
+}
+
+function parseChannelFeatures(value: unknown): 0 | 1 {
+  if (value === undefined || value === "0x0") return 0;
+  if (value === "0x1") return 1;
+  throw new Error("Unsupported channel features in watchtower data");
 }
 
 /**

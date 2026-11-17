@@ -99,6 +99,16 @@ test("the store keeps what Fiber's watchtower keeps, keys normalised to 0x hex",
 test("malformed watchtower data is rejected rather than stored", () => {
   assert.throws(() => applyWatchtowerCall(undefined, { ...create, params: { ...create.params, local_settlement_key: "0x1234" } }), /settlement key/);
   assert.throws(() => applyWatchtowerCall(undefined, { ...create, params: { ...create.params, settlement_data: { tlcs: [] } } }), /settlement data/);
+  assert.throws(() => applyWatchtowerCall(undefined, { ...create, params: { ...create.params, channel_features: "0x2" } }), /channel features/);
+});
+
+test("the watchtower retains V2 features across settlement updates and defaults old channels to legacy", () => {
+  const legacy = applyWatchtowerCall(undefined, create)!;
+  assert.ok(legacy !== "remove" && legacy.channelFeatures === 0);
+  const v2 = applyWatchtowerCall(undefined, { ...create, params: { ...create.params, channel_features: "0x1" } })!;
+  assert.ok(v2 !== "remove" && v2.channelFeatures === 1);
+  const updated = applyWatchtowerCall(v2, { method: "update_local_settlement", params: create.params })!;
+  assert.ok(updated !== "remove" && updated.channelFeatures === 1);
 });
 
 test("a repeated create_watch_channel keeps the peer's settlement and revocation data", () => {

@@ -30,12 +30,12 @@
   },
   "dependencies": {
     "@ckb-ccc/core": "1.16.1",
-    "@fiber-pay/sdk": "0.2.7",
+    "@fiber-pay/sdk": "0.2.8",
     "@joyid/common": "0.2.2",
-    "@nervosnetwork/fiber-js": "0.9.1",
     "@noble/curves": "2.0.1",
     "@noble/hashes": "2.0.1",
-    "cbor-x": "1.6.5"
+    "cbor-x": "1.6.5",
+    "keyway-fiber-runtime": "npm:@nervosnetwork/fiber-js@0.10.1"
   },
   "peerDependencies": {
     "react": ">=18.2.0"

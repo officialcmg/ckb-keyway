@@ -179,6 +179,15 @@ export function proxyUserRequest(userId, body, signal) {
     if (signal?.aborted) throw new Error("The request was abandoned");
     // One call at a time: a batch would carry methods the checks below never see.
     if (isBatch(body)) throw new Error("Batch requests aren't supported");
+    // Fiber keeps "signed funding was handed over" only while the node runs (its external-funding state is not
+    // stored), so after a restart it would let such an opening be abandoned. This host's record is kept on disk
+    // and written before the funding goes to Fiber: an opening in it is never abandoned, as its funding may have
+    // reached the peer. Nor is one that can't be checked.
+    if (method === "abandon_channel") {
+      const id = submittedChannelId(body);
+      const refused = () => new Error("This channel's funding was already handed to Fiber, so it can't be cancelled");
+      if (!id || (await fundingRecord(userId).catch(() => { throw refused(); }))?.ids.has(id)) throw refused();
+    }
     const setup = CHANNEL_SETUP.has(method);
     // Signed funding goes to Fiber only for a channel the node lists as waiting for it. Its node is never stopped
     // to make room from before it is found until a minute after Fiber answers (see SUBMIT_PROTECTION_MS), and it
@@ -188,7 +197,7 @@ export function proxyUserRequest(userId, body, signal) {
     const fundingId = funding ? submittedChannelId(body) : undefined;
     // Whether this channel's funding was recorded before: an earlier submission that may or may not have reached
     // Fiber (the host stopped, or the request failed on its way). Fiber still listing the channel as waiting for
-    // its funding means it never installed any, and Fiber 0.9.1 refuses funding it already has ("Signed funding
+    // its funding can still accept a retry, and Fiber 0.10.1 refuses funding it already has ("Signed funding
     // tx has already been submitted"), so the funding may be sent again; but its record is never undone, as the
     // earlier attempt may have reached the peer.
     let retry = false;
@@ -503,7 +512,7 @@ async function startFundingRecord(userId) {
   await rename(`${path}.new`, path);
 }
 
-/** The channel ID a submit_signed_funding_tx request names, lower-cased, if it names a valid one. */
+/** The channel ID a submit_signed_funding_tx or abandon_channel request names, lower-cased, if it names a valid one. */
 function submittedChannelId(body) {
   let id;
   try { id = JSON.parse(body.toString("utf8"))?.params?.[0]?.channel_id; } catch {}
@@ -511,8 +520,8 @@ function submittedChannelId(body) {
 }
 
 /**
- * Whether the node lists the channel in a state Fiber takes signed funding in (negotiating, waiting for it, or
- * with only the peer's commitment signed).
+ * Whether the node lists an external-funding stage. V2 exchanges BOTH commitments before returning the
+ * unsigned transaction. Native Fiber checks the exact state and rejects a repeated signed submission.
  */
 async function awaitingFunding(node, id) {
   try {
@@ -521,7 +530,8 @@ async function awaitingFunding(node, id) {
     const flags = new Set(JSON.stringify(channel?.state?.state_flags ?? "").match(/\b[A-Z][A-Z0-9_]*\b/g) ?? []);
     const name = stateName(channel);
     return (name === "negotiatingfunding" && flags.has("AWAITING_EXTERNAL_FUNDING")) ||
-      (name === "signingcommitment" && flags.has("THEIR_COMMITMENT_SIGNED_SENT") && !flags.has("OUR_COMMITMENT_SIGNED_SENT"));
+      (name === "signingcommitment" && flags.has("THEIR_COMMITMENT_SIGNED_SENT")
+        && (!flags.has("OUR_COMMITMENT_SIGNED_SENT") || flags.has("COMMITMENT_SIGNED_SENT")));
   } catch {
     return false;
   }
@@ -770,6 +780,11 @@ async function startNode(userId) {
 }
 
 async function spawnNode(userId, baseDir, port) {
+  // Native Fiber 0.10.1 asks on stdin before its non-breaking Channel V2 store migration.
+  // Snapshot while the node is stopped, and never answer unknown or breaking migrations affirmatively.
+  const upgradeMarker = join(baseDir, "keyway-fiber-0.10.1");
+  const upgradeBackup = await fileExists(join(baseDir, "fiber", "store")) && !await fileExists(upgradeMarker)
+    ? await createSnapshot({ userId }) : undefined;
   const child = spawn(required("FNN_PATH", "/usr/local/bin/fnn"), [
     "-d", baseDir,
     "-c", required("FIBER_CONFIG_TEMPLATE", "/usr/local/share/fiber/config/testnet/config.yml"),
@@ -777,9 +792,17 @@ async function spawnNode(userId, baseDir, port) {
     "--fiber-announce-listening-addr=false",
     `--rpc-listening-addr=127.0.0.1:${port}`,
     `--ckb-node-rpc-url=${process.env.CKB_NODE_RPC_URL ?? "https://testnet.ckbapp.dev/"}`,
-  ], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+  ], { env: process.env, stdio: ["pipe", "pipe", "pipe"] });
+  child.stdin.on("error", logError);
+  let startupText = "";
   child.stdout.on("data", (chunk) => process.stdout.write(`[fnn:${userId.slice(0, 8)}] ${chunk}`));
-  child.stderr.on("data", (chunk) => process.stderr.write(`[fnn:${userId.slice(0, 8)}] ${chunk}`));
+  child.stderr.on("data", (chunk) => {
+    process.stderr.write(`[fnn:${userId.slice(0, 8)}] ${chunk}`);
+    startupText = (startupText + chunk.toString()).slice(-8192);
+    if (!child.stdin.writableEnded && startupText.includes("Continue? [y/N]")) {
+      child.stdin.end(approvedFiberMigration(startupText, Boolean(upgradeBackup)) ? "yes\n" : "no\n");
+    }
+  });
   const node = { child, port, lastUsed: 0, startedAt: 0, heldUntil: 0, setupStartedAt: 0 };
   // A missing or unrunnable binary is reported here, and the start then fails in waitForRpc.
   child.once("error", logError);
@@ -805,10 +828,16 @@ async function spawnNode(userId, baseDir, port) {
   }
   // A process that died as its RPC answered is not registered as running.
   if (child.exitCode !== null || child.signalCode !== null) throw new Error("Fiber node exited during startup");
+  await writeFile(upgradeMarker, upgradeBackup?.name ?? "ready", { mode: 0o600 });
   node.lastUsed = ++uses;
   node.startedAt = Date.now();
   nodes.set(userId, node);
   return node;
+}
+
+export function approvedFiberMigration(message, backedUp) {
+  return backedUp && !/breaking changes/i.test(message)
+    && /Database migration required \(20260618120000 -> 20260925120000\), 1 pending migration\(s\)/.test(message);
 }
 
 export async function createCkbKey(path) {
