@@ -5,7 +5,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import type { User } from "./auth-user.ts";
 import type { TransactionSql } from "postgres";
 import { database, type DatabaseSql } from "./database.ts";
-import { createConfirmationEmailTemplate } from "./email-template.ts";
+import { CONFIRMATION_TOO_LONG, confirmationEmailFits, createConfirmationEmailTemplate } from "./email-template.ts";
 import { serializeTransaction, signAccountGroups, signingGroups, type SigningGroup } from "./funding-transaction.ts";
 import { accountLocks, secp256k1Lock } from "../sdk/browser/account-lock.ts";
 import {
@@ -23,6 +23,7 @@ import {
 import { parseLitEmailCode, policySendCode, policySignMessage, policySignTransaction, type LitEmailCode } from "./lit-policy.ts";
 import { listPendingTransactions, nodeStatus, recordPendingTransaction } from "./pending-transactions.ts";
 import { applySendLimitRecord, buildSendLimitChange, buildSendLimitGenesis, LIT_CODE_KINDS, planSendLimits, sendLimitHead, withFingerprint } from "./send-limits.ts";
+import { sendSecurityAlert } from "./security-alerts.ts";
 import { formatCkb, previewGeneralTransaction, previewSummaryLines, type ValidatedTransaction } from "./transaction-policy.ts";
 import type { ReadyWallet } from "./user-wallet.ts";
 
@@ -49,6 +50,14 @@ const REQUEST_TTL_MS = 5 * 60_000;
 const CODE_TTL_MS = 10 * 60_000;
 export const REQUEST_EXPIRED = "This request expired. Start again.";
 const MAX_CODE_ATTEMPTS = 5;
+// Wrong email codes in 24 hours, across every code sent: the server's six-digit codes, and tries of the Lit Action's
+// eight-digit codes that didn't sign (countLitCodeAttempt). Each code allows five tries and codes can be sent again,
+// so without this the tries add up day after day. Only someone signed in can make them, and they are counted per
+// session, so a stolen session can't use up the owner's own: a new session needs a login code from the inbox. All of
+// a user's sessions together get 60, counted from when each session began (codeFailures).
+const MAX_CODE_FAILURES_PER_SESSION = 20;
+const MAX_CODE_FAILURES_PER_USER = 60;
+const CODE_FAILURES_MESSAGE = "Too many wrong email codes today. Try again tomorrow";
 const MAX_MESSAGE_BYTES = 4096;
 
 /** Transactions: preview, request-email-code, sign. */
@@ -67,6 +76,8 @@ export async function transactionSigning(context: SigningContext, body: Record<s
     // Lit's rule, or the server's own (which also counts Fiber payments): either one asks for the code.
     const requiresEmailCode = Boolean(plan?.needsCode) || await outflowNeedsEmailCode(context.user, transactionOutflow(validated));
     const summary = { lines: previewSummaryLines(validated.preview), ...(plan ? { sendLimits: { kind: plan.limits, litCode, ...(plan.record ? { record: plan.record, recordIndex: plan.recordIndex } : {}) } } : {}) };
+    // KeyWay's code is only sent for a summary the email shows whole: refused now, rather than when the code is asked for.
+    if (requiresEmailCode && !litCode && !confirmationEmailFits(context.appName, "Confirm a transaction", summary.lines)) throw new Error(CONFIRMATION_TOO_LONG);
     const confirmationNonce = await issueRequest(context.user, "transaction", digest, summary, requiresEmailCode);
     return { preview: validated.preview, confirmationNonce, requiresEmailCode };
   }
@@ -94,9 +105,10 @@ export async function transactionSigning(context: SigningContext, body: Record<s
   }
   const limits = sendLimitsOf(request);
   let emailCode: LitEmailCode | undefined;
+  let refund: (() => Promise<void>) | undefined;
   if (request.requires_email_code && limits?.litCode) {
     emailCode = parseLitEmailCode(body.emailCode, request.summary.litTicket);
-    await countLitCodeAttempt(context.user, "transaction", nonce);
+    refund = await countLitCodeAttempt(context.user, "transaction", nonce);
   } else if (request.requires_email_code) {
     await verifyCode(context.user, "transaction", nonce, body.emailCode);
     await consumeRequest(context.user, "transaction", nonce);
@@ -111,6 +123,7 @@ export async function transactionSigning(context: SigningContext, body: Record<s
     await context.recordSigning(context.user.id);
     if (limits) applySendLimitRecord(validated.transaction, limits);
     signed = await signGroups(context, validated.transaction, validated.groups, validated.signer.client, emailCode ? { email: await context.email(), emailCode } : {});
+    await refund?.();
   } catch (error) {
     await release();
     // Lit counted something the preview didn't see yet (another send landed in between).
@@ -185,8 +198,8 @@ export async function fundingCode(context: FundingCodeContext, nonce: string, se
   const request = await fundingRequest(context.user, nonce, serialized);
   if (!request) return undefined;
   const emailCode = parseLitEmailCode(code, request.summary.litTicket);
-  await countLitCodeAttempt(context.user, "transaction", nonce);
-  return { email: await context.email(), emailCode, consume: () => consumeRequest(context.user, "transaction", nonce) };
+  const refund = await countLitCodeAttempt(context.user, "transaction", nonce);
+  return { email: await context.email(), emailCode, consume: async () => { await refund(); await consumeRequest(context.user, "transaction", nonce); } };
 }
 
 type SendLimitsSummary = { kind: string; litCode: boolean; record?: ccc.Hex; recordIndex?: number };
@@ -503,9 +516,9 @@ async function sendLimitSettings(
   }
   if (typeof request.summary.litFingerprint === "string") withFingerprint(transaction, request.summary.litFingerprint);
   const emailCode = parseLitEmailCode(body.emailCode, request.summary.litTicket);
-  await countLitCodeAttempt(context.user, "settings", nonce);
+  const refund = await countLitCodeAttempt(context.user, "settings", nonce);
   return { amounts: await serverAmountsAround(context.user, current, next, change, from, transaction, async () => {
-    await signAndSendSettings(context, client, transaction, { email: await context.email(), emailCode });
+    await signAndSendSettings(context, client, transaction, { email: await context.email(), emailCode, signed: refund });
     await consumeRequest(context.user, "settings", nonce);
   }) };
 }
@@ -561,11 +574,14 @@ async function serverAmountsAround(user: User, current: DailyAmounts, next: Dail
   return readDailyAmounts(user);
 }
 
-async function signAndSendSettings(context: SigningContext, client: ccc.Client, transaction: ccc.Transaction, options: { email?: string; emailCode?: LitEmailCode }): Promise<void> {
+async function signAndSendSettings(context: SigningContext, client: ccc.Client, transaction: ccc.Transaction, options: { email?: string; emailCode?: LitEmailCode; signed?: () => Promise<void> } = {}): Promise<void> {
   const locks = await accountLocks(client, context.wallet.litPublicKey, context.wallet.recovery);
   const groups = signingGroups(locks, await Promise.all(transaction.inputs.map((input) => input.getCell(client))));
   await context.recordSigning(context.user.id);
-  const signed = await signGroups(context, transaction, groups, client, options);
+  const { signed: afterSigning, ...signing } = options;
+  const signed = await signGroups(context, transaction, groups, client, signing);
+  // Called before the broadcast, which can fail for reasons that have nothing to do with the code.
+  await afterSigning?.();
   await recordPendingTransaction(context.user.id, signed);
   try {
     await (context.broadcast ?? ((tx: ccc.Transaction) => client.sendTransaction(tx, "passthrough")))(signed);
@@ -617,8 +633,9 @@ export function weakens(before: DailyAmounts, after: DailyAmounts): boolean {
   });
 }
 
+/** A token by its whole ID (type script hash): a shortened one could be ground to match another token's. */
 function assetName(asset: string): string {
-  return asset === "ckb" ? "CKB" : `token ${asset.slice(0, 10)}…${asset.slice(-6)}`;
+  return asset === "ckb" ? "CKB" : `token ${asset}`;
 }
 
 function describeAmount(amounts: DailyAmounts, asset: string): string {
@@ -719,9 +736,12 @@ export async function consumeRequest(user: User, purpose: Purpose, nonce: string
  * email limit bounds how often that can happen.
  */
 export async function sendCode(context: Pick<SigningContext, "user" | "appName" | "email" | "sendEmail" | "rateLimit">, purpose: Purpose, nonce: string, heading: string, lines: string[], options: { limited?: boolean } = {}): Promise<string> {
-  if (!options.limited) await codeLimit(context);
   const code = randomInt(0, 1_000_000).toString().padStart(6, "0");
+  // Built first: a summary too long for one email is refused here, before the request gets a code.
+  const template = createConfirmationEmailTemplate(context.appName, code, heading, lines);
   const sql = await database();
+  if (overFailureLimit(await codeFailures(sql, context.user))) throw new Error(CODE_FAILURES_MESSAGE);
+  if (!options.limited) await codeLimit(context);
   const rows = await sql`
     update keyway_v2_signature_requests
     set email_code_hash = ${codeHash(nonce, code)}, email_code_expires_at = now() + ${`${CODE_TTL_MS} milliseconds`}::interval, email_attempts = 0,
@@ -730,7 +750,6 @@ export async function sendCode(context: Pick<SigningContext, "user" | "appName" 
   `;
   if (!rows[0]) throw new Error(REQUEST_EXPIRED);
   const to = await context.email();
-  const template = createConfirmationEmailTemplate(context.appName, code, heading, lines);
   await context.sendEmail(to, template, `keyway-step-up/${nonce}/${Date.now()}`);
   return to;
 }
@@ -752,16 +771,37 @@ export async function recordLitCode(user: User, purpose: Purpose, nonce: string,
   if (!rows[0]) throw new Error(REQUEST_EXPIRED);
 }
 
-/** Counts one try of a Lit-sent code, so this server still stops a browser after five wrong codes. */
-export async function countLitCodeAttempt(user: User, purpose: Purpose, nonce: string): Promise<void> {
+/**
+ * Counts one try of a Lit-sent code, so this server still stops a browser after five wrong codes, and after the
+ * day's wrong codes across all codes. Only the Action knows whether the code is right, so the try is counted as a
+ * wrong code now; call the function it returns as soon as the Action has signed with the code, to take it back.
+ */
+export async function countLitCodeAttempt(user: User, purpose: Purpose, nonce: string): Promise<() => Promise<void>> {
   const sql = await database();
-  const [row] = await sql<Array<{ email_attempts: number }>>`
-    update keyway_v2_signature_requests set email_attempts = email_attempts + 1
-    where user_id = ${user.id} and purpose = ${purpose} and nonce = ${nonce} and expires_at > now() and email_code_expires_at > now()
-    returning email_attempts
-  `;
-  if (!row) throw new Error("The email code has expired. Request a new one");
-  if (row.email_attempts > MAX_CODE_ATTEMPTS) throw new Error("Too many wrong codes. Request a new one");
+  if (overFailureLimit(await codeFailures(sql, user))) throw new Error(CODE_FAILURES_MESSAGE);
+  const outcome = await sql.begin(async (tx) => {
+    const query = tx as unknown as DatabaseSql;
+    // The same lock as server-sent codes, so tries at once can't each see room under the day's limit.
+    const [{ locked }] = await query<Array<{ locked: boolean }>>`select pg_try_advisory_xact_lock(hashtextextended(${`step-up-failures:${user.id}`}, 0)) as locked`;
+    if (!locked) return "busy";
+    if (overFailureLimit(await codeFailures(query, user))) return "failures";
+    const [row] = await query<Array<{ email_attempts: number }>>`
+      update keyway_v2_signature_requests set email_attempts = email_attempts + 1
+      where user_id = ${user.id} and purpose = ${purpose} and nonce = ${nonce} and expires_at > now() and email_code_expires_at > now()
+      returning email_attempts
+    `;
+    if (!row) return "expired";
+    if (row.email_attempts > MAX_CODE_ATTEMPTS) return "attempts";
+    const [{ id }] = await query<Array<{ id: string }>>`insert into keyway_v2_step_up_failures (user_id, session_id, request_nonce)
+      values (${user.id}, ${user.sessionId ?? ""}, ${nonce}) returning id`;
+    return { id };
+  });
+  if (outcome === "busy") throw new Error("Another email code check is in progress. Try again in a moment");
+  if (outcome === "failures") throw new Error(CODE_FAILURES_MESSAGE);
+  if (outcome === "expired") throw new Error("The email code has expired. Request a new one");
+  if (outcome === "attempts") throw new Error("Too many wrong codes. Request a new one");
+  await pruneCodeFailures(sql);
+  return async () => { await sql`delete from keyway_v2_step_up_failures where id = ${outcome.id}`; };
 }
 
 /** Up to 5 emailed codes per user every 10 minutes, across all purposes. */
@@ -778,16 +818,65 @@ function waitText(seconds: number): string {
 export async function verifyCode(user: User, purpose: Purpose, nonce: string, code: unknown): Promise<void> {
   if (typeof code !== "string" || !/^\d{6}$/.test(code)) throw new Error("Enter the six-digit code from your email");
   const sql = await database();
-  const [row] = await sql<Array<{ email_code_hash: string | null; email_attempts: number }>>`
-    update keyway_v2_signature_requests set email_attempts = email_attempts + 1
-    where user_id = ${user.id} and purpose = ${purpose} and nonce = ${nonce} and expires_at > now() and email_code_expires_at > now()
-    returning email_code_hash, email_attempts
+  // A session past its limit is refused before it competes for the lock below.
+  if (overFailureLimit(await codeFailures(sql, user))) throw new Error(CODE_FAILURES_MESSAGE);
+  // One check at a time per user, so the day's wrong codes are counted before the next one is compared. Another
+  // check already running is refused rather than waited for, so checks never queue on pool connections.
+  const outcome = await sql.begin(async (tx) => {
+    const query = tx as unknown as DatabaseSql;
+    const [{ locked }] = await query<Array<{ locked: boolean }>>`select pg_try_advisory_xact_lock(hashtextextended(${`step-up-failures:${user.id}`}, 0)) as locked`;
+    if (!locked) return "busy";
+    if (overFailureLimit(await codeFailures(query, user))) return "failures";
+    const [row] = await query<Array<{ email_code_hash: string | null; email_attempts: number }>>`
+      update keyway_v2_signature_requests set email_attempts = email_attempts + 1
+      where user_id = ${user.id} and purpose = ${purpose} and nonce = ${nonce} and expires_at > now() and email_code_expires_at > now()
+      returning email_code_hash, email_attempts
+    `;
+    if (!row?.email_code_hash) return "expired";
+    if (row.email_attempts > MAX_CODE_ATTEMPTS) return "attempts";
+    const expected = Buffer.from(row.email_code_hash, "hex");
+    const supplied = Buffer.from(codeHash(nonce, code), "hex");
+    if (expected.length === supplied.length && timingSafeEqual(expected, supplied)) return "ok";
+    await query`insert into keyway_v2_step_up_failures (user_id, session_id) values (${user.id}, ${user.sessionId ?? ""})`;
+    const failures = await codeFailures(query, user);
+    return failures.session === MAX_CODE_FAILURES_PER_SESSION || failures.user === MAX_CODE_FAILURES_PER_USER ? "wrong-last" : "wrong";
+  });
+  if (outcome === "ok") return;
+  if (outcome === "busy") throw new Error("Another email code check is in progress. Try again in a moment");
+  if (outcome === "failures") throw new Error(CODE_FAILURES_MESSAGE);
+  if (outcome === "expired") throw new Error("The email code has expired. Request a new one");
+  if (outcome === "attempts") throw new Error("Too many wrong codes. Request a new one");
+  if (outcome === "wrong-last") void sendSecurityAlert("step_up_failure_limit", { userId: user.id });
+  await pruneCodeFailures(sql);
+  throw new Error("That email code isn't right");
+}
+
+/** Failures older than a day count for nothing; a few go with each wrong code. */
+async function pruneCodeFailures(sql: DatabaseSql): Promise<void> {
+  await sql`delete from keyway_v2_step_up_failures where id in (
+    select id from keyway_v2_step_up_failures where created_at < now() - interval '1 day' limit 100
+  )`;
+}
+
+/**
+ * Wrong codes in the last day: from this session, and from all of the user's sessions since this one began. Sessions
+ * that can't sign in again keep counting everything; a session signed in afterwards with a login code from the inbox
+ * starts its own count, so a few stolen sessions using up the day can't shut the owner out.
+ */
+async function codeFailures(sql: DatabaseSql, user: User): Promise<{ session: number; user: number }> {
+  const session = user.sessionId ?? "";
+  const [row] = await sql<Array<{ session: number; user: number }>>`
+    select count(*) filter (where session_id = ${session})::int as session,
+      count(*) filter (where created_at >= coalesce(
+        (select "createdAt" from keyway_auth_sessions where id::text = ${session}), '-infinity'::timestamptz
+      ))::int as user
+    from keyway_v2_step_up_failures where user_id = ${user.id} and created_at > now() - interval '1 day'
   `;
-  if (!row?.email_code_hash) throw new Error("The email code has expired. Request a new one");
-  if (row.email_attempts > MAX_CODE_ATTEMPTS) throw new Error("Too many wrong codes. Request a new one");
-  const expected = Buffer.from(row.email_code_hash, "hex");
-  const supplied = Buffer.from(codeHash(nonce, code), "hex");
-  if (expected.length !== supplied.length || !timingSafeEqual(expected, supplied)) throw new Error("That email code isn't right");
+  return row;
+}
+
+function overFailureLimit(failures: { session: number; user: number }): boolean {
+  return failures.session >= MAX_CODE_FAILURES_PER_SESSION || failures.user >= MAX_CODE_FAILURES_PER_USER;
 }
 
 /**

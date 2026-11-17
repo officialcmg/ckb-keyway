@@ -5,7 +5,7 @@ import { createRemoteWatchtower, remoteWatchUpdate, updatesForStoredChannel, typ
 import type { WatchedChannel } from "../src/sdk/browser/watchtower-store.ts";
 import {
   FUNDING_LOCK, assessChannel, chainView, type HistoryScan, buildPenaltyTransaction, commitmentArgs, fundingLockArgs, keyAggXOnly, parseRevocation,
-  parseWatchtowerRequest, peerCommitmentKey, revocationSignatureValid, revocationWitness, type ChainView,
+  parseWatchtowerRequest, peerCommitmentKey, penaltySender, revocationSignatureValid, revocationWitness, type ChainView,
 } from "../src/server/watchtower.ts";
 import { COMMITMENT_LOCK, blake160 } from "../src/sdk/browser/watchtower-settle.ts";
 
@@ -428,7 +428,6 @@ test("a reorganization that moves a spend into blocks already read doesn't hide 
     fundingHistory: async () => { throw new Error("not read while a spend is saved"); },
     transaction: async () => undefined,
     isLive: async () => false,
-    spender: async () => undefined,
   };
   const row = { funding_lock_args: `0x${"00".repeat(20)}`, peer_commitment_key: `0x${"11".repeat(32)}`, commitment_number: null, funding_seen: true, funding_spend: `${closingHash}:0` };
   const saved: unknown[] = [];
@@ -464,7 +463,6 @@ test("the funding outpoint is the cell the spend consumed, not the first cell un
     fundingHistory: async () => ({ sawOutput: true, spend: { txHash: closing.hash(), index: 1 } }),
     transaction: async () => ({ tx: closing, committed: true, status: "committed" }),
     isLive: async () => true,
-    spender: async () => undefined,
   };
   const assessment = await assessChannel(chain, { funding_lock_args: fundingLockArgs(local, remote), peer_commitment_key: peerCommitmentKey(local, remote), commitment_number: null });
   assert.equal(assessment.state, "closed");
@@ -535,6 +533,138 @@ test("the penalty pays the user and returns the watchtower's own capacity less t
   assert.equal(tx.inputs.length, 2);
 });
 
+test("a penalty the chain dropped leaves no phantom fee cell for the next pass, and isn't read as sent", async () => {
+  const CKB = 100_000_000n;
+  const client = new ccc.ClientPublicTestnet();
+  const feeSigner = new ccc.SignerCkbPrivateKey(client, `0x${"42".repeat(32)}`);
+  const feeLock = (await feeSigner.getRecommendedAddressObj()).script;
+  const commitmentLock = { codeHash: COMMITMENT_LOCK.testnet.codeHash, hashType: "type", args: `0x${"00".repeat(57)}` } as const;
+  const commitments = [1, 2].map((n) => ccc.Cell.from({
+    outPoint: { txHash: ccc.hexFrom(new Uint8Array(32).fill(n)), index: 0 },
+    cellOutput: { capacity: 1000n * CKB, lock: commitmentLock },
+    outputData: "0x",
+  }));
+  // The fee key's only cell on-chain.
+  const feeCell = ccc.Cell.from({ outPoint: { txHash: `0x${"0f".repeat(32)}`, index: 0 }, cellOutput: { capacity: 10_000n * CKB, lock: feeLock }, outputData: "0x" });
+  const sent: ccc.Transaction[] = [];
+  Object.assign(client, {
+    findCellsPagedNoCache: async (key: { scriptSearchMode?: string }) => ({ cells: key.scriptSearchMode === "exact" ? [feeCell] : [], lastCursor: "" }),
+    getCell: async (outPoint: ccc.OutPointLike) => [...commitments, feeCell].find((cell) => cell.outPoint.eq(ccc.OutPoint.from(outPoint))),
+    findSingletonCellByType: async () => commitments[0],
+    sendTransactionNoCache: async (tx: ccc.Transaction) => { sent.push(ccc.Transaction.from(tx)); return ccc.Transaction.from(tx).hash(); },
+    // The node never saw it, or has dropped it.
+    getTransactionNoCache: async () => undefined,
+  });
+  const row = (n: number) => ({
+    channel_id: `0x${String(n).repeat(64)}`, peer_commitment_key: `0x${"77".repeat(32)}`,
+    commitment_number: "2", aggregated_signature: `0x${"5a".repeat(64)}`, revocation_output: ccc.CellOutput.from({ capacity: 1000n * CKB, lock: userLock }).toHex(), revocation_output_data: "0x",
+  }) as unknown as Parameters<ReturnType<typeof penaltySender>>[0];
+  const commitment = (cell: ccc.Cell) => ({ outPoint: cell.outPoint, capacity: cell.cellOutput.capacity, lock: cell.cellOutput.lock });
+
+  // Pass 1 sends a penalty; the chain then drops it.
+  const first = penaltySender(client, feeSigner);
+  const dropped = await first(row(1), commitment(commitments[0]));
+  assert.ok(sent[0].inputs[1].previousOutput.eq(feeCell.outPoint));
+  assert.equal(await chainView(client).transaction(dropped), undefined, "a dropped penalty doesn't read as sent");
+  // Pass 2 spends the real fee cell again, not the dropped penalty's change.
+  await penaltySender(client, feeSigner)(row(2), commitment(commitments[1]));
+  assert.deepEqual(sent[1].inputs.slice(1).map((input) => input.previousOutput.toHex()), [feeCell.outPoint.toHex()]);
+});
+
+test("a penalty still in the mempool from an earlier pass keeps its fee cell spent for the next pass's penalty", async () => {
+  const CKB = 100_000_000n;
+  const client = new ccc.ClientPublicTestnet();
+  const feeSigner = new ccc.SignerCkbPrivateKey(client, `0x${"43".repeat(32)}`);
+  const feeLock = (await feeSigner.getRecommendedAddressObj()).script;
+  const commitmentLock = { codeHash: COMMITMENT_LOCK.testnet.codeHash, hashType: "type", args: `0x${"00".repeat(57)}` } as const;
+  const commitments = [1, 2].map((n) => ccc.Cell.from({ outPoint: { txHash: ccc.hexFrom(new Uint8Array(32).fill(n)), index: 0 }, cellOutput: { capacity: 1000n * CKB, lock: commitmentLock }, outputData: "0x" }));
+  const feeCell = ccc.Cell.from({ outPoint: { txHash: `0x${"0e".repeat(32)}`, index: 0 }, cellOutput: { capacity: 10_000n * CKB, lock: feeLock }, outputData: "0x" });
+  const sent: ccc.Transaction[] = [];
+  Object.assign(client, {
+    // The indexer shows committed cells only: the fee cell looks unspent while the first penalty is pending.
+    findCellsPagedNoCache: async (key: { scriptSearchMode?: string }) => ({ cells: key.scriptSearchMode === "exact" ? [feeCell] : [], lastCursor: "" }),
+    getCell: async (outPoint: ccc.OutPointLike) => [...commitments, feeCell].find((cell) => cell.outPoint.eq(ccc.OutPoint.from(outPoint))) ?? await client.cache.getCell(outPoint),
+    findSingletonCellByType: async () => commitments[0],
+    sendTransactionNoCache: async (tx: ccc.Transaction) => { sent.push(ccc.Transaction.from(tx)); return ccc.Transaction.from(tx).hash(); },
+    getTransactionNoCache: async (hash: ccc.Hex) => {
+      const found = sent.find((tx) => tx.hash() === hash);
+      return found ? { transaction: found, status: "pending" } : undefined;
+    },
+  });
+  const row = (n: number) => ({
+    channel_id: `0x${String(n).repeat(64)}`, peer_commitment_key: `0x${"77".repeat(32)}`,
+    commitment_number: "2", aggregated_signature: `0x${"5a".repeat(64)}`, revocation_output: ccc.CellOutput.from({ capacity: 1000n * CKB, lock: userLock }).toHex(), revocation_output_data: "0x",
+  }) as unknown as Parameters<ReturnType<typeof penaltySender>>[0];
+  const commitment = (cell: ccc.Cell) => ({ outPoint: cell.outPoint, capacity: cell.cellOutput.capacity, lock: cell.cellOutput.lock });
+  const pending = await penaltySender(client, feeSigner)(row(1), commitment(commitments[0]));
+  // The next pass: the first penalty is still pending, so the new one spends its change, not the fee cell again.
+  const second = await penaltySender(client, feeSigner, async () => [pending])(row(2), commitment(commitments[1]));
+  assert.deepEqual(sent[1].inputs.slice(1).map((input) => input.previousOutput.toHex()), [ccc.OutPoint.from({ txHash: pending, index: 1 }).toHex()]);
+  // A pass later both are still pending, listed child first: the next one spends the second's change, not the first's.
+  await penaltySender(client, feeSigner, async () => [second, pending])(row(3), commitment(commitments[0]));
+  assert.deepEqual(sent[2].inputs.slice(1).map((input) => input.previousOutput.toHex()), [ccc.OutPoint.from({ txHash: second, index: 1 }).toHex()]);
+});
+
+test("before its first penalty a sender reads each in-flight penalty once, and only a bounded number in a bounded time", async () => {
+  const CKB = 100_000_000n;
+  const client = new ccc.ClientPublicTestnet();
+  const feeSigner = new ccc.SignerCkbPrivateKey(client, `0x${"44".repeat(32)}`);
+  const feeLock = (await feeSigner.getRecommendedAddressObj()).script;
+  const commitmentLock = { codeHash: COMMITMENT_LOCK.testnet.codeHash, hashType: "type", args: `0x${"00".repeat(57)}` } as const;
+  const commitment = ccc.Cell.from({ outPoint: { txHash: `0x${"01".repeat(32)}`, index: 0 }, cellOutput: { capacity: 1000n * CKB, lock: commitmentLock }, outputData: "0x" });
+  const feeCell = ccc.Cell.from({ outPoint: { txHash: `0x${"0d".repeat(32)}`, index: 0 }, cellOutput: { capacity: 10_000n * CKB, lock: feeLock }, outputData: "0x" });
+  const reads: string[] = [];
+  Object.assign(client, {
+    findCellsPagedNoCache: async (key: { scriptSearchMode?: string }) => ({ cells: key.scriptSearchMode === "exact" ? [feeCell] : [], lastCursor: "" }),
+    getCell: async (outPoint: ccc.OutPointLike) => [commitment, feeCell].find((cell) => cell.outPoint.eq(ccc.OutPoint.from(outPoint))),
+    findSingletonCellByType: async () => commitment,
+    sendTransactionNoCache: async (tx: ccc.Transaction) => ccc.Transaction.from(tx).hash(),
+    getTransactionNoCache: async (hash: ccc.Hex) => {
+      reads.push(hash);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return undefined;
+    },
+  });
+  // 400 penalty-sent rows naming 200 transactions (many channels can share one).
+  const hashes = Array.from({ length: 400 }, (_, n) => ccc.hexFrom(ccc.hashCkb(new Uint8Array([n % 200, n % 200 >> 8]))));
+  const row = {
+    channel_id: `0x${"1".repeat(64)}`, peer_commitment_key: `0x${"77".repeat(32)}`,
+    commitment_number: "2", aggregated_signature: `0x${"5a".repeat(64)}`, revocation_output: ccc.CellOutput.from({ capacity: 1000n * CKB, lock: userLock }).toHex(), revocation_output_data: "0x",
+  } as unknown as Parameters<ReturnType<typeof penaltySender>>[0];
+  const started = Date.now();
+  await penaltySender(client, feeSigner, async () => hashes)(row, { outPoint: commitment.outPoint, capacity: commitment.cellOutput.capacity, lock: commitment.cellOutput.lock });
+  assert.equal(new Set(reads).size, reads.length, "no transaction is read twice");
+  assert.ok(reads.length <= 64, `at most 64 reads: ${reads.length}`);
+  assert.ok(Date.now() - started < 2_000, `several at a time: ${Date.now() - started} ms`);
+});
+
+test("a read that never answers doesn't hold up the penalty past the sender's time budget", async () => {
+  const CKB = 100_000_000n;
+  const client = new ccc.ClientPublicTestnet();
+  const feeSigner = new ccc.SignerCkbPrivateKey(client, `0x${"45".repeat(32)}`);
+  const feeLock = (await feeSigner.getRecommendedAddressObj()).script;
+  const commitmentLock = { codeHash: COMMITMENT_LOCK.testnet.codeHash, hashType: "type", args: `0x${"00".repeat(57)}` } as const;
+  const commitment = ccc.Cell.from({ outPoint: { txHash: `0x${"01".repeat(32)}`, index: 0 }, cellOutput: { capacity: 1000n * CKB, lock: commitmentLock }, outputData: "0x" });
+  const feeCell = ccc.Cell.from({ outPoint: { txHash: `0x${"0c".repeat(32)}`, index: 0 }, cellOutput: { capacity: 10_000n * CKB, lock: feeLock }, outputData: "0x" });
+  const sent: string[] = [];
+  Object.assign(client, {
+    findCellsPagedNoCache: async (key: { scriptSearchMode?: string }) => ({ cells: key.scriptSearchMode === "exact" ? [feeCell] : [], lastCursor: "" }),
+    getCell: async (outPoint: ccc.OutPointLike) => [commitment, feeCell].find((cell) => cell.outPoint.eq(ccc.OutPoint.from(outPoint))),
+    findSingletonCellByType: async () => commitment,
+    sendTransactionNoCache: async (tx: ccc.Transaction) => { const hash = ccc.Transaction.from(tx).hash(); sent.push(hash); return hash; },
+    // The node never answers about the penalty still in flight.
+    getTransactionNoCache: () => new Promise(() => undefined),
+  });
+  const row = {
+    channel_id: `0x${"1".repeat(64)}`, peer_commitment_key: `0x${"77".repeat(32)}`,
+    commitment_number: "2", aggregated_signature: `0x${"5a".repeat(64)}`, revocation_output: ccc.CellOutput.from({ capacity: 1000n * CKB, lock: userLock }).toHex(), revocation_output_data: "0x",
+  } as unknown as Parameters<ReturnType<typeof penaltySender>>[0];
+  const started = Date.now();
+  const hash = await penaltySender(client, feeSigner, async () => [`0x${"ee".repeat(32)}`], { budgetMs: 100 })(row, { outPoint: commitment.outPoint, capacity: commitment.cellOutput.capacity, lock: commitment.cellOutput.lock });
+  assert.deepEqual(sent, [hash], "the penalty is still sent");
+  assert.ok(Date.now() - started < 1_000, `within the budget: ${Date.now() - started} ms`);
+});
+
 test("the watchtower refuses revocations that would move capacity between it and the channel", async () => {
   const CKB = 100_000_000n;
   // A self-dealt revocation larger than the commitment would make the watchtower pay the difference.
@@ -554,7 +684,6 @@ function fakeChain(options: { funded?: boolean; closing?: ccc.Transaction; commi
       return hash === closingHash && options.closing ? { tx: options.closing, committed: options.committed ?? true, status: options.committed === false ? "pending" : "committed" } : undefined;
     },
     async isLive() { return true; },
-    async spender() { return undefined; },
   };
 }
 

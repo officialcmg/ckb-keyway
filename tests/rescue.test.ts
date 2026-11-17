@@ -66,7 +66,7 @@ async function joyIdAddress(client: ccc.Client): Promise<string> {
  * A recovery account on chain: its AdminList under the key's owner-only lock, the transaction that recorded the
  * list, and some funds, every cell an output of a transaction the client returns.
  */
-async function rescueChain(options: { plainCkb?: bigint[]; token?: boolean; listData?: ccc.Hex } = {}) {
+async function rescueChain(options: { plainCkb?: bigint[]; token?: boolean; tokenCkb?: bigint; listData?: ccc.Hex } = {}) {
   const base = await offlineClient();
   const backups: RecoveryBackup[] = [{ kind: "evm", address: evmAddress }, { kind: "joyid", address: await joyIdAddress(base) }];
   const typeArgs = ccc.hexFrom(new Uint8Array(32).fill(0x42));
@@ -84,7 +84,7 @@ async function rescueChain(options: { plainCkb?: bigint[]; token?: boolean; list
   const dao = await base.getKnownScript(ccc.KnownScript.NervosDao);
   const outputs = [
     ...(options.plainCkb ?? [1_000n * CKB, 300n * CKB]).map((capacity) => ({ cellOutput: { lock, capacity }, outputData: "0x" })),
-    ...(options.token === false ? [] : [{ cellOutput: { lock, capacity: 176n * CKB, type: token }, outputData: amount(2_500n) }]),
+    ...(options.token === false ? [] : [{ cellOutput: { lock, capacity: options.tokenCkb ?? 176n * CKB, type: token }, outputData: amount(2_500n) }]),
     { cellOutput: { lock, capacity: 102n * CKB, type: ccc.Script.from({ codeHash: dao.codeHash, hashType: dao.hashType, args: "0x" }) }, outputData: ccc.hexFrom(new Uint8Array(8)) },
   ];
   const funding = ccc.Transaction.from({
@@ -291,6 +291,34 @@ test("puts a small remainder into the token cell, and says how much is missing w
   const none = await rescueChain({ plainCkb: [], token: false });
   const empty = await openRescueAccount(none.client, none.address);
   await rejects(planRescue(none.client, empty, await rescueEntryForEvm(none.client, empty, [evmAddress]), none.destination), "empty");
+});
+
+test("never gives a token cell more CKB than it held: plain CKB that can't be a cell of its own stays", async () => {
+  // A destination whose lock args are 86 bytes: a plain cell there needs 127 CKB and the token cell 208. The account
+  // has the token cell (218 CKB) and 95 CKB plain: 105 CKB spare can't be a plain cell, and the token cell may take
+  // only the 10 CKB it held beyond what it needs, so the plain cell stays where it is.
+  const chain = await rescueChain({ plainCkb: [95n * CKB], tokenCkb: 218n * CKB });
+  const account = await openRescueAccount(chain.client, chain.address);
+  const omnilock = await ccc.Script.fromKnownScript(chain.client, ccc.KnownScript.OmniLock, "0x");
+  const wide = ccc.Address.fromScript(ccc.Script.from({ ...omnilock, args: `0x00${"12".repeat(20)}01${"34".repeat(64)}` }), chain.client).toString();
+  const plan = await planRescue(chain.client, account, await rescueEntryForEvm(chain.client, account, [evmAddress]), wide);
+  assert.equal(plan.plainLeft, 95n * CKB);
+  assert.equal(plan.transaction.inputs.length, 1);
+  assert.equal(plan.transaction.outputs.length, 1);
+  assert.equal(plan.tokens[0].capacity + plan.fee, 218n * CKB);
+  assert.match(plan.approvalText, /\nCKB: 21[78](\.\d+)?\nTokens: 1 token cell\n/);
+  // Signed and checked as the verifier will check it.
+  await signRescueWithEvm(chain.client, account, plan, evmWallet());
+  // A token cell at exactly its size and the smallest plain cell, to an address as large as the account's: the
+  // plain CKB less the fee is too little for a plain cell there, and the token cell has no room for it. Short by
+  // what a plain cell there still needs: sending that much more moves everything.
+  const tight = await rescueChain({ plainCkb: [95n * CKB] });
+  const tightAccount = await openRescueAccount(tight.client, tight.address);
+  const same = ccc.Address.fromScript(ccc.Script.from({ ...omnilock, args: `0x00${"12".repeat(20)}01${"34".repeat(32)}` }), tight.client).toString();
+  await assert.rejects(planRescue(tight.client, tightAccount, await rescueEntryForEvm(tight.client, tightAccount, [evmAddress]), same), (error: unknown) =>
+    error instanceof RescueError && error.code === "short" && /0\.0000\d+ CKB more is needed/.test(error.message));
+  // A plain destination fits everything: nothing stays.
+  assert.equal((await planRescue(chain.client, account, await rescueEntryForEvm(chain.client, account, [evmAddress]), chain.destination)).plainLeft, 0n);
 });
 
 test("the transaction check refuses anything but the rescue's own shape", async () => {

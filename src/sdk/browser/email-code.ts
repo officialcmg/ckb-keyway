@@ -29,6 +29,14 @@ export function canRetryCode(message: string): boolean {
   return RETRY_CODE.test(message);
 }
 
+/** A login code check that ended its challenge: the server says to request a new code. */
+const LOGIN_CODE_USED_UP = /request a new code/i;
+
+/** Whether a sign-in code can't be tried again, so the login dialog should offer only a new code. */
+export function loginCodeUsedUp(message: string): boolean {
+  return LOGIN_CODE_USED_UP.test(message);
+}
+
 /** Whether the approval behind the prompt is gone, so only starting again helps. */
 export function isRequestExpired(message: string): boolean {
   return REQUEST_EXPIRED.test(message);

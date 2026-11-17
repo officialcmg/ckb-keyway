@@ -78,7 +78,7 @@ test("M3 fixed: the backup's wallet shows where everything goes and how much, an
       return ccc.hexFrom(ccc.bytesConcat(raw.slice(1), [raw[0] + 27]));
     },
   };
-  const signed = await signRecoverySpendWithEvm(drain, { client, lock, omnilock: KEYWAY_OMNILOCK.testnet, auths: list.auths, entry, adminList: adminList.outPoint, inputCapacity: 10_000n * CKB }, wallet);
+  const signed = await signRecoverySpendWithEvm(drain, { client, lock, omnilock: KEYWAY_OMNILOCK.testnet, auths: list.auths, entry, adminList: adminList.outPoint, inputCells: [funds] }, wallet);
 
   assert.equal(requests.length, 1);
   const thief = ccc.Address.fromScript(thiefLock, client).toString();
@@ -91,10 +91,10 @@ test("M3 fixed: the backup's wallet shows where everything goes and how much, an
   const zeroed = signed.clone();
   zeroed.setWitnessArgsAt(0, ccc.WitnessArgs.from({ ...witnessArgs, lock: ccc.hexFrom(new Uint8Array(ccc.bytesFrom(witnessArgs.lock!).length)) }));
   const sighash = (await zeroed.getSignHashInfo(lock, client))!.message;
-  assert.equal(requests[0], recoveryApprovalText(client, rescueApproval(signed, lock, 10_000n * CKB), sighash));
+  assert.equal(requests[0], recoveryApprovalText(client, rescueApproval(signed, lock, [funds]), sighash));
   const elsewhere = signed.clone();
   elsewhere.outputs[0].lock = ccc.Script.from({ ...thiefLock, args: `0x${"cd".repeat(20)}` });
-  assert.notEqual(recoveryApprovalText(client, rescueApproval(elsewhere, lock, 10_000n * CKB), sighash), requests[0]);
+  assert.notEqual(recoveryApprovalText(client, rescueApproval(elsewhere, lock, [funds]), sighash), requests[0]);
   // The witness carries version 1 ‖ network ‖ the personal_sign signature, through the EVM exec verifier.
   const witness = ccc.bytesFrom(witnessArgs.lock!);
   assert.deepEqual([witness[20], witness[21]], [1, 0]);

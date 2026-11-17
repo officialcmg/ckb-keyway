@@ -140,7 +140,7 @@ export class KeyWayApiClient {
 
   saveNodeBackup(
     authToken: string,
-    body: { deviceIdHash: string; leaseId: string; backup: NodeBackupPayload },
+    body: { deviceIdHash: string; leaseId: string; keyDelivery: string; backup: NodeBackupPayload },
   ): Promise<{ generation: number; digest: string }> {
     return this.idempotentJson(`${KEYWAY_API_PATH}/node-backup/save`, authToken, body);
   }

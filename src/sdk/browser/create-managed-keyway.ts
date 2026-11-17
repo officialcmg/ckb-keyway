@@ -44,7 +44,7 @@ import { serializeCccTransactionForRpc } from "./ccc-transaction";
 import { fundingLockCellDeps, FUNDING_LOCK_KNOWN_SCRIPTS, type KeyWayRecovery } from "./account-lock";
 import { getLockBalance } from "./ckb-balance";
 import { toKeyWayError } from "./keyway-error";
-import { refuseFundingBeyondRequest, type FundingRequest } from "./funding-limit";
+import { createChannelOpenings, refuseFundingBeyondRequest, type ChannelOpening } from "./funding-limit";
 import { createFeeReserve, FEE_RESERVE } from "./fee-reserve";
 
 type ManagedStatus = {
@@ -68,20 +68,19 @@ export function createManagedKeyWay(options: {
   approvals?: () => FiberActionApprovals;
   apiClient?: KeyWayApiClient;
 }) {
-  let openingPeer: string | undefined;
-  let openingWithReserve = false;
-  let openingRequest: FundingRequest | undefined;
+  const openings = createChannelOpenings();
   const api = options.apiClient ?? new KeyWayApiClient();
   const fundingSigner = new RemoteCkbSigner(
     options.authToken,
     options.ckbPublicKey,
     (preview) => {
+      const opening = openings.current();
       // The account's share may not exceed what the app asked Fiber for, whatever the peer did to the transaction.
-      refuseFundingBeyondRequest(preview, openingRequest);
+      refuseFundingBeyondRequest(preview, opening?.request);
       return options.approveFiberChannelOpen({
-      ...preview,
-      ...(openingPeer ? { peer: openingPeer } : {}),
-      ...(openingWithReserve ? { feeReserveCkb: ccc.fixedPointToString(FEE_RESERVE) } : {}),
+        ...preview,
+        ...(opening?.peer ? { peer: opening.peer } : {}),
+        ...(opening?.withReserve ? { feeReserveCkb: ccc.fixedPointToString(FEE_RESERVE) } : {}),
       });
     },
     undefined,
@@ -158,12 +157,18 @@ export function createManagedKeyWay(options: {
     );
   }
 
-  /** Opens a channel funded from the account, recording the request so its funding preview can be checked against it. */
-  async function openFundedChannel(params: KeyWayFundingParams) {
-    openingPeer = params.pubkey;
-    openingWithReserve = await feeReserve.needed();
+  /**
+   * Opens a channel funded from the account, recording the request so its funding preview can be checked against it.
+   * Opens run one at a time (see `createChannelOpenings`).
+   */
+  function openFundedChannel(params: KeyWayFundingParams) {
+    return openings.run((opening) => openFundedChannelNow(opening, params));
+  }
+  async function openFundedChannelNow(opening: ChannelOpening, params: KeyWayFundingParams) {
+    opening.peer = params.pubkey;
+    opening.withReserve = await feeReserve.needed();
     const funding = await resolveExternalFunding(undefined);
-    openingRequest = { fundingAmount: BigInt(params.funding_amount), udtTypeScript: params.funding_udt_type_script, shutdownScript: funding.shutdownScript };
+    opening.request = { fundingAmount: BigInt(params.funding_amount), udtTypeScript: params.funding_udt_type_script, shutdownScript: funding.shutdownScript };
     const result = await openChannelWithExternalFundingFlow({
       node: { openChannelWithExternalFunding, submitSignedFundingTx },
       params: {
@@ -175,7 +180,7 @@ export function createManagedKeyWay(options: {
       },
       signFundingTx: funding.signFundingTx,
     });
-    const feeReserveTxHash = openingWithReserve ? await feeReserve.send(result.fundingTxHash) : undefined;
+    const feeReserveTxHash = opening.withReserve ? await feeReserve.send(result.fundingTxHash) : undefined;
     return { ...result, ...(feeReserveTxHash ? { feeReserveTxHash } : {}) };
   }
 

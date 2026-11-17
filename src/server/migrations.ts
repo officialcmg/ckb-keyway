@@ -5,6 +5,11 @@ export const migrations: Array<{
   version: number;
   name: string;
   up: (sql: DatabaseSql) => Promise<unknown>;
+  /**
+   * False for a migration that can't run inside a transaction (building an index concurrently). It must be safe to
+   * run again from the start, since it's recorded only once it has finished.
+   */
+  transaction?: false;
 }> = [
   {
     version: 1,
@@ -402,7 +407,110 @@ export const migrations: Array<{
     up: (sql) => sql`alter table keyway_v2_watchtower_channels add column closing_commitment_number numeric(20, 0)`,
   },
   {
-    version: 23, name: "daily-amount-versions",
+    version: 23, name: "security-alert-state",
+    // When each kind of alert last went out, so concurrent signings raise one alert per window between them.
+    up: (sql) => sql`create table keyway_security_alert_state (kind text primary key, alerted_at timestamptz not null, claim_id uuid not null)`,
+  },
+  {
+    version: 24, name: "wallet-provisioning-claims",
+    // The one request setting up a new account's wallet, so its Lit calls run without holding the wallet lock.
+    up: (sql) => sql`create table keyway_v2_provisioning_claims (
+      user_id text primary key,
+      claim_id uuid not null,
+      claimed_at timestamptz not null default now()
+    )`,
+  },
+  {
+    version: 25, name: "idempotency-pruning", transaction: false,
+    // Lets each new record find the expired records still holding a response or error text to drop, and count the
+    // account's records from the last day. Built concurrently, so live writes to the table carry on meanwhile: a
+    // plain index build would hold every new record behind it, and behind any write still in progress. Existing
+    // records are left as they are; new ones prune them in small batches. An interrupted build leaves an invalid
+    // index, so each is dropped first and the migration can simply run again.
+    up: async (sql) => {
+      const indexes = [
+        ["keyway_v2_idempotency_keys_unpruned", "(expires_at) where response is not null or error_message is not null"],
+        ["keyway_v2_idempotency_keys_user_created", "(user_id, created_at)"],
+      ];
+      for (const [name, definition] of indexes) {
+        await sql.unsafe(`drop index concurrently if exists ${name}`);
+        await sql.unsafe(`create index concurrently ${name} on keyway_v2_idempotency_keys ${definition}`);
+      }
+    },
+  },
+  {
+    version: 26, name: "session-origin-required",
+    // Every session issued since version 21 has the origin it was issued at. The older ones have none, so removing an
+    // origin could never end them; they are signed out, and sessions without an origin are refused.
+    up: (sql) => sql`delete from keyway_auth_sessions where "origin" is null`,
+  },
+  {
+    version: 27, name: "step-up-code-failures",
+    up: async (sql) => {
+      // Wrong step-up codes per user and session, kept for a day: each code allows five tries, and codes can be sent again.
+      await sql`create table keyway_v2_step_up_failures (
+        id bigint generated always as identity primary key,
+        user_id uuid not null,
+        session_id text not null,
+        created_at timestamptz not null default now()
+      )`;
+      await sql`create index keyway_v2_step_up_failures_user on keyway_v2_step_up_failures (user_id, created_at)`;
+      await sql`create index keyway_v2_step_up_failures_age on keyway_v2_step_up_failures (created_at)`;
+    },
+  },
+  {
+    version: 28, name: "login-code-sources",
+    up: async (sql) => {
+      // The wrong codes tried on each login challenge, so its owner can still use a fresh code while wrong codes from
+      // others pause the email's checks.
+      await sql`alter table keyway_auth_challenges add column wrong_attempts integer not null default 0`;
+      // Expired challenges hold the emails people typed: removed now, and from here on as new ones are made.
+      await sql`delete from keyway_auth_challenges where expires_at < now()`;
+      await sql`create index keyway_auth_challenges_expiry on keyway_auth_challenges (expires_at)`;
+      // The network (IPv4 address or IPv6 /48) of each login-code event, and whether a wrong code was tried while
+      // the email's checks were paused.
+      await sql`alter table keyway_otp_events add column network_hash text, add column bypass boolean not null default false`;
+      // Every code check counts one email's wrong codes over a day; this keeps that from reading everyone's.
+      await sql`create index keyway_otp_events_failures on keyway_otp_events (app_id, email_hash, created_at) where outcome = 'verify_failed'`;
+      // Networks that signed in to an email's account in an app, kept 90 days: the owner's own, which strangers can't add.
+      await sql`create table keyway_otp_known_networks (
+        app_id text not null, email_hash text not null, network_hash text not null, verified_at timestamptz not null,
+        primary key (app_id, email_hash, network_hash)
+      )`;
+      await sql`create index keyway_otp_known_networks_age on keyway_otp_known_networks (verified_at)`;
+    },
+  },
+  {
+    version: 29, name: "security-alert-marks",
+    // When each deduplicated security alert last went out, by kind and hashed subject.
+    up: (sql) => sql`create table keyway_security_alert_marks (key text primary key, sent_at timestamptz not null)`,
+  },
+  {
+    version: 30, name: "lit-step-up-tries",
+    // A try of a code the Lit Action emailed counts as a wrong code until the request it was for is used up, which
+    // happens only once the Action has signed; this names that request.
+    up: (sql) => sql`alter table keyway_v2_step_up_failures add column request_nonce text`,
+  },
+  {
+    version: 31, name: "auth-rate-limit-expiry",
+    up: async (sql) => {
+      // When each rate-limit window ends, so ended ones can be removed. Every window in use is 10 minutes or less,
+      // so a day after a window started it has ended.
+      await sql`alter table keyway_auth_rate_limits add column expires_at timestamptz`;
+      await sql`update keyway_auth_rate_limits set expires_at = starts_at + interval '1 day'`;
+      // The default keeps the API from before this migration working until the new one replaces it.
+      await sql`alter table keyway_auth_rate_limits alter column expires_at set default now() + interval '1 day', alter column expires_at set not null`;
+      await sql`create index keyway_auth_rate_limits_expiry on keyway_auth_rate_limits (expires_at)`;
+    },
+  },
+  {
+    version: 32, name: "device-lease-key-delivery",
+    // The device's latest Fiber-key delivery under this lease: a backup is accepted only from the logout that took
+    // that key, so an upload that lands after the node ran again (and got its key again) can't be restored.
+    up: (sql) => sql`alter table keyway_v2_device_leases add column key_delivery uuid`,
+  },
+  {
+    version: 33, name: "daily-amount-versions",
     // Counts writes to each user's daily amounts, so a raise written after its send-limit transaction was sent can
     // tell whether any other change was written since; and the last transaction sent to make the send-limit cell, so a
     // server-only raise can tell the cell exists before an indexer lists it.

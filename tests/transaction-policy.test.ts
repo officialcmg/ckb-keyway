@@ -135,7 +135,163 @@ test("shows an NFT leaving the account and flags unrecognized scripts", () => {
   assert.equal(preview.nfts[0].change, "sent");
   assert.equal(preview.unrecognized.length, 1);
   assert.equal(preview.unrecognized[0].cells, 2);
+  // By its whole code hash.
+  assert.equal(preview.unrecognized[0].codeHash, mystery.codeHash);
+  assert.ok(previewSummaryLines(preview).includes(`Unrecognized script ${mystery.codeHash} (type, 2 cells)`));
+  // The same code hash run another way is another program, and is listed apart.
+  const other = ccc.Script.from({ ...mystery, hashType: "data1" });
+  const both = build(
+    [{ lock: own, capacity: 500n * CKB, type: mystery }, { lock: own, capacity: 500n * CKB, type: other }],
+    [{ lock: contract, capacity: 500n * CKB, type: mystery }, { lock: own, capacity: 500n * CKB - 4_000n, type: other }],
+  ).preview;
+  assert.deepEqual(both.unrecognized, [{ codeHash: mystery.codeHash, hashType: "type", cells: 2 }, { codeHash: mystery.codeHash, hashType: "data1", cells: 2 }]);
+  assert.ok(both.details.outputs.every(({ type }) => !type?.includes("…")));
+  assert.equal(both.details.outputs[0].lock, contract.hash());
   assert.equal(preview.recipients.find((recipient) => recipient.kind === "contract")?.ckb, "499.99996");
+});
+
+test("names NFTs and tokens by their whole ID, and keeps tokens apart that a short ID would merge", () => {
+  // Two xUDT tokens ground (in seconds) so their type script hashes share the old short form, 0xbdb681…72b5.
+  const twinA = ccc.Script.from({ codeHash: known.xudt.codeHash, hashType: "type", args: `0x71d40e${"00".repeat(29)}` });
+  const twinB = ccc.Script.from({ codeHash: known.xudt.codeHash, hashType: "type", args: `0xedc32b${"00".repeat(29)}` });
+  assert.equal(twinA.hash(), "0xbdb681eee837511ca24e81fff9e2476fbcb402d5ef264a31c4fa30ef01da72b5");
+  assert.equal(twinB.hash(), "0xbdb68117fdbb5becaaeaaa710e97c5e02cf34fa8eac6abafea610c90224472b5");
+  // Two Spores whose IDs share their start and end.
+  const sporeA = ccc.Script.from({ ...spore, args: `0x${"5e".repeat(14)}${"00".repeat(4)}${"5e".repeat(14)}` });
+  const sporeB = ccc.Script.from({ ...spore, args: `0x${"5e".repeat(14)}${"ff".repeat(4)}${"5e".repeat(14)}` });
+  const { preview } = build(
+    [
+      { lock: own, capacity: 300n * CKB, type: sporeA, data: "0x01" },
+      { lock: own, capacity: 200n * CKB, type: twinA, data: u128(1_000n) },
+      { lock: own, capacity: 200n * CKB, type: twinB, data: u128(7n) },
+      { lock: own, capacity: 500n * CKB },
+    ],
+    [
+      { lock: alice, capacity: 300n * CKB, type: sporeA, data: "0x01" },
+      { lock: alice, capacity: 200n * CKB, type: twinA, data: u128(1_000n) },
+      { lock: alice, capacity: 200n * CKB, type: twinB, data: u128(7n) },
+      { lock: own, capacity: 300n * CKB, type: sporeB, data: "0x02" },
+      { lock: own, capacity: 200n * CKB - 5_000n },
+    ],
+  );
+  assert.deepEqual(preview.nfts, [{ kind: "Spore", id: sporeA.args, change: "sent" }, { kind: "Spore", id: sporeB.args, change: "minted" }]);
+  const [recipient] = preview.recipients;
+  assert.deepEqual(recipient.nfts, [`Spore ${sporeA.args}`]);
+  assert.deepEqual(recipient.tokens.map(({ asset, amount }) => ({ asset, amount })), [{ asset: twinA.hash(), amount: "1000" }, { asset: twinB.hash(), amount: "7" }]);
+  assert.deepEqual(recipient.tokens.map(({ amountText }) => amountText), [`1000 of token ${twinA.hash()}`, `7 of token ${twinB.hash()}`]);
+  const lines = previewSummaryLines(preview);
+  assert.ok(lines.includes(`Spore ${sporeA.args}: sent`), lines.join("\n"));
+  assert.ok(lines.includes(`Spore ${sporeB.args}: minted`), lines.join("\n"));
+  assert.ok(lines.includes(`Token -1000 of token ${twinA.hash()} (xUDT ${twinA.hash()})`), lines.join("\n"));
+  assert.ok(lines.includes(`Token -7 of token ${twinB.hash()} (xUDT ${twinB.hash()})`), lines.join("\n"));
+  assert.ok(lines.every((line) => !line.includes("…")), lines.join("\n"));
+});
+
+test("the confirmation email says which tokens, NFTs and other typed cells go to which recipient", () => {
+  const bob = lock("33");
+  const tokenA = ccc.Script.from({ codeHash: known.xudt.codeHash, hashType: "type", args: `0x${"a1".repeat(32)}` });
+  const tokenB = ccc.Script.from({ codeHash: known.xudt.codeHash, hashType: "type", args: `0x${"b2".repeat(32)}` });
+  const sporeA = ccc.Script.from({ ...spore, args: `0x${"a3".repeat(32)}` });
+  const sporeB = ccc.Script.from({ ...spore, args: `0x${"b4".repeat(32)}` });
+  const typeA = ccc.Script.from({ codeHash: TYPE_ID, hashType: "type", args: `0x${"a5".repeat(32)}` });
+  const typeB = ccc.Script.from({ codeHash: TYPE_ID, hashType: "type", args: `0x${"b6".repeat(32)}` });
+  const mysteryA = ccc.Script.from({ ...mystery, args: "0xa7" });
+  const mysteryB = ccc.Script.from({ ...mystery, args: "0xb8" });
+  const pairs: Array<[ccc.Script, ccc.Script, ccc.Hex, ccc.Hex]> = [
+    [tokenA, tokenB, u128(1_000n), u128(1_000n)],
+    [sporeA, sporeB, "0x01", "0x01"],
+    [typeA, typeB, "0x01", "0x01"],
+    [mysteryA, mysteryB, "0x", "0x"],
+  ];
+  for (const [a, b, dataA, dataB] of pairs) {
+    // The same cells, same capacities, with the two assets going to each other's recipient.
+    const send = (toAlice: [ccc.Script, ccc.Hex], toBob: [ccc.Script, ccc.Hex]) => build(
+      [{ lock: own, capacity: 200n * CKB, type: a, data: dataA }, { lock: own, capacity: 200n * CKB, type: b, data: dataB }, { lock: own, capacity: 500n * CKB }],
+      [
+        { lock: alice, capacity: 200n * CKB, type: toAlice[0], data: toAlice[1] },
+        { lock: bob, capacity: 200n * CKB, type: toBob[0], data: toBob[1] },
+        { lock: own, capacity: 500n * CKB - 5_000n },
+      ],
+    ).preview;
+    const intended = previewSummaryLines(send([a, dataA], [b, dataB]));
+    const swapped = previewSummaryLines(send([b, dataB], [a, dataA]));
+    assert.notDeepEqual(intended, swapped, `${a.codeHash}: ${intended.join("\n")}`);
+    // Each recipient's line names what it gets by its whole ID.
+    const aliceLine = intended.find((line) => line.includes(ccc.Address.fromScript(alice, client).toString()));
+    assert.ok(aliceLine, intended.join("\n"));
+    const id = a === sporeA ? a.args : a.hash();
+    assert.ok(aliceLine.includes(id), aliceLine);
+    assert.ok(!aliceLine.includes(b === sporeB ? b.args : b.hash()), aliceLine);
+  }
+});
+
+test("the confirmation email says which of the account's typed cells it gives up, changes or gets", () => {
+  const typeA = ccc.Script.from({ codeHash: TYPE_ID, hashType: "type", args: `0x${"a5".repeat(32)}` });
+  const typeB = ccc.Script.from({ codeHash: TYPE_ID, hashType: "type", args: `0x${"b6".repeat(32)}` });
+  const mysteryA = ccc.Script.from({ ...mystery, args: "0xa7" });
+  const mysteryB = ccc.Script.from({ ...mystery, args: "0xb8" });
+  for (const [a, b] of [[typeA, typeB], [mysteryA, mysteryB]]) {
+    // Keeps one of the two cells and destroys the other; same capacities, same recipient.
+    const keep = (kept: ccc.Script) => build(
+      [{ lock: own, capacity: 200n * CKB, type: a, data: "0x01" }, { lock: own, capacity: 200n * CKB, type: b, data: "0x01" }, { lock: own, capacity: 500n * CKB }],
+      [{ lock: own, capacity: 200n * CKB, type: kept, data: "0x01" }, { lock: alice, capacity: 100n * CKB }, { lock: own, capacity: 600n * CKB - 5_000n }],
+    ).preview;
+    const destroysB = keep(a);
+    assert.deepEqual(destroysB.cellChanges, [{ typeHash: b.hash(), given: 1, changed: 0, received: 0 }]);
+    const lines = previewSummaryLines(destroysB);
+    assert.ok(lines.includes(`Gives up 1 cell of type ${b.hash()}`), lines.join("\n"));
+    assert.notDeepEqual(lines, previewSummaryLines(keep(b)), lines.join("\n"));
+
+    // Getting one cell or the other from someone else, for the same payment.
+    const gets = (incoming: ccc.Script) => build(
+      [{ lock: own, capacity: 500n * CKB }, { lock: alice, capacity: 200n * CKB, type: incoming, data: "0x01" }],
+      [{ lock: own, capacity: 200n * CKB, type: incoming, data: "0x01" }, { lock: alice, capacity: 100n * CKB }, { lock: own, capacity: 400n * CKB - 5_000n }],
+    ).preview;
+    const getsA = gets(a);
+    assert.deepEqual(getsA.cellChanges, [{ typeHash: a.hash(), given: 0, changed: 0, received: 1 }]);
+    assert.ok(previewSummaryLines(getsA).includes(`Gets 1 cell of type ${a.hash()}`), previewSummaryLines(getsA).join("\n"));
+    assert.notDeepEqual(previewSummaryLines(getsA), previewSummaryLines(gets(b)));
+  }
+  // Changing a cell's data reads differently from destroying it, with the same CKB going the same places.
+  const update = build(
+    [{ lock: own, capacity: 200n * CKB, type: typeA, data: "0x01" }, { lock: own, capacity: 500n * CKB }],
+    [{ lock: own, capacity: 200n * CKB, type: typeA, data: "0x02" }, { lock: alice, capacity: 100n * CKB }, { lock: own, capacity: 400n * CKB - 5_000n }],
+  ).preview;
+  const destroy = build(
+    [{ lock: own, capacity: 200n * CKB, type: typeA, data: "0x01" }, { lock: own, capacity: 500n * CKB }],
+    [{ lock: own, capacity: 200n * CKB }, { lock: alice, capacity: 100n * CKB }, { lock: own, capacity: 400n * CKB - 5_000n }],
+  ).preview;
+  assert.deepEqual(update.cellChanges, [{ typeHash: typeA.hash(), given: 0, changed: 1, received: 0 }]);
+  assert.deepEqual(destroy.cellChanges, [{ typeHash: typeA.hash(), given: 1, changed: 0, received: 0 }]);
+  assert.ok(previewSummaryLines(update).includes(`Changes the data of 1 cell of type ${typeA.hash()} it keeps`), previewSummaryLines(update).join("\n"));
+  assert.notDeepEqual(previewSummaryLines(update), previewSummaryLines(destroy));
+  // NFTs already listed as sent, burned, received or minted aren't listed twice; kept unchanged, nothing is.
+  const sent = build(
+    [{ lock: own, capacity: 300n * CKB, type: spore, data: "0x01" }, { lock: own, capacity: 500n * CKB }],
+    [{ lock: alice, capacity: 300n * CKB, type: spore, data: "0x01" }, { lock: own, capacity: 500n * CKB - 5_000n }],
+  ).preview;
+  assert.deepEqual(sent.cellChanges, []);
+  const received = build(
+    [{ lock: alice, capacity: 300n * CKB, type: spore, data: "0x01" }, { lock: own, capacity: 500n * CKB }],
+    [{ lock: own, capacity: 300n * CKB, type: spore, data: "0x01" }, { lock: own, capacity: 500n * CKB - 5_000n }],
+  ).preview;
+  assert.deepEqual(received.cellChanges, []);
+  const kept = build(
+    [{ lock: own, capacity: 200n * CKB, type: typeA, data: "0x01" }, { lock: own, capacity: 500n * CKB }],
+    [{ lock: own, capacity: 200n * CKB, type: typeA, data: "0x01" }, { lock: own, capacity: 500n * CKB - 5_000n }],
+  ).preview;
+  assert.deepEqual(kept.cellChanges, []);
+});
+
+test("the confirmation email says how much CKB the account gets", () => {
+  // The same token cell sold for 1,000 CKB or for 300: only what comes back differs.
+  const sell = (price: bigint) => build(
+    [{ lock: own, capacity: 200n * CKB, type: xudt, data: u128(100n) }, { lock: alice, capacity: 2_000n * CKB }],
+    [{ lock: alice, capacity: 200n * CKB, type: xudt, data: u128(100n) }, { lock: own, capacity: price * CKB }, { lock: alice, capacity: (2_000n - price) * CKB - 5_000n }],
+  ).preview;
+  const fair = previewSummaryLines(sell(1_000n));
+  assert.ok(fair.includes("Receive 800 CKB"), fair.join("\n"));
+  assert.notDeepEqual(fair, previewSummaryLines(sell(300n)));
 });
 
 test("counts inputs that other people must sign", () => {

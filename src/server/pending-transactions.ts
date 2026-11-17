@@ -1,5 +1,5 @@
 import * as ccc from "@ckb-ccc/core";
-import { database } from "./database.ts";
+import { database, type DatabaseSql } from "./database.ts";
 import { serializeTransaction } from "./funding-transaction.ts";
 
 /**
@@ -14,13 +14,23 @@ export const UNSENT_GRACE_MS = 2 * 60_000;
 const MAX_AGE = "1 day";
 const MAX_LISTED = 64;
 
-export async function recordPendingTransaction(userId: string, transaction: ccc.Transaction): Promise<void> {
-  const sql = await database();
+/** `connection` is a reserved connection the caller holds, if any, so it never waits on the pool while holding one. */
+export async function recordPendingTransaction(userId: string, transaction: ccc.Transaction, connection?: DatabaseSql): Promise<void> {
+  const sql = connection ?? await database();
   await sql`
     insert into keyway_v2_pending_transactions (user_id, transaction_hash, transaction)
     values (${userId}, ${transaction.hash()}, ${sql.json(serializeTransaction(transaction) as never)})
     on conflict (user_id, transaction_hash) do update set transaction = excluded.transaction
   `;
+}
+
+/** A transaction KeyWay signed for this account, by its hash (which leaves out witnesses), if it is still kept. */
+export async function signedTransaction(userId: string, hash: string): Promise<ccc.TransactionLike | undefined> {
+  const sql = await database();
+  const [row] = await sql<Array<{ transaction: ccc.TransactionLike }>>`
+    select transaction from keyway_v2_pending_transactions where user_id = ${userId} and transaction_hash = ${hash}
+  `;
+  return row?.transaction;
 }
 
 export type TransactionStatus = "pending" | "proposed" | "committed" | "rejected" | "unknown" | string;

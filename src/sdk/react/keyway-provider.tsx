@@ -28,9 +28,10 @@ import {
 } from "../browser/connect-managed-keyway";
 import { bootstrapKeyWay, type PublicWallet } from "../browser/bootstrap";
 import { createStoppedNodes, recoverFailedLogout } from "../browser/node-migration";
+import { handOffLogout, logsOutBrowserNode, newTabId, refuseWhileFiberRuns, serveLogoutHandoff, startUnlessLoggingOut, whileLoggingOut, type HandledLogout } from "../browser/logout-handoff";
 import type { ApproveFiberChannelOpen, FiberChannelOpenPreview } from "../browser/remote-ckb-signer";
 import type { ApproveFiberPayment } from "../browser/fiber-payment";
-import type { EmailCodeReason, RequestEmailCode } from "../browser/email-code";
+import { loginCodeUsedUp, type EmailCodeReason, type RequestEmailCode } from "../browser/email-code";
 import { friendlyKeyWayError } from "../browser/friendly-error";
 import { changeRecoveryBackup, createJoyIdBackup as createJoyIdBackupWithSigner, enableRecovery, recoveryAccountAddress, requestBackupChallenge, type ApproveBackupChange, type ApproveRecovery, type BackupChanged, type BackupChangePreview, type RecoveryEnabled, type RecoveryPreview } from "../browser/account-recovery";
 import type { RecoveryBackup, RecoveryBackupProof } from "../browser/recovery-backups";
@@ -274,6 +275,13 @@ export function KeyWayProvider({
   const connectionRunRef = useRef(0);
   // Stopped nodes may still be sending channel updates to KeyWay's watchtower: a logout delivers them first.
   const [stoppedNodes] = useState(() => createStoppedNodes<KeyWayConnection["keyway"]>());
+  // From this tab's first connect until a logout, a logout started in another tab of the session is handed here
+  // first (logout-handoff.ts), so it can't end the session before this tab's nodes have logged out.
+  const [tabId] = useState(newTabId);
+  const handoffRef = useRef<{ release(): void } | undefined>(undefined);
+  const handoffHandlerRef = useRef<() => Promise<HandledLogout>>(async () => ({ nodeLoggedOut: false }));
+  /** Logouts in progress here (this tab's own, or one handed from another tab). */
+  const loggingOutRef = useRef(0);
   const operationRef = useRef<Promise<void>>(Promise.resolve());
   const runRef = useRef(0);
   const callbacksRef = useRef({ approveFiberChannelOpen, approveFiberPayment, approveFiberChannelClose, approveFiberPeerConnect, approveFiberChannelSettings, approveCkbTransaction, approveCkbMessage, approveDailyLimit, approveRecovery, approveBackupChange, onError, onFiberStartup });
@@ -346,6 +354,7 @@ export function KeyWayProvider({
   async function connect() {
     if (isJoyIdHelperWindow()) throw new Error("The JoyID window doesn't run Fiber");
     if (!authToken) throw new Error("Log in before connecting KeyWay");
+    if (user) handoffRef.current ??= serveLogoutHandoff({ scope: handoffScope(appId, user.id), tabId, handle: () => handoffHandlerRef.current() });
     const run = ++runRef.current;
     setStatus("connecting");
     setError(undefined);
@@ -382,16 +391,21 @@ export function KeyWayProvider({
             approveFiberChannelSettings: (preview) => callbacksRef.current.approveFiberChannelSettings?.(preview) ?? approvalsRef.current.channelSettings.ask(preview),
             settled: fiberSettled,
           }),
-          ...(fiberNode === "browser" ? { onLeaseLost: (leaseError: Error) => {
-            if (run !== runRef.current) return;
-            if (connectionRef.current) stoppedNodes.add(connectionRef.current.keyway);
-            connectionRef.current = undefined;
-            setConnection(undefined);
-            setError(leaseError);
-            setFiberError(leaseError);
-            setStatus("error");
-            callbacksRef.current.onError?.(leaseError);
-          } } : {}),
+          ...(fiberNode === "browser" ? {
+            onLeaseLost: (leaseError: Error) => {
+              if (run !== runRef.current) return;
+              if (connectionRef.current) stoppedNodes.add(connectionRef.current.keyway);
+              connectionRef.current = undefined;
+              setConnection(undefined);
+              setError(leaseError);
+              setFiberError(leaseError);
+              setStatus("error");
+              callbacksRef.current.onError?.(leaseError);
+            },
+            // The node takes the device only while no logout of this session is in progress, and while the session
+            // (kept in the origin's storage, which a logout in any tab clears) is still signed in.
+            ...(user ? { guardClaim: <T,>(claim: () => Promise<T>) => startUnlessLoggingOut(handoffScope(appId, user.id), claim, () => readStoredSession(appId)?.user.id === user.id) } : {}),
+          } : {}),
           onWalletReady: (nextWallet) => {
             if (run === runRef.current) setWallet(nextWallet);
           },
@@ -403,6 +417,16 @@ export function KeyWayProvider({
           },
         });
         if (run !== runRef.current) {
+          if (loggingOutRef.current > 0 && !connectionRef.current) {
+            // A logout overtook it and is waiting for this connect: it takes this node as the connection, so the
+            // node is stopped, delivers to KeyWay's watchtower and is backed up before the session ends.
+            connectionRef.current = next;
+            connectionRunRef.current = run;
+            setConnection(next);
+            throw new Error("KeyWay connection was superseded");
+          }
+          // Otherwise it stops; any channel updates it still owes KeyWay's watchtower go with the stopped nodes.
+          stoppedNodes.add(next.keyway);
           await next.keyway.stop();
           throw new Error("KeyWay connection was superseded");
         }
@@ -453,6 +477,15 @@ export function KeyWayProvider({
   }
 
   async function logout() {
+    loggingOutRef.current += 1;
+    try {
+      await logoutNow();
+    } finally {
+      loggingOutRef.current -= 1;
+    }
+  }
+
+  async function logoutNow() {
     const token = authToken;
     const logoutRun = ++runRef.current;
     funding.dismiss();
@@ -462,14 +495,27 @@ export function KeyWayProvider({
     const current = connectionRef.current;
     const currentRun = connectionRunRef.current;
     try {
+      const nodeLoggedOutHere = logsOutBrowserNode(current);
       if (current) await current.keyway.stopForLogout();
       await stoppedNodes.logout();
-      if (token) await api.logout(token);
+      const endSession = async () => {
+        // Another tab of this session may run Fiber: it logs out there first, or this logout fails. One that closed
+        // in the middle of an earlier handoff keeps failing logouts until a node has logged out in this browser again
+        // (this one's, if it is a browser node: it just stopped, delivered and backed up; a hosted one doesn't count).
+        if (user) await handOffLogout({ scope: handoffScope(appId, user.id), tabId, nodeLoggedOutHere });
+        if (wallet) await refuseWhileFiberRuns(wallet.litPkpId);
+        if (token) await api.logout(token);
+        clearStoredSession(appId);
+      };
+      // Held from before the handoff until the session has ended, so no node starts after the check that none runs.
+      if (user) await whileLoggingOut(handoffScope(appId, user.id), endSession);
+      else await endSession();
+      handoffRef.current?.release();
+      handoffRef.current = undefined;
       ++runRef.current;
       connectionRef.current = undefined;
       setConnection(undefined);
       setWallet(undefined);
-      clearStoredSession(appId);
       setAuthToken(undefined);
       setExpiresAt(undefined);
       setUser(undefined);
@@ -492,6 +538,49 @@ export function KeyWayProvider({
       throw logoutError;
     }
   }
+
+  /**
+   * A logout started in another tab of this session: this tab's nodes log out here (stop, deliver to KeyWay's
+   * watchtower, back up, release the device) before that tab ends the session. A failure is reported back, which
+   * fails that logout, and a node that kept the device runs again, as after a failed logout here.
+   */
+  handoffHandlerRef.current = async () => {
+    loggingOutRef.current += 1;
+    try {
+      return await logOutNodesHere();
+    } finally {
+      loggingOutRef.current -= 1;
+    }
+  };
+  async function logOutNodesHere(): Promise<HandledLogout> {
+    const handoffRun = ++runRef.current;
+    for (const approval of [funding, channelClose, peer, channelSettings]) approval.dismiss();
+    await operationRef.current;
+    const current = connectionRef.current;
+    const currentRun = connectionRunRef.current;
+    const nodeLoggedOut = logsOutBrowserNode(current);
+    try {
+      if (current) await current.keyway.stopForLogout();
+      await stoppedNodes.logout();
+    } catch (cause) {
+      if (current) {
+        await recoverFailedLogout(current.keyway, connect, () => {
+          if (runRef.current === handoffRun) runRef.current = currentRun;
+        });
+      }
+      throw cause;
+    }
+    handoffRef.current = undefined;
+    connectionRef.current = undefined;
+    setConnection(undefined);
+    setStatus("idle");
+    setFiberStartupStage(undefined);
+    return { nodeLoggedOut };
+  }
+  useEffect(() => () => {
+    handoffRef.current?.release();
+    handoffRef.current = undefined;
+  }, []);
 
   useEffect(() => {
     if (isJoyIdHelperWindow()) {
@@ -530,6 +619,8 @@ export function KeyWayProvider({
     let active = true;
     const invalidate = () => {
       ++runRef.current;
+      handoffRef.current?.release();
+      handoffRef.current = undefined;
       const current = connectionRef.current;
       connectionRef.current = undefined;
       if (current) void current.keyway.stop().catch(() => undefined);
@@ -991,6 +1082,8 @@ export function KeyWayLoginModal({
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string>();
   const [verificationState, setVerificationState] = useState<"idle" | "success" | "error">("idle");
+  // The code can't be tried again (its last try was wrong): only a new code helps.
+  const [usedUp, setUsedUp] = useState(false);
   const codeInputRef = useRef<HTMLInputElement>(null);
 
   async function submit() {
@@ -1007,12 +1100,14 @@ export function KeyWayLoginModal({
       await new Promise((resolve) => setTimeout(resolve, 900));
       authenticated({ authToken: result.sessionToken, user: result.user, expiresAt: result.expiresAt });
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Could not complete email login");
+      const message = cause instanceof Error ? cause.message : "Could not complete email login";
+      setError(message);
       if (challengeId) {
-        // A wrong code is cleared so the next one can be typed straight away.
+        // A wrong code is cleared so the next one can be typed straight away, unless this code can't be tried again.
         setVerificationState("error");
         setCode("");
-        requestAnimationFrame(() => codeInputRef.current?.focus());
+        if (loginCodeUsedUp(message)) setUsedUp(true);
+        else requestAnimationFrame(() => codeInputRef.current?.focus());
       }
     } finally {
       setPending(false);
@@ -1025,11 +1120,12 @@ export function KeyWayLoginModal({
     const next = await api.sendCode(email);
     setChallengeId(next.challengeId);
     setCode("");
+    setUsedUp(false);
     codeInputRef.current?.focus();
   }
 
   useEffect(() => {
-    if (challengeId && code.length === 6 && !pending && verificationState !== "success") void submit();
+    if (challengeId && code.length === 6 && !pending && !usedUp && verificationState !== "success") void submit();
   }, [code, challengeId]);
 
   // The email field is gone once the code is sent, so focus moves to the code.
@@ -1048,6 +1144,7 @@ export function KeyWayLoginModal({
               setCode("");
               setError(undefined);
               setVerificationState("idle");
+              setUsedUp(false);
             }}><ArrowLeftIcon /></button>
           )}
           <div style={{ ...modalIcon, background: palette.surface, color: palette.muted }}><MailIcon /></div>
@@ -1058,7 +1155,7 @@ export function KeyWayLoginModal({
             : `Use your email to continue to ${appName}.`}</p>
           <form onSubmit={(event) => {
             event.preventDefault();
-            if (!challengeId || code.length === 6) void submit();
+            if (!challengeId || (code.length === 6 && !usedUp)) void submit();
           }}>
             {!challengeId ? (
               <label style={{ ...modalLabel, color: palette.muted }}>
@@ -1080,7 +1177,7 @@ export function KeyWayLoginModal({
                 value={code}
                 inputRef={codeInputRef}
                 label="One-time code"
-                readOnly={pending || verificationState === "success"}
+                readOnly={pending || usedUp || verificationState === "success"}
                 state={verificationState}
                 describedBy={error ? "keyway-login-error" : undefined}
                 onChange={(next) => {
@@ -1098,7 +1195,7 @@ export function KeyWayLoginModal({
                 {pending ? "Sending code…" : "Continue"}
               </button>
             ) : (
-              <ResendLine palette={palette} resend={resend} waitSeconds={60} disabled={pending || verificationState === "success"} prompt="Didn't get an email?" style={{ margin: "22px 0 0", textAlign: "center" }} />
+              <ResendLine palette={palette} resend={resend} waitSeconds={60} disabled={pending || verificationState === "success"} prompt={usedUp ? undefined : "Didn't get an email?"} style={{ margin: "22px 0 0", textAlign: "center" }} />
             )}
           </form>
           <p style={{ ...modalFootnote, color: palette.subtle }}>Secured by <strong>CKB KeyWay</strong></p>
@@ -1119,6 +1216,11 @@ function MailIcon() {
 type StoredSession = { authToken: string; user: KeyWayUser; appId?: string; expiresAt: string };
 
 const SESSION_STORAGE_KEY = "ckb-keyway.session.v2";
+
+/** The tabs that share a session: the same app's, signed in as the same user. */
+function handoffScope(appId: string | undefined, userId: string): string {
+  return `${appId ?? "unregistered"}:${userId}`;
+}
 
 function sessionStorageKey(appId?: string): string { return `${SESSION_STORAGE_KEY}:${appId ?? "unregistered"}`; }
 

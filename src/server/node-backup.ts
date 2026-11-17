@@ -1,6 +1,6 @@
 import type { User } from "./auth-user.ts";
 import { createHash } from "node:crypto";
-import { database, type DatabaseSql } from "./database.ts";
+import { database, withUserLock, type DatabaseSql } from "./database.ts";
 
 export type StoredNodeBackup = {
   generation: number;
@@ -28,12 +28,41 @@ type BackupRow = {
   claimed_device_id_hash: string | null;
 };
 
+type NodeBackupPayload = Omit<StoredNodeBackup, "generation" | "sourceDeviceIdHash" | "status" | "claimedDeviceIdHash">;
+
+/**
+ * Saves a logout's backup only if it is the device's latest key delivery that the logout took (`keyDelivery`, from
+ * `fiberKeyAccess`) and the device still holds the lease. A logout loads the key, stops the node, then uploads; if
+ * the upload stalls, the client gives up and the node runs again, which fetches the key again and retires the
+ * device's backups. Checked under the same lock as that retirement, so the stalled upload, landing later, is refused
+ * rather than stored as a restorable copy of state the node has since revoked.
+ */
+export async function saveFencedNodeBackup(
+  user: User,
+  deviceIdHash: string,
+  leaseId: string,
+  keyDelivery: string,
+  backup: NodeBackupPayload,
+): Promise<{ generation: number; digest: string }> {
+  return withUserLock(user.id, async (sql) => {
+    const [lease] = await sql`
+      select 1 from keyway_v2_device_leases
+      where user_id = ${user.id} and device_id_hash = ${deviceIdHash} and lease_id = ${leaseId} and expires_at > now()
+        and key_delivery = ${keyDelivery}::uuid
+      for update
+    `;
+    if (!lease) throw new Error("The Fiber node ran again after this backup was taken, or the device lease ended; log out again");
+    return saveNodeBackup(user, deviceIdHash, backup, sql);
+  });
+}
+
 export async function saveNodeBackup(
   user: User,
   deviceIdHash: string,
-  backup: Omit<StoredNodeBackup, "generation" | "sourceDeviceIdHash" | "status" | "claimedDeviceIdHash">,
+  backup: NodeBackupPayload,
+  connection?: DatabaseSql,
 ): Promise<{ generation: number; digest: string }> {
-  const sql = await database();
+  const sql = connection ?? await database();
   const ciphertext = Buffer.from(backup.ciphertext, "base64");
   const digest = createHash("sha256").update(ciphertext).digest("hex");
   if (digest !== backup.digest) throw new Error("Encrypted Fiber node backup digest does not match its ciphertext");
@@ -112,6 +141,23 @@ export async function confirmNodeBackupRestored(user: User, deviceIdHash: string
     returning generation
   `;
   if (!rows[0]) throw new Error("Fiber node backup claim is no longer valid");
+}
+
+/**
+ * Called when a device that holds the lease gets its Fiber key back, i.e. is about to run its node again (a logout
+ * that saved its backup and then failed resumes the node this way). From then on the node moves its channels past
+ * whatever this device backed up earlier, so no other device may restore those backups: restoring one would bring
+ * back revoked channel state. A claim of one by another device is stale too, since this device holds the lease. A
+ * claim by this device itself is the restore it is about to run (it loads the key first), so that one stays.
+ */
+export async function retireOwnBackups(user: User, deviceIdHash: string, connection?: DatabaseSql): Promise<void> {
+  const sql = connection ?? await database();
+  await sql`
+    update keyway_v2_node_backups set status = 'consumed', claim_expires_at = null, updated_at = now()
+    where user_id = ${user.id}
+      and source_device_id_hash = ${deviceIdHash}
+      and (status = 'available' or (status = 'claimed' and claimed_device_id_hash is distinct from ${deviceIdHash}))
+  `;
 }
 
 async function consumeBackup(user: User, sql: DatabaseSql): Promise<void> {
