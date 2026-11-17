@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createServer } from "node:http";
-import { handleKeyWayRequest } from "../src/server/http.ts";
+import { handleKeyWayRequest, managedNodeRateLimit } from "../src/server/http.ts";
 import { nodeRequestHandler } from "../src/server/node-server.ts";
 
 test("serves health checks and configured CORS without authentication", async () => {
@@ -131,4 +131,16 @@ test("errors outside the API handler get a fixed message", async (t) => {
   const tooLarge = await fetch(`http://127.0.0.1:${port}/api/v1/keyway/auth/send-code`, { method: "POST", body: "x".repeat(10_000) });
   assert.equal(tooLarge.status, 413);
   assert.deepEqual(await tooLarge.json(), { error: "Request body is too large" });
+});
+
+test("opening a hosted channel counts against the same per-user limit as other node changes", () => {
+  assert.deepEqual(managedNodeRateLimit("open-channel"), managedNodeRateLimit("act"));
+  assert.equal(managedNodeRateLimit("act")?.key, "fiber-act");
+  assert.equal(managedNodeRateLimit("call")?.key, "fiber-call");
+  assert.deepEqual(managedNodeRateLimit("submit-channel-funding"), managedNodeRateLimit("act"));
+  // Every other hosted-node request has a limit too; status and the fee reserve start the node.
+  for (const operation of ["status", "fee-reserve", "list-channels", "get-invoice", "parse-invoice", "get-payment", "wait-for-payment", "wait-channel-ready", "unknown"]) {
+    assert.equal(managedNodeRateLimit(operation)?.key, "fiber-read", operation);
+  }
+  assert.equal(managedNodeRateLimit("pay"), undefined);
 });
