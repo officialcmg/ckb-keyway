@@ -5,8 +5,8 @@ import type { SettlementDataJson, SettlementTlcJson, WatchedChannel } from "./wa
 
 /**
  * Claims the user's share of a force-closed channel from its commitment cell, and the payments (TLCs) still in
- * flight that are the user's, the way Fiber 0.9.1's watchtower does (fiber-lib watchtower/actor.rs
- * `build_settlement_tx`, channel.rs `settlement_data_to_witness`; fiber-scripts commitment-lock). Fiber's browser
+ * flight that are the user's, following Fiber 0.10.1 (d9b6bbd), including legacy and V2 commitments
+ * (fiber-lib watchtower/actor.rs `build_settlement_tx`, fiber-types/watchtower.rs; fiber-scripts commitment-lock). Fiber's browser
  * build has no watchtower (see watchtower-bridge.ts), so the page does this with the data the node handed it,
  * including the payment preimages. As in Fiber, the claim pays to the node's own CKB key (the settlement key),
  * which also pays the fee from its reserve cell; the settlement sweep then moves it to the user.
@@ -45,18 +45,21 @@ const pubkeyOf = (privateKey: ccc.HexLike) => secp256k1.getPublicKey(ccc.bytesFr
 export function parseCommitmentArgs(args: ccc.HexLike) {
   const bytes = ccc.bytesFrom(args);
   if (bytes.length < 56) throw new Error("Not a commitment lock");
+  const channelFeatures = bytes.length === 58 ? bytes[57] : 0;
+  if (bytes.length > 58 || (bytes.length === 58 && channelFeatures !== 1)) throw new Error("Unsupported commitment channel features");
   return {
     prefix: bytes.slice(0, 36),
     delaySince: readLe(bytes.slice(20, 28)),
     commitmentNumber: bytes.slice(28, 36).reduce((acc, byte) => (acc << 8n) | BigInt(byte), 0n),
     witnessHash: bytes.slice(36, 56),
+    channelFeatures,
   };
 }
 
 const HASH_ALGORITHMS: Record<string, number> = { CkbHash: 0, ckb_hash: 0, Sha256: 1, sha256: 1 };
 
 /** Fiber's settlement witness for a commitment (channel.rs `settlement_data_to_witness`). */
-export function encodeSettlementWitness(data: SettlementDataJson, forRemote: boolean, localSettlementKey: ccc.HexLike, remoteSettlementKey: ccc.HexLike): Uint8Array {
+export function encodeSettlementWitness(data: SettlementDataJson, forRemote: boolean, localSettlementKey: ccc.HexLike, remoteSettlementKey: ccc.HexLike, channelFeatures: 0 | 1 = 0): Uint8Array {
   const localHash = blake160(pubkeyOf(localSettlementKey));
   const remoteHash = blake160(remoteSettlementKey);
   const tlcs = data.tlcs.map((tlc) => {
@@ -69,7 +72,7 @@ export function encodeSettlementWitness(data: SettlementDataJson, forRemote: boo
     return concat(
       new Uint8Array([(algorithm << 1) + (offered ? 0 : 1)]),
       u128le(BigInt(tlc.payment_amount)),
-      ccc.bytesFrom(tlc.payment_hash).slice(0, 20),
+      ccc.bytesFrom(tlc.payment_hash).slice(0, channelFeatures === 1 ? 32 : 20),
       forRemote ? remote : local,
       forRemote ? local : remote,
       u64le((0b0100_0000n << 56n) | expirySeconds),
@@ -92,7 +95,7 @@ export type SettlementWitness = {
 };
 
 /** Reads a settlement witness (without the 16-byte header; with the leading unlock count when `withUnlockCount`). */
-export function parseSettlementWitness(bytes: Uint8Array, withUnlockCount = true): SettlementWitness | undefined {
+export function parseSettlementWitness(bytes: Uint8Array, withUnlockCount = true, channelFeatures: 0 | 1 = 0): SettlementWitness | undefined {
   let offset = withUnlockCount ? 1 : 0;
   const take = (length: number) => {
     if (offset + length > bytes.length) throw new Error("short");
@@ -102,7 +105,7 @@ export function parseSettlementWitness(bytes: Uint8Array, withUnlockCount = true
   };
   try {
     const count = take(1)[0];
-    const pendingTlcs = Array.from({ length: count }, () => take(85));
+    const pendingTlcs = Array.from({ length: count }, () => take(channelFeatures === 1 ? 97 : 85));
     const first = { pubkeyHash: take(20), amount: readLe(take(16)) };
     const second = { pubkeyHash: take(20), amount: readLe(take(16)) };
     const unlocks: SettlementWitness["unlocks"] = [];
@@ -212,25 +215,27 @@ function paymentHashOf(preimage: ccc.HexLike, algorithm: string): ccc.Hex {
  * received TLC with the preimage by the second slot, after expiry by the first (fiber-scripts commitment-lock).
  */
 function pendingTlcs(channel: ClaimChannel, state: SettlementWitness): PendingTlc[] {
+  const hashLength = channel.channelFeatures === 1 ? 32 : 20;
+  const tlcLength = 65 + hashLength;
   const known: Array<{ bytes: Uint8Array; tlc: SettlementTlcJson }> = [];
   for (const [data, forRemote] of [[channel.localSettlement, false], [channel.remoteSettlement, true], [channel.pendingRemoteSettlement, true]] as const) {
     for (const tlc of data?.tlcs ?? []) {
       try {
-        known.push({ bytes: encodeSettlementWitness({ local_amount: "0x0", remote_amount: "0x0", tlcs: [tlc] }, forRemote, channel.localSettlementKey, channel.remoteSettlementKey).slice(1, 86), tlc });
+        known.push({ bytes: encodeSettlementWitness({ local_amount: "0x0", remote_amount: "0x0", tlcs: [tlc] }, forRemote, channel.localSettlementKey, channel.remoteSettlementKey, channel.channelFeatures).slice(1, 1 + tlcLength), tlc });
       } catch {
         // A TLC the node can't encode is never matched.
       }
     }
   }
   return state.pendingTlcs.map((bytes, index) => {
-    const expirySince = readLe(bytes.slice(77, 85));
+    const expirySince = readLe(bytes.slice(tlcLength - 8, tlcLength));
     const pending: PendingTlc = { index, amount: readLe(bytes.slice(1, 17)), expirySince, expiryMs: Number(expirySince & 0x00ff_ffff_ffff_ffffn) * 1000 };
     const match = known.find((item) => equal(item.bytes, bytes));
     if (!match) return pending;
     const key = ccc.hexFrom(`0x${match.tlc.local_key.replace(/^0x/, "")}`);
     const mine = blake160(pubkeyOf(key));
     const offered = (bytes[0] & 1) === 0;
-    const [first, second] = [bytes.slice(37, 57), bytes.slice(57, 77)];
+    const [first, second] = [bytes.slice(17 + hashLength, 37 + hashLength), bytes.slice(37 + hashLength, 57 + hashLength)];
     const preimageSlot = offered ? first : second;
     const expirySlot = offered ? second : first;
     const path = equal(preimageSlot, mine) ? "preimage" : equal(expirySlot, mine) ? "expiry" : undefined;
@@ -239,7 +244,7 @@ function pendingTlcs(channel: ClaimChannel, state: SettlementWitness): PendingTl
   });
 }
 
-type ClaimChannel = Pick<WatchedChannel, "localSettlementKey" | "remoteSettlementKey" | "localSettlement" | "remoteSettlement" | "pendingRemoteSettlement">;
+type ClaimChannel = Pick<WatchedChannel, "channelFeatures" | "localSettlementKey" | "remoteSettlementKey" | "localSettlement" | "remoteSettlement" | "pendingRemoteSettlement">;
 
 /**
  * Decides the next claim from a live commitment cell, as Fiber 0.9.1's watchtower does (`build_settlement_tx`), one
@@ -266,6 +271,7 @@ export function planClaim(options: {
   const now = options.now ?? Date.now();
   const delayPassed = options.delayPassed ?? (() => true);
   const args = parseCommitmentArgs(cell.args);
+  if (args.channelFeatures !== (channel.channelFeatures ?? 0)) return { skip: "the commitment's channel features do not match the stored channel" };
   const ours = blake160(pubkeyOf(channel.localSettlementKey));
   let state: SettlementWitness | undefined;
   const first = !options.previousWitness;
@@ -276,12 +282,12 @@ export function planClaim(options: {
     ];
     for (const [data, forRemote] of candidates) {
       if (!data) continue;
-      const encoded = encodeSettlementWitness(data, forRemote, channel.localSettlementKey, channel.remoteSettlementKey);
-      if (equal(blake160(encoded), args.witnessHash)) { state = parseSettlementWitness(encoded, false); break; }
+      const encoded = encodeSettlementWitness(data, forRemote, channel.localSettlementKey, channel.remoteSettlementKey, channel.channelFeatures);
+      if (equal(blake160(encoded), args.witnessHash)) { state = parseSettlementWitness(encoded, false, channel.channelFeatures); break; }
     }
     if (!state) return { skip: "the on-chain commitment matches none of the node's settlement data (an old commitment needs revocation, which this does not do)" };
   } else {
-    const parsed = parseSettlementWitness(options.previousWitness!);
+    const parsed = parseSettlementWitness(options.previousWitness!, true, channel.channelFeatures);
     state = parsed && applyUnlocks(parsed);
     if (!state) return { skip: "could not read the previous settlement witness" };
   }
@@ -289,7 +295,7 @@ export function planClaim(options: {
   const occupied = (successorArgs: ccc.Hex) => ccc.fixedPointFrom(8 + 32 + 1 + ccc.bytesFrom(successorArgs).length);
   const successorFor = (unlockType: number) => {
     const after = applyUnlocks({ ...current, unlocks: [{ type: unlockType, withPreimage: false }] })!;
-    return { after, args: ccc.hexFrom(concat(args.prefix, blake160(encodeWitnessState(after)), new Uint8Array([1]))) };
+    return { after, args: ccc.hexFrom(concat(args.prefix, blake160(encodeWitnessState(after)), new Uint8Array(args.channelFeatures ? [1, args.channelFeatures] : [1]))) };
   };
 
   // Which slot is the user's, and whether the peer has already emptied its own.

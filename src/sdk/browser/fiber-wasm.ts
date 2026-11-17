@@ -34,7 +34,8 @@ export function fiberWasmFactory(network: "testnet" | "mainnet", options: { watc
     let fiber: FiberWasmInstance | undefined;
     return {
       async start(config, ...rest) {
-        const module = await import("@nervosnetwork/fiber-js") as { Fiber?: new () => FiberWasmInstance; default?: { Fiber?: new () => FiberWasmInstance } };
+        // The explicit factory uses 0.10.1; the alias avoids fiber-pay's optional 0.9.x peer dependency.
+        const module = await import("keyway-fiber-runtime") as { Fiber?: new () => FiberWasmInstance; default?: { Fiber?: new () => FiberWasmInstance } };
         const Fiber = module.Fiber ?? module.default?.Fiber;
         if (!Fiber) throw new Error("Could not load Fiber's browser node");
         let nodeConfig = withFiberContracts(config, network);

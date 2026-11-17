@@ -148,6 +148,29 @@ function tlcFixture(options: { offeredExpiry?: number; receivedExpiry?: number }
   return { channel: withTlcs, remoteKey, argsFor, theirs, capacity, outgoing, incoming, incomingPreimage, cell: { capacity, args: argsFor(theirs) } };
 }
 
+test("V2 settlements preserve all 32 hash bytes and the feature flag through a TLC claim", () => {
+  const f = tlcFixture();
+  const channel = { ...f.channel, channelFeatures: 1 as const };
+  const witness = encodeSettlementWitness(channel.remoteSettlement, true, channel.localSettlementKey, channel.remoteSettlementKey, 1);
+  assert.equal(witness.length, 1 + 2 * 97 + 72);
+  assert.equal(hex(witness.slice(18, 50)), f.outgoing.payment_hash);
+  const parsed = parseSettlementWitness(witness, false, 1)!;
+  assert.equal(parsed.pendingTlcs[1].length, 97);
+  assert.equal(hex(parsed.pendingTlcs[1].slice(17, 49)), f.incoming.payment_hash);
+  const args = hex(ccc.bytesConcat(ccc.bytesFrom(f.argsFor(witness)), new Uint8Array([1])));
+  assert.equal(parseCommitmentArgs(args).channelFeatures, 1);
+  const decision = planClaim({ channel, cell: { capacity: f.capacity, args }, preimages: new Map([[f.incoming.payment_hash, f.incomingPreimage]]), now: NOW, delayPassed: () => true });
+  assert.ok("claim" in decision);
+  assert.equal(decision.claim.unlockType, 1);
+  assert.equal(decision.claim.preimage, f.incomingPreimage);
+  assert.equal(decision.claim.successor?.capacity, f.capacity - 170n * CKB);
+  assert.equal(decision.claim.successor!.args.slice(-4), "0101");
+  const after = applyUnlocks({ ...parsed, unlocks: [{ type: 1, withPreimage: true }] })!;
+  assert.equal(hex(parseCommitmentArgs(decision.claim.successor!.args).witnessHash), hex(blake160(encodeWitnessState(after))));
+  assert.ok("skip" in planClaim({ channel: f.channel, cell: { capacity: f.capacity, args }, now: NOW }));
+  assert.throws(() => parseCommitmentArgs(args.slice(0, -2) + "02"), /Unsupported/);
+});
+
 test("an incoming payment in flight is claimed with its preimage once a third of the delay has passed", () => {
   const f = tlcFixture();
   const preimages = new Map([[f.incoming.payment_hash, f.incomingPreimage]]);

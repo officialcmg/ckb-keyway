@@ -54,6 +54,21 @@ test("does not retry a request Lit rejects outright", async () => {
   assert.equal(calls, 1);
 });
 
+test("a wrong confirmation code stays retryable without exposing Lit's error wrapper", async () => {
+  for (const response of [
+    () => Response.json({ message: "Actions failed with: lit_node::Error { source: Error: That email code isn't right; internal details }" }, { status: 500 }),
+    () => Response.json({ has_error: true, logs: "Error: That email code isn't right\nprovider stack", response: null }),
+  ]) {
+    await withFetch(async () => response(), async () => {
+      await assert.rejects(() => runLitAction(config, { pkpId }), (error: Error) => {
+        assert.equal(error.message, "That email code isn't right");
+        assert.equal(publicErrorMessage(error.message), "That email code isn't right");
+        return true;
+      });
+    });
+  }
+});
+
 test("gives up once the retry budget is spent", async () => {
   let clock = 0;
   const waits: number[] = [];

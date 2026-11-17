@@ -118,6 +118,23 @@ export async function managedNodeRequest(
   if (body.operation === "list-channels") {
     return node.listChannels({ include_closed: body.includeClosed === true });
   }
+  if (body.operation === "cancel-channel-opening") {
+    const id = channelId(body.channelId);
+    return serializeMutation(userId, async () => {
+      const channel = (await node.listChannels({})).channels.find((item) => item.channel_id === id);
+      const state = channel && String(channel.state.state_name).replaceAll("_", "").toLowerCase();
+      if (!channel || channel.is_acceptor || !["negotiatingfunding", "collaboratingfundingtx", "signingcommitment"].includes(state!)) {
+        throw new Error("Only an opening still waiting for unsigned external funding can be cancelled");
+      }
+      // V2 negotiates commitments (and a funding outpoint) BEFORE the wallet signs, so the state alone can't
+      // tell an unsigned opening from a funded one. The managed host refuses to abandon an opening whose signed
+      // funding it recorded (its record is on disk and written before the funding reaches Fiber), and Fiber
+      // refuses one whose funding it was handed since it started, or that confirmed. Never replace this with
+      // state-only abandonment: submission can race with cancellation.
+      await node.call("abandon_channel", [{ channel_id: id }]);
+      return { done: true };
+    });
+  }
   if (body.operation === "get-invoice") {
     return node.getInvoice({ payment_hash: paymentHash(body.paymentHash) });
   }

@@ -205,8 +205,8 @@ The production deployment also sends `Cross-Origin-Opener-Policy: same-origin` a
 
 ## Upstream foundations
 
-- `@nervosnetwork/fiber-js` `0.9.1`
-- `@fiber-pay/sdk` `0.2.7`
+- `@nervosnetwork/fiber-js` `0.10.1` (installed as `keyway-fiber-runtime` and supplied through the explicit WASM factory; Fiber Pay's optional runtime peer still targets 0.9.x)
+- `@fiber-pay/sdk` `0.2.8`
 - `@ckb-ccc/core` `1.16.1`
 - Better Auth `1.7.7` and Resend `6.32.1` (private backend only)
 - Lit Chipotle Actions pinned by IPFS CID (checked by the backend and allow-listed in the KeyWay Lit group)

@@ -41,6 +41,7 @@ const server = createServer((request, response) => {
     const { id, method } = JSON.parse(body);
     if (method === "submit_signed_funding_tx" && existsSync(join(dir, "drop-funding"))) return request.socket.destroy();
     if (method === "submit_signed_funding_tx") writeFileSync(join(dir, "funding-received"), "");
+    if (method === "abandon_channel") appendFileSync(join(dir, "abandoned"), "x");
     let result = null;
     if (method === "node_info") result = { pubkey: "02" + "11".repeat(32), version: "fake", default_funding_lock_script: { code_hash: "0x" + "22".repeat(32), hash_type: "type", args: "0x" } };
     if (method === "list_channels") {
@@ -63,7 +64,15 @@ const server = createServer((request, response) => {
     setTimeout(() => response.end(JSON.stringify({ jsonrpc: "2.0", id, result })), slow ? 1_500 : 0);
   });
 });
-setTimeout(() => server.listen(port, "127.0.0.1"), existsSync(join(dir, "slow-start")) ? 1_500 : 0);
+const listen = () => setTimeout(() => server.listen(port, "127.0.0.1"), existsSync(join(dir, "slow-start")) ? 1_500 : 0);
+if (existsSync(join(dir, "needs-migration"))) {
+  process.stderr.write("Database migration required (20260618120000 -> 20260925120000), 1 pending migration(s). Backup recommended.\\nContinue? [y/N] ");
+  process.stdin.once("data", (answer) => {
+    if (answer.toString().trim() !== "yes") process.exit(1);
+    writeFileSync(join(dir, "migrated"), "yes");
+    listen();
+  });
+} else listen();
 `;
 
 // As Fiber 0.9.1's list_channels sends them to the host, which reads them unchanged.
@@ -145,6 +154,7 @@ async function host(context: TestContext) {
     FNN_PATH: fnn,
     KEYWAY_MANAGED_DATA_DIR: join(root, "users"),
     KEYWAY_MANAGED_BACKUP_DIR: join(root, "backups"),
+    KEYWAY_MANAGED_BACKUP_KEY: "07".repeat(32),
     KEYWAY_MANAGED_RETIRED_DIR: join(root, "retired"),
     KEYWAY_MANAGED_MAX_NODES: "2",
     CKB_NODE_RPC_URL: ckb.url,
@@ -176,6 +186,22 @@ async function host(context: TestContext) {
   const starts = async () => (await readFile(join(root, "users", "starts.log"), "utf8").catch(() => "")).split("\n").filter(Boolean);
   return { module, root, chain: ckb.chain, request, submit, running, marked, withChannels, markedNode, starts };
 }
+
+test("a V2 upgrade snapshots a stopped existing store before confirming the known migration", async (context) => {
+  const h = await host(context);
+  const dir = join(h.root, "users", A);
+  await mkdir(join(dir, "fiber", "store"), { recursive: true });
+  await writeFile(join(dir, "needs-migration"), "");
+  assert.equal(await h.request(A), 200);
+  assert.equal(await readFile(join(dir, "migrated"), "utf8"), "yes");
+  const snapshots = await h.module.listSnapshots({ userId: A });
+  assert.equal(snapshots.length, 1);
+  assert.equal(await readFile(join(dir, "keyway-fiber-0.10.1"), "utf8"), snapshots[0].name);
+  const message = "Database migration required (20260618120000 -> 20260925120000), 1 pending migration(s)";
+  assert.equal(h.module.approvedFiberMigration(message, false), false);
+  assert.equal(h.module.approvedFiberMigration(message + " WARNING: breaking changes", true), false);
+  assert.equal(h.module.approvedFiberMigration(message.replace("20260925120000", "20270101000000"), true), false);
+});
 
 test("at capacity, a node idle for a few minutes makes room for a new user; one with channels or just used is never stopped", async (context) => {
   context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
@@ -821,6 +847,39 @@ test("a funding submission for no channel waiting for it, or one Fiber refuses, 
   await markedNode(F);
   await module.startKnownNodes([F]);
   assert.ok(running().includes(F), running().join(","));
+});
+
+test("V2 accepts signed funding after both commitments and records it before handing it to Fiber", async (context) => {
+  const { root, request, submit, marked, withChannels } = await host(context);
+  await withChannels(A, [{ ...WAITING_CHANNEL[0], channel_outpoint: `${FUNDING_TX}00000000`, state: { state_name: "SigningCommitment", state_flags: "OUR_COMMITMENT_SIGNED_SENT|THEIR_COMMITMENT_SIGNED_SENT|COMMITMENT_SIGNED_SENT" } }]);
+  assert.equal(await request(A), 200);
+  assert.equal(await submit(A), 200);
+  assert.equal(await marked(A), true);
+  assert.ok((await readFile(join(root, "users", A, "keyway-funded-channels"), "utf8")).includes(WAITING_ID));
+  assert.equal(await readFile(join(root, "users", A, "funding-received"), "utf8"), "");
+});
+
+test("an opening is abandoned only until its signed funding is recorded, whatever Fiber remembers", async (context) => {
+  const { module, root, request, submit, withChannels } = await host(context);
+  const abandon = (params: unknown[] = [{ channel_id: WAITING_ID }]) => module
+    .proxyUserRequest(A, Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "abandon_channel", params })))
+    .then(({ status }) => String(status), (error: Error) => error.message);
+  const abandoned = () => readFile(join(root, "users", A, "abandoned"), "utf8").catch(() => "");
+  await withChannels(A, WAITING_CHANNEL);
+  assert.equal(await request(A), 200);
+  // Unsigned: nothing was handed to Fiber, so the opening can go.
+  assert.equal(await abandon(), "200");
+  assert.equal(await abandoned(), "x");
+  assert.equal(await submit(A), 200);
+  // The stand-in Fiber would abandon it (as Fiber does once a restart has dropped its own marker): the host doesn't ask.
+  assert.match(await abandon(), /already handed to Fiber/);
+  assert.match(await abandon([]), /already handed to Fiber/);
+  // A record that can't be read says nothing, so nothing is abandoned.
+  const record = join(root, "users", A, "keyway-funded-channels");
+  await rm(record);
+  await mkdir(record);
+  assert.match(await abandon([{ channel_id: `0x${"55".repeat(32)}` }]), /already handed to Fiber/);
+  assert.equal(await abandoned(), "x");
 });
 
 test("funding Fiber fails on after sending it to the peer stays recorded and marked", async (context) => {

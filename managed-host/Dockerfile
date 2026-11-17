@@ -1,5 +1,5 @@
-# FNN 0.9.1, pinned by digest so the binary matches the backend's method table.
-FROM nervos/fiber:0.9.1@sha256:b4d68916a42d1847b6c562b8710a20b409e3f5da57cfb347b6b7e0a38f57fe8a AS fiber
+# FNN 0.10.1: official testnet peers require Channel V2 for new channels.
+FROM nervos/fiber:0.10.1@sha256:a808a66e9b3d0f8b31fc848e6a96b7e225add71213b266f01e1a5780abdfbbab AS fiber
 
 FROM node:24-bookworm-slim
 RUN apt-get update \

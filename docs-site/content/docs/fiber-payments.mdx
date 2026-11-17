@@ -160,7 +160,7 @@ await fiber.closeChannel(channelId);
 
 KeyWay shows a close dialog first, with what returns to the user; replace it with `approveFiberChannelClose`. A normal (cooperative) close returns the user's side to their own address once the closing transaction confirms.
 
-`closeChannel(channelId, { force: true })` closes without the peer and settles after about 4 hours. Fiber 0.9.1 settles force-closed channels to the node's own key, and KeyWay currently sweeps those settlements to the user's address; see [Closing channels](/fiber-node#closing-channels). Prefer a cooperative close whenever the peer is online.
+`closeChannel(channelId, { force: true })` closes without the peer and settles after about 4 hours. Fiber 0.10.1 settles force-closed channels to the node's own key, and KeyWay currently sweeps those settlements to the user's address; see [Closing channels](/fiber-node#closing-channels). Prefer a cooperative close whenever the peer is online.
 
 ## Stop Fiber
 

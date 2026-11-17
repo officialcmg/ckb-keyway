@@ -20,6 +20,11 @@ export type IdempotencyOptions<T> = {
   reconcile?: (handle: unknown) => Promise<{ completed: T } | undefined>;
   /** Without `reconcile`, a stale request is reported as having an unknown outcome rather than as still running. */
   staleAfterMs?: number;
+  /**
+   * For a mutation that is safe to run again after any failure: a failure isn't kept as the key's answer. The
+   * record is removed, as for a `RetryableError`, so the same key runs it again. Only its success is replayed.
+   */
+  retryFailures?: boolean;
 };
 
 /**
@@ -201,7 +206,7 @@ export async function runIdempotentMutation<T>(
     // Its outcome isn't known, so it isn't recorded as failed: repeats reconcile it, or say it's unknown.
     if (error instanceof OutcomeUnknownError) throw error;
     // A refusal to retry isn't an outcome: the key stays free, so the retry it asks for runs.
-    if (error instanceof RetryableError) {
+    if (error instanceof RetryableError || options.retryFailures) {
       await sql`
         delete from keyway_v2_idempotency_keys
         where user_id = ${userId} and operation = ${operation} and idempotency_key = ${key} and status = 'running'

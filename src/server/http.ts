@@ -173,13 +173,16 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
     const result = await fiberPayment(context, managedFiberNode(user.id), body, request.headers.get("idempotency-key") || undefined);
     return Response.json(result, { headers: { "Cache-Control": "no-store" } });
   }
-  const result = ["open-channel", "submit-channel-funding"].includes(operation)
+  const result = ["open-channel", "submit-channel-funding", "cancel-channel-opening"].includes(operation)
     ? await runIdempotentMutation(
       user.id,
       `managed:${operation}`,
       request.headers.get("idempotency-key") ?? "",
       body,
       () => managedNodeRequest(user.id, body, undefined, () => ownLockScript(user), (hash) => signedTransaction(user.id, hash)),
+      // Releasing an opening is checked afresh each time and changes nothing unless it succeeds, so a failure
+      // (the node being unreachable, say) never stays this key's answer.
+      { retryFailures: operation === "cancel-channel-opening" },
     )
     : await managedNodeRequest(user.id, body);
   return Response.json(result, {
@@ -189,12 +192,14 @@ async function managedNodeHttpRequest(request: Request): Promise<Response> {
 
 /**
  * Per-user limits on hosted-node requests: free calls, changes such as peers, channel opens and their funding,
- * and every other read (status and the fee reserve also start the node). Payments have limits of their own.
+ * releasing an unsigned opening, and every other read (status and the fee reserve also start the node). Payments have limits of their own.
  */
 export function managedNodeRateLimit(operation: string): { key: string; rule: { max: number; window: number }; message: string } | undefined {
   if (operation === "pay") return undefined;
   if (operation === "call") return { key: "fiber-call", rule: { max: 120, window: 60 }, message: "Too many Fiber node requests" };
   if (["act", "open-channel", "submit-channel-funding"].includes(operation)) return { key: "fiber-act", rule: { max: 30, window: 60 }, message: "Too many Fiber node changes" };
+  // Counted apart from the changes above, so an opening that used the last of that allowance can still be released.
+  if (operation === "cancel-channel-opening") return { key: "fiber-cancel", rule: { max: 30, window: 60 }, message: "Too many Fiber node changes" };
   return { key: "fiber-read", rule: { max: 120, window: 60 }, message: "Too many Fiber node requests" };
 }
 
