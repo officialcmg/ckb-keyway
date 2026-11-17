@@ -57,6 +57,19 @@ test("the transaction dialog names NFTs, tokens and other cells KeyWay can't nam
   assert.doesNotMatch(rows, /…/);
 });
 
+test("the transaction dialog's warning wraps an unrecognized script's whole hash instead of running past the dialog", () => {
+  const codeHash = `0x${"c7".repeat(32)}`;
+  const preview = {
+    network: "CKB testnet", sendingCkb: "100", receivingCkb: "0", feeCkb: "0.00001", tokens: [], nfts: [], dao: [], cellChanges: [], recipients: [],
+    unrecognized: [{ codeHash, hashType: "type", cells: 1 }], otherSigners: 0, details: { inputs: [], outputs: [] }, transactionHash: `0x${"ab".repeat(32)}`, requiresEmailCode: false,
+  } as unknown as TransactionPreview;
+  const html = renderToStaticMarkup(createElement(KeyWayTransactionModal, { theme: "light", appName: "Acme Pay", preview, answer: () => undefined }));
+  const warning = /<p role="alert" style="([^"]*)">([^<]*)<\/p>/.exec(html);
+  assert.ok(warning && warning[2].includes(codeHash), "the warning names the whole hash");
+  // The hash is one unbroken word: without this it runs past the dialog's edge on a narrow screen.
+  assert.match(warning[1], /overflow-wrap:anywhere/);
+});
+
 test("the peer dialog shows the whole node ID", () => {
   const pubkey = `0x03${"4c".repeat(16)}${"00".repeat(16)}`;
   const html = renderToStaticMarkup(createElement(KeyWayPeerModal, { theme: "light", appName: "Acme Pay", preview: { action: "connect", pubkey, openChannels: 0 }, answer: () => undefined }));
