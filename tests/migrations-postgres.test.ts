@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { database, migrateDatabase } from "../src/server/database.ts";
+import postgres from "postgres";
+import { database, migrateDatabase, type DatabaseSql } from "../src/server/database.ts";
 import { migrations } from "../src/server/migrations.ts";
 
 const enabled = Boolean(process.env.KEYWAY_AUTH_TEST_DATABASE_URL);
@@ -19,4 +20,45 @@ test("migrations apply once and drop the unused hosted-node confirmations table"
   assert.equal(dropped?.name, null);
   const [kept] = await sql<Array<{ name: string | null }>>`select to_regclass('keyway_v2_signature_requests')::text as name`;
   assert.equal(kept?.name, "keyway_v2_signature_requests");
+});
+
+test("migrations 26, 28 and 31 sign out sessions without an origin, remove expired challenges and date rate-limit windows", { skip: !enabled }, async (t) => {
+  const admin = postgres(process.env.KEYWAY_AUTH_TEST_DATABASE_URL!, { max: 1 });
+  const name = `keyway_migration_${crypto.randomUUID().replaceAll("-", "")}`;
+  await admin.unsafe(`create database ${name}`);
+  const url = new URL(process.env.KEYWAY_AUTH_TEST_DATABASE_URL!);
+  url.pathname = `/${name}`;
+  const sql = postgres(url.toString(), { max: 1 });
+  t.after(async () => {
+    await sql.end({ timeout: 0 });
+    await admin.unsafe(`drop database if exists ${name} with (force)`);
+    await admin.end();
+  });
+  // The schema as it was at version 22, with one session from before origins and one from after.
+  await sql.begin(async (tx) => {
+    await tx`create table keyway_schema_migrations (version integer primary key, name text not null, applied_at timestamptz not null default now())`;
+    for (const item of migrations.filter(({ version }) => version <= 22)) {
+      await item.up(tx as unknown as DatabaseSql);
+      await tx`insert into keyway_schema_migrations (version, name) values (${item.version}, ${item.name})`;
+    }
+  });
+  const [user] = await sql<Array<{ id: string }>>`insert into keyway_auth_users (name, email, "emailVerified") values ('', 'old@example.com', true) returning id`;
+  await sql`insert into keyway_auth_sessions ("expiresAt", token, "updatedAt", "userId", "scopeId", "origin") values
+    (now() + interval '1 day', 'before-origins', now(), ${user.id}, 'dashboard', null),
+    (now() + interval '1 day', 'after-origins', now(), ${user.id}, 'dashboard', 'https://dashboard.example')`;
+  const [expired, open] = [crypto.randomUUID(), crypto.randomUUID()];
+  await sql`insert into keyway_auth_challenges (id, scope_id, email, expires_at, status) values
+    (${expired}, 'dashboard', 'old@example.com', now() - interval '1 minute', 'sent'),
+    (${open}, 'dashboard', 'old@example.com', now() + interval '5 minutes', 'sent')`;
+  await sql`insert into keyway_auth_rate_limits (key, count, starts_at) values ('before-expiry', 1, '2026-11-01T00:00:00Z')`;
+  await migrateDatabase(sql);
+  // Migration 31: windows from before it end a day after they started, so they can be removed.
+  const [window] = await sql<Array<{ expires_at: Date }>>`select expires_at from keyway_auth_rate_limits where key = 'before-expiry'`;
+  assert.equal(window.expires_at.toISOString(), "2026-11-02T00:00:00.000Z");
+  // The API from before it, which doesn't set the expiry, can still record windows until it is replaced.
+  await sql`insert into keyway_auth_rate_limits (key, count, starts_at) values ('old-api', 1, now())`;
+  const challenges = await sql<Array<{ id: string }>>`select id from keyway_auth_challenges`;
+  assert.deepEqual(challenges.map(({ id }) => id), [open]);
+  const sessions = await sql<Array<{ token: string }>>`select token from keyway_auth_sessions order by token`;
+  assert.deepEqual(sessions.map(({ token }) => token), ["after-origins"]);
 });

@@ -4,8 +4,9 @@ import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { formatCkbSignature, type ValidatedFunding } from "../src/server/funding-transaction.ts";
 import { fundingSigning, type FundingContext } from "../src/server/funding-signing.ts";
+import postgres from "postgres";
 import { database } from "../src/server/database.ts";
-import { countLitCodeAttempt, issueRequest, loadRequest, messageSigning, outflowNeedsEmailCode, recordLitCode, reserveOutflow, signingSettings, transactionSigning, type SigningContext } from "../src/server/general-signing.ts";
+import { consumeRequest, countLitCodeAttempt, issueRequest, loadRequest, messageSigning, outflowNeedsEmailCode, recordLitCode, reserveOutflow, sendCode, signingSettings, transactionSigning, verifyCode, type SigningContext } from "../src/server/general-signing.ts";
 import type { ValidatedTransaction } from "../src/server/transaction-policy.ts";
 import type { ReadyWallet } from "../src/server/user-wallet.ts";
 
@@ -34,8 +35,8 @@ function harness(outflow: bigint, tokenOutflows: Array<{ asset: string; amount: 
       script,
       groups: [{ script, kind: "secp256k1" }],
       preview: {
-        network: "CKB testnet", sendingCkb: "100", receivingCkb: "0", feeCkb: "0.00001", tokens: [], nfts: [], dao: [],
-        recipients: [{ address: "ckt1qtest", kind: "wallet", walletType: "standard", ckb: "100", tokens: [], nfts: [] }],
+        network: "CKB testnet", sendingCkb: "100", receivingCkb: "0", feeCkb: "0.00001", tokens: [], nfts: [], dao: [], cellChanges: [],
+        recipients: [{ address: "ckt1qtest", kind: "wallet", walletType: "standard", ckb: "100", tokens: [], nfts: [], cells: [] }],
         unrecognized: [], otherSigners: 0, details: { inputs: [], outputs: [] }, transactionHash: transaction.hash(),
       },
       outflowShannons: outflow,
@@ -125,6 +126,37 @@ test("general signing binds approvals, email codes and threshold changes", { ski
     await assert.rejects(() => transactionSigning(context, { operation: "sign", transaction: tx(3), confirmationNonce: preview.confirmationNonce, emailCode: wrong }), /isn't right/);
     const signed = await transactionSigning(context, { operation: "sign", transaction: tx(3), confirmationNonce: preview.confirmationNonce, emailCode: codeFrom() });
     assert.ok(signed);
+  });
+
+  await t.test("a transaction too long to show in one confirmation email is refused before any code", async () => {
+    const { context, emails } = harness(100n * CKB);
+    await signingSettings(context, { operation: "set-daily-amount", asset: "ckb", amount: (100n * CKB).toString() });
+    const previewOf = context.preview!;
+    context.preview = async (wallet, input) => {
+      const validated = await previewOf(wallet, input);
+      const [recipient] = validated.preview.recipients;
+      validated.preview.recipients = Array.from({ length: 600 }, (_, index) => ({ ...recipient, address: `ckt1qtest${index}` }));
+      return validated;
+    };
+    await assert.rejects(() => transactionSigning(context, { operation: "preview", transaction: tx(77) }), /too much to show in one confirmation email/);
+    assert.equal(emails.length, 0);
+  });
+
+  await t.test("a code is never stored, counted or sent for a summary too long for one email", async () => {
+    const { context, emails } = harness(100n * CKB);
+    let limited = 0;
+    context.rateLimit = async () => { limited += 1; return { allowed: true, retryAfter: null }; };
+    const lines = Array.from({ length: 600 }, (_, index) => `100 CKB to ckt1qtest${index} (wallet)`);
+    const nonce = await issueRequest(context.user, "transaction", `0x${"cd".repeat(32)}`, { lines }, true);
+    await assert.rejects(() => sendCode(context, "transaction", nonce, "Confirm a transaction", lines), /too much to show in one confirmation email/);
+    const sql = await database();
+    const [row] = await sql<Array<{ email_code_hash: string | null }>>`select email_code_hash from keyway_v2_signature_requests where nonce = ${nonce}`;
+    assert.equal(row.email_code_hash, null);
+    assert.equal(emails.length, 0);
+    assert.equal(limited, 0, "no email allowance used");
+    // The same request with a summary that fits gets its code.
+    await sendCode(context, "transaction", nonce, "Confirm a transaction", lines.slice(0, 10));
+    assert.equal(emails.length, 1);
   });
 
   await t.test("a token with no daily amount of its own has no limit, even with a CKB amount set", async () => {
@@ -386,4 +418,169 @@ test("general signing binds approvals, email codes and threshold changes", { ski
     assert.equal((await loadRequest(user, "recovery", nonce, "digest")).summary.litTicket, "v1.2.ticket");
     await assert.rejects(() => recordLitCode(user, "recovery", crypto.randomUUID(), {}), /expired/);
   });
+});
+
+test("wrong step-up codes add up across codes, to 20 a day per session", { skip: !enabled }, async (t) => {
+  process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
+  delete process.env.KEYWAY_SECURITY_ALERT_WEBHOOK_URL;
+  const sql = await database();
+  const alerts: string[] = [];
+  const warn = console.warn;
+  console.warn = (...args: unknown[]) => { if (args[0] === "[keyway-security]") alerts.push(String(args[1])); else warn(...args); };
+  t.after(() => { console.warn = warn; });
+  const wrong = (code: string) => code === "000000" ? "111111" : "000000";
+  const limitAlerts = () => alerts.filter((alert) => JSON.parse(alert).kind === "step_up_failure_limit").length;
+
+  await t.test("each code allows five tries, but codes sent again don't bring more", async () => {
+    const { context, codeFrom } = harness(0n);
+    const nonce = await issueRequest(context.user, "message", "digest", {}, true);
+    for (let round = 0; round < 3; round++) {
+      await sendCode(context, "message", nonce, "Sign a message", []);
+      const code = codeFrom();
+      for (let i = 0; i < 5; i++) await assert.rejects(() => verifyCode(context.user, "message", nonce, wrong(code)), /isn't right/);
+    }
+    await sendCode(context, "message", nonce, "Sign a message", []);
+    const kept = codeFrom();
+    for (let i = 0; i < 4; i++) await assert.rejects(() => verifyCode(context.user, "message", nonce, wrong(kept)), /isn't right/);
+    // The twentieth wrong code, on another approval: one alert, and then no code is checked or sent for the day.
+    const other = await issueRequest(context.user, "settings", "digest", {}, true);
+    await sendCode(context, "settings", other, "Confirm a security change", []);
+    await assert.rejects(() => verifyCode(context.user, "settings", other, wrong(codeFrom())), /isn't right/);
+    assert.equal(limitAlerts(), 1);
+    await assert.rejects(() => verifyCode(context.user, "message", nonce, kept), /Too many wrong email codes today/);
+    await assert.rejects(() => sendCode(context, "message", nonce, "Sign a message", []), /Too many wrong email codes today/);
+    assert.equal(limitAlerts(), 1);
+    // A day later they count for nothing.
+    await sql`update keyway_v2_step_up_failures set created_at = created_at - interval '1 day' where user_id = ${context.user.id}`;
+    await sendCode(context, "message", nonce, "Sign a message", []);
+    await verifyCode(context.user, "message", nonce, codeFrom());
+  });
+
+  await t.test("they count per session, so another session of the same user still gets codes, up to 60 a day", async () => {
+    const { context, codeFrom } = harness(0n);
+    const session = (sessionId: string) => ({ ...context, user: { ...context.user, sessionId } });
+    const nonce = await issueRequest(context.user, "message", "digest", {}, true);
+    const twenty = async (signing: SigningContext) => {
+      for (let round = 0; round < 4; round++) {
+        await sendCode(signing, "message", nonce, "Sign a message", []);
+        const code = codeFrom();
+        for (let i = 0; i < 5; i++) await assert.rejects(() => verifyCode(signing.user, "message", nonce, wrong(code)), /isn't right/);
+      }
+    };
+    const stolen = session("stolen");
+    await twenty(stolen);
+    await assert.rejects(() => sendCode(stolen, "message", nonce, "Sign a message", []), /today/);
+    // Past its limit, it is refused without competing for the check lock the owner's own checks use.
+    const holder = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      await holder.begin(async (tx) => {
+        await tx`select pg_advisory_xact_lock(hashtextextended(${`step-up-failures:${context.user.id}`}, 0))`;
+        await assert.rejects(() => verifyCode(stolen.user, "message", nonce, "123456"), /today/);
+      });
+    } finally {
+      await holder.end({ timeout: 0 });
+    }
+    // The owner's own sign-in, a session of its own, isn't held back by it.
+    const owner = session("owner");
+    await sendCode(owner, "message", nonce, "Sign a message", []);
+    await verifyCode(owner.user, "message", nonce, codeFrom());
+    // Across all of a user's sessions, 60 a day.
+    await twenty(owner);
+    await twenty(session("third"));
+    await assert.rejects(() => sendCode(session("fourth"), "message", nonce, "Sign a message", []), /today/);
+  });
+
+  await t.test("wrong codes tried at once still stop at 20", async () => {
+    const { context, codeFrom } = harness(0n);
+    const nonces: Array<{ nonce: string; code: string }> = [];
+    for (let i = 0; i < 6; i++) {
+      const nonce = await issueRequest(context.user, "payment", `digest-${i}`, {}, true);
+      await sendCode(context, "payment", nonce, "Confirm a payment", []);
+      nonces.push({ nonce, code: codeFrom() });
+    }
+    const outcomes = await Promise.all(nonces.flatMap(({ nonce, code }) => Array.from({ length: 5 }, () =>
+      verifyCode(context.user, "payment", nonce, wrong(code)).then(() => "ok", (error: Error) => error.message))));
+    // Checks running at once are refused rather than queued; however they interleave, no more than 20 are compared.
+    assert.equal(outcomes.filter((message) => message === "ok").length, 0);
+    assert.ok(outcomes.filter((message) => /isn't right/.test(message)).length <= 20);
+    assert.ok(outcomes.every((message) => /isn't right|today|in progress/.test(message)), outcomes.join(", "));
+    const [{ failures }] = await sql<Array<{ failures: number }>>`select count(*)::int as failures from keyway_v2_step_up_failures where user_id = ${context.user.id}`;
+    assert.ok(failures <= 20);
+    // Then the rest, one at a time, stop at exactly 20.
+    for (const { nonce, code } of nonces) {
+      for (let i = 0; i < 5; i++) await verifyCode(context.user, "payment", nonce, wrong(code)).catch(() => undefined);
+    }
+    const [{ total }] = await sql<Array<{ total: number }>>`select count(*)::int as total from keyway_v2_step_up_failures where user_id = ${context.user.id}`;
+    assert.equal(total, 20);
+  });
+});
+
+test("codes the Lit Action emailed count toward the day's wrong-code limit; one that signs doesn't", { skip: !enabled }, async () => {
+  process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
+  const sql = await database();
+  const { context, codeFrom } = harness(0n);
+  const user = { ...context.user, sessionId: "lit-session" };
+  // The server can't tell a wrong Lit code from a right one until the Action answers, so each try counts until it signs.
+  const litRequest = async () => {
+    const nonce = await issueRequest(user, "transaction", `digest-${crypto.randomUUID()}`, {}, true);
+    await recordLitCode(user, "transaction", nonce, { litTicket: "v2.ticket" });
+    return nonce;
+  };
+  for (let round = 0; round < 3; round++) {
+    const nonce = await litRequest();
+    for (let i = 0; i < 5; i++) await countLitCodeAttempt(user, "transaction", nonce);
+  }
+  const signed = await litRequest();
+  for (let i = 0; i < 4; i++) await countLitCodeAttempt(user, "transaction", signed);
+  // The twentieth try signs, so it is taken back, once: one more try is left today.
+  const refund = await countLitCodeAttempt(user, "transaction", signed);
+  await refund();
+  await refund();
+  await consumeRequest(user, "transaction", signed);
+  const last = await litRequest();
+  await countLitCodeAttempt(user, "transaction", last);
+  // Twenty wrong Lit codes: no more tries today, of either kind of code, even with a new Lit code.
+  await assert.rejects(() => countLitCodeAttempt(user, "transaction", last), /Too many wrong email codes today/);
+  await recordLitCode(user, "transaction", last, { litTicket: "v2.again" });
+  await assert.rejects(() => countLitCodeAttempt(user, "transaction", last), /Too many wrong email codes today/);
+  const server = await issueRequest(user, "message", "digest", {}, true);
+  await assert.rejects(() => sendCode({ ...context, user }, "message", server, "Sign a message", []), /today/);
+  const [{ failures }] = await sql<Array<{ failures: number }>>`select count(*)::int as failures from keyway_v2_step_up_failures where user_id = ${user.id}`;
+  assert.equal(failures, 20);
+  // Another session of the same user still gets its own.
+  const owner = { ...context, user: { ...user, sessionId: "owner-session" } };
+  await sendCode(owner, "message", server, "Sign a message", []);
+  await verifyCode(owner.user, "message", server, codeFrom());
+});
+
+test("stolen sessions using up the day's wrong codes don't shut out a session signed in afterwards", { skip: !enabled }, async () => {
+  process.env.DATABASE_URL = process.env.KEYWAY_AUTH_TEST_DATABASE_URL;
+  const sql = await database();
+  const wrong = (code: string) => code === "000000" ? "111111" : "000000";
+  const { context, codeFrom } = harness(0n);
+  const [account] = await sql<Array<{ id: string }>>`insert into keyway_auth_users (name, email, "emailVerified")
+    values ('', ${`epoch-${crypto.randomUUID()}@example.com`}, true) returning id`;
+  const session = async () => {
+    const [row] = await sql<Array<{ id: string }>>`insert into keyway_auth_sessions ("expiresAt", token, "updatedAt", "userId", "scopeId", "origin")
+      values (now() + interval '1 day', ${crypto.randomUUID()}, now(), ${account.id}, 'epoch-app', 'https://epoch.example') returning id`;
+    return { ...context, user: { ...context.user, sessionId: row.id } };
+  };
+  const nonce = await issueRequest(context.user, "message", "digest", {}, true);
+  const twenty = async (signing: SigningContext) => {
+    for (let round = 0; round < 4; round++) {
+      await sendCode(signing, "message", nonce, "Sign a message", []);
+      const code = codeFrom();
+      for (let i = 0; i < 5; i++) await assert.rejects(() => verifyCode(signing.user, "message", nonce, wrong(code)), /isn't right/);
+    }
+  };
+  const stolen = [await session(), await session(), await session()];
+  const spare = await session();
+  for (const signing of stolen) await twenty(signing);
+  // Another session from before is refused: the user's 60 are used up.
+  await assert.rejects(() => sendCode(spare, "message", nonce, "Sign a message", []), /today/);
+  // The owner signs in again, with a login code from the inbox, and confirms with the right code.
+  const fresh = await session();
+  await sendCode(fresh, "message", nonce, "Sign a message", []);
+  await verifyCode(fresh.user, "message", nonce, codeFrom());
+  await assert.rejects(() => sendCode(spare, "message", nonce, "Sign a message", []), /today/);
 });

@@ -44,11 +44,14 @@ export function tokenAsset(script: { code_hash: string; hash_type: string; args:
   return ccc.Script.from({ codeHash: script.code_hash, hashType: script.hash_type as ccc.HashType, args: script.args }).hash();
 }
 
-/** "1.5 CKB", "20 RUSD", or the raw amount of an unknown token with its short ID. */
+/**
+ * "1.5 CKB", "20 RUSD", or the raw amount of an unknown token with its whole ID (type script hash): a shortened
+ * one could be ground to match another token's.
+ */
 export function formatAsset(amount: bigint, asset: "ckb" | string): string {
   if (asset === "ckb") return `${decimal(amount, 8)} CKB`;
   const known = KNOWN_TOKENS[asset.toLowerCase()];
-  return known ? `${decimal(amount, known.decimals)} ${known.symbol}` : `${amount} of token ${asset.slice(0, 10)}…${asset.slice(-6)}`;
+  return known ? `${decimal(amount, known.decimals)} ${known.symbol}` : `${amount} of token ${asset}`;
 }
 
 function decimal(amount: bigint, decimals: number): string {

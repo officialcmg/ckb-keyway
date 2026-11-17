@@ -5,6 +5,8 @@ import { DEFAULT_STALE_MS, MAX_WAITING_REPEATS, runIdempotentMutation, waitingRe
 import { database } from "../src/server/database.ts";
 import { signingSettings, type SigningContext } from "../src/server/general-signing.ts";
 
+const PAYEE = `0x02${"9e".repeat(32)}`;
+
 const enabled = Boolean(process.env.KEYWAY_AUTH_TEST_DATABASE_URL);
 const CKB = 100_000_000n;
 
@@ -21,7 +23,7 @@ function harness(amount: bigint, options: { failSend?: boolean } = {}) {
   const node = {
     call: async <T>(method: string, params: Array<Record<string, unknown>> = []): Promise<T> => {
       if (method === "parse_invoice") {
-        return { invoice: { amount: `0x${amount.toString(16)}`, data: { payment_hash: `0x${"ab".repeat(32)}`, attrs: [{ description: "tea" }] } } } as T;
+        return { invoice: { amount: `0x${amount.toString(16)}`, data: { payment_hash: `0x${"ab".repeat(32)}`, attrs: [{ description: "tea" }, { payee_public_key: PAYEE }] } } } as T;
       }
       if (method === "send_payment" && params[0]?.dry_run) return { fee: "0x0" } as T;
       if (method === "send_payment") {
@@ -71,6 +73,8 @@ test("hosted Fiber payments: daily amount, email codes and overlapping approvals
     await pay(h, { stage: "request-email-code", confirmationNonce: third.confirmationNonce });
     assert.match(h.emails[0].subject, /Confirm a payment in Acme Pay/);
     assert.match(h.emails[0].plaintext, /Pay 40 CKB for "tea"/);
+    // The payee by its whole node ID: a shortened one could be ground to match another node's.
+    assert.ok(h.emails[0].plaintext.includes(`To Fiber node ${PAYEE}\n`), h.emails[0].plaintext);
     await pay(h, { stage: "send", confirmationNonce: third.confirmationNonce, emailCode: h.codeFrom() });
     assert.equal(h.sent.length, 3);
   });
