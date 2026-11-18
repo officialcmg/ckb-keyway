@@ -3,7 +3,6 @@ import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { KEYWAY_OMNILOCK, omnilockArgsFor, omnilockScript, secp256k1Lock } from "../src/sdk/browser/account-lock.ts";
-import { sentReserveStands } from "../src/sdk/browser/fee-reserve.ts";
 import { FEE_RESERVE, needsFeeReserve, planSweep, sweepSettlement } from "../src/sdk/browser/settlement-sweep.ts";
 
 const CKB = 100_000_000n;
@@ -139,6 +138,7 @@ test("for a recovery account a kept reserve is kept at a size that can be return
 
 test("a reserve just sent counts for the next channel open until the chain lists it, unless a sweep has already taken it", async () => {
   // The account's client sent the reserve; the node key's client (the viewer) asks its own indexer, which lags.
+  const { sentReserveStands } = await import("../src/sdk/browser/fee-reserve.ts");
   const txHash = `0x${"5e".repeat(32)}`;
   const outPoint = ccc.OutPoint.from({ txHash, index: 0 });
   const clients = (status: string | undefined, live = false) => {
