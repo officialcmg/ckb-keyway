@@ -384,9 +384,13 @@ async function assertKnownPublicPeer(node: ManagedNodeClient, peer: string): Pro
     const found = result.nodes.find((item) => item.pubkey.toLowerCase().replace(/^0x/, "") === bare);
     if (found) {
       const tcp = found.addresses.filter((address) => /\/tcp\/\d+(\/p2p\/|$)/.test(address) && !/\/(ws|wss)(\/|$)/.test(address));
-      if (tcp.length === 0) throw new Error("This peer announces no address a hosted node can reach; pass one with connectPeer");
+      // An address that isn't a plain public one is left out, not dialed: the peer chose what it announced.
       const pinned: string[] = [];
-      for (const address of tcp.slice(0, MAX_PEER_ADDRESSES)) pinned.push(await pinPublicPeerAddress(address));
+      for (const address of tcp.slice(0, MAX_PEER_ADDRESSES)) {
+        const checked = await pinPublicPeerAddress(address).catch(() => undefined);
+        if (checked) pinned.push(checked);
+      }
+      if (pinned.length === 0) throw new Error("This peer announces no address a hosted node can reach; pass one with connectPeer");
       return pinned;
     }
     if (result.nodes.length < 256) break;
