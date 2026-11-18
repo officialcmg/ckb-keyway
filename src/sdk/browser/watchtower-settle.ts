@@ -416,7 +416,38 @@ async function medianTime(client: ccc.Client): Promise<number | undefined> {
   return typeof median === "string" ? Number(BigInt(median)) : undefined;
 }
 
-export type SettleResult = { channelId: string; txHash?: ccc.Hex; status: string };
+export type SettleResult = {
+  channelId: string;
+  txHash?: ccc.Hex;
+  status: string;
+  /** Set once the funding cell is seen spent by a commitment (a force close, by either side): that transaction. */
+  closingTx?: ccc.Hex;
+  /** With a status in FINISHED: the transaction the status rests on, for `isBuried`. */
+  evidence?: ccc.Hex;
+};
+
+/**
+ * Statuses after which the channel needs nothing more from the watchtower: nothing is left under its commitment
+ * lock, or what is left isn't the user's. A cooperative close is left to Fiber's own remove_watch_channel, so an
+ * unexpected closing transaction never drops the data.
+ */
+export const FINISHED: ReadonlySet<string> = new Set(["settled", "the user's share is already claimed", "the user has no share in this channel"]);
+
+/** Blocks a transaction must be under before a verdict resting on it is kept for good (as the server watchtower's REORG_DEPTH). */
+export const FINAL_DEPTH = 24n;
+
+/**
+ * Whether a transaction is on-chain with FINAL_DEPTH blocks on top of it. A verdict that a channel is finished
+ * is acted on (its watchtower record dropped, its fee reserve released) only once the transaction it rests on is,
+ * so a reorganization that undoes the transaction finds the watchtower still able to claim.
+ */
+export async function isBuried(client: ccc.Client, txHash: ccc.HexLike): Promise<boolean> {
+  const found = await client.getTransactionNoCache(txHash);
+  if (found?.status !== "committed") return false;
+  const number = found.blockNumber ?? (found.blockHash ? (await client.getHeaderByHash(found.blockHash))?.number : undefined);
+  if (number === undefined) return false;
+  return (await client.getTip()) - number >= FINAL_DEPTH;
+}
 
 /**
  * One pass of the in-page watchtower over a channel: finds its commitment on-chain, follows any settlements to
@@ -436,8 +467,11 @@ export async function settleChannel(options: {
   dryRun?: { submit: (tx: ccc.Transaction) => Promise<ccc.Hex> };
 }): Promise<SettleResult> {
   const { client, channel } = options;
-  const result = (status: string, txHash?: ccc.Hex): SettleResult => ({ channelId: channel.channelId, status, ...(txHash ? { txHash } : {}) });
-  if (channel.fundingUdtTypeScript) return result("token channels are not settled by the in-page watchtower");
+  let closingTx: ccc.Hex | undefined;
+  const result = (status: string, txHash?: ccc.Hex, evidence?: ccc.Hex): SettleResult => ({
+    channelId: channel.channelId, status,
+    ...(txHash ? { txHash } : {}), ...(closingTx ? { closingTx } : {}), ...(evidence && FINISHED.has(status) ? { evidence } : {}),
+  });
   const funding = ccc.OutPoint.from(options.ref.fundingOutPoint);
   const fundingTx = (await client.getTransaction(funding.txHash))?.transaction;
   const fundingOutput = fundingTx?.outputs[Number(funding.index)];
@@ -448,7 +482,10 @@ export async function settleChannel(options: {
   const codeHash = COMMITMENT_LOCK[options.network].codeHash;
   const isCommitment = (output?: ccc.CellOutput) => output?.lock.codeHash === codeHash && output.lock.hashType === "type";
   if (!isCommitment(commitmentTx.outputs[0])) return result("closed cooperatively");
-  if (commitmentTx.outputs[0].type) return result("token channels are not settled by the in-page watchtower");
+  // From here the channel is force-closed on-chain, whatever the node itself still says about it.
+  closingTx = commitmentTx.hash();
+  // A token channel's close is seen (above: reads only), but its claim is not built here.
+  if (channel.fundingUdtTypeScript || commitmentTx.outputs[0].type) return result("token channels are not settled by the in-page watchtower");
   const prefix = ccc.bytesFrom(commitmentTx.outputs[0].lock.args).slice(0, 36);
 
   // Follow the commitment cell through any settlements to the one that is live now.
@@ -465,7 +502,7 @@ export async function settleChannel(options: {
     // The lock requires a settlement that leaves anything behind to put it in output 0 (its successor); any other
     // commitment-locked output isn't this channel's.
     const successor = next.outputs[0];
-    if (!isCommitment(successor) || !equal(ccc.bytesFrom(successor.lock.args).slice(0, 36), prefix)) return result("settled");
+    if (!isCommitment(successor) || !equal(ccc.bytesFrom(successor.lock.args).slice(0, 36), prefix)) return result("settled", undefined, next.hash());
     previousWitness = witness.slice(16);
     cell = ccc.OutPoint.from({ txHash: next.hash(), index: 0 });
     output = successor;
@@ -498,7 +535,8 @@ export async function settleChannel(options: {
   const decision = planClaim({
     channel, cell: { capacity: output.capacity, args: output.lock.args }, previousWitness, preimages, now, delayPassed,
   });
-  if ("skip" in decision) return result(decision.skip);
+  // A status that ends the watch rests on the transaction that created the cell it was read from.
+  if ("skip" in decision) return result(decision.skip, undefined, cell.txHash);
   const plan = decision.claim;
 
   const signer = new ccc.SignerCkbPrivateKey(client, options.nodeKey);

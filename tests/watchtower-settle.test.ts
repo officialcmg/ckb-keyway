@@ -9,6 +9,8 @@ import {
   applyUnlocks, blake160, delayFraction, encodeSettlementWitness, encodeWitnessState, epochDelayPassed, parseCommitmentArgs, parseSettlementWitness,
   planClaim, settleChannel, settlementMessage, signSettlement, trackNodeKeySends, XUDT_COMPATIBLE_WITNESS,
 } from "../src/sdk/browser/watchtower-settle.ts";
+import { normalizeChannel } from "../src/sdk/browser/create-keyway.ts";
+import { needsFeeReserve } from "../src/sdk/browser/settlement-sweep.ts";
 import { openWatchtowerStore, type WatchedChannel } from "../src/sdk/browser/watchtower-store.ts";
 import { COMMITMENT_LOCK } from "../src/sdk/browser/watchtower-settle.ts";
 
@@ -289,17 +291,6 @@ test("a peer remainder too small for its own commitment cell is not claimed (the
   assert.ok("skip" in decision && /too small/.test(decision.skip));
 });
 
-test("token channels are left to Fiber's native watchtower", async () => {
-  const { channel } = channelFixture();
-  const untouched = new Proxy({}, { get: () => { throw new Error("no chain access expected"); } }) as ccc.Client;
-  const result = await settleChannel({
-    client: untouched, network: "testnet", nodeKey: hex(secp256k1.utils.randomSecretKey()),
-    channel: { ...channel, channelId: "0x" + "01".repeat(32), fundingUdtTypeScript: { code_hash: "0x00", hash_type: "type", args: "0x" }, localFundingPubkey: "", remoteFundingPubkey: "", createdAt: 0, updatedAt: 0 } as WatchedChannel,
-    ref: { channelId: "0x" + "01".repeat(32), fundingOutPoint: { txHash: "0x" + "02".repeat(32), index: 0 } },
-  });
-  assert.match(result.status, /token channels/);
-});
-
 /**
  * A chain for settleChannel: the funding transaction, the commitment that spent it, any settlements after it, and
  * the node's fee reserve, served by a fake client so the chain following, the delay and the claim are checked
@@ -321,17 +312,29 @@ function fakeChain(options: {
    * says so, and reports them as `pool` says (unknown, by default: dropped).
    */
   cachedSends?: { pool?: (hash: ccc.Hex) => "pending" | undefined };
+  /** The commitment on-chain is the peer's latest one (an honest force close by the peer) instead of the node's own. */
+  byPeer?: boolean;
+  /** The commitment on-chain is one the peer had revoked: it matches none of the node's settlement data. */
+  revoked?: boolean;
+  /** After a revoked commitment: the penalty has spent it, paying the whole channel to the user's own lock. */
+  penalized?: boolean;
+  /** A token channel. */
+  token?: boolean;
 } = {}) {
   const { channel, argsFor } = options.tlcs ?? channelFixture();
-  const ours = options.tlcs?.theirs ?? encodeSettlementWitness(channel.localSettlement, false, channel.localSettlementKey, channel.remoteSettlementKey);
+  const ours = options.tlcs?.theirs
+    ?? (options.revoked ? new Uint8Array([0, 9, 9, 9]) : undefined)
+    ?? encodeSettlementWitness(options.byPeer ? channel.remoteSettlement! : channel.localSettlement, Boolean(options.byPeer), channel.localSettlementKey, channel.remoteSettlementKey);
   const nodeKey = hex(secp256k1.utils.randomSecretKey());
   const plainLock = { codeHash: "0x" + "00".repeat(32), hashType: "data" as const, args: "0x01" };
   const commitmentLock = (args: ccc.HexLike) => ({ codeHash: COMMITMENT_LOCK.testnet.codeHash, hashType: "type" as const, args });
-  const txs = new Map<string, { tx: ccc.Transaction; blockHash: ccc.Hex; epoch: ccc.EpochLike }>();
+  const txs = new Map<string, { tx: ccc.Transaction; blockHash: ccc.Hex; epoch: ccc.EpochLike; blockNumber: bigint }>();
   const live = new Set<string>();
   const key = (outPoint: ccc.OutPointLike) => `${ccc.hexFrom(ccc.OutPoint.from(outPoint).txHash)}:${Number(ccc.OutPoint.from(outPoint).index)}`;
-  const add = (tx: ccc.Transaction, epoch: ccc.EpochLike = [90, 0, 1]) => {
-    txs.set(tx.hash(), { tx, blockHash: ccc.hexFrom(ccc.hashCkb(tx.hash())), epoch });
+  // Each transaction lands in a block of its own, at the chain's tip.
+  let height = 0n;
+  const add = (tx: ccc.Transaction, epoch: ccc.EpochLike = [90, 0, 1], blockNumber = ++height) => {
+    txs.set(tx.hash(), { tx, blockHash: ccc.hexFrom(ccc.hashCkb(tx.hash())), epoch, blockNumber });
     for (const input of tx.inputs) live.delete(key(input.previousOutput));
     tx.outputs.forEach((_output, index) => live.add(key({ txHash: tx.hash(), index })));
     return tx;
@@ -344,6 +347,13 @@ function fakeChain(options: {
     witnesses: ["0x"],
   }), [100, 0, 1]);
   let liveCell = { txHash: commitmentTx.hash(), index: 0 };
+  // The penalty: Fiber's revocation unlock (unlock count 0, commitment number, a key and the aggregated signature).
+  const penaltyTx = options.penalized ? add(ccc.Transaction.from({
+    inputs: [{ previousOutput: liveCell }],
+    outputs: [{ capacity: 750n * CKB, lock: plainLock }],
+    outputsData: ["0x"],
+    witnesses: [ccc.hexFrom(ccc.bytesConcat(XUDT_COMPATIBLE_WITNESS, new Uint8Array([0]), new Uint8Array(8 + 32 + 64).fill(7)))],
+  }), [100, 1, 2]) : undefined;
   if (options.peerSettledFirst || options.settlementWitness || options.peerTookEverything) {
     const previous = ccc.bytesConcat(new Uint8Array([1]), ours, new Uint8Array([0xff, 0]), new Uint8Array(65));
     const witness = options.settlementWitness ? options.settlementWitness(ours) : ccc.bytesConcat(XUDT_COMPATIBLE_WITNESS, previous);
@@ -378,13 +388,17 @@ function fakeChain(options: {
   const signer = new ccc.SignerCkbPrivateKey(base, nodeKey);
   const ready = (async () => {
     const nodeLock = (await signer.getRecommendedAddressObj()).script;
-    add(ccc.Transaction.from({ outputs: [{ capacity: 200n * CKB, lock: nodeLock }], outputsData: ["0x"] }));
+    // The node's fee reserve, from before the channel's funding.
+    add(ccc.Transaction.from({ outputs: [{ capacity: 200n * CKB, lock: nodeLock }], outputsData: ["0x"] }), undefined, 0n);
     return nodeLock;
   })();
   const overrides: Record<string, unknown> = {
     async getTransaction(hash: ccc.HexLike) {
       const found = txs.get(ccc.hexFrom(hash));
-      return found && { transaction: found.tx, status: "committed", blockHash: found.blockHash, blockNumber: 1n };
+      return found && { transaction: found.tx, status: "committed", blockHash: found.blockHash, blockNumber: found.blockNumber };
+    },
+    async getTip() {
+      return height;
     },
     async getCellLive(outPoint: ccc.OutPointLike) {
       return live.has(key(outPoint)) ? {} : undefined;
@@ -425,7 +439,7 @@ function fakeChain(options: {
       },
       async getTransactionNoCache(hash: ccc.HexLike) {
         const found = txs.get(ccc.hexFrom(hash));
-        if (found) return { transaction: found.tx, status: "committed", blockHash: found.blockHash, blockNumber: 1n };
+        if (found) return { transaction: found.tx, status: "committed", blockHash: found.blockHash, blockNumber: found.blockNumber };
         const pending = sent.find((tx) => tx.hash() === ccc.hexFrom(hash));
         return pending && options.cachedSends?.pool?.(pending.hash()) ? { transaction: pending, status: "pending" } : undefined;
       },
@@ -435,21 +449,41 @@ function fakeChain(options: {
         sent.push(signed);
         return signed.hash();
       },
+      async getTransactionNoCache(hash: ccc.HexLike) {
+        const found = txs.get(ccc.hexFrom(hash));
+        if (found) return { transaction: found.tx, status: "committed", blockHash: found.blockHash, blockNumber: found.blockNumber };
+        return sent.some((tx) => tx.hash() === ccc.hexFrom(hash)) ? { transaction: sent.find((tx) => tx.hash() === ccc.hexFrom(hash))!, status: "pending" } : undefined;
+      },
     }),
   };
   const client = new Proxy(base, {
     get: (target, property, receiver) => property in overrides ? overrides[property as string] : Reflect.get(target, property, receiver),
   }) as ccc.Client;
-  const watched = { ...channel, channelId: "0x" + "01".repeat(32), localFundingPubkey: "", remoteFundingPubkey: "", createdAt: 0, updatedAt: 0 } as WatchedChannel;
+  const watched = {
+    ...channel, channelId: "0x" + "01".repeat(32), localFundingPubkey: "", remoteFundingPubkey: "", createdAt: 0, updatedAt: 0,
+    ...(options.token ? { fundingUdtTypeScript: { code_hash: "0x00", hash_type: "type", args: "0x" } } : {}),
+  } as WatchedChannel;
   const settle = (dryRun?: { submit: (tx: ccc.Transaction) => Promise<ccc.Hex> }) => settleChannel({
     client, network: "testnet", nodeKey, channel: watched,
     ref: { channelId: watched.channelId, fundingOutPoint: { txHash: funding.hash(), index: 0 } }, ...(dryRun ? { dryRun } : {}),
     preimage: async (hash) => options.preimages?.get(hash), now: options.now,
   });
   return {
-    channel, settle, sent, liveCell, ready, funding, commitmentTx, client,
+    channel, settle, sent, liveCell, ready, funding, commitmentTx, penaltyTx, client, watched,
     setTip: (epoch: ccc.EpochLike) => { tip = epoch; },
     reopen: () => live.add(key({ txHash: funding.hash(), index: 0 })),
+    /** A transaction the node sent is mined, at the tip. */
+    mine: (tx: ccc.Transaction) => add(tx, tip),
+    /** `count` more blocks are mined on top. */
+    bury: (count: bigint) => { height += count; },
+    /** The channel as the node lists it, on this chain's funding cell, in the state the node reports. */
+    listed: (state_name: string, state_flags?: string) => ({
+      channel_id: watched.channelId, is_public: false, pubkey: `0x02${"bb".repeat(32)}`, funding_udt_type_script: null,
+      channel_outpoint: ccc.hexFrom(ccc.OutPoint.from({ txHash: funding.hash(), index: 0 }).toBytes()),
+      state: { state_name, ...(state_flags ? { state_flags } : {}) },
+      // 360 CKB the user's, 140 CKB the peer's, as the node last knew them.
+      local_balance: `0x${(360n * CKB).toString(16)}`, remote_balance: `0x${(140n * CKB).toString(16)}`,
+    }) as unknown as Parameters<typeof normalizeChannel>[0],
   };
 }
 
@@ -674,4 +708,173 @@ test("a sweep that lands while a pass rebuilds the cache keeps its spent marks",
   answer();
   await Promise.all([pass, sweep]);
   assert.equal(await client.cache.isUnusable(payout), true, "the next claim must not pick the swept payout");
+});
+
+test("a token channel's force close is seen, but its claim is left to Fiber's native watchtower", async () => {
+  const open = fakeChain({ token: true });
+  open.reopen();
+  assert.equal((await open.settle()).status, "open");
+  const closed = fakeChain({ token: true });
+  closed.setTip([200, 0, 1]);
+  const result = await closed.settle();
+  assert.match(result.status, /token channels/);
+  assert.equal(result.closingTx, closed.commitmentTx.hash(), "the commitment that spent the funding cell is reported");
+  assert.equal(closed.sent.length, 0, "no claim is built for a token channel");
+});
+
+// What the in-page watchtower has seen of a channel's close, kept apart from what the node says (channel-closures.ts).
+const closureModule = () => import("../src/sdk/browser/channel-closures.ts");
+const FINAL_DEPTH = 24n;
+
+/** One watchtower pass over the chain's channel, as create-keyway.ts runs it: settle, then record what was seen. */
+async function pass(chain: ReturnType<typeof fakeChain>, prefix: string, removed: string[] = []) {
+  const { openClosureStore, recordSettleResult } = await closureModule();
+  const { isBuried } = await import("../src/sdk/browser/watchtower-settle.ts");
+  const closures = openClosureStore(prefix);
+  const result = await chain.settle();
+  await recordSettleResult({
+    result, closures, fundingOutPoint: String(chain.listed("CHANNEL_READY").channel_outpoint),
+    watchtower: { remove: async (channelId) => { removed.push(channelId); } },
+    isBuried: (txHash) => isBuried(chain.client, txHash),
+  });
+  return result;
+}
+
+/** The channel as the SDK presents it and whether it holds the fee reserve, read afresh from storage (as after a reload). */
+async function presented(chain: ReturnType<typeof fakeChain>, prefix: string, state_name: string, state_flags?: string) {
+  const { openClosureStore, closureOf, withClosure } = await closureModule();
+  const closures = await openClosureStore(prefix).list();
+  const raw = chain.listed(state_name, state_flags);
+  return { channel: withClosure(normalizeChannel(raw), closureOf(closures, raw)), reserveHeld: needsFeeReserve([raw], closures) };
+}
+
+test("a channel the node still calls ready, whose funding the peer's revoked commitment has spent, is shown as closing with nothing to send", async () => {
+  const chain = fakeChain({ revoked: true });
+  const result = await chain.settle();
+  assert.match(result.status, /needs revocation/);
+  assert.equal(result.closingTx, chain.commitmentTx.hash(), "the watchtower reports that a commitment spent the funding cell");
+  const prefix = `/wasm-test-${crypto.randomUUID()}`;
+  await pass(chain, prefix);
+  // Fiber's own check hasn't run yet: the node still lists the channel as ready with 360 CKB to send.
+  const { channel, reserveHeld } = await presented(chain, prefix, "CHANNEL_READY");
+  assert.equal(channel.status, "closing");
+  assert.equal(channel.canSend, 0n);
+  assert.equal(channel.canReceive, 0n);
+  assert.equal(channel.capacity, 500n * CKB);
+  assert.equal(reserveHeld, true, "nothing is finished yet: the reserve stays");
+});
+
+test("a penalized channel the node keeps in WAITING_ONCHAIN_SETTLEMENT releases the fee reserve once the penalty is buried, and not before", async () => {
+  const chain = fakeChain({ revoked: true, penalized: true });
+  const prefix = `/wasm-test-${crypto.randomUUID()}`;
+  const removed: string[] = [];
+  const first = await pass(chain, prefix, removed);
+  assert.equal(first.status, "settled");
+  assert.equal(first.evidence, chain.penaltyTx!.hash(), "the verdict rests on the penalty transaction");
+  // The penalty is only a block deep: a reorganization could still undo it, so nothing is final yet.
+  let now = await presented(chain, prefix, "CLOSED", "UNCOOPERATIVE_REMOTE|WAITING_ONCHAIN_SETTLEMENT");
+  assert.equal(now.reserveHeld, true);
+  assert.deepEqual(removed, [], "the watchtower keeps its record until the verdict is final");
+  assert.equal((await presented(chain, prefix, "CHANNEL_READY")).channel.status, "closing");
+
+  chain.bury(FINAL_DEPTH - 1n);
+  await pass(chain, prefix, removed);
+  assert.equal((await presented(chain, prefix, "CLOSED", "UNCOOPERATIVE_REMOTE|WAITING_ONCHAIN_SETTLEMENT")).reserveHeld, true, "23 blocks on top is not enough");
+  chain.bury(1n);
+  await pass(chain, prefix, removed);
+  assert.deepEqual(removed, [chain.watched.channelId], "final: the watch ends");
+  // Fiber 0.10.1's browser node never drops the flag from a force-closed channel; the verdict stands in for it.
+  now = await presented(chain, prefix, "CLOSED", "UNCOOPERATIVE_REMOTE|WAITING_ONCHAIN_SETTLEMENT");
+  assert.equal(now.reserveHeld, false);
+  // While the node still calls it ready, it is shown as closed, but the reserve waits for the node to agree.
+  now = await presented(chain, prefix, "CHANNEL_READY");
+  assert.equal(now.channel.status, "closed");
+  assert.equal(now.channel.canSend, 0n);
+  assert.equal(now.reserveHeld, true);
+});
+
+test("an honest force close keeps the fee reserve until the user's share is claimed and the claim is buried", async () => {
+  const chain = fakeChain({ byPeer: true });
+  const prefix = `/wasm-test-${crypto.randomUUID()}`;
+  const removed: string[] = [];
+  const waiting = "UNCOOPERATIVE_REMOTE|WAITING_ONCHAIN_SETTLEMENT";
+  // The peer's commitment is on-chain; its delay hasn't passed, so the user's share can't be claimed yet.
+  chain.setTip([100, 500, 1000]);
+  assert.equal((await pass(chain, prefix, removed)).status, "waiting for the commitment delay");
+  assert.equal((await presented(chain, prefix, "CHANNEL_READY")).channel.status, "closing", "seen on-chain before the node notices");
+  assert.equal((await presented(chain, prefix, "CLOSED", waiting)).reserveHeld, true, "the claim will need the reserve for its fee");
+  // The delay passes; the claim is sent, paying its fee from the reserve.
+  chain.setTip([101, 0, 1000]);
+  const claimed = await pass(chain, prefix, removed);
+  assert.equal(claimed.status, "claimed");
+  assert.equal((await presented(chain, prefix, "CLOSED", waiting)).reserveHeld, true, "a claim only sent proves nothing yet");
+  // Still in the mempool on the next pass: the commitment cell is live, the claim is built again.
+  assert.equal((await pass(chain, prefix, removed)).status, "claimed");
+  assert.equal((await presented(chain, prefix, "CLOSED", waiting)).reserveHeld, true);
+  // The claim is mined: the user's slot is empty in the cell it left for the peer.
+  chain.mine(chain.sent[0]);
+  const after = await pass(chain, prefix, removed);
+  assert.equal(after.status, "the user's share is already claimed");
+  assert.equal(after.evidence, chain.sent[0].hash());
+  assert.equal((await presented(chain, prefix, "CLOSED", waiting)).reserveHeld, true, "mined, but not yet buried");
+  assert.deepEqual(removed, []);
+  chain.bury(FINAL_DEPTH);
+  await pass(chain, prefix, removed);
+  assert.deepEqual(removed, [chain.watched.channelId]);
+  assert.equal((await presented(chain, prefix, "CLOSED", waiting)).reserveHeld, false);
+});
+
+test("the verdict survives a reload, and speaks only for the channel and funding cell it was reached on", async () => {
+  const chain = fakeChain({ revoked: true, penalized: true });
+  const prefix = `/wasm-test-${crypto.randomUUID()}`;
+  chain.bury(FINAL_DEPTH);
+  const removed: string[] = [];
+  await pass(chain, prefix, removed);
+  assert.deepEqual(removed, [chain.watched.channelId], "as on main, a finished channel's watchtower record is removed");
+  // A reload: nothing in memory, the watchtower record gone. Only the stored verdict is left.
+  const { openClosureStore } = await closureModule();
+  const stored = await openClosureStore(prefix).list();
+  assert.equal(stored.length, 1);
+  assert.deepEqual(stored[0].finished, { status: "settled", evidence: chain.penaltyTx!.hash() });
+  const waiting = chain.listed("CLOSED", "UNCOOPERATIVE_REMOTE|WAITING_ONCHAIN_SETTLEMENT");
+  assert.equal(needsFeeReserve([waiting]), true, "by the node's own state the reserve would stay forever");
+  assert.equal(needsFeeReserve([waiting], stored), false);
+  // Another channel still waiting to settle keeps the reserve, as does the same channel ID on another funding cell.
+  const other = { ...waiting, channel_id: "0x" + "02".repeat(32) };
+  assert.equal(needsFeeReserve([waiting, other], stored), true);
+  assert.equal(needsFeeReserve([{ ...waiting, channel_outpoint: "0x" + "aa".repeat(36) }], stored), true);
+  // A second pass over a record that reappeared (the page closed between writing the verdict and removing it).
+  await pass(chain, prefix, removed);
+  assert.deepEqual(removed, [chain.watched.channelId, chain.watched.channelId]);
+  assert.deepEqual((await openClosureStore(prefix).list())[0].finished, stored[0].finished, "a finished closure is never changed");
+});
+
+test("a close that a reorganization undid is forgotten, unless it was already final", async () => {
+  const chain = fakeChain({ byPeer: true });
+  const prefix = `/wasm-test-${crypto.randomUUID()}`;
+  chain.setTip([100, 500, 1000]);
+  await pass(chain, prefix);
+  assert.equal((await presented(chain, prefix, "CHANNEL_READY")).channel.status, "closing");
+  chain.reopen();
+  assert.equal((await pass(chain, prefix)).status, "open");
+  const back = await presented(chain, prefix, "CHANNEL_READY");
+  assert.equal(back.channel.status, "ready");
+  assert.equal(back.channel.canSend, 360n * CKB);
+});
+
+test("a transaction counts as buried only when committed with 24 blocks on top", async () => {
+  const { isBuried } = await import("../src/sdk/browser/watchtower-settle.ts");
+  const chain = fakeChain({ revoked: true, penalized: true });
+  const penalty = chain.penaltyTx!.hash();
+  chain.bury(FINAL_DEPTH - 1n);
+  assert.equal(await isBuried(chain.client, penalty), false);
+  chain.bury(1n);
+  assert.equal(await isBuried(chain.client, penalty), true);
+  assert.equal(await isBuried(chain.client, "0x" + "ee".repeat(32)), false, "unknown to the chain");
+  // A claim sent but not mined is not evidence of anything.
+  const claiming = fakeChain({ byPeer: true });
+  claiming.setTip([101, 0, 1000]);
+  const claimed = await claiming.settle();
+  claiming.bury(100n);
+  assert.equal(await isBuried(claiming.client, claimed.txHash!), false);
 });

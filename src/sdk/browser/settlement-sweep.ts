@@ -13,7 +13,18 @@ export const FEE_RESERVE = 62n * 100_000_000n;
 /** The smallest plain CKB cell (61 CKB of occupied capacity). */
 export const MIN_PLAIN_CELL = 61n * 100_000_000n;
 
-type ChannelState = { state: { state_name: string; state_flags?: unknown } };
+type ChannelState = { channel_id?: unknown; channel_outpoint?: unknown; state: { state_name: string; state_flags?: unknown } };
+/** A channel the in-page watchtower has established as finished on-chain (channel-closures.ts), on its funding cell. */
+export type FinishedOnChain = { channelId: string; fundingOutPoint: string; finished?: unknown };
+
+/** A channel ID as a key: 32 bytes of lower-case hex, or undefined for anything else. */
+export function channelKey(value: unknown): string | undefined {
+  return typeof value === "string" && /^0x[0-9a-f]{64}$/i.test(value) ? value.toLowerCase() : undefined;
+}
+/** A funding cell as Fiber names it in `channel_outpoint` (a serialized out point, 36 bytes of hex), as a key. */
+export function outPointKey(value: unknown): string | undefined {
+  return typeof value === "string" && /^0x[0-9a-f]{72}$/i.test(value) ? value.toLowerCase() : undefined;
+}
 
 /** A channel's state flags, which Fiber sends as one string such as "UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT". */
 function stateFlags(flags: unknown): Set<string> {
@@ -27,13 +38,29 @@ function stateFlags(flags: unknown): Set<string> {
  * test holds the two equal.
  */
 export function channelFinished({ state }: ChannelState): boolean {
-  if (String(state?.state_name).replaceAll("_", "").toLowerCase() !== "closed") return false;
+  if (!isClosed(state)) return false;
   return !stateFlags(state.state_flags).has("WAITING_ONCHAIN_SETTLEMENT");
 }
 
-/** True while any channel is open, closing, or closed but not yet settled on-chain. */
-export function needsFeeReserve(channels: ChannelState[]): boolean {
-  return channels.some((channel) => !channelFinished(channel));
+const isClosed = (state: ChannelState["state"]) => String(state?.state_name).replaceAll("_", "").toLowerCase() === "closed";
+
+/**
+ * True while any channel is open, closing, or closed but not yet settled on-chain.
+ *
+ * Fiber 0.10.1's browser node never drops WAITING_ONCHAIN_SETTLEMENT from a force-closed channel (it waits for a
+ * settlement record its build can't write), so for a channel the node itself reports closed, the in-page
+ * watchtower's verdict that nothing is left to claim (`finishedOnChain`) counts as settled. Both must agree, about
+ * the same funding cell: a channel the node still calls open keeps the reserve whatever the verdict says, and so
+ * does a force-closed channel without a verdict, whose claim the reserve pays for.
+ */
+export function needsFeeReserve(channels: ChannelState[], finishedOnChain: readonly FinishedOnChain[] = []): boolean {
+  const settledOnChain = (channel: ChannelState) => {
+    const id = channelKey(channel.channel_id);
+    const outPoint = outPointKey(channel.channel_outpoint);
+    return isClosed(channel.state) && id !== undefined && outPoint !== undefined
+      && finishedOnChain.some((item) => Boolean(item.finished) && item.channelId === id && item.fundingOutPoint === outPoint);
+  };
+  return channels.some((channel) => !channelFinished(channel) && !settledOnChain(channel));
 }
 
 /**

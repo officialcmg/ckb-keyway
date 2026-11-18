@@ -89,11 +89,13 @@ Each channel has:
 | `asset` | `{ kind: "ckb" }`, or `{ kind: "token", typeScript }` for a token channel. |
 | `canSend` | What the user can still send, in the asset's smallest unit. |
 | `canReceive` | What the user can still receive. |
-| `capacity` | The channel's size: `canSend` plus `canReceive`. |
+| `capacity` | The channel's size: `canSend` plus `canReceive` (or what those were, once a force close is on-chain; see below). |
 | `public` | Whether the channel is announced to the network. |
 | `raw` | Fiber's own channel object. |
 
 `fiber.channels` refreshes every ten seconds while the node runs; call `refreshChannels()` to read it now. Reserves, in-flight payments and route liquidity can limit what is payable at a given moment.
+
+With a browser node, the SDK also reads the chain itself. When a channel's funding cell has been spent by a force close (for example the peer closed it while the wallet was shut), the channel is `closing` with `canSend` and `canReceive` at zero, and `closed` once nothing is left to claim, even if Fiber's own `raw.state` still says `CHANNEL_READY` for a few minutes.
 
 ## Create an invoice
 
