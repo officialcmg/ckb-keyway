@@ -54,6 +54,20 @@ test("a token channel funding can't issue the token, so the amount counted is al
   assert.deepEqual(await checkTokenFunding(client, exact, inputs, own, exact.outputs[0]), { asset: rusd.hash(), amount: 20n });
 });
 
+test("a token channel funding can't destroy the token, so the channel holds all that leaves the account", async () => {
+  // The account's 50 leave it, but the channel gets 10 and nothing comes back: 40 would be gone.
+  const burned = tx([{ lock: funding, type: rusd, data: amount(10n) }, { lock: own }]);
+  await assert.rejects(() => checkTokenFunding(client, burned, inputs, own, burned.outputs[0]), /can't burn tokens/);
+  // The other side adds 40 of the token, but the channel holds only the account's 20: the 40 would be gone, and
+  // the channel would hold less than the two sides put in.
+  const theirs = { cellOutput: ccc.CellOutput.from({ lock: peer, type: rusd, capacity: 143n * 100_000_000n }), outputData: amount(40n) };
+  const short = tx([{ lock: funding, type: rusd, data: amount(20n) }, { lock: own, type: rusd, data: amount(30n) }]);
+  await assert.rejects(() => checkTokenFunding(client, short, [...inputs, theirs], own, short.outputs[0]), /can't burn tokens/);
+  // With all of it kept, the account's share is still what left it.
+  const both = tx([{ lock: funding, type: rusd, data: amount(60n) }, { lock: own, type: rusd, data: amount(30n) }]);
+  assert.deepEqual(await checkTokenFunding(client, both, [...inputs, theirs], own, both.outputs[0]), { asset: rusd.hash(), amount: 20n });
+});
+
 test("token payments are counted in the token, fee included", async () => {
   const typeScript = { code_hash: rusd.codeHash, hash_type: "type", args: rusd.args };
   const described = await describePayment("sendPayment", { invoice: "fibt1x", udt_type_script: typeScript }, {
