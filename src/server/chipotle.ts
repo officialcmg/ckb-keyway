@@ -28,7 +28,7 @@ export async function addPkpToGroup(apiKey: string, groupId: number, pkpId: stri
 }
 
 async function request(operation: string, path: string, apiKey: string, init: RequestInit = {}): Promise<unknown> {
-  if (!apiKey) throw new Error("Lit usage API key is missing");
+  if (!apiKey) throw new Error("Lit provisioning API key is missing");
   const response = await fetch(`${BASE_URL}${path}`, {
     ...init,
     // Management calls wait for Base confirmations and can take several seconds.
