@@ -437,8 +437,11 @@ export type SettleResult = {
   unsettled?: true;
 };
 
-/** A pass that failed after it had seen a commitment spend the funding cell still says so (`closingTx`). */
-export type SettleFailure = Error & { closingTx?: ccc.Hex };
+/**
+ * A pass that failed after it had seen a commitment spend the funding cell still says so (`closingTx`), and, if it
+ * failed while building or sending a claim, that there is something still to settle (`unsettled`).
+ */
+export type SettleFailure = Error & { closingTx?: ccc.Hex; unsettled?: true };
 
 /**
  * Statuses after which the channel needs nothing more from the watchtower: nothing is left under its commitment
@@ -482,19 +485,21 @@ type SettleOptions = {
 };
 
 export async function settleChannel(options: SettleOptions): Promise<SettleResult> {
-  const seen: { closingTx?: ccc.Hex } = {};
+  const seen: { closingTx?: ccc.Hex; claiming?: boolean } = {};
   try {
     return await settle(options, seen);
   } catch (cause) {
     // Building or sending a claim can fail (no fee cell on the node's key, an RPC error) after the pass has
-    // already seen that the channel is force-closed: the failure carries that along.
+    // already seen that the channel is force-closed, and that something in it is the user's: the failure carries
+    // both along.
     const error: SettleFailure = cause instanceof Error ? cause : new Error(String(cause));
     if (seen.closingTx) error.closingTx = seen.closingTx;
+    if (seen.claiming) error.unsettled = true;
     throw error;
   }
 }
 
-async function settle(options: SettleOptions, seen: { closingTx?: ccc.Hex }): Promise<SettleResult> {
+async function settle(options: SettleOptions, seen: { closingTx?: ccc.Hex; claiming?: boolean }): Promise<SettleResult> {
   const { client, channel } = options;
   let closingTx: ccc.Hex | undefined;
   /** `onLiveCell`: the status was read off the live commitment cell, so anything outside FINISHED is unsettled. */
@@ -569,6 +574,7 @@ async function settle(options: SettleOptions, seen: { closingTx?: ccc.Hex }): Pr
   // A status that ends the watch rests on the transaction that created the cell it was read from.
   if ("skip" in decision) return result(decision.skip, undefined, cell.txHash, true);
   const plan = decision.claim;
+  seen.claiming = true;
 
   const signer = new ccc.SignerCkbPrivateKey(client, options.nodeKey);
   const nodeLock = (await signer.getRecommendedAddressObj()).script;

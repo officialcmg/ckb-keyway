@@ -434,8 +434,11 @@ export function createKeyWay(options: CreateKeyWayOptions) {
           } catch (error) {
             console.warn(`[keyway] watchtower: channel ${channel.channelId} could not be settled yet`, error);
             // A claim that couldn't be built or sent (no fee cell, an RPC error) doesn't unsee the close.
-            const closingTx = (error as SettleFailure | undefined)?.closingTx;
-            if (closingTx) await noteOnChain(channel.channelId, { channelId: channel.channelId, status: "could not be settled yet", closingTx }, outpoint, raw);
+            // And a claim that was due contradicts any verdict that nothing is left.
+            const failure = error as SettleFailure | undefined;
+            if (failure?.closingTx) {
+              await noteOnChain(channel.channelId, { channelId: channel.channelId, status: "could not be settled yet", closingTx: failure.closingTx, ...(failure.unsettled ? { unsettled: true as const } : {}) }, outpoint, raw);
+            }
           }
         }
       } finally {

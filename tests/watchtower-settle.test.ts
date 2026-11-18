@@ -790,8 +790,8 @@ function walletOver(chain: ReturnType<typeof fakeChain>, prefix = `/wasm-test-${
         const result = await chain.settle();
         return { ...result, finishedNow: await record(result) };
       } catch (error) {
-        const closingTx = (error as { closingTx?: ccc.Hex }).closingTx;
-        if (closingTx) await record({ channelId: chain.watched.channelId, status: "could not be settled yet", closingTx });
+        const failure = error as { closingTx?: ccc.Hex; unsettled?: true };
+        if (failure.closingTx) await record({ channelId: chain.watched.channelId, status: "could not be settled yet", closingTx: failure.closingTx, ...(failure.unsettled ? { unsettled: true as const } : {}) });
         return { channelId: chain.watched.channelId, status: `failed: ${(error as Error).message}`, finishedNow: false } as Awaited<ReturnType<typeof chain.settle>> & { finishedNow: boolean };
       }
     },
@@ -994,13 +994,31 @@ test("a claim that can't be built doesn't unsee the close", async () => {
   chain.setTip([101, 0, 1000]);
   await chain.emptyNodeKey();
   // No fee cell on the node's key: the claim can't be built, and settleChannel rejects.
-  const failure = await chain.settle().then(() => undefined, (error: Error & { closingTx?: string }) => error);
+  const failure = await chain.settle().then(() => undefined, (error: Error & { closingTx?: string; unsettled?: true }) => error);
   assert.ok(failure, "the claim was expected to fail without a fee cell");
   assert.equal(failure.closingTx, chain.commitmentTx.hash(), "the failure still says the channel is force-closed");
+  assert.equal(failure.unsettled, true, "and that something in it was the user's to claim");
   const wallet = walletOver(chain);
   assert.match((await wallet.pass("CHANNEL_READY")).status, /^failed/);
   assert.equal((await wallet.shown("CHANNEL_READY"))[0].status, "closing");
   assert.equal(await wallet.reserveHeld("CLOSED", WAITING), true);
+
+  // Nor does it leave a verdict standing: the claim was mined and buried, the channel called finished, then a
+  // reorganization dropped the claim and the fee cell with it. The pass that now fails to claim takes the verdict
+  // back and keeps the watchtower's record, although the node reports the channel closed.
+  const undone = fakeChain({ byPeer: true });
+  const after = walletOver(undone);
+  undone.setTip([101, 0, 1000]);
+  await after.pass("CHANNEL_READY");
+  undone.mine(undone.sent[0]);
+  undone.bury(FINAL_DEPTH);
+  assert.equal((await after.pass("CHANNEL_READY")).finishedNow, true);
+  undone.drop(undone.sent[0]);
+  await undone.emptyNodeKey();
+  assert.match((await after.pass("CLOSED", WAITING)).status, /^failed/);
+  assert.equal((await after.stored())[0].finished, undefined);
+  assert.deepEqual(after.removed, []);
+  assert.equal(await after.reserveHeld("CLOSED", WAITING), true);
 });
 
 test("the close is recorded before the chain is asked whether a verdict is final", async () => {
