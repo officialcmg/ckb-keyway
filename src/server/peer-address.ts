@@ -1,14 +1,19 @@
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 
+const PEER_ADDRESS = /^\/(?:ip4|ip6|dns|dns4|dns6)\/[^/]+\/tcp\/(\d{1,5})(?:\/(?:ws|wss|tls\/ws))?(?:\/p2p\/\w+)?$/;
+
 /**
  * Hosted nodes dial peers from inside KeyWay's network, so an app could otherwise point them at internal
  * services. Only public addresses are allowed: private, loopback, link-local and shared ranges, and internal
  * host names, are refused, including host names that resolve to them.
  */
 export async function assertPublicPeerAddress(multiaddr: string, resolve: (host: string) => Promise<string[]> = resolveAll): Promise<void> {
+  // The whole address is one host and one TCP port, then at most a WebSocket layer and the peer's ID. Only the
+  // host is checked below, so nothing after it may name another one, as an address a peer announces could.
+  const port = Number(PEER_ADDRESS.exec(multiaddr)?.[1]);
+  if (multiaddr.length > 512 || !(port >= 1 && port <= 65535)) throw new Error("Peer address is invalid");
   const [, kind, host] = multiaddr.split("/");
-  if (!host) throw new Error("Peer address is invalid");
   if (kind === "ip4" || kind === "ip6") {
     if (isPrivateIp(host)) throw new Error("Peer addresses must be public");
     return;

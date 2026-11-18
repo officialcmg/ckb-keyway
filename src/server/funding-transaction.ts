@@ -141,8 +141,8 @@ export function refuseUncoveredForeignOutputs(
 
 /**
  * A token channel carries one standard token (xUDT or sUDT) on the channel output. The token may appear only
- * on that output and on the account's own change, so none of it can be sent anywhere else. Plain CKB outputs
- * carry no data. Returns the token put into the channel, or undefined for a CKB channel.
+ * on that output and on the account's own change, and none may be issued or destroyed, so what leaves the
+ * account is in the channel. Plain CKB outputs carry no data. Returns the token put into the channel, or undefined for a CKB channel.
  */
 export async function checkTokenFunding(
   client: ccc.Client,
@@ -173,9 +173,12 @@ export async function checkTokenFunding(
   const tokenAmount = (cells: typeof typed) => cells.reduce((sum, { outputData }) => sum + ccc.numLeFromBytes(ccc.bytesFrom(outputData).slice(0, 16)), 0n);
   // A token's owner can issue more of it in any transaction. A funding never needs to, and the amount counted below
   // (the account's token in, less its change) would miss what was issued, so the outputs may hold no more than the inputs.
-  if (tokenAmount(outputs.filter(({ cellOutput }) => cellOutput.type)) > tokenAmount(inputCells.filter(({ cellOutput }) => cellOutput.type))) {
-    throw new Error("A channel funding can't issue tokens");
-  }
+  const tokensOut = tokenAmount(outputs.filter(({ cellOutput }) => cellOutput.type));
+  const tokensIn = tokenAmount(inputCells.filter(({ cellOutput }) => cellOutput.type));
+  if (tokensOut > tokensIn) throw new Error("A channel funding can't issue tokens");
+  // Nor may they hold less: the token is only on the channel output and the account's change, so with none
+  // destroyed the channel gets all of what the account is counted as putting in, plus any the other side adds.
+  if (tokensOut < tokensIn) throw new Error("A channel funding can't burn tokens");
   const amount = tokenAmount(inputCells.filter((cell) => cell.cellOutput.type && owns(cell.cellOutput.lock)))
     - tokenAmount(outputs.filter((cell) => cell.cellOutput.type && cell.cellOutput !== fundingOutput && owns(cell.cellOutput.lock)));
   if (amount <= 0n) throw new Error("A token channel must take the token from the KeyWay wallet");

@@ -89,7 +89,7 @@ test("managed beta exposes only bounded authenticated node operations", async ()
         funding_lock_script: { code_hash: `0x${"11".repeat(32)}`, hash_type: "type", args: "0x" },
       },
     }, { ...node, call: async () => ({ nodes: [{ pubkey: `02${"55".repeat(32)}`, addresses: ["/ip4/10.1.2.3/tcp/8228/p2p/Qm1"] }], last_cursor: "0x" }) } as never, ownLock),
-    /must be public/,
+    /no address a hosted node can reach/,
   );
 });
 

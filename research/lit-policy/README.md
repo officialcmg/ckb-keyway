@@ -272,9 +272,15 @@ Plainly, after the switch:
   limits are bound to (`research/send-limits/README.md`), so the server can't pick the email there.
 - **Lit itself.** The TEE network, Chipotle's group check, and the founder's Lit account key, which can register
   any CID.
-- **`LIT_PROVISIONING_API_KEY` on the server.** If it can add Actions to group 1, the server can register an
-  unrestricted Action and none of this holds. **The founder must confirm this key can only create PKPs and add
-  PKPs to the group, not add actions.** Otherwise PKP provisioning has to move off the server.
+- **`LIT_PROVISIONING_API_KEY` on the server.** If it could add Actions to group 1, the server could register an
+  unrestricted Action and none of this would hold, so the key must only be able to create PKPs and add PKPs to
+  the group. **Checked 2026-11-18:** the key on the production API server is the Chipotle usage key
+  `keyway-provisioning`, matched by its hash in the account's key list. Chipotle lists it with
+  `can_create_pkps: true` and `can_add_pkp_to_groups: [1]`; it has no group it can manage Actions in
+  (`can_manage_ipfs_ids_in_groups: []`), can't create or delete groups, can't remove PKPs from a group and
+  can't run Actions. The runtime key (`keyway-runtime`) can only run Actions in group 1. Check again whenever
+  either key is replaced: if the provisioning key could ever manage Actions, PKP provisioning has to move off
+  the server. `tests/provisioning-key.test.ts` holds the server to the three calls the key is scoped for.
 - **Email.** Resend, the user's inbox, and KeyWay's DNS. Also, no `full_access` Resend key may be on the server,
   or it could read the code emails back.
 - **CKB RPC.** Pinned hosts `testnet.ckb.dev` and `testnet.ckbapp.dev`. Every transaction is checked against its
@@ -291,13 +297,15 @@ Plainly, after the switch:
 
 ## Founder steps
 
-You run these locally. The server has no Lit account credentials.
+You run these locally. The server holds no Lit account key: only the two scoped usage keys described above
+(one to run the group's Actions, one to create PKPs and add them to the group).
 
 1. **Resend.** The Action sends codes with the server's existing `RESEND_API_KEY`. Make sure that key is a
    `sending_access` key restricted to `auth.ckbkeyway.dev`: a `full_access` key could read sent emails, codes
    included, back from Resend.
-2. **Check the provisioning key.** In the Chipotle dashboard, confirm that `LIT_PROVISIONING_API_KEY` can't add
-   actions to groups.
+2. **Check the provisioning key.** In the Chipotle dashboard (or its `list_api_keys` call), confirm that the
+   key set as `LIT_PROVISIONING_API_KEY` on the server can't add actions to groups. Last checked 2026-11-18;
+   the result is recorded under "What stays trusted" above.
 3. **Register the policy Action.**
    1. In the Chipotle dashboard, open **Action Runner** and paste `lit-actions/sign-ckb-transaction.js` exactly.
    2. Click **Get Lit Action IPFS CID**. It must be the CID in `LIT_ACTION_CIDS["sign-ckb-transaction"]` in

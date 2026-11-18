@@ -3,7 +3,7 @@ import dnsPromises from "node:dns/promises";
 import { syncBuiltinESMExports } from "node:module";
 import test from "node:test";
 import { managedNodeRequest } from "../src/server/managed-node.ts";
-import { isPrivateIp } from "../src/server/peer-address.ts";
+import { isPrivateIp, pinPublicPeerAddress } from "../src/server/peer-address.ts";
 
 const PEER = `0x03${"ab".repeat(32)}`;
 const OFFICIAL = "0x02b6d4e3ab86a2ca2fad6fae0ecb2e1e559e0b911939872a90abdda6d20302be71";
@@ -239,6 +239,43 @@ test("a hosted node dials only the first few addresses a peer announces", async 
     const { node, dialed } = hostedNode(announced);
     await managedNodeRequest("many-addresses", request, node as never, async () => lock as never);
     assert.deepEqual(dialed.map(({ address }) => address), announced.slice(0, 4), request.operation);
+  }
+});
+
+test("a peer address is one host and one port: nothing after the host may name another", async () => {
+  const resolve = async () => ["203.0.113.9"];
+  for (const address of [
+    "/ip4/203.0.113.5/p2p/QmA/ip4/127.0.0.1/tcp/8227/p2p/QmB",
+    "/ip4/203.0.113.5/udp/1/ip4/10.0.0.1/tcp/80",
+    "/ip4/203.0.113.5/tcp/8228/ip4/127.0.0.1/tcp/8227",
+    "/dns4/example.com/p2p/QmA/ip4/127.0.0.1/tcp/8227",
+    "/dns4/example.com/tcp/8228/p2p/QmA/ip4/127.0.0.1/tcp/8227",
+    "/ip4/203.0.113.5/tcp/0",
+    "/ip4/203.0.113.5/tcp/65536",
+    "/ip4/203.0.113.5",
+  ]) {
+    await assert.rejects(pinPublicPeerAddress(address, resolve), /Peer address is invalid/, address);
+  }
+  assert.equal(await pinPublicPeerAddress("/ip4/203.0.113.5/tcp/8228", resolve), "/ip4/203.0.113.5/tcp/8228");
+  assert.equal(await pinPublicPeerAddress("/ip4/203.0.113.5/tcp/8228/p2p/QmA", resolve), "/ip4/203.0.113.5/tcp/8228/p2p/QmA");
+  assert.equal(await pinPublicPeerAddress("/ip4/203.0.113.5/tcp/443/wss/p2p/QmA", resolve), "/ip4/203.0.113.5/tcp/443/wss/p2p/QmA");
+  assert.equal(await pinPublicPeerAddress("/dns4/example.com/tcp/8228/p2p/QmA", resolve), "/ip4/203.0.113.9/tcp/8228/p2p/QmA");
+});
+
+test("an announced address that isn't a plain public one is left out, and the rest are dialed", async () => {
+  const good = "/ip4/203.0.113.5/tcp/8228/p2p/Qm1";
+  const announced = ["/ip4/203.0.113.6/tcp/8228/p2p/Qm1/ip4/127.0.0.1/tcp/8227", "/ip4/10.0.0.7/tcp/8228/p2p/Qm1", good];
+  for (const request of [
+    { operation: "act", method: "connectPeer", params: { pubkey: PEER } },
+    { operation: "open-channel", params: { pubkey: PEER, funding_amount: "0x5f5e100", funding_lock_script: lock } },
+  ]) {
+    const { node, dialed } = hostedNode(announced);
+    await managedNodeRequest("mixed-addresses", request, node as never, async () => lock as never);
+    assert.deepEqual(dialed.map(({ address }) => address), [good], request.operation);
+    // With nothing left to dial, the request is refused and nothing is dialed.
+    const none = hostedNode(announced.slice(0, 2));
+    await assert.rejects(managedNodeRequest("mixed-addresses", request, none.node as never, async () => lock as never), /no address a hosted node can reach/);
+    assert.deepEqual(none.dialed, [], request.operation);
   }
 });
 
