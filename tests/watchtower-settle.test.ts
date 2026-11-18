@@ -7,7 +7,7 @@ import { JsonRpcTransformers } from "@ckb-ccc/core/advanced";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import {
   applyUnlocks, blake160, delayFraction, encodeSettlementWitness, encodeWitnessState, epochDelayPassed, parseCommitmentArgs, parseSettlementWitness,
-  planClaim, settleChannel, settlementMessage, signSettlement, trackNodeKeySends, XUDT_COMPATIBLE_WITNESS,
+  forceCloseSettled, planClaim, settleChannel, settlementMessage, signSettlement, trackNodeKeySends, XUDT_COMPATIBLE_WITNESS,
 } from "../src/sdk/browser/watchtower-settle.ts";
 import { openWatchtowerStore, type WatchedChannel } from "../src/sdk/browser/watchtower-store.ts";
 import { COMMITMENT_LOCK } from "../src/sdk/browser/watchtower-settle.ts";
@@ -514,6 +514,20 @@ test("settleChannel reports an open channel, a settled one and a settlement it c
   assert.equal((await fakeChain({ peerTookEverything: true }).settle()).status, "settled");
   const odd = fakeChain({ settlementWitness: (ours) => ccc.bytesConcat(new Uint8Array(16).fill(9), ours) });
   assert.equal((await odd.settle()).status, "unexpected settlement witness");
+});
+
+test("a force close counts as settled on chain only once nothing is left under its commitment lock", async () => {
+  const settled = (chain: ReturnType<typeof fakeChain>) => forceCloseSettled(chain.client, "testnet", { txHash: chain.funding.hash(), index: 0 });
+  // The commitment cell itself is live, or the peer settled and the user's part is still locked in the successor.
+  assert.equal(await settled(fakeChain()), false);
+  assert.equal(await settled(fakeChain({ peerSettledFirst: true })), false);
+  // The cell was emptied: by one settlement, or by the second of two (a lookalike cell at output 1 isn't followed).
+  assert.equal(await settled(fakeChain({ peerTookEverything: true })), true);
+  assert.equal(await settled(fakeChain({ peerSettledFirst: true, bothSettledWithDecoy: true })), true);
+  // An open channel is not a settled one.
+  const open = fakeChain();
+  open.reopen();
+  assert.equal(await settled(open), false);
 });
 
 test("settleChannel claims an incoming payment with its preimage, signed by the payment's key", async () => {

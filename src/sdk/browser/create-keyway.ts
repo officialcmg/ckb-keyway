@@ -32,15 +32,15 @@ import { createFiberActions, type FiberActionApprovals } from "./fiber-actions";
 import { approveFiberParams } from "./fiber-methods";
 import { createFiberNode, listLoggedPayments, type ListPaymentsParams } from "./fiber-node";
 import { createPaymentLog } from "./payment-log";
-import { sweepSettlement } from "./settlement-sweep";
+import { needsFeeReserveOnChain, sweepSettlement } from "./settlement-sweep";
 import { fiberWasmFactory } from "./fiber-wasm";
 import { listenForWatchtowerCalls } from "./watchtower-bridge";
 import { openWatchtowerStore } from "./watchtower-store";
-import { settleChannel, trackNodeKeySends } from "./watchtower-settle";
+import { forceCloseSettled, settleChannel, trackNodeKeySends } from "./watchtower-settle";
 import { createRemoteWatchtower, remoteWatchUpdate, updatesForStoredChannel } from "./watchtower-remote";
 import { createNodeLifecycle } from "./node-lifecycle";
 import { createChannelOpenings, refuseFundingBeyondRequest, type ChannelOpening } from "./funding-limit";
-import { createFeeReserve, FEE_RESERVE, needsFeeReserve } from "./fee-reserve";
+import { createFeeReserve, FEE_RESERVE } from "./fee-reserve";
 import type { RequestEmailCode } from "./email-code";
 
 export type KeyWayFundingParams = Omit<
@@ -300,7 +300,9 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     try {
       const destination = (await fundingSigner.getRecommendedAddressObj()).script;
       const { channels } = await node.listChannels({ include_closed: true });
-      const swept = await sweepSettlement(nodeKeyClient, ccc.hexFrom(key), destination, needsFeeReserve(channels) ? FEE_RESERVE : 0n);
+      // The browser node never reports a force close as settled, so the chain decides when the reserve can go back.
+      const keep = await needsFeeReserveOnChain(channels, (outpoint) => forceCloseSettled(nodeKeyClient, network, ccc.OutPoint.decode(outpoint)));
+      const swept = await sweepSettlement(nodeKeyClient, ccc.hexFrom(key), destination, keep ? FEE_RESERVE : 0n);
       if (swept) nodeKeySends.record(swept as ccc.Hex);
     } finally {
       key.fill(0);

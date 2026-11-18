@@ -419,6 +419,36 @@ async function medianTime(client: ccc.Client): Promise<number | undefined> {
 export type SettleResult = { channelId: string; txHash?: ccc.Hex; status: string };
 
 /**
+ * Whether a force-closed channel has nothing left to settle: its commitment cell, followed through every settlement
+ * (each leaves what remains in output 0), is gone from the chain. False for anything else, including a channel that
+ * is open, was closed cooperatively, or whose transactions the indexer doesn't show yet. This is the test Fiber's
+ * node applies itself (no live cell under the commitment lock); the browser node can't act on it, see
+ * `needsFeeReserveOnChain`.
+ */
+export async function forceCloseSettled(client: ccc.Client, network: "testnet" | "mainnet", fundingOutPoint: ccc.OutPointLike): Promise<boolean> {
+  const funding = ccc.OutPoint.from(fundingOutPoint);
+  const fundingOutput = (await client.getTransaction(funding.txHash))?.transaction.outputs[Number(funding.index)];
+  if (!fundingOutput || await client.getCellLive(funding, false)) return false;
+  const commitmentTx = await spentBy(client, funding, fundingOutput.lock);
+  const codeHash = COMMITMENT_LOCK[network].codeHash;
+  const isCommitment = (output?: ccc.CellOutput) => output?.lock.codeHash === codeHash && output.lock.hashType === "type";
+  if (!commitmentTx || !isCommitment(commitmentTx.outputs[0])) return false;
+  const prefix = ccc.bytesFrom(commitmentTx.outputs[0].lock.args).slice(0, 36);
+  let cell = ccc.OutPoint.from({ txHash: commitmentTx.hash(), index: 0 });
+  let output = commitmentTx.outputs[0];
+  for (let step = 0; step < 300; step++) {
+    if (await client.getCellLive(cell, false)) return false;
+    const next = await spentBy(client, cell, output.lock);
+    if (!next) return false;
+    const successor = next.outputs[0];
+    if (!isCommitment(successor) || !equal(ccc.bytesFrom(successor.lock.args).slice(0, 36), prefix)) return true;
+    cell = ccc.OutPoint.from({ txHash: next.hash(), index: 0 });
+    output = successor;
+  }
+  return false;
+}
+
+/**
  * One pass of the in-page watchtower over a channel: finds its commitment on-chain, follows any settlements to
  * the live commitment cell, and claims the user's share once the commitment's delay has passed.
  */
