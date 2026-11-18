@@ -13,13 +13,20 @@ export const FEE_RESERVE = 62n * 100_000_000n;
 /** The smallest plain CKB cell (61 CKB of occupied capacity). */
 export const MIN_PLAIN_CELL = 61n * 100_000_000n;
 
-type ChannelState = { channel_id?: unknown; channel_outpoint?: unknown; state: { state_name: string; state_flags?: unknown } };
-/** A channel the in-page watchtower has established as finished on-chain (channel-closures.ts), on its funding cell. */
-export type FinishedOnChain = { channelId: string; fundingOutPoint: string; finished?: unknown };
+type ChannelState = { channel_id?: unknown; channel_outpoint?: unknown; shutdown_transaction_hash?: unknown; state: { state_name: string; state_flags?: unknown } };
+/**
+ * A channel the in-page watchtower has established as finished on-chain (channel-closures.ts): on which funding
+ * cell, and after which commitment transaction spent it.
+ */
+export type FinishedOnChain = { channelId: string; fundingOutPoint: string; closingTx: string; finished?: unknown };
 
-/** A channel ID as a key: 32 bytes of lower-case hex, or undefined for anything else. */
+/** A channel ID or transaction hash as a key: 32 bytes of lower-case hex, or undefined for anything else. */
 export function channelKey(value: unknown): string | undefined {
   return typeof value === "string" && /^0x[0-9a-f]{64}$/i.test(value) ? value.toLowerCase() : undefined;
+}
+/** The transaction the node says closed the channel (`shutdown_transaction_hash`), once it reports the channel closed. */
+export function closedBy(channel: ChannelState): string | undefined {
+  return isClosed(channel.state) ? channelKey(channel.shutdown_transaction_hash) : undefined;
 }
 /** A funding cell as Fiber names it in `channel_outpoint` (a serialized out point, 36 bytes of hex), as a key. */
 export function outPointKey(value: unknown): string | undefined {
@@ -50,15 +57,17 @@ const isClosed = (state: ChannelState["state"]) => String(state?.state_name).rep
  * Fiber 0.10.1's browser node never drops WAITING_ONCHAIN_SETTLEMENT from a force-closed channel (it waits for a
  * settlement record its build can't write), so for a channel the node itself reports closed, the in-page
  * watchtower's verdict that nothing is left to claim (`finishedOnChain`) counts as settled. Both must agree, about
- * the same funding cell: a channel the node still calls open keeps the reserve whatever the verdict says, and so
- * does a force-closed channel without a verdict, whose claim the reserve pays for.
+ * the same funding cell and the same closing transaction: a channel the node still calls open keeps the reserve
+ * whatever the verdict says, so does one the node saw closed by another transaction than the verdict followed,
+ * and so does a force-closed channel without a verdict, whose claim the reserve pays for.
  */
 export function needsFeeReserve(channels: ChannelState[], finishedOnChain: readonly FinishedOnChain[] = []): boolean {
   const settledOnChain = (channel: ChannelState) => {
     const id = channelKey(channel.channel_id);
     const outPoint = outPointKey(channel.channel_outpoint);
-    return isClosed(channel.state) && id !== undefined && outPoint !== undefined
-      && finishedOnChain.some((item) => Boolean(item.finished) && item.channelId === id && item.fundingOutPoint === outPoint);
+    const closing = closedBy(channel);
+    return id !== undefined && outPoint !== undefined && closing !== undefined
+      && finishedOnChain.some((item) => Boolean(item.finished) && item.channelId === id && item.fundingOutPoint === outPoint && item.closingTx === closing);
   };
   return channels.some((channel) => !channelFinished(channel) && !settledOnChain(channel));
 }
@@ -86,8 +95,12 @@ const SWEEP_FEE_MARGIN = 1_000_000n;
  * every channel is settled to return it too. Cells with a type script it can't move safely are left where
  * they are, and so are token cells the plain CKB can't bring up to the destination lock's minimum. Returns the
  * transaction hash, or undefined when there is nothing to sweep.
+ *
+ * `returnableReserve`: a reserve smaller than the destination's smallest cell (62 CKB against the 95 CKB of a
+ * recovery account's Omnilock) could never be returned on its own. With this set, a sweep that keeps the reserve
+ * keeps that smallest cell's worth instead whenever the key holds enough, so the reserve can leave later.
  */
-export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.HexLike, destination: ccc.ScriptLike, keepReserve = 0n): Promise<string | undefined> {
+export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.HexLike, destination: ccc.ScriptLike, keepReserve = 0n, options: { returnableReserve?: boolean } = {}): Promise<string | undefined> {
   const signer = new ccc.SignerCkbPrivateKey(client, settlementKey);
   const from = (await signer.getRecommendedAddressObj()).script;
   const to = ccc.Script.from(destination);
@@ -120,12 +133,14 @@ export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.Hex
     extra += needed;
     return true;
   });
-  const plan = planSweep(plainTotal - extra, tokens.length, keepReserve);
-  if (!plan) return undefined;
-  let { toUser, reserve } = plan;
   // Too little for a plain cell of its own at the destination (95 CKB at an Omnilock): it joins the reserve, or
   // rides in the first token cell, or waits for a later sweep.
   const minimumPlain = ccc.fixedPointFrom(ccc.CellOutput.from({ lock: to, capacity: 0n }).occupiedSize);
+  const returnable = minimumPlain + SWEEP_FEE_MARGIN;
+  const keep = options.returnableReserve && keepReserve > 0n && keepReserve < returnable && plainTotal - extra >= returnable ? returnable : keepReserve;
+  const plan = planSweep(plainTotal - extra, tokens.length, keep);
+  if (!plan) return undefined;
+  let { toUser, reserve } = plan;
   if (toUser > 0n && toUser < minimumPlain + SWEEP_FEE_MARGIN) {
     if (reserve > 0n) reserve += toUser;
     else if (tokens.length > 0) tokens[0].output.capacity += toUser;

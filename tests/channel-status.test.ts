@@ -24,15 +24,16 @@ test("keeps the other channel states", () => {
 });
 
 // What the in-page watchtower has seen on-chain corrects what the node says (channel-closures.ts).
-function funded(state_name: string) {
+function funded(state_name: string, state_flags?: string) {
   // Fiber's `channel_outpoint` is the serialized out point (36 bytes of hex), whatever the SDK's types call it.
-  return { ...channel(state_name), channel_outpoint: `0x${"cc".repeat(32)}00000000`, local_balance: "0x861c46800", remote_balance: "0x342770c00" } as unknown as Parameters<typeof normalizeChannel>[0];
+  return { ...channel(state_name), state: { state_name, ...(state_flags ? { state_flags } : {}) }, channel_outpoint: `0x${"cc".repeat(32)}00000000`, local_balance: "0x861c46800", remote_balance: "0x342770c00" } as unknown as Parameters<typeof normalizeChannel>[0];
 }
+const seen = [{ channelId: `0x${"aa".repeat(32)}`, fundingOutPoint: `0x${"cc".repeat(32)}00000000`, closingTx: `0x${"dd".repeat(32)}`, seenAt: 0 }];
+const finished = [{ ...seen[0], finished: { status: "settled", evidence: `0x${"ee".repeat(32)}` } }];
 
 test("a channel the node calls ready is closing, with nothing to send, once a force close has spent its funding cell", async () => {
   const { closureOf, withClosure } = await import("../src/sdk/browser/channel-closures.ts");
   const raw = funded("CHANNEL_READY");
-  const seen = [{ channelId: `0x${"aa".repeat(32)}`, fundingOutPoint: `0x${"cc".repeat(32)}00000000`, closingTx: `0x${"dd".repeat(32)}`, seenAt: 0 }];
   const shown = withClosure(normalizeChannel(raw), closureOf(seen, raw));
   assert.equal(shown.status, "closing");
   assert.equal(shown.canSend, 0n);
@@ -40,13 +41,30 @@ test("a channel the node calls ready is closing, with nothing to send, once a fo
   assert.equal(shown.capacity, 500n * 100_000_000n);
   assert.equal(shown.raw, raw, "Fiber's own channel object is untouched");
   // Finished on-chain: closed.
-  const finished = [{ ...seen[0], finished: { status: "settled", evidence: `0x${"ee".repeat(32)}` } }];
   assert.equal(withClosure(normalizeChannel(raw), closureOf(finished, raw)).status, "closed");
   // The same holds while the node is still opening or cooperatively closing the channel.
   assert.equal(withClosure(normalizeChannel(funded("SHUTTING_DOWN")), closureOf(seen, raw)).canSend, 0n);
 });
 
-test("a closure applies only to its own channel and funding cell, and never changes a channel the node reports closed", async () => {
+test("once the node reports the force close, the channel stays closing with nothing to send until nothing is left to claim", async () => {
+  const { presentChannels } = await import("../src/sdk/browser/channel-closures.ts");
+  const waiting = normalizeChannel(funded("CLOSED", "UNCOOPERATIVE_REMOTE|WAITING_ONCHAIN_SETTLEMENT"));
+  assert.deepEqual([waiting.status, waiting.canSend], ["closed", 360n * 100_000_000n], "as the node alone has it");
+  // The user's share is unclaimed: listed, closing, nothing to send.
+  assert.deepEqual(presentChannels([waiting], seen, false).map(({ status, canSend, canReceive }) => [status, canSend, canReceive]), [["closing", 0n, 0n]]);
+  // Nothing left to claim: closed, and listed only when closed channels are asked for.
+  assert.deepEqual(presentChannels([waiting], finished, false), []);
+  assert.deepEqual(presentChannels([waiting], finished, true).map(({ status, canSend }) => [status, canSend]), [["closed", 0n]]);
+  // A channel the node itself calls settled is closed whatever the closure says.
+  const settled = normalizeChannel(funded("CLOSED", "UNCOOPERATIVE_REMOTE"));
+  assert.deepEqual(presentChannels([settled], seen, true).map(({ status }) => status), ["closed"]);
+  // Channels without a closure are listed as the node has them: open ones always, closed ones when asked for.
+  const ready = normalizeChannel({ ...funded("CHANNEL_READY"), channel_id: `0x${"ab".repeat(32)}` } as never);
+  assert.deepEqual(presentChannels([ready, waiting], [], false), [ready]);
+  assert.deepEqual(presentChannels([ready, waiting], [], true), [ready, waiting]);
+});
+
+test("a closure applies only to its own channel and funding cell", async () => {
   const { closureOf, withClosure } = await import("../src/sdk/browser/channel-closures.ts");
   const raw = funded("CHANNEL_READY");
   const elsewhere = [
@@ -62,11 +80,4 @@ test("a closure applies only to its own channel and funding cell, and never chan
   // Nor does a funding cell that isn't a serialized out point: no two channels may ever compare equal by accident.
   const odd = { ...raw, channel_outpoint: { tx_hash: `0x${"cc".repeat(32)}`, index: "0x0" } } as unknown as typeof raw;
   assert.equal(closureOf([{ channelId: `0x${"aa".repeat(32)}`, fundingOutPoint: "[object object]", closingTx: "0x", seenAt: 0 }], odd), undefined);
-  const closed = normalizeChannel(funded("CLOSED"));
-  assert.deepEqual(withClosure(closed, { finished: undefined }), closed);
-});
-
-test("normalizeChannel still maps over a channel list", () => {
-  // Array.map passes the index as a second argument; it must not be read as anything.
-  assert.deepEqual([funded("CHANNEL_READY"), funded("CHANNEL_READY")].map(normalizeChannel).map(({ status, canSend }) => [status, canSend]), [["ready", 360n * 100_000_000n], ["ready", 360n * 100_000_000n]]);
 });

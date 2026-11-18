@@ -129,6 +129,26 @@ test("a repeated create_watch_channel keeps the peer's settlement and revocation
   assert.equal(again.createdAt, 1);
 });
 
+test("a repeated create_watch_channel keeps the node's latest settlement, as Fiber's own store does", () => {
+  // Fiber registers a channel again at every start, with the settlement it was funded with, before it replays the
+  // latest one. A pass that read the first settlement in between wouldn't know the payments in flight as the user's.
+  const created = applyWatchtowerCall(undefined, create, 1);
+  assert.ok(created && created !== "remove");
+  const latest = { local_amount: "0x9", remote_amount: "0x8", tlcs: [{ tlc_id: { Offered: "0x0" } }] };
+  const updated = applyWatchtowerCall(created, { method: "update_local_settlement", params: { channel_id: create.params.channel_id, settlement_data: latest } }, 2);
+  assert.ok(updated && updated !== "remove");
+  const again = applyWatchtowerCall(updated, create, 3);
+  assert.ok(again && again !== "remove");
+  assert.deepEqual(again.localSettlement, latest);
+  // The replayed update that follows still lands.
+  const newer = { local_amount: "0xa", remote_amount: "0x7", tlcs: [] };
+  const replayed = applyWatchtowerCall(again, { method: "update_local_settlement", params: { channel_id: create.params.channel_id, settlement_data: newer } }, 4);
+  assert.ok(replayed && replayed !== "remove");
+  assert.deepEqual(replayed.localSettlement, newer);
+  // Malformed data in a repeated create is still refused.
+  assert.throws(() => applyWatchtowerCall(updated, { ...create, params: { ...create.params, settlement_data: { tlcs: [] } } }), /settlement data/);
+});
+
 test("stopping the listener waits for calls it already received", async () => {
   const name = `test-${Math.random()}`;
   let finish!: () => void;

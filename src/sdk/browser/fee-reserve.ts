@@ -43,12 +43,17 @@ export async function sendFeeReserve(options: {
   return signer.sendTransaction(transaction);
 }
 
-/** The fee reserve around a channel open: checked before it, sent once the funding transaction is on-chain. */
-export function createFeeReserve(options: Omit<Parameters<typeof sendFeeReserve>[0], "lock"> & { lock: () => Promise<ccc.ScriptLike> }) {
+/**
+ * The fee reserve around a channel open: checked before it, sent once the funding transaction is on-chain.
+ * `reserveClient`: the client that sends from the node's key, if there is one in the page. It knows which of the
+ * key's cells its own unconfirmed sends (a sweep returning the reserve) have already spent; the account's client
+ * would still count a reserve that is on its way out, and the new channel would open without one.
+ */
+export function createFeeReserve(options: Omit<Parameters<typeof sendFeeReserve>[0], "lock"> & { lock: () => Promise<ccc.ScriptLike>; reserveClient?: ccc.Client }) {
   return {
     /** Whether this open must also send the reserve, because the node's key doesn't hold one yet. */
     async needed(): Promise<boolean> {
-      return !await hasFeeReserve(options.client, await options.lock());
+      return !await hasFeeReserve(options.reserveClient ?? options.client, await options.lock());
     },
     /**
      * Waits for the funding transaction, so the reserve can't spend the same cells, then sends the reserve.

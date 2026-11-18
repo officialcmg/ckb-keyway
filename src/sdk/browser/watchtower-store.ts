@@ -84,7 +84,12 @@ export function applyWatchtowerCall(existing: WatchedChannel | undefined, call: 
         remoteSettlementKey: pubkey(p.remote_settlement_key, "remote settlement key"),
         localFundingPubkey: pubkey(p.local_funding_pubkey, "local funding key"),
         remoteFundingPubkey: pubkey(p.remote_funding_pubkey, "remote funding key"),
-        localSettlement: settlement(p.settlement_data),
+        // Fiber registers a channel again at every start, with the settlement it was funded with. As in Fiber's
+        // own store (insert_watch_channel_with_features: "never reset an already monitored channel's usable
+        // settlement/revocation snapshots"), that must not put the first settlement back in place of the latest:
+        // a pass that read it would not recognise the payments in flight on the commitment as the user's.
+        // What a repeated create carries is still checked, and refused if malformed.
+        localSettlement: ((fresh) => existing?.localSettlement ?? fresh)(settlement(p.settlement_data)),
         createdAt: existing?.createdAt ?? now,
         updatedAt: now,
       };
