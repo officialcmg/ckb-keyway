@@ -37,6 +37,28 @@ export function needsFeeReserve(channels: ChannelState[]): boolean {
 }
 
 /**
+ * `needsFeeReserve` for a node in the browser, where the node's word isn't enough. Fiber 0.10.1 completes a force
+ * close (drops WAITING_ONCHAIN_SETTLEMENT) only against a settlement snapshot it recovers from its own watchtower's
+ * data (network.rs `check_channel_shutdown_settlement`, onchain_tlc_reconcile.rs `has_unresolved_onchain_tlcs`), and
+ * the browser build is compiled without that watchtower: its node sees the settlement on-chain and still reports the
+ * channel as waiting, for good. So a channel closed by force and waiting is judged by the chain instead (`settled`,
+ * given its funding cell): once nothing is left under its commitment lock there is nothing a fee could be needed for.
+ * Any doubt (no funding cell to follow, the chain can't be asked) keeps the reserve.
+ */
+export async function needsFeeReserveOnChain(
+  channels: (ChannelState & { channel_outpoint?: unknown })[],
+  settled: (channelOutpoint: string) => Promise<boolean>,
+): Promise<boolean> {
+  for (const channel of channels) {
+    if (channelFinished(channel)) continue;
+    const closed = String(channel.state?.state_name).replaceAll("_", "").toLowerCase() === "closed";
+    if (!closed || !channel.channel_outpoint) return true;
+    if (!await settled(String(channel.channel_outpoint)).catch(() => false)) return true;
+  }
+  return false;
+}
+
+/**
  * How a sweep splits the key's plain CKB: the reserve stays (when there's enough for it), the rest goes to
  * the user. Undefined when there's nothing to move beyond the reserve.
  */

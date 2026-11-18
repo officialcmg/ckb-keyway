@@ -1,9 +1,14 @@
 // Shared helpers for live end-to-end checks: disposable mail.tm inboxes and a headless Chrome.
 import { randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
+import { resolve } from "node:path";
 const require = createRequire(import.meta.url);
-export const { chromium } = require("playwright");
-export const EVIDENCE = new URL("./.evidence", import.meta.url).pathname;
+export const { chromium } = require(process.env.PLAYWRIGHT_MODULE ?? "playwright");
+/**
+ * Where a run keeps its account, browser profile and logs. KEYWAY_EVIDENCE names another folder so that two runs can
+ * go on at the same time; keep it under research/e2e with a name that starts with ".evidence" (those are gitignored).
+ */
+export const EVIDENCE = process.env.KEYWAY_EVIDENCE ? resolve(process.env.KEYWAY_EVIDENCE) : new URL("./.evidence", import.meta.url).pathname;
 /** The live demo's app ID. It is public: the demo sends it with every request. */
 export const DEMO_APP_ID = process.env.KEYWAY_APP_ID ?? "keyway_H3jyHCLd0tDqJ0qpEot8j3zB";
 
@@ -43,28 +48,35 @@ export async function markSeen(mailbox) {
   for (const message of (await json("https://api.mail.tm/messages", undefined, mailbox.token))["hydra:member"]) mailbox.seen.add(message.id);
 }
 
-/** Waits for the next unseen email and returns its six-digit code and subject. */
-export async function nextCode(mailbox) {
-  for (let attempt = 0; attempt < 45; attempt++) {
+/**
+ * Waits for the next unseen email that carries a code of `digits` digits and returns the code and the subject. The
+ * code is picked out by its label: a funding email states amounts with eight decimal places before the code.
+ */
+export async function nextCode(mailbox, digits = 6) {
+  const labelled = new RegExp(`(?:Your confirmation code is|Your code is)\\s+(\\d{${digits}})\\b`, "i");
+  for (let attempt = 0; attempt < 60; attempt++) {
     for (const message of (await json("https://api.mail.tm/messages", undefined, mailbox.token))["hydra:member"]) {
       if (mailbox.seen.has(message.id)) continue;
-      mailbox.seen.add(message.id);
       const full = await json(`https://api.mail.tm/messages/${message.id}`, undefined, mailbox.token);
-      const code = `${full.text ?? ""}`.match(/\b\d{6}\b/)?.[0];
-      if (code) return { code, subject: full.subject };
+      const code = `${full.text ?? ""}`.match(labelled)?.[1];
+      if (code) { mailbox.seen.add(message.id); return { code, subject: full.subject }; }
     }
     await new Promise((resolve) => setTimeout(resolve, 2000));
   }
-  throw new Error("OTP email did not arrive within 90 s");
+  throw new Error(`the ${digits}-digit email code did not arrive within two minutes`);
 }
+
+/** How the headless browser reaches the network: through HTTPS_PROXY when the machine has one. */
+const proxy = process.env.HTTPS_PROXY ? { proxy: { server: process.env.HTTPS_PROXY } } : {};
+const executable = process.env.CHROME_PATH ? { executablePath: process.env.CHROME_PATH } : {};
 
 /** A browser whose profile (local storage, IndexedDB) lives in `dir`, so a restarted run keeps the page's state. */
 export async function launchPersistent(dir) {
-  return chromium.launchPersistentContext(dir, { headless: true, ...(process.env.CHROME_PATH ? { executablePath: process.env.CHROME_PATH } : {}) });
+  return chromium.launchPersistentContext(dir, { headless: true, ...executable, ...proxy });
 }
 
 export async function launch() {
-  return chromium.launch({ headless: true, ...(process.env.CHROME_PATH ? { executablePath: process.env.CHROME_PATH } : {}) });
+  return chromium.launch({ headless: true, ...executable, ...proxy });
 }
 
 export function watchErrors(page, label) {
