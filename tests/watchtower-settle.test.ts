@@ -804,7 +804,8 @@ function walletOver(chain: ReturnType<typeof fakeChain>, prefix = `/wasm-test-${
     async reserveHeld(state_name: string, state_flags?: string, others: unknown[] = [], shutdownTx?: string | null) {
       node = [chain.listed(state_name, state_flags, shutdownTx), ...(others as typeof node)];
       gate ??= await makeGate();
-      return gate.needed();
+      // As the sweep asks: every verdict the answer rests on is put to the chain again.
+      return gate.needed({ fresh: true });
     },
     async stored() {
       return (await (await closureModule()).openClosureStore(prefix).list());
@@ -974,6 +975,70 @@ test("a verdict is taken back when the chain no longer bears it out", async () =
   assert.match((await reloaded.pass("CLOSED", WAITING)).status, /needs revocation/);
   assert.deepEqual(reloaded.removed, []);
   assert.equal((await reloaded.stored())[0].finished, undefined);
+});
+
+test("a verdict whose transaction a reorganization replaced gives way to the new one, at its own depth", async () => {
+  const chain = fakeChain({ byPeer: true });
+  const wallet = walletOver(chain);
+  chain.setTip([101, 0, 1000]);
+  await wallet.pass("CHANNEL_READY");
+  chain.mine(chain.sent[0]);
+  chain.bury(FINAL_DEPTH);
+  assert.equal((await wallet.pass("CHANNEL_READY")).finishedNow, true);
+  // The claim is dropped and another transaction makes the same claim instead (here: the same one, a shannon apart).
+  chain.drop(chain.sent[0]);
+  const replacement = chain.sent[0].clone();
+  replacement.outputs[replacement.outputs.length - 1].capacity -= 1n;
+  chain.mine(replacement);
+  assert.notEqual(replacement.hash(), chain.sent[0].hash());
+  // The node has noticed the close meanwhile. The status is the same, the transaction under it is not.
+  const after = await wallet.pass("CLOSED", WAITING);
+  assert.equal(after.status, "the user's share is already claimed");
+  assert.equal(after.evidence, replacement.hash());
+  assert.equal((await wallet.stored())[0].finished, undefined, "the old verdict is void; the new transaction is one block deep");
+  assert.deepEqual(wallet.removed, [], "the watchtower keeps its record until the new one is buried");
+  assert.equal(await wallet.reserveHeld("CLOSED", WAITING), true);
+  chain.bury(FINAL_DEPTH);
+  assert.equal((await wallet.pass("CLOSED", WAITING)).finishedNow, true);
+  assert.deepEqual((await wallet.stored())[0].finished, { status: "the user's share is already claimed", evidence: replacement.hash() });
+  assert.deepEqual(wallet.removed, [chain.watched.channelId]);
+  assert.equal(await wallet.reserveHeld("CLOSED", WAITING), false);
+});
+
+test("the sweep puts a verdict to the chain every time; a restart forgets every earlier answer", async () => {
+  const { createReserveGate } = await closureModule();
+  const id = "0x" + "0a".repeat(32);
+  const outPoint = "0x" + "0b".repeat(32) + "00000000";
+  const closingTx = "0x" + "0d".repeat(32);
+  const closure = { channelId: id, fundingOutPoint: outPoint, closingTx, seenAt: 0, finished: { status: "settled", evidence: "0x" + "0c".repeat(32) } };
+  const listed = { channel_id: id, channel_outpoint: outPoint, shutdown_transaction_hash: closingTx, state: { state_name: "CLOSED", state_flags: WAITING } };
+  let buried = true;
+  let asked = 0;
+  const gate = createReserveGate({
+    listChannels: async () => [listed], listClosures: async () => [closure], opening: () => false,
+    isBuried: async () => { asked++; return buried; },
+  });
+  // A channel Fiber hands over again is dropped on one answer, and noticing that the reserve may be due reuses it.
+  assert.equal(await gate.settledForGood(closure, listed), true);
+  assert.equal(await gate.needed(), false);
+  assert.equal(asked, 1);
+  // A reorganization then drops the verdict's transaction. The answer already had would still say "buried"...
+  buried = false;
+  assert.equal(await gate.needed(), false);
+  // ...so the sweep, which is what moves the reserve, never goes by it.
+  assert.equal(await gate.needed({ fresh: true }), true);
+  assert.equal(asked, 2);
+  assert.equal(await gate.needed(), true, "and the stale answer is gone with it");
+  // The node is stopped and started again: nothing is taken from before.
+  buried = true;
+  assert.equal(await gate.needed({ fresh: true }), false);
+  buried = false;
+  gate.reset();
+  assert.equal(await gate.settledForGood(closure, listed), false, "the channel handed over again is looked at afresh");
+  assert.equal(await gate.needed(), true);
+  // An RPC failure is not an answer.
+  const failing = createReserveGate({ listChannels: async () => [listed], listClosures: async () => [closure], opening: () => false, isBuried: async () => { throw new Error("unreachable"); } });
+  assert.equal(await failing.needed({ fresh: true }), true);
 });
 
 test("a close that a reorganization undid before it was final is forgotten", async () => {

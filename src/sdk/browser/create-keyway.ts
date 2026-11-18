@@ -313,7 +313,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     const key = await credential.getCkbSecretKey();
     try {
       const destination = (await fundingSigner.getRecommendedAddressObj()).script;
-      const keep = await reserve.needed() ? FEE_RESERVE : 0n;
+      // The decision that can move the reserve: every verdict it rests on is asked about again now.
+      const keep = await reserve.needed({ fresh: true }) ? FEE_RESERVE : 0n;
       // While the reserve stays, it stays at a size that can be returned to this account's address later.
       const swept = await sweepSettlement(nodeKeyClient, ccc.hexFrom(key), destination, keep, { returnableReserve: true });
       if (swept) nodeKeySends.record(swept as ccc.Hex);
@@ -342,6 +343,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     if (!node.isRunning) return;
     watchStopped = false;
     reserveHeld = undefined;
+    // What the chain said in an earlier run of the node is asked again in this one.
+    reserve.reset();
     // The first pass goes before the first sweep, so the first channel list waits for as little as it can.
     const first = watchNow().catch(() => undefined).finally(() => { if (firstWatch?.pass === first) firstWatch = undefined; });
     firstWatch = { pass: first, until: Date.now() + FIRST_WATCH_WAIT };

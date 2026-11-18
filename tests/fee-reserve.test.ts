@@ -3,6 +3,7 @@ import test from "node:test";
 import * as ccc from "@ckb-ccc/core";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { KEYWAY_OMNILOCK, omnilockArgsFor, omnilockScript, secp256k1Lock } from "../src/sdk/browser/account-lock.ts";
+import { sentReserveStands } from "../src/sdk/browser/fee-reserve.ts";
 import { FEE_RESERVE, needsFeeReserve, planSweep, sweepSettlement } from "../src/sdk/browser/settlement-sweep.ts";
 
 const CKB = 100_000_000n;
@@ -134,4 +135,30 @@ test("for a recovery account a kept reserve is kept at a size that can be return
   const back = await nodeKeyHolding([FEE_RESERVE]);
   await sweepSettlement(back.client, settlementKey, secp, 0n, { returnableReserve: true });
   assert.equal(back.sent.length, 1);
+});
+
+test("a reserve just sent counts for the next channel open until the chain lists it, unless a sweep has already taken it", async () => {
+  // The account's client sent the reserve; the node key's client (the viewer) asks its own indexer, which lags.
+  const txHash = `0x${"5e".repeat(32)}`;
+  const outPoint = ccc.OutPoint.from({ txHash, index: 0 });
+  const clients = (status: string | undefined, live = false) => {
+    const viewer = new ccc.ClientPublicTestnet({ url: "http://127.0.0.1:9/" });
+    Object.assign(viewer, { getCellLiveNoCache: async () => live ? {} : undefined });
+    const client = new ccc.ClientPublicTestnet({ url: "http://127.0.0.1:9/" });
+    Object.assign(client, { getTransactionNoCache: async () => status && { status } });
+    return { client, viewer, txHash };
+  };
+  // On its way in: a second open must not send a second reserve.
+  assert.equal(await sentReserveStands(clients("pending")), true);
+  assert.equal(await sentReserveStands(clients("proposed")), true);
+  // Committed and live, the indexer just hasn't caught up.
+  assert.equal(await sentReserveStands(clients("committed", true)), true);
+  // Committed and already spent, dropped, or rejected: there is no reserve, the open sends one.
+  assert.equal(await sentReserveStands(clients("committed", false)), false);
+  assert.equal(await sentReserveStands(clients(undefined)), false);
+  assert.equal(await sentReserveStands(clients("rejected")), false);
+  // A sweep of the node's key has spent it (still unconfirmed): it is on its way out, whatever the chain says.
+  const swept = clients("committed", true);
+  await swept.viewer.cache.markUnusable(outPoint);
+  assert.equal(await sentReserveStands(swept), false);
 });

@@ -92,11 +92,14 @@ export function closureOf(closures: readonly ChannelClosure[], channel: { channe
  * commitment has spent the funding cell the channel can carry no more payments, whatever the node says: it is
  * closing, with nothing to send or receive, until nothing is left to claim, and closed after that. So it reads
  * the same before and after the node notices the close, and stays in the list of open channels while the user's
- * share is still to be claimed.
+ * share is still to be claimed. A verdict reached on another closing transaction than the one the node has seen
+ * close the channel (a reorganization replaced it) says nothing about this close: the channel stays closing.
  */
-export function withClosure(channel: KeyWayChannel, closure: Pick<ChannelClosure, "finished"> | undefined): KeyWayChannel {
+export function withClosure(channel: KeyWayChannel, closure: Pick<ChannelClosure, "finished" | "closingTx"> | undefined): KeyWayChannel {
   if (!closure) return channel;
-  const finished = Boolean(closure.finished) || channelFinished(channel.raw as never);
+  const nodeClosing = closedBy(channel.raw as never);
+  const verdict = closure.finished !== undefined && (nodeClosing === undefined || nodeClosing === closure.closingTx);
+  const finished = verdict || channelFinished(channel.raw as never);
   return { ...channel, status: finished ? "closed" : "closing", canSend: 0n, canReceive: 0n };
 }
 
@@ -119,7 +122,8 @@ export function presentChannels(channels: KeyWayChannel[], closures: readonly Ch
  * - The watchtower's record is removed only once there is a verdict and the node reports the channel closed by the
  *   same transaction (`nodeClosedBy`). Until then every pass reads the chain again, and what it finds wins:
  *   the funding cell live, or spent by something that is no commitment, forgets the closure; another commitment
- *   starts it over; a live commitment cell with something still to settle (`unsettled`) takes the verdict back.
+ *   starts it over; a live commitment cell with something still to settle (`unsettled`) takes the verdict back;
+ *   a finished status resting on another transaction than the verdict's replaces it, once that one is buried.
  *
  * Returns true when this result finished the channel.
  */
@@ -150,6 +154,9 @@ export async function recordSettleResult(options: {
   const same = known !== undefined && known.fundingOutPoint === fundingOutPoint && known.closingTx === closingTx;
   const closure: ChannelClosure = { channelId, fundingOutPoint, closingTx, seenAt: same ? known.seenAt : options.now ?? Date.now() };
   let finished = same && !result.unsettled ? known.finished : undefined;
+  // The chain now rests the same conclusion on another transaction (a reorganization replaced the claim, say):
+  // the old verdict is void, and the new transaction has its own depth to reach.
+  if (finished && FINISHED.has(result.status) && result.evidence && channelKey(result.evidence) !== channelKey(finished.evidence)) finished = undefined;
   // The observation first: whatever fails after this, the channel no longer reads as ready.
   if (!same || Boolean(known.finished) !== Boolean(finished)) await closures.put(closure);
   let finishedNow = false;
@@ -170,9 +177,12 @@ export async function recordSettleResult(options: {
  * The reserve is released only when every channel is finished: by the node's own account, or because the node
  * reports it closed and a verdict for the same channel, funding cell and closing transaction says nothing is left
  * to claim. Before the reserve goes on the strength of a verdict, the transaction the verdict rests on is asked
- * about once more (once per session): if it is no longer buried (a deep reorganization, or a wrong answer when the
- * verdict was written), the verdict doesn't count. A channel being opened keeps the reserve too: the node lists it
- * only once the peer has answered. If anything can't be read, the reserve stays.
+ * about once more: if it is no longer buried (a deep reorganization, or a wrong answer when the verdict was
+ * written), the verdict doesn't count. `needed({ fresh: true })`, which the sweep uses when it decides whether to
+ * move the reserve, asks the chain every time; otherwise an answer already had since the last `reset` (each start)
+ * is used, which is enough to notice that the reserve may be due and to drop a channel Fiber hands over again. A
+ * channel being opened keeps the reserve too: the node lists it only once the peer has answered. If anything can't
+ * be read, the reserve stays.
  */
 export function createReserveGate(deps: {
   /** Every channel the node knows, closed ones included. */
@@ -183,15 +193,18 @@ export function createReserveGate(deps: {
   opening(): boolean;
 }) {
   const stood = new Set<string>();
-  async function holds(closure: ChannelClosure): Promise<boolean> {
+  async function holds(closure: ChannelClosure, fresh = false): Promise<boolean> {
     if (!closure.finished) return false;
     const key = `${closure.channelId}:${closure.closingTx}:${closure.finished.evidence}`;
-    if (stood.has(key)) return true;
-    if (!await deps.isBuried(closure.finished.evidence).catch(() => false)) return false;
+    if (!fresh && stood.has(key)) return true;
+    if (!await deps.isBuried(closure.finished.evidence).catch(() => false)) {
+      stood.delete(key);
+      return false;
+    }
     stood.add(key);
     return true;
   }
-  async function needed(): Promise<boolean> {
+  async function needed(options: { fresh?: boolean } = {}): Promise<boolean> {
     if (deps.opening()) return true;
     const channels = await deps.listChannels();
     if (!needsFeeReserve(channels)) return false;
@@ -208,7 +221,7 @@ export function createReserveGate(deps: {
     for (const closure of closures) {
       // Only the verdicts the release would rest on: those of channels the node reports closed by the same transaction.
       const relied = channels.some((channel) => !channelFinished(channel) && closureOf([closure], channel) && closedBy(channel) === closure.closingTx);
-      if (relied && await holds(closure)) standing.push(closure);
+      if (relied && await holds(closure, options.fresh)) standing.push(closure);
     }
     return needsFeeReserve(channels, standing);
   }
@@ -220,5 +233,9 @@ export function createReserveGate(deps: {
   async function settledForGood(closure: ChannelClosure | undefined, channel: Parameters<typeof closedBy>[0]): Promise<boolean> {
     return closure?.finished !== undefined && closedBy(channel) === closure.closingTx && await holds(closure);
   }
-  return { needed, holds, settledForGood };
+  return {
+    needed, holds, settledForGood,
+    /** Forgets every answer had so far: the chain may have changed while the node was stopped. */
+    reset: () => stood.clear(),
+  };
 }

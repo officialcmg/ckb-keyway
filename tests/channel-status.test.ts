@@ -55,6 +55,12 @@ test("once the node reports the force close, the channel stays closing with noth
   // Nothing left to claim: closed, and listed only when closed channels are asked for.
   assert.deepEqual(presentChannels([waiting], finished, false), []);
   assert.deepEqual(presentChannels([waiting], finished, true).map(({ status, canSend }) => [status, canSend]), [["closed", 0n]]);
+  // A verdict reached on another closing transaction than the one the node saw (a reorganization replaced it)
+  // says nothing about this close: still closing, still listed.
+  const replaced = normalizeChannel({ ...funded("CLOSED", "UNCOOPERATIVE_REMOTE|WAITING_ONCHAIN_SETTLEMENT"), shutdown_transaction_hash: `0x${"d1".repeat(32)}` } as never);
+  assert.deepEqual(presentChannels([replaced], finished, false).map(({ status, canSend }) => [status, canSend]), [["closing", 0n]]);
+  const agreed = normalizeChannel({ ...funded("CLOSED", "UNCOOPERATIVE_REMOTE|WAITING_ONCHAIN_SETTLEMENT"), shutdown_transaction_hash: `0x${"dd".repeat(32)}` } as never);
+  assert.deepEqual(presentChannels([agreed], finished, false), []);
   // A channel the node itself calls settled is closed whatever the closure says.
   const settled = normalizeChannel(funded("CLOSED", "UNCOOPERATIVE_REMOTE"));
   assert.deepEqual(presentChannels([settled], seen, true).map(({ status }) => status), ["closed"]);
