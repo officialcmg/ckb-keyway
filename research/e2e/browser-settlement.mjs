@@ -11,6 +11,8 @@
 // KEYWAY_PAY_WITH   the folder of another run going on at the same time: before the force closes the two accounts pay
 //                   each other 1 CKB over their channels, so each channel is closed from a state after a payment.
 //                   Given up after KEYWAY_PAY_MINUTES (default 15); the force close then goes ahead without it.
+// KEYWAY_RESERVE_MINUTES  how long the page stays open after the user's address is paid, to see the fee reserve
+//                   come back from the node's key as well (default 30; 0 ends the run at the payment).
 //
 // Everything the page and Fiber's workers print goes to <folder>/settlement-console.log (nothing is filtered).
 // Chain facts come from CKB RPC (block timestamps), not the explorer. While it runs:
@@ -331,11 +333,24 @@ try {
     }
   }
 
+  /** What the node's key (the lock the fee reserve was paid to) holds now; undefined when it can't be told. */
+  async function atNodeKey() {
+    if (!state.feeReserveTxHash) return undefined;
+    state.nodeKeyLock ??= (await rpc("get_transaction", [state.feeReserveTxHash])).transaction.outputs.find((o) => BigInt(o.capacity) === 62n * 100_000_000n)?.lock;
+    if (!state.nodeKeyLock) return undefined;
+    const held = await rpc("get_cells_capacity", [{ script: state.nodeKeyLock, script_type: "lock", script_search_mode: "exact" }]);
+    return BigInt(held?.capacity ?? 0);
+  }
+
   const seen = new Set();
   // A resumed run already found its commitment: follow on from it.
   const frontier = state.commitment ? [state.commitment] : [];
   const deadline = Date.now() + Number(process.env.KEYWAY_FOLLOW_HOURS ?? 7.5) * 60 * 60 * 1000;
   let done = false;
+  // A run restarted after the payment only watches for the fee reserve.
+  let paid = Boolean(state.paid);
+  const reserveMs = Number(process.env.KEYWAY_RESERVE_MINUTES ?? 30) * 60_000;
+  let reserveDeadline = paid ? Date.now() + reserveMs : 0;
   let nextStartAttempt = 0;
   while (Date.now() < deadline && !done) {
     if (existsSync(`${EVIDENCE}/reload`)) {
@@ -383,7 +398,18 @@ try {
       const script = state.userScript;
       for (const hash of frontier.slice(1)) {
         const tx = (await rpc("get_transaction", [hash])).transaction;
-        if (tx.outputs.some((o) => o.lock.code_hash === script.code_hash && o.lock.args === script.args)) { record(`DONE: ${hash} pays the user's own address`); done = true; }
+        if (!paid && tx.outputs.some((o) => o.lock.code_hash === script.code_hash && o.lock.args === script.args)) {
+          record(`DONE: ${hash} pays the user's own address`);
+          paid = true; state.paid = true; save();
+          reserveDeadline = Date.now() + reserveMs;
+        }
+      }
+      // The payment can leave the fee reserve at the node's key (it stays while a channel may still need settling):
+      // the page stays open a while longer to see whether that comes back to the user too.
+      if (paid) {
+        const left = await atNodeKey();
+        if (left === 0n) { record("nothing is left at the node's key"); done = true; }
+        else if (Date.now() >= reserveDeadline) { record(`${left === undefined ? "an unknown amount" : `${Number(left) / 1e8} CKB`} is still at the node's key ${Math.round(reserveMs / 60_000)} minutes after the payment`); done = true; }
       }
     } catch (error) { log("follow error", error.message); }
     if (!done) {
