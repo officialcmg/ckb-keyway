@@ -1,12 +1,17 @@
 # Force close on Channel V2 (Fiber 0.10.1): live testnet results
 
 **Result: both modes finished.** In each mode a committed transaction downstream of the commitment pays the user's own
-address: 4 h 02 min after the force close with the node in the browser, 4 h 05 min with a hosted node. <!--reserve-summary-->
+address: 4 h 02 min after the force close with the node in the browser, 4 h 05 min with a hosted node.
+
+**One defect found, in browser mode, and fixed on this branch:** the user's share arrived, but the 62 CKB fee reserve
+stayed at the node key, and would have stayed for good. It came back to the user's address once the page ran the
+fixed SDK. See "Defect: the fee reserve never came back in browser mode".
 
 CKB testnet, production KeyWay API, 2026-11-18. All times UTC. Block numbers, block times and epochs are from CKB RPC
 (`testnet.ckb.dev`), not an explorer; times marked "harness clock" are the test machine's clock when the SDK call
-returned. SDK: this branch's `main` (`67b6b79`, `@ckb-keyway/react` 0.2.14, Fiber 0.10.1) built locally and served
-under the production origin; the API and the hosted nodes are production.
+returned. SDK: `main` (`67b6b79`, `@ckb-keyway/react` 0.2.14, Fiber 0.10.1) built locally and served under the
+production origin, for everything up to and including the payment to each user's address; the last browser-mode step
+(the fee reserve's return) ran this branch's SDK, with the fix. The API and the hosted nodes are production.
 
 The 2026-11-17 live run (`docs/LIVE_TEST_2026-11-17.md`) left the force close of a Channel V2 channel to unit tests.
 This run does the honest force close (the node closes with its own latest state) once with the node in the browser and
@@ -25,10 +30,15 @@ Two disposable accounts (emailed sign-in codes), one per mode, at the same time:
 5. The page stayed signed in with the node running (browser mode) or in use, listing its channels every minute (hosted
    mode), while the harness followed the funding cell on chain until a transaction downstream of the commitment paid
    the user's own lock.
+6. Browser mode only, after the payment: the harness was started again on the same account and browser profile to
+   see whether the fee reserve left at the node key would come back too, first with the same SDK for 45 minutes, then
+   with the fix. (In hosted mode the reserve came back with the share.)
 
 Harness: `research/e2e/browser-settlement.mjs` (`FIBER_MODE=hosted` for the hosted run, `KEYWAY_EVIDENCE` for each
-run's own folder, `KEYWAY_PAY_WITH` for the payment exchange), `research/e2e/trace-close.mjs` to read a close from the
-chain, `research/e2e/claim-dry-run.mjs` for the early check below.
+run's own folder, `KEYWAY_PAY_WITH` for the payment exchange, `KEYWAY_RESERVE_MINUTES` for how long a run stays on
+after the payment to watch the fee reserve), `research/e2e/trace-close.mjs` to read a close from the chain,
+`research/e2e/claim-dry-run.mjs` for the early check below. The reserve watch was added during the run: the two
+restarts in step 6 were made by hand, by marking the saved run as paid but not finished.
 
 ## Browser mode
 
@@ -47,7 +57,7 @@ chain, `research/e2e/claim-dry-run.mjs` for the early check below.
 | The peer's side claims first: 250.001 CKB out of the commitment cell, 499.99899543 CKB left in a successor commitment cell for the user | `0x16c198dfa5160275120e9ef2a39cabaa6969c63710764e32d906b34af109ba7e` | 23100896 | 05:13:39 |
 | Claim of the user's share by the in-page watchtower: the successor cell and the 62 CKB fee reserve in, 561.99898905 CKB to the node key | `0x63466adcc2bb9842e8a1cc8253bf98f888acb0c5f53639f5ff9c5479e3b245e1` | 23100903 | 05:15:06 |
 | Sweep by the SDK: **499.99896589 CKB to the user's address**, 62 CKB (the fee reserve) kept at the node key | `0x91ff72f977e25838bf02fba093c6ea0b025a956ee1b7b15c25bb185cc42e6849` | 23100909 | 05:15:45 |
-<!--reserve-row-->
+| Return of the fee reserve, by the SDK with this branch's fix: 61.99988206 CKB to the user's address, nothing left at the node key | `0xa3b3bce7c638b5f7b87895753554d67664a319d0cda890715421521ce317ccdd` | 23101293 | 06:08:40 |
 
 The commitment cell's lock args are 58 bytes (Channel V2), commitment number 5, delay `0xa000010000000001`: a relative
 `since` of 1 epoch. The commitment is in epoch 14210 at block 1441 of 1800, so the delay ends at epoch 14211, block
@@ -60,7 +70,9 @@ The commitment cell's lock args are 58 bytes (Channel V2), commitment number 5, 
   the end of the delay.
 - **Amounts:** the user's balance in the channel was 499.999 CKB (500 funded, 1.001 paid including the routing fee, 1
   received). 499.99896589 CKB reached the user's address: 0.00003411 CKB less, which is the commitment transaction's
-  fee (457 shannons), the claim's fee (638) and the sweep's fee (2316).
+  fee (457 shannons), the claim's fee (638) and the sweep's fee (2316). The reserve's return cost another 11794
+  shannons. At the end the node key held 0 CKB and the user's address 9999.99850945 CKB of the 10,000 from the
+  faucet (`get_cells_capacity` at block 23101301).
 - **The peer's part:** claimed by the peer's side three blocks after the delay ended, in one transaction with the
   delay's `since` on the commitment input: 250.001 CKB went, together with one of that lock's existing cells, to the
   secp256k1 lock with args `0x24ab9e804a1b7f3f303ff54af57e6a0112c72f2a` (1412.00095478 CKB, still live at the time
@@ -86,8 +98,47 @@ of the cell and the rest stays in the successor. Here the peer was first, so the
 part (499.99899543 CKB instead of 499.999). In the early check, where the user would have been first, they came off
 the peer's part.
 
-<!--reserve-section-->
-The 62 CKB fee reserve was still at the node key when this was written; see the table.
+### Defect: the fee reserve never came back in browser mode
+
+**What happened.** The sweep at 05:15:45 paid the user's share and kept 62 CKB at the node key, as it does while any
+channel may still need settling. After that sweep nothing of the channel was left to settle: the commitment cell and
+its successor were both spent. The harness kept the page open with the node running for another 45 minutes (05:18:46
+to 06:04:37, after a restart of the harness, which had ended at the payment). The node went on reporting the channel
+as `CLOSED` / `UNCOOPERATIVE_LOCAL|WAITING_ONCHAIN_SETTLEMENT` at every reading, one a minute, and at 06:04:37 the
+node key still held the 62 CKB. The hosted node, by contrast, dropped `WAITING_ONCHAIN_SETTLEMENT` within a minute
+and a half of its claim, and the API's sweep returned the share and the reserve together.
+
+**Root cause** (Fiber v0.10.1 source, `d9b6bbd`). A node checks every 5 minutes whether a force-closed channel has
+settled: no live cell is left under the commitment lock (`network.rs`, `check_channel_shutdown_settlement`). The
+browser node does notice this: its log has "on-chain settlement reconciliation incomplete; keeping
+ONCHAIN_SETTLEMENT_CONFIRMED" (`channel.rs:4438`) 46 times, from 05:15:36 to 06:03:43. But it only drops
+`WAITING_ONCHAIN_SETTLEMENT` when no payment of the closing commitment is unresolved, and
+`has_unresolved_onchain_tlcs` (`onchain_tlc_reconcile.rs`) answers "unresolved" for every force close that has no
+stored settlement snapshot ("a force-close without a valid snapshot must keep waiting"). The only places that store
+that snapshot build it from `store.get_local_watch_channel`, the node's own watchtower data, and without the
+`watchtower` feature that function returns `None` (`store_impl/mod.rs`). `fiber-wasm` compiles the library with
+`default-features = false`, so the browser node never has a snapshot and never finishes a force close, with or
+without payments. The SDK released the reserve only when the node reported every channel as finished
+(`needsFeeReserve`), so in browser mode one force-closed channel kept the reserve at the node key for good.
+
+**Fix** (in the SDK, this branch). For a channel that is closed by force and still reported as waiting, the browser
+sweep now asks the chain instead of the node: `forceCloseSettled` (`watchtower-settle.ts`) follows the funding cell
+to the commitment and through every settlement, and answers yes only once nothing is left under the channel's
+commitment lock, which is the node's own test. `needsFeeReserveOnChain` (`settlement-sweep.ts`) keeps the reserve
+for any other unfinished channel, and whenever the chain can't be asked. The hosted path is unchanged.
+
+**Regression test.** `tests/fee-reserve.test.ts`, "a force close the chain shows as fully settled gives the reserve
+back, though the browser node still says waiting", uses the state the node reported in this run. With the decision
+as it was (the node's word only) it fails: `Expected values to be strictly equal: true !== false`. With the fix it
+passes. `tests/watchtower-settle.test.ts` adds the chain cases: commitment cell live, the user's part still locked
+after the peer's claim, cell emptied by one or by two settlements, channel open.
+
+**On the same channel.** The page was started again at 06:08 with this branch's SDK (same account, same browser
+profile). On its first sweep the SDK sent the 62 CKB to the user's address: `0xa3b3bce7…ccdd`, block 23101293,
+06:08:40. The node still reported the channel as waiting at that time.
+
+Anyone who force closed a browser-mode channel on 0.2.14 is in the same position until they run an SDK with this fix:
+their share is paid, their 62 CKB reserve is at their node key, and it is returned on the next sweep after the update.
 
 ## Hosted mode
 
@@ -138,7 +189,9 @@ in the same block, so the delay ended at the same block (23100893, 05:13:09).
 - A page that is closed, or a hosted node that is not in use, during or after the delay. Both pages stayed open and
   signed in for the whole run.
 - A private channel, and any peer other than the one public testnet node.
-- The published package and the deployed website: the SDK was this branch's `main` built locally.
+- The published package and the deployed website: the SDK was built locally. The fix is not published or deployed.
+- The fix with more than one channel, on mainnet, and with the user's claim first (the reserve should then stay
+  until the peer has claimed its part): unit tests only.
 
 ## Reading it from the chain
 
@@ -151,5 +204,4 @@ epoch, the inputs' `since` and whether each output is still live.
 
 ## Checks on this branch
 
-<!--checks-->
-`npm test` and `npm run typecheck`: see the pull request.
+On the final commit, with `KEYWAY_AUTH_TEST_DATABASE_URL` unset: `npm test` ran 683 tests (572 passed, 0 failed, 111 skipped, the ones that need a database); `npm run typecheck` passes.
