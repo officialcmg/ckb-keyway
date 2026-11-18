@@ -76,8 +76,8 @@ The commitment cell's lock args are 58 bytes (Channel V2), commitment number 5, 
 - **The peer's part:** claimed by the peer's side three blocks after the delay ended, in one transaction with the
   delay's `since` on the commitment input: 250.001 CKB went, together with one of that lock's existing cells, to the
   secp256k1 lock with args `0x24ab9e804a1b7f3f303ff54af57e6a0112c72f2a` (1412.00095478 CKB, still live at the time
-  of writing; fee 785 shannons). That this lock is the public node's own is inferred from it
-  paying the fee and receiving the peer's part; it was not checked any other way.
+  of writing; fee 785 shannons). That this lock is the public node's own is inferred from it paying the fee and
+  receiving the peer's part; it was not checked any other way.
 
 Early check, 01:16 (before the delay): the claim the in-page watchtower builds for this commitment (unlock `0xFE`,
 `since` `0xa000010000000001`, 499.999 CKB out of the cell for the user, 250.00099543 CKB left in a successor cell for
@@ -137,8 +137,9 @@ after the peer's claim, cell emptied by one or by two settlements, channel open.
 profile). On its first sweep the SDK sent the 62 CKB to the user's address: `0xa3b3bce7…ccdd`, block 23101293,
 06:08:40. The node still reported the channel as waiting at that time.
 
-Anyone who force closed a browser-mode channel on 0.2.14 is in the same position until they run an SDK with this fix:
-their share is paid, their 62 CKB reserve is at their node key, and it is returned on the next sweep after the update.
+A user who force closes a browser-mode channel on 0.2.14 should be in the same position until they run an SDK with
+this fix: the share paid, the 62 CKB reserve at their node key. On this channel the reserve came back on the first
+sweep after the update; no other account was checked.
 
 ## Hosted mode
 
@@ -165,7 +166,7 @@ in the same block, so the delay ended at the same block (23100893, 05:13:09).
   claim in it, as in browser mode.
 - **Force close to the user's address:** 4 h 05 min 15 s (force close accepted 01:13:07 harness clock, sweep in a
   block at 05:18:22); 4 h 04 min 57 s from the commitment's block. The sweep came 3 min 16 s after the claim; the
-  API sweeps at most once per 10 minutes per user, so this gap can be up to about 10 minutes longer.
+  API sweeps at most once per 10 minutes per user, so in general this gap can be up to about 10 minutes.
 - **Amounts:** the user's balance in the channel was 499.999 CKB, and the fee reserve 62 CKB. 561.99887111 CKB
   reached the user's address: 0.00012889 CKB less, which is the commitment transaction's fee (457 shannons), the
   claim's fee (638) and the sweep's fee (11794). After the sweep the hosted node's key held 0 CKB and the user's
@@ -190,8 +191,8 @@ in the same block, so the delay ended at the same block (23100893, 05:13:09).
   signed in for the whole run.
 - A private channel, and any peer other than the one public testnet node.
 - The published package and the deployed website: the SDK was built locally. The fix is not published or deployed.
-- The fix with more than one channel, on mainnet, and with the user's claim first (the reserve should then stay
-  until the peer has claimed its part): unit tests only.
+- The fix with more than one channel, and with the user's claim first (the reserve should then stay until the peer
+  has claimed its part): unit tests only, not run live. The fix on mainnet: not tested.
 
 ## Reading it from the chain
 
@@ -204,4 +205,6 @@ epoch, the inputs' `since` and whether each output is still live.
 
 ## Checks on this branch
 
-On the final commit, with `KEYWAY_AUTH_TEST_DATABASE_URL` unset: `npm test` ran 683 tests (572 passed, 0 failed, 111 skipped, the ones that need a database); `npm run typecheck` passes.
+On the final commit, with `KEYWAY_AUTH_TEST_DATABASE_URL` unset: `npm test` ran 683 tests
+(572 passed, 0 failed, 111 skipped); `npm run typecheck` passes. On `main` before this branch the same commands gave
+681 tests (570 passed, 0 failed, 111 skipped).
