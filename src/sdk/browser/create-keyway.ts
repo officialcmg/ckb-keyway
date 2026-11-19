@@ -32,12 +32,13 @@ import { createFiberActions, type FiberActionApprovals } from "./fiber-actions";
 import { approveFiberParams } from "./fiber-methods";
 import { createFiberNode, listLoggedPayments, type ListPaymentsParams } from "./fiber-node";
 import { createPaymentLog } from "./payment-log";
-import { closedBy, sweepSettlement } from "./settlement-sweep";
+import { sweepSettlement } from "./settlement-sweep";
 import { fiberWasmFactory } from "./fiber-wasm";
 import { listenForWatchtowerCalls } from "./watchtower-bridge";
 import { openWatchtowerStore } from "./watchtower-store";
-import { isBuried, settleChannel, trackNodeKeySends, type SettleFailure, type SettleResult } from "./watchtower-settle";
-import { closureOf, createReserveGate, openClosureStore, presentChannels, recordSettleResult, type ChannelClosure } from "./channel-closures";
+import { isBuried, settleChannel, trackNodeKeySends } from "./watchtower-settle";
+import { createReserveGate, openClosureStore, presentChannels, type ChannelClosure } from "./channel-closures";
+import { watchChannels } from "./watchtower-pass";
 import { createRemoteWatchtower, remoteWatchUpdate, updatesForStoredChannel } from "./watchtower-remote";
 import { createNodeLifecycle } from "./node-lifecycle";
 import { createChannelOpenings, refuseFundingBeyondRequest, type ChannelOpening } from "./funding-limit";
@@ -394,58 +395,31 @@ export function createKeyWay(options: CreateKeyWayOptions) {
         await sweepWithNodeKey().catch((error) => console.warn("[keyway] could not sweep the claimed funds yet", error));
       }
       if (watchStopped) return;
-      const watched = await watchtower.list();
-      if (watchStopped) return;
       const { channels } = await node.listChannels({ include_closed: true });
       if (watchStopped) return;
-      const seen: ChannelClosure[] = watched.length > 0 ? await closures.list().catch(() => []) : [];
+      // The node's key is fetched for the first channel that is looked at, and wiped when the pass ends.
+      let key: Uint8Array | undefined;
       let finishedThisPass = false;
-      const key = watched.length > 0 ? await credential.getCkbSecretKey() : new Uint8Array(0);
       try {
-        for (const channel of watched) {
-          if (watchStopped) break;
-          const raw = channels.find((item) => String(item.channel_id).toLowerCase() === channel.channelId);
-          const outpoint = raw?.channel_outpoint ? String(raw.channel_outpoint) : undefined;
-          // Fiber hands a force-closed channel over again at every start; one finished for good needs no second look.
-          if (raw && await reserve.settledForGood(closureOf(seen, raw), raw)) {
-            await watchtower.remove(channel.channelId).catch(() => undefined);
-            continue;
-          }
-          if (!outpoint) {
-            if (watchStatus.get(channel.channelId) !== "missing") {
-              watchStatus.set(channel.channelId, "missing");
-              console.warn(`[keyway] watchtower: channel ${channel.channelId} is not in the node's channel list; it can't be checked until it is`);
-            }
-            continue;
-          }
-          try {
-            const result = await settleChannel({
+        ({ finished: finishedThisPass } = await watchChannels({
+          watchtower, closures, channels, gate: reserve, statuses: watchStatus,
+          stopped: () => watchStopped,
+          settle: async (channel, outpoint) => {
+            key ??= await credential.getCkbSecretKey();
+            return settleChannel({
               client: nodeKeyClient, network, channel, nodeKey: ccc.hexFrom(key),
               ref: { channelId: channel.channelId, fundingOutPoint: ccc.OutPoint.decode(outpoint) },
               preimage: (paymentHash) => watchtower.preimage(paymentHash),
             });
-            if (watchStatus.get(channel.channelId) !== result.status) {
-              watchStatus.set(channel.channelId, result.status);
-              console.info(`[keyway] watchtower: channel ${channel.channelId}: ${result.status}${result.txHash ? ` ${result.txHash}` : ""}`);
-            }
-            if (result.txHash) {
-              nodeKeySends.record(result.txHash);
-              claimsToSweep.add(result.txHash);
-            }
-            // Remembers a force close seen on-chain and, once the channel is finished for good, ends its watch.
-            if (await noteOnChain(channel.channelId, result, outpoint, raw)) finishedThisPass = true;
-          } catch (error) {
-            console.warn(`[keyway] watchtower: channel ${channel.channelId} could not be settled yet`, error);
-            // A claim that couldn't be built or sent (no fee cell, an RPC error) doesn't unsee the close.
-            // And a claim that was due contradicts any verdict that nothing is left.
-            const failure = error as SettleFailure | undefined;
-            if (failure?.closingTx) {
-              await noteOnChain(channel.channelId, { channelId: channel.channelId, status: "could not be settled yet", closingTx: failure.closingTx, ...(failure.unsettled ? { unsettled: true as const } : {}) }, outpoint, raw);
-            }
-          }
-        }
+          },
+          isBuried: (txHash) => isBuried(nodeKeyClient, txHash),
+          onClaim: (txHash) => {
+            nodeKeySends.record(txHash);
+            claimsToSweep.add(txHash);
+          },
+        }));
       } finally {
-        key.fill(0);
+        key?.fill(0);
       }
       if (watchStopped) return;
       // The node comes to report a close, and the watchtower to call it finished, at different times: the pass
@@ -455,21 +429,6 @@ export function createKeyWay(options: CreateKeyWayOptions) {
         await sweepWithNodeKey(true).catch((error) => console.warn("[keyway] could not return the fee reserve yet", error));
       }
       reserveHeld = held;
-    }
-  }
-  /** Records what a pass saw of a channel on-chain (channel-closures.ts); true when that finished the channel. */
-  async function noteOnChain(channelId: string, result: SettleResult, fundingOutPoint: string, raw: Parameters<typeof closedBy>[0] | undefined): Promise<boolean> {
-    try {
-      const finished = await recordSettleResult({
-        result, fundingOutPoint, closures, watchtower,
-        nodeClosedBy: raw ? closedBy(raw) : undefined,
-        isBuried: (txHash) => isBuried(nodeKeyClient, txHash),
-      });
-      if (finished) console.info(`[keyway] watchtower: channel ${channelId} is finished on-chain (${result.status}); nothing is left to claim`);
-      return finished;
-    } catch (error) {
-      console.warn(`[keyway] watchtower: could not record what channel ${channelId} looks like on-chain; the next pass tries again`, error);
-      return false;
     }
   }
 

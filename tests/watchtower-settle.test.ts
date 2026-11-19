@@ -743,13 +743,38 @@ const closureModule = () => import("../src/sdk/browser/channel-closures.ts");
 const FINAL_DEPTH = 24n;
 const WAITING = "UNCOOPERATIVE_REMOTE|WAITING_ONCHAIN_SETTLEMENT";
 
+type PassResult = Awaited<ReturnType<typeof settleChannel>> & { finishedNow: boolean };
+
 /**
- * The wallet's side of a channel on the fake chain, through the functions create-keyway.ts itself runs: a
- * watchtower pass (settle, then record what was seen, with what the node reports about the channel), the channel
- * list as `getChannels` builds it, and the reserve gate the sweep asks. Each `walletOver` is one page load: the
- * closures are read from storage every time, the gate's memory is the session's.
+ * The wallet's side of a channel on the fake chain, through the code create-keyway.ts itself runs: its watchtower
+ * pass (watchtower-pass.ts `watchChannels`: settle, then record what was seen, with what the node reports about
+ * the channel), the channel list as `getChannels` builds it, and the reserve gate the sweep asks.
+ *
+ * Each `walletOver` is one page load over real stores (fake-indexeddb): the watchtower's own, in which a removed
+ * record is gone, and the closures. A new `prefix` is a wallet that holds the channel's record, as after the node
+ * handed it over; an existing `prefix` is a reload, which finds whatever the earlier page left. The gate's memory
+ * is the session's.
  */
-function walletOver(chain: ReturnType<typeof fakeChain>, prefix = `/wasm-test-${crypto.randomUUID()}`) {
+function walletOver(chain: ReturnType<typeof fakeChain>, prefix?: string, options: { /** Start without the watchtower's record. */ record?: boolean } = {}) {
+  const fresh = prefix === undefined;
+  const at = prefix ?? `/wasm-test-${crypto.randomUUID()}`;
+  const store = openWatchtowerStore(at);
+  const put = async (channel: WatchedChannel) => {
+    // What a create_watch_channel and the updates after it leave in the store: the record as the node gave it.
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open(`${at}-keyway-watchtower`, 1);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    await new Promise<void>((resolve, reject) => {
+      const tx = database.transaction("channels", "readwrite");
+      tx.objectStore("channels").put(channel);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    database.close();
+  };
+  const seeded = (async () => { await store.list(); if (fresh && options.record !== false) await put(chain.watched); })();
   const removed: string[] = [];
   let opening = false;
   let gate: Awaited<ReturnType<typeof makeGate>> | undefined;
@@ -760,45 +785,59 @@ function walletOver(chain: ReturnType<typeof fakeChain>, prefix = `/wasm-test-${
     const { isBuried } = await import("../src/sdk/browser/watchtower-settle.ts");
     return createReserveGate({
       listChannels: async () => node,
-      listClosures: async () => { if (closuresFail) throw new Error("IndexedDB is unavailable"); return openClosureStore(prefix).list(); },
+      listClosures: async () => { if (closuresFail) throw new Error("IndexedDB is unavailable"); return openClosureStore(at).list(); },
       isBuried: (txHash) => isBuried(chain.client, txHash),
       opening: () => opening,
     });
   }
   return {
-    prefix, removed,
+    prefix: at, removed,
     setOpening: (value: boolean) => { opening = value; },
     failClosures: (value: boolean) => { closuresFail = value; },
-    /** One pass, with the node reporting the channel in this state. A failed settle is recorded as create-keyway.ts does. */
-    async pass(state_name: string, state_flags?: string, shutdownTx?: string | null) {
-      const { openClosureStore, recordSettleResult } = await closureModule();
-      const { closedBy } = await import("../src/sdk/browser/settlement-sweep.ts");
+    /** Whether the watchtower still holds the channel's record. */
+    async watching() {
+      await seeded;
+      return (await store.get(chain.watched.channelId)) !== undefined;
+    },
+    /** The node hands the channel to the watchtower again, as Fiber does for a Channel V2 channel at every start. */
+    async reregister() {
+      await seeded;
+      await put(chain.watched);
+    },
+    /**
+     * One pass, with the node reporting the channel in this state. Returns what the look at the chain found; when
+     * the pass didn't look (the channel was dropped on a standing verdict, or there is no record), a status saying so.
+     */
+    async pass(state_name: string, state_flags?: string, shutdownTx?: string | null): Promise<PassResult> {
+      await seeded;
+      const { openClosureStore } = await closureModule();
+      const { watchChannels } = await import("../src/sdk/browser/watchtower-pass.ts");
       const { isBuried } = await import("../src/sdk/browser/watchtower-settle.ts");
       const raw = chain.listed(state_name, state_flags, shutdownTx);
-      const record = (result: Awaited<ReturnType<typeof chain.settle>>) => recordSettleResult({
-        result, closures: openClosureStore(prefix), fundingOutPoint: String(raw.channel_outpoint), nodeClosedBy: closedBy(raw as never),
-        watchtower: { remove: async (channelId) => { removed.push(channelId); } },
-        isBuried: (txHash) => isBuried(chain.client, txHash),
-      });
-      // As the pass does: a channel finished for good is dropped without another look at the chain.
       gate ??= await makeGate();
-      if (await gate.settledForGood((await closureModule()).closureOf(await openClosureStore(prefix).list(), raw), raw as never)) {
-        removed.push(chain.watched.channelId);
-        return { channelId: chain.watched.channelId, status: "finished for good: not looked at again", finishedNow: false } as Awaited<ReturnType<typeof chain.settle>> & { finishedNow: boolean };
-      }
-      try {
-        const result = await chain.settle();
-        return { ...result, finishedNow: await record(result) };
-      } catch (error) {
-        const failure = error as { closingTx?: ccc.Hex; unsettled?: true };
-        if (failure.closingTx) await record({ channelId: chain.watched.channelId, status: "could not be settled yet", closingTx: failure.closingTx, ...(failure.unsettled ? { unsettled: true as const } : {}) });
-        return { channelId: chain.watched.channelId, status: `failed: ${(error as Error).message}`, finishedNow: false } as Awaited<ReturnType<typeof chain.settle>> & { finishedNow: boolean };
-      }
+      const had = (await store.get(chain.watched.channelId)) !== undefined;
+      let looked: Awaited<ReturnType<typeof settleChannel>> | undefined;
+      let failure: Error | undefined;
+      const { finished } = await watchChannels({
+        watchtower: { ...store, remove: async (channelId: string) => { removed.push(channelId); await store.remove(channelId); } },
+        closures: openClosureStore(at), channels: [raw as never], gate,
+        settle: async () => {
+          try {
+            return looked = await chain.settle();
+          } catch (error) {
+            failure = error as Error;
+            throw error;
+          }
+        },
+        isBuried: (txHash: string) => isBuried(chain.client, txHash),
+      } as never);
+      const status = looked?.status ?? (failure ? `failed: ${failure.message}` : had ? "finished for good: not looked at again" : "no record: not looked at");
+      return { ...(looked ?? { channelId: chain.watched.channelId }), status, finishedNow: finished };
     },
     /** The channel list, default (closed channels left out) or with them. */
     async shown(state_name: string, state_flags?: string, includeClosed = false) {
       const { openClosureStore, presentChannels } = await closureModule();
-      return presentChannels([normalizeChannel(chain.listed(state_name, state_flags))], await openClosureStore(prefix).list(), includeClosed);
+      return presentChannels([normalizeChannel(chain.listed(state_name, state_flags))], await openClosureStore(at).list(), includeClosed);
     },
     /** Whether the sweep would keep the fee reserve, the node listing these channels (this chain's one by default). */
     async reserveHeld(state_name: string, state_flags?: string, others: unknown[] = [], shutdownTx?: string | null) {
@@ -808,7 +847,7 @@ function walletOver(chain: ReturnType<typeof fakeChain>, prefix = `/wasm-test-${
       return gate.needed({ fresh: true });
     },
     async stored() {
-      return (await (await closureModule()).openClosureStore(prefix).list());
+      return (await (await closureModule()).openClosureStore(at).list());
     },
   };
 }
@@ -910,6 +949,7 @@ test("the verdict survives a reload, and speaks only for its channel, funding ce
   const first = walletOver(chain);
   await first.pass("CLOSED", WAITING);
   assert.deepEqual(first.removed, [chain.watched.channelId], "a finished channel's watchtower record is removed");
+  assert.equal(await first.watching(), false, "and is really gone from the watchtower's store");
   // A reload: nothing in memory, the watchtower record gone. Only the stored verdict is left.
   const wallet = walletOver(chain, first.prefix);
   const stored = await wallet.stored();
@@ -927,7 +967,10 @@ test("the verdict survives a reload, and speaks only for its channel, funding ce
   assert.equal(await wallet.reserveHeld("CLOSED", WAITING, [], null), true);
   // Fiber hands the channel over again at the next start: the pass that follows drops it again without reading
   // the chain, the verdict untouched.
+  assert.equal(await wallet.watching(), false, "the reload finds no record");
+  await wallet.reregister();
   assert.match((await wallet.pass("CLOSED", WAITING)).status, /not looked at again/);
+  assert.equal(await wallet.watching(), false);
   assert.deepEqual(wallet.removed, [chain.watched.channelId]);
   assert.deepEqual((await wallet.stored())[0].finished, stored[0].finished);
 });
@@ -972,6 +1015,7 @@ test("a verdict is taken back when the chain no longer bears it out", async () =
   const reloaded = walletOver(gone, before.prefix);
   assert.equal(await reloaded.reserveHeld("CLOSED", WAITING), true);
   // And the channel Fiber hands over again at that start is looked at afresh, not dropped on the stale verdict.
+  await reloaded.reregister();
   assert.match((await reloaded.pass("CLOSED", WAITING)).status, /needs revocation/);
   assert.deepEqual(reloaded.removed, []);
   assert.equal((await reloaded.stored())[0].finished, undefined);
