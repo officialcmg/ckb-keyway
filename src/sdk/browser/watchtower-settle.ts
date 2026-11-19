@@ -166,7 +166,10 @@ type PendingTlc = {
   /** The TLC's expiry as an absolute timestamp `since`, and in milliseconds. */
   expirySince: bigint;
   expiryMs: number;
-  /** How this node can claim it, with which key: with the preimage (before the peer reclaims it) or once expired. */
+  /**
+   * How this node can claim it, with which key: with the preimage (before the peer reclaims it) or once expired.
+   * Unset for a TLC that matches none of the node's settlement data: it can't be told the peer's from the user's.
+   */
   ours?: { path: "preimage" | "expiry"; key: ccc.Hex; paymentHash: ccc.Hex; hashAlgorithm: string };
 };
 
@@ -229,8 +232,8 @@ function pendingTlcs(channel: ClaimChannel, state: SettlementWitness): PendingTl
   }
   return state.pendingTlcs.map((bytes, index) => {
     const expirySince = readLe(bytes.slice(tlcLength - 8, tlcLength));
-    const pending: PendingTlc = { index, amount: readLe(bytes.slice(1, 17)), expirySince, expiryMs: Number(expirySince & 0x00ff_ffff_ffff_ffffn) * 1000 };
     const match = known.find((item) => equal(item.bytes, bytes));
+    const pending: PendingTlc = { index, amount: readLe(bytes.slice(1, 17)), expirySince, expiryMs: Number(expirySince & 0x00ff_ffff_ffff_ffffn) * 1000 };
     if (!match) return pending;
     const key = ccc.hexFrom(`0x${match.tlc.local_key.replace(/^0x/, "")}`);
     const mine = blake160(pubkeyOf(key));
@@ -255,8 +258,13 @@ type ClaimChannel = Pick<WatchedChannel, "channelFeatures" | "localSettlementKey
  * pending TLCs come first, the most urgent first: one the node can unlock with a payment preimage it holds (the peer
  * can take it back once it expires), soonest expiry first, then one that has expired and is the node's to take back.
  * Then the user's own share, only once no TLC may still become the user's (the party that settles second can take
- * the whole cell), leaving a successor for the peer. On the first settlement each unlock also waits for its share of
- * the commitment's delay (`delayPassed`, given the input `since` it needs).
+ * the whole cell) and none is left that the node's data can't classify, leaving a successor for the peer. On the
+ * first settlement each unlock also waits for its share of the commitment's delay (`delayPassed`, given the input
+ * `since` it needs).
+ *
+ * A skip that is one of FINISHED says nothing in the cell is, or can still become, the user's: it is never given
+ * while the cell holds a TLC the node has a key for (whatever its expiry, with or without its preimage) or one it
+ * can't classify.
  */
 export function planClaim(options: {
   channel: ClaimChannel;
@@ -348,16 +356,45 @@ export function planClaim(options: {
       },
     };
   }
-  // TLCs the node may still claim: ones it holds the key for, unless it needed a preimage it doesn't have and the
-  // TLC has expired (the peer takes those back).
+  // TLCs the node may still claim on what it knows now: ones it holds the key for, unless it needed a preimage it
+  // doesn't have and the TLC has expired (the peer can take those back).
   const waitingTlcs = tlcs.some((tlc) => tlc.ours && !(tlc.ours.path === "preimage" && !preimageOf(tlc) && now > tlc.expiryMs));
-  const waiting = (reason: string) => ({ skip: waitingTlcs ? "waiting for a pending payment to resolve" : reason });
+  // TLCs the node holds a key for at all. One that has expired without its preimage is still the user's to claim
+  // if the preimage arrives before the peer takes it back (the claimable list above takes it, expired or not), so
+  // while any is in the cell the channel is not finished: only the chain showing them gone ends the watch.
+  const heldTlcs = tlcs.some((tlc) => tlc.ours);
+  // TLCs that match none of the node's data (it may be incomplete), so they can't be told the peer's from the
+  // user's, and the node has no key to claim them with.
+  const unclassifiedTlcs = tlcs.some((tlc) => !tlc.ours);
+  const WAITING = "waiting for a pending payment to resolve";
+  const UNCLASSIFIED = "a pending payment in the cell matches none of the node's data";
+  const HELD = "a pending payment is still in the cell, to be claimed if its preimage arrives";
 
+  // The user's slot is not in the cell. A status that ends the watch for good (FINISHED) says nothing in the cell
+  // is the user's, so it is given only when the slot was emptied (not when the witness simply doesn't name the
+  // user's key) and no pending payment is left that is, or may be, the user's.
+  if (!base) {
+    if (waitingTlcs) return { skip: WAITING };
+    // Emptied by the user's own claim: one slot is blank and the other is the peer's. Anything else is a witness
+    // this channel's keys don't account for.
+    const peer = blake160(channel.remoteSettlementKey);
+    const emptied = (equal(current.first.pubkeyHash, ZERO20) && equal(current.second.pubkeyHash, peer))
+      || (equal(current.second.pubkeyHash, ZERO20) && equal(current.first.pubkeyHash, peer));
+    if (!emptied) return { skip: "the settlement witness does not name the user's settlement key" };
+    if (unclassifiedTlcs) return { skip: `the user's share is already claimed, but ${UNCLASSIFIED}` };
+    if (heldTlcs) return { skip: `the user's share is already claimed; ${HELD}` };
+    return { skip: "the user's share is already claimed" };
+  }
   // The user's own share, settling first. Whoever settles second may take the whole cell, TLCs included, so it
   // waits, as Fiber's does, until no TLC may still become the user's.
-  if (!base) return waiting("the user's share is already claimed");
-  if (waitingTlcs) return { skip: "waiting for a pending payment to resolve" };
-  if (mine === 0n) return { skip: "the user has no share in this channel" };
+  if (waitingTlcs) return { skip: WAITING };
+  // A TLC that can't be classified holds the share back too, as in Fiber's watchtower (watchtower/actor.rs
+  // `build_settlement_tx`: a TLC without a matching key is never taken off `pending_tlcs_count`, and the node's own
+  // slot is unlocked only at zero). Settling first would hand the peer the whole remaining cell, that TLC included,
+  // although it may be one the user is owed back; waiting costs time, and once the peer settles its own share the
+  // claim above takes the whole cell. The price: while the peer leaves its share unclaimed, the user's waits too.
+  if (unclassifiedTlcs) return { skip: `waiting for the peer to settle its share first: ${UNCLASSIFIED}` };
+  if (mine === 0n) return { skip: heldTlcs ? `the user has no share in this channel; ${HELD}` : "the user has no share in this channel" };
   if (!delayPassed(since)) return { skip: "waiting for the commitment delay" };
   const { args: successorArgs } = successorFor(base.unlockType);
   const left = cell.capacity - mine;
@@ -416,13 +453,55 @@ async function medianTime(client: ccc.Client): Promise<number | undefined> {
   return typeof median === "string" ? Number(BigInt(median)) : undefined;
 }
 
-export type SettleResult = { channelId: string; txHash?: ccc.Hex; status: string };
+export type SettleResult = {
+  channelId: string;
+  txHash?: ccc.Hex;
+  status: string;
+  /** Set once the funding cell is seen spent by a commitment (a force close, by either side): that transaction. */
+  closingTx?: ccc.Hex;
+  /** With a status in FINISHED: the transaction the status rests on, for `isBuried`. */
+  evidence?: ccc.Hex;
+  /**
+   * Set when the pass read the live commitment cell and found something still to settle or wait for (any status
+   * outside FINISHED, a claim just sent included). It contradicts an earlier verdict that the channel was finished.
+   */
+  unsettled?: true;
+};
+
+/**
+ * A pass that failed after it had seen a commitment spend the funding cell still says so (`closingTx`), and, if it
+ * failed while building or sending a claim, that there is something still to settle (`unsettled`).
+ */
+export type SettleFailure = Error & { closingTx?: ccc.Hex; unsettled?: true };
+
+/**
+ * Statuses after which the channel needs nothing more from the watchtower: nothing is left under its commitment
+ * lock, or what is left isn't the user's. A cooperative close is left to Fiber's own remove_watch_channel, so an
+ * unexpected closing transaction never drops the data.
+ */
+export const FINISHED: ReadonlySet<string> = new Set(["settled", "the user's share is already claimed", "the user has no share in this channel"]);
+
+/** Blocks a transaction must be under before a verdict resting on it is kept for good (as the server watchtower's REORG_DEPTH). */
+export const FINAL_DEPTH = 24n;
+
+/**
+ * Whether a transaction is on-chain with FINAL_DEPTH blocks on top of it. A verdict that a channel is finished
+ * is acted on (its watchtower record dropped, its fee reserve released) only once the transaction it rests on is,
+ * so a reorganization that undoes the transaction finds the watchtower still able to claim.
+ */
+export async function isBuried(client: ccc.Client, txHash: ccc.HexLike): Promise<boolean> {
+  const found = await client.getTransactionNoCache(txHash);
+  if (found?.status !== "committed") return false;
+  const number = found.blockNumber ?? (found.blockHash ? (await client.getHeaderByHash(found.blockHash))?.number : undefined);
+  if (number === undefined) return false;
+  return (await client.getTip()) - number >= FINAL_DEPTH;
+}
 
 /**
  * One pass of the in-page watchtower over a channel: finds its commitment on-chain, follows any settlements to
  * the live commitment cell, and claims the user's share once the commitment's delay has passed.
  */
-export async function settleChannel(options: {
+type SettleOptions = {
   client: ccc.Client;
   network: "testnet" | "mainnet";
   channel: WatchedChannel;
@@ -434,42 +513,128 @@ export async function settleChannel(options: {
   now?: number;
   /** For checks only: builds the claim before the delay has passed and hands it to `submit` instead of sending it. */
   dryRun?: { submit: (tx: ccc.Transaction) => Promise<ccc.Hex> };
-}): Promise<SettleResult> {
-  const { client, channel } = options;
-  const result = (status: string, txHash?: ccc.Hex): SettleResult => ({ channelId: channel.channelId, status, ...(txHash ? { txHash } : {}) });
-  if (channel.fundingUdtTypeScript) return result("token channels are not settled by the in-page watchtower");
-  const funding = ccc.OutPoint.from(options.ref.fundingOutPoint);
+};
+
+export async function settleChannel(options: SettleOptions): Promise<SettleResult> {
+  const seen: { closingTx?: ccc.Hex; claiming?: boolean } = {};
+  try {
+    return await settle(options, seen);
+  } catch (cause) {
+    // Building or sending a claim can fail (no fee cell on the node's key, an RPC error) after the pass has
+    // already seen that the channel is force-closed, and that something in it is the user's: the failure carries
+    // both along.
+    const error: SettleFailure = cause instanceof Error ? cause : new Error(String(cause));
+    if (seen.closingTx) error.closingTx = seen.closingTx;
+    if (seen.claiming) error.unsettled = true;
+    throw error;
+  }
+}
+
+/** Where a channel's funding cell has gone on-chain. */
+type FundingFate =
+  /** Nothing that says the channel is force-closed: the status to report. */
+  | { status: string }
+  /** A commitment transaction spent it: a force close, by either side. */
+  | { commitmentTx: ccc.Transaction };
+
+/** Where a force-closed channel's commitment cell has gone, followed through every settlement since. */
+type CommitmentFate =
+  /** The commitment cell (the commitment's own output, or a settlement's successor) that is live now. */
+  | { live: { cell: ccc.OutPoint; output: ccc.CellOutput; previousWitness?: Uint8Array } }
+  /** Nothing is left under the commitment lock: this transaction spent the last cell and left no successor. */
+  | { settledBy: ccc.Hex }
+  /** It can't be followed to its end right now: the status to report. */
+  | { status: string };
+
+const isCommitmentOutput = (network: "testnet" | "mainnet", output?: ccc.CellOutput) =>
+  output?.lock.codeHash === COMMITMENT_LOCK[network].codeHash && output.lock.hashType === "type";
+
+/** What spent a channel's funding cell, if anything has. */
+async function fundingFate(client: ccc.Client, network: "testnet" | "mainnet", fundingOutPoint: ccc.OutPointLike): Promise<FundingFate> {
+  const funding = ccc.OutPoint.from(fundingOutPoint);
   const fundingTx = (await client.getTransaction(funding.txHash))?.transaction;
   const fundingOutput = fundingTx?.outputs[Number(funding.index)];
-  if (!fundingOutput) return result("funding transaction not found");
-  if (await client.getCellLive(funding, false)) return result("open");
+  if (!fundingOutput) return { status: "funding transaction not found" };
+  if (await client.getCellLive(funding, false)) return { status: "open" };
   const commitmentTx = await spentBy(client, funding, fundingOutput.lock);
-  if (!commitmentTx) return result("funding spent; closing transaction not indexed yet");
-  const codeHash = COMMITMENT_LOCK[options.network].codeHash;
-  const isCommitment = (output?: ccc.CellOutput) => output?.lock.codeHash === codeHash && output.lock.hashType === "type";
-  if (!isCommitment(commitmentTx.outputs[0])) return result("closed cooperatively");
-  if (commitmentTx.outputs[0].type) return result("token channels are not settled by the in-page watchtower");
-  const prefix = ccc.bytesFrom(commitmentTx.outputs[0].lock.args).slice(0, 36);
+  if (!commitmentTx) return { status: "funding spent; closing transaction not indexed yet" };
+  if (!isCommitmentOutput(network, commitmentTx.outputs[0])) return { status: "closed cooperatively" };
+  return { commitmentTx };
+}
 
-  // Follow the commitment cell through any settlements to the one that is live now.
+/** Follows a commitment transaction's cell through any settlements to the one that is live now, or to its end. */
+async function commitmentFate(client: ccc.Client, network: "testnet" | "mainnet", commitmentTx: ccc.Transaction): Promise<CommitmentFate> {
+  const prefix = ccc.bytesFrom(commitmentTx.outputs[0].lock.args).slice(0, 36);
   let cell = ccc.OutPoint.from({ txHash: commitmentTx.hash(), index: 0 });
   let output = commitmentTx.outputs[0];
   let previousWitness: Uint8Array | undefined;
   for (let step = 0; step < 300; step++) {
-    if (await client.getCellLive(cell, false)) break;
+    if (await client.getCellLive(cell, false)) return { live: { cell, output, ...(previousWitness ? { previousWitness } : {}) } };
     const next = await spentBy(client, cell, output.lock);
-    if (!next) return result("commitment cell spent; settlement not indexed yet");
+    if (!next) return { status: "commitment cell spent; settlement not indexed yet" };
     const inputIndex = next.inputs.findIndex((input) => input.previousOutput.eq(cell));
     const witness = ccc.bytesFrom(next.witnesses[inputIndex] ?? "0x");
-    if (witness.length <= 16 || !equal(witness.slice(0, 16), XUDT_COMPATIBLE_WITNESS)) return result("unexpected settlement witness");
+    if (witness.length <= 16 || !equal(witness.slice(0, 16), XUDT_COMPATIBLE_WITNESS)) return { status: "unexpected settlement witness" };
     // The lock requires a settlement that leaves anything behind to put it in output 0 (its successor); any other
     // commitment-locked output isn't this channel's.
     const successor = next.outputs[0];
-    if (!isCommitment(successor) || !equal(ccc.bytesFrom(successor.lock.args).slice(0, 36), prefix)) return result("settled");
+    if (!isCommitmentOutput(network, successor) || !equal(ccc.bytesFrom(successor.lock.args).slice(0, 36), prefix)) return { settledBy: next.hash() };
     previousWitness = witness.slice(16);
     cell = ccc.OutPoint.from({ txHash: next.hash(), index: 0 });
     output = successor;
   }
+  return { status: "too many settlements to follow in one pass" };
+}
+
+/** What the chain alone shows of a channel's close, read without any of the channel's data. */
+export type ForceCloseOnChain = {
+  /** Set when the chain says the channel is not force-closed: its funding cell is live, or was spent by a cooperative close. */
+  notForceClosed?: true;
+  /** The commitment transaction that spent the funding cell, if one did. */
+  closingTx?: ccc.Hex;
+  /** Set once nothing is left under the commitment lock: the transaction that spent its last cell. */
+  settledBy?: ccc.Hex;
+};
+
+/**
+ * Whether a force-closed channel has nothing left to settle, by the chain alone: its commitment cell, followed
+ * through every settlement (each leaves what remains in output 0), is gone. For a channel the watchtower holds no
+ * record of (an earlier SDK removed it, and Fiber hands only Channel V2 channels over again), this is all that
+ * can be known: who the remaining funds belong to can't be told without the record, so nothing short of "nothing
+ * is left" (`settledBy`) says the channel is finished. Anything else (open, closed cooperatively, a transaction
+ * the indexer doesn't show yet, a live commitment cell) leaves `settledBy` unset. `closingTx` alone says the
+ * channel is force-closed, which is enough to stop showing it as ready.
+ */
+export async function forceCloseSettled(client: ccc.Client, network: "testnet" | "mainnet", fundingOutPoint: ccc.OutPointLike): Promise<ForceCloseOnChain> {
+  const funding = await fundingFate(client, network, fundingOutPoint);
+  if (!("commitmentTx" in funding)) return funding.status === "open" || funding.status === "closed cooperatively" ? { notForceClosed: true } : {};
+  const closingTx = funding.commitmentTx.hash();
+  const fate = await commitmentFate(client, network, funding.commitmentTx);
+  return { closingTx, ...("settledBy" in fate ? { settledBy: fate.settledBy } : {}) };
+}
+
+async function settle(options: SettleOptions, seen: { closingTx?: ccc.Hex; claiming?: boolean }): Promise<SettleResult> {
+  const { client, channel } = options;
+  let closingTx: ccc.Hex | undefined;
+  /** `onLiveCell`: the status was read off the live commitment cell, so anything outside FINISHED is unsettled. */
+  const result = (status: string, txHash?: ccc.Hex, evidence?: ccc.Hex, onLiveCell = false): SettleResult => ({
+    channelId: channel.channelId, status,
+    ...(txHash ? { txHash } : {}), ...(closingTx ? { closingTx } : {}), ...(evidence && FINISHED.has(status) ? { evidence } : {}),
+    ...(onLiveCell && (txHash || !FINISHED.has(status)) ? { unsettled: true as const } : {}),
+  });
+  const funding = await fundingFate(client, options.network, options.ref.fundingOutPoint);
+  if (!("commitmentTx" in funding)) return result(funding.status);
+  const { commitmentTx } = funding;
+  // From here the channel is force-closed on-chain, whatever the node itself still says about it.
+  closingTx = seen.closingTx = commitmentTx.hash();
+  // Follow the commitment cell through any settlements to the one that is live now.
+  const fate = await commitmentFate(client, options.network, commitmentTx);
+  // Nothing left under the commitment lock: that is read off the chain alone, whatever the channel carried.
+  if ("settledBy" in fate) return result("settled", undefined, fate.settledBy);
+  // A token channel's close is seen and followed (reads only), but its claim is not built here.
+  if (channel.fundingUdtTypeScript || commitmentTx.outputs[0].type) return result("token channels are not settled by the in-page watchtower");
+  if (!("live" in fate)) return result(fate.status);
+  const { cell, output, previousWitness } = fate.live;
 
   // The first settlement waits for (a share of) the commitment's delay, counted in epochs from its block.
   let delayPassed: ((since: bigint) => boolean) | undefined;
@@ -498,8 +663,10 @@ export async function settleChannel(options: {
   const decision = planClaim({
     channel, cell: { capacity: output.capacity, args: output.lock.args }, previousWitness, preimages, now, delayPassed,
   });
-  if ("skip" in decision) return result(decision.skip);
+  // A status that ends the watch rests on the transaction that created the cell it was read from.
+  if ("skip" in decision) return result(decision.skip, undefined, cell.txHash, true);
   const plan = decision.claim;
+  seen.claiming = true;
 
   const signer = new ccc.SignerCkbPrivateKey(client, options.nodeKey);
   const nodeLock = (await signer.getRecommendedAddressObj()).script;
@@ -525,7 +692,7 @@ export async function settleChannel(options: {
   if (plan.feeSince !== undefined) for (const input of tx.inputs.slice(1)) input.since = plan.feeSince;
   signSettlement(tx, plan.signingKey, Boolean(plan.preimage));
   const signed = await signer.signOnlyTransaction(tx);
-  return result("claimed", await (options.dryRun?.submit(signed) ?? client.sendTransaction(signed)));
+  return result("claimed", await (options.dryRun?.submit(signed) ?? client.sendTransaction(signed)), undefined, true);
 }
 
 /**
