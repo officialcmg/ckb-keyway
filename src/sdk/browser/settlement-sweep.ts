@@ -52,6 +52,14 @@ export function channelFinished({ state }: ChannelState): boolean {
 const isClosed = (state: ChannelState["state"]) => String(state?.state_name).replaceAll("_", "").toLowerCase() === "closed";
 
 /**
+ * True for a channel the node reports closed but still waiting for its on-chain settlement: a force close, by
+ * either side, whose funds may still be under the commitment lock.
+ */
+export function waitingOnChain(channel: ChannelState): boolean {
+  return isClosed(channel.state) && !channelFinished(channel);
+}
+
+/**
  * True while any channel is open, closing, or closed but not yet settled on-chain.
  *
  * Fiber 0.10.1's browser node never drops WAITING_ONCHAIN_SETTLEMENT from a force-closed channel (it waits for a
@@ -73,11 +81,12 @@ export function needsFeeReserve(channels: ChannelState[], finishedOnChain: reado
 }
 
 /**
- * How a sweep splits the key's plain CKB: the reserve stays (when there's enough for it), the rest goes to
- * the user. Undefined when there's nothing to move beyond the reserve.
+ * How a sweep splits the key's plain CKB: the reserve stays, the rest goes to the user. Undefined when there's
+ * nothing to move beyond the reserve. With a reserve to keep and less than it on the key, all of it stays: what is
+ * there is what is left of the reserve, and `reserve` comes back smaller than was asked for.
  */
 export function planSweep(plainTotal: bigint, tokenCells: number, keepReserve: bigint): { toUser: bigint; reserve: bigint } | undefined {
-  let reserve = keepReserve > 0n && plainTotal >= keepReserve ? keepReserve : 0n;
+  let reserve = keepReserve > 0n ? (plainTotal >= keepReserve ? keepReserve : plainTotal) : 0n;
   let toUser = plainTotal - reserve;
   // Too little for a cell of its own: it stays with the reserve.
   if (reserve > 0n && toUser < MIN_PLAIN_CELL + SWEEP_FEE_MARGIN) { reserve += toUser; toUser = 0n; }
@@ -95,6 +104,12 @@ const SWEEP_FEE_MARGIN = 1_000_000n;
  * every channel is settled to return it too. Cells with a type script it can't move safely are left where
  * they are, and so are token cells the plain CKB can't bring up to the destination lock's minimum. Returns the
  * transaction hash, or undefined when there is nothing to sweep.
+ *
+ * While a reserve is to be kept, only the plain CKB beyond it is spent on anything: token top-ups, the fee, the
+ * user's output. A token cell that can't be topped up from that waits on the key, a sweep whose fee nothing but
+ * the reserve could pay isn't sent, and plain CKB that adds up to less than the reserve isn't touched. So the
+ * output kept on the key is never smaller than `keepReserve`, whatever else sits on the key (anyone can send a
+ * cell there).
  *
  * `returnableReserve`: a reserve smaller than the destination's smallest cell (62 CKB against the 95 CKB of a
  * recovery account's Omnilock) could never be returned on its own. With this set, a sweep that keeps the reserve
@@ -117,19 +132,26 @@ export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.Hex
   if (cells.length === 0) return undefined;
 
   // Token cells move as they are, each at least at what it occupies under the destination's lock (an Omnilock
-  // needs 176 CKB for a standard xUDT cell where secp256k1 needs 142); the difference comes out of the plain CKB.
-  // Token cells the plain CKB can't top up stay on the key for a later sweep. Plain CKB is pooled: the reserve
-  // stays on the key, the rest goes to the user.
-  const plainCells = cells.filter((cell) => !cell.cellOutput.type);
-  const plainTotal = plainCells.reduce((total, cell) => total + cell.cellOutput.capacity, 0n);
+  // needs 176 CKB for a standard xUDT cell where secp256k1 needs 142); the difference comes out of the plain CKB
+  // that isn't the reserve. Token cells that can't be topped up from that stay on the key for a later sweep. Plain
+  // CKB is pooled: the reserve stays on the key, the rest goes to the user.
+  const keeping = keepReserve > 0n;
+  const allPlain = cells.filter((cell) => !cell.cellOutput.type);
+  const allPlainTotal = allPlain.reduce((total, cell) => total + cell.cellOutput.capacity, 0n);
+  // Less than the reserve on the key: it is what is left of the reserve, and no part of it moves or pays for anything.
+  const short = keeping && allPlainTotal < keepReserve;
+  const plainCells = short ? [] : allPlain;
+  const plainTotal = short ? 0n : allPlainTotal;
+  const spendable = keeping ? plainTotal - (short ? 0n : keepReserve) : plainTotal;
   const sized = cells.filter((cell) => cell.cellOutput.type).map((cell) => {
     const output = ccc.CellOutput.from({ lock: to, type: cell.cellOutput.type, capacity: 0n });
-    output.capacity = ccc.numMax(cell.cellOutput.capacity, ccc.fixedPointFrom(output.occupiedSize + ccc.bytesFrom(cell.outputData).length));
-    return { cell, output, extra: output.capacity - cell.cellOutput.capacity };
+    const minimum = ccc.fixedPointFrom(output.occupiedSize + ccc.bytesFrom(cell.outputData).length);
+    output.capacity = ccc.numMax(cell.cellOutput.capacity, minimum);
+    return { cell, output, minimum, extra: output.capacity - cell.cellOutput.capacity };
   }).sort((a, b) => a.extra < b.extra ? -1 : a.extra > b.extra ? 1 : 0);
   let extra = 0n;
   const tokens = sized.filter(({ extra: needed }) => {
-    if (extra + needed > plainTotal) return false;
+    if (extra + needed > spendable) return false;
     extra += needed;
     return true;
   });
@@ -137,7 +159,7 @@ export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.Hex
   // rides in the first token cell, or waits for a later sweep.
   const minimumPlain = ccc.fixedPointFrom(ccc.CellOutput.from({ lock: to, capacity: 0n }).occupiedSize);
   const returnable = minimumPlain + SWEEP_FEE_MARGIN;
-  const keep = options.returnableReserve && keepReserve > 0n && keepReserve < returnable && plainTotal - extra >= returnable ? returnable : keepReserve;
+  const keep = options.returnableReserve && keeping && !short && keepReserve < returnable && plainTotal - extra >= returnable ? returnable : (short ? 0n : keepReserve);
   const plan = planSweep(plainTotal - extra, tokens.length, keep);
   if (!plan) return undefined;
   let { toUser, reserve } = plan;
@@ -159,11 +181,21 @@ export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.Hex
   await tx.addCellDepsOfKnownScripts(client, ccc.KnownScript.Secp256k1Blake160);
   await addTokenCellDeps(client, tx, tokens.map(({ cell }) => cell));
 
-  // The fee comes out of the user's CKB, else the reserve, else a token cell's spare capacity.
-  const indexed = tx.outputs.map((output, index) => ({ output, index }));
-  const plain = indexed.filter(({ output }) => !output.type);
-  const payer = plain[0] ?? indexed.reduce((best, item) => item.output.capacity > best.output.capacity ? item : best);
-  await tx.completeFeeChangeToOutput(signer, payer.index);
+  // The fee comes out of the user's CKB; else out of what the kept output holds beyond the reserve; else out of a
+  // token cell's capacity beyond what it occupies. Never out of the reserve, and never out of capacity a cell needs
+  // to exist: with no such payer the sweep waits.
+  const userIndex = toUser > 0n ? tokens.length : undefined;
+  const reserveIndex = reserve > 0n ? tokens.length + (toUser > 0n ? 1 : 0) : undefined;
+  const floor = (index: number) => index === reserveIndex ? keep : index === userIndex ? minimumPlain : tokens[index].minimum;
+  const spare = (index: number) => tx.outputs[index].capacity - floor(index);
+  const payer = [userIndex, reserveIndex, ...tokens.map((_token, index) => index).sort((a, b) => spare(a) > spare(b) ? -1 : spare(a) < spare(b) ? 1 : 0)]
+    .find((index): index is number => index !== undefined && spare(index) >= SWEEP_FEE_MARGIN);
+  if (payer === undefined) return undefined;
+  // Every cell that may be spent is already an input: the fee must not draw in another of the key's cells.
+  await tx.completeFeeChangeToOutput(signer, payer, undefined, undefined, { shouldAddInputs: false });
+  // Whatever the fee rate turned out to be: the payer still holds what it must, and the reserve is whole.
+  if (tx.outputs[payer].capacity < floor(payer)) return undefined;
+  if (reserveIndex !== undefined && tx.outputs[reserveIndex].capacity < keep) return undefined;
   return signer.sendTransaction(tx);
 }
 

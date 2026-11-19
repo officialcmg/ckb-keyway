@@ -7,12 +7,30 @@ import { FEE_RESERVE, MIN_PLAIN_CELL } from "./settlement-sweep";
 
 export { FEE_RESERVE, needsFeeReserve } from "./settlement-sweep";
 
-/** Whether the node's key already holds a plain cell the watchtower can use for fees. */
+/**
+ * Whether the node's key already holds a plain cell the watchtower can use for fees.
+ *
+ * The indexer that lists the key's cells can lag the chain, and still list a reserve cell that a sweep has
+ * returned to the user; a channel opened on its word would get no reserve. So a listed cell counts only if the node
+ * itself says it is live, with the node's transaction pool taken into account: a cell that a transaction still on
+ * its way spends (a sweep sent before a reload, of which this page remembers nothing) doesn't count either. A cell
+ * the node doesn't have yet counts only while the transaction that creates it is on its way in (the change of this
+ * page's own claim or sweep, which the client lists from its cache). Cells this page's own unconfirmed sends have
+ * spent are never listed (ccc leaves them out). When the node can't be asked, the cell isn't counted: at worst a
+ * second reserve is sent, which comes back with the first.
+ */
 export async function hasFeeReserve(client: ccc.Client, lock: ccc.ScriptLike): Promise<boolean> {
   for await (const cell of client.findCellsByLock(lock, undefined, true)) {
-    if (!cell.cellOutput.type && cell.outputData === "0x" && cell.cellOutput.capacity >= MIN_PLAIN_CELL) return true;
+    if (cell.cellOutput.type || cell.outputData !== "0x" || cell.cellOutput.capacity < MIN_PLAIN_CELL) continue;
+    if (await reserveCellStands(client, cell.outPoint).catch(() => false)) return true;
   }
   return false;
+}
+
+async function reserveCellStands(client: ccc.Client, outPoint: ccc.OutPoint): Promise<boolean> {
+  if (await client.getCellLiveNoCache(outPoint, false, true)) return true;
+  const created = await client.getTransactionNoCache(outPoint.txHash);
+  return created?.status === "pending" || created?.status === "proposed";
 }
 
 /**
