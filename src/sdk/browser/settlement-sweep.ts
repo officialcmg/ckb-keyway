@@ -167,8 +167,15 @@ export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.Hex
   for (let count = affordable.length; count >= 0; count--) {
     const tokens = affordable.slice(0, count).map(({ cell, output, minimum, extra }) => ({ cell, minimum, extra, output: output.clone() }));
     const extra = tokens.reduce((total, token) => total + token.extra, 0n);
-    const keep = options.returnableReserve && keeping && !short && keepReserve < returnable && plainTotal - extra >= returnable ? returnable : (short ? 0n : keepReserve);
-    const plan = planSweep(plainTotal - extra, tokens.length, keep);
+    const rest = plainTotal - extra;
+    // The reserve is kept at a returnable size only when that doesn't hold back a payout: if what would go to the
+    // user beyond it is too little for a cell at the destination, while beyond the plain reserve it is enough, the
+    // user is paid and the reserve stays as it is.
+    const wantsReturnable = options.returnableReserve && keeping && !short && keepReserve < returnable && rest >= returnable;
+    const beyondReturnable = rest - returnable;
+    const holdsBack = wantsReturnable && beyondReturnable < minimumPlain + SWEEP_FEE_MARGIN && rest - keepReserve >= minimumPlain + SWEEP_FEE_MARGIN;
+    const keep = wantsReturnable && !holdsBack ? returnable : (short ? 0n : keepReserve);
+    const plan = planSweep(rest, tokens.length, keep);
     if (!plan) continue;
     let { toUser, reserve } = plan;
     if (toUser > 0n && toUser < minimumPlain + SWEEP_FEE_MARGIN) {
@@ -177,6 +184,8 @@ export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.Hex
       else continue;
       toUser = 0n;
     }
+    // Nothing leaves the key: no transaction that only turns the key's cells into one of its own, at a fee.
+    if (toUser === 0n && tokens.length === 0) continue;
     const plainOutputs = [
       ...(toUser > 0n ? [{ lock: to, capacity: toUser }] : []),
       ...(reserve > 0n ? [{ lock: from, capacity: reserve }] : []),

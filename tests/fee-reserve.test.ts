@@ -316,6 +316,24 @@ test("a reserve cell counts for a channel open only if the node says it is live"
   assert.equal(await hasFeeReserve(down.client, down.lock), false);
 });
 
+test("for a recovery account, keeping the reserve at a returnable size never holds a payout back, and a sweep that would move nothing isn't sent", async () => {
+  // A claim of 108 CKB paid out next to the 62 CKB reserve. Keeping 95 CKB would leave 75 CKB, too little for a
+  // cell at the account's address: the user is paid from beyond the plain reserve instead.
+  const claimed = await nodeKeyHolding([FEE_RESERVE + 108n * CKB]);
+  await sweepSettlement(claimed.client, settlementKey, omnilock, FEE_RESERVE, { returnableReserve: true });
+  assert.equal(claimed.sent.length, 1);
+  assert.equal(claimed.sent[0].outputs.find((output) => output.lock.eq(claimed.from))!.capacity, FEE_RESERVE);
+  const paid = claimed.sent[0].outputs.find((output) => output.lock.eq(omnilock))!;
+  assert.ok(paid.capacity > 107n * CKB && paid.capacity < 108n * CKB, `${paid.capacity} to the user`);
+  // 78 CKB next to the reserve can't be a cell at the account's address either way: nothing can leave the key,
+  // and no transaction is sent that would only rewrite the key's own cells at a fee.
+  for (const options of [{ returnableReserve: true }, undefined]) {
+    const small = await nodeKeyHolding([FEE_RESERVE + 78n * CKB]);
+    assert.equal(await sweepSettlement(small.client, settlementKey, omnilock, FEE_RESERVE, options), undefined);
+    assert.equal(small.sent.length, 0);
+  }
+});
+
 test("a reserve just sent counts for the next channel open until the chain lists it, unless a sweep has already taken it", async () => {
   // The account's client sent the reserve; the node key's client (the viewer) asks its own indexer, which lags.
   const { sentReserveStands } = await import("../src/sdk/browser/fee-reserve.ts");

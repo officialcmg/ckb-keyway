@@ -32,8 +32,8 @@ export type ChannelClosure = {
   closingTx: string;
   /**
    * Set once nothing is left for the user to claim: the watchtower's status (one of FINISHED) and the transaction
-   * it rests on, which was FINAL_DEPTH blocks deep when this was written (and is asked about again, once a
-   * session, before the fee reserve is released on it: `createReserveGate`).
+   * it rests on, which was FINAL_DEPTH blocks deep when this was written (and is asked about again every time the
+   * fee reserve is about to be released on it, and every ten minutes otherwise: `createReserveGate`).
    */
   finished?: { status: string; evidence: string };
   /**
@@ -203,8 +203,8 @@ export type WatchRecords = {
 /**
  * Ends the watch of a channel finished for good: the watchtower's record is removed from its store, after a copy
  * has been put with the verdict. The copy is what lets the watchtower act again if the verdict is ever taken back
- * (`revokeVerdict`); a copy already kept (the node handed the channel over again at a later start, with less than
- * the watchtower had gathered) is left as it is.
+ * (`revokeVerdict`); a copy already kept is not replaced by what the store holds now (the node handed the channel
+ * over again at a later start, possibly with less than the watchtower had gathered).
  */
 export async function endWatch(options: { closure: ChannelClosure; closures: ClosureStore; watchtower: WatchRecords }): Promise<void> {
   const { closure, closures, watchtower } = options;
@@ -239,7 +239,8 @@ export async function revokeVerdict(options: { closure: ChannelClosure; closures
 /**
  * Gives the watchtower back the record of every channel that is force-closed, not finished, and whose record is
  * kept here: after a verdict was taken back, the watch has to start again. Run at the start of every pass too, so
- * a restore that failed is tried again. A record the watchtower already holds is left alone (`restore`).
+ * a restore that failed is tried again. Nothing in a record the watchtower already holds is replaced; the kept copy
+ * only fills in what that record lacks (watchtower-store.ts `restore`).
  */
 export async function restoreWatch(options: { closures: readonly ChannelClosure[]; watchtower: Pick<WatchRecords, "restore"> }): Promise<void> {
   for (const closure of options.closures) {
@@ -283,7 +284,18 @@ export async function recordChainVerdict(options: {
   const closingTx = channelKey(seen.closingTx);
   const known = (await closures.list()).find((closure) => closure.channelId === channelId);
   if (closingTx === undefined) {
-    if (known && seen.notForceClosed) await closures.remove(channelId);
+    // The funding cell is live again, or a cooperative close spent it: nothing says the channel is force-closed.
+    // A closure that carries the kept copy of the watchtower's record is never dropped on this answer (it may be
+    // a stale one, and the copy is the only place the channel's keys still are): it loses its verdict, which
+    // sends the record back to the watchtower at the next pass, and the pass over that record decides from there.
+    if (known && seen.notForceClosed) {
+      if (known.record) {
+        if (known.finished) {
+          const { finished: _dropped, ...rest } = known;
+          await closures.put(rest);
+        }
+      } else await closures.remove(channelId);
+    }
     return false;
   }
   const same = known !== undefined && known.fundingOutPoint === fundingOutPoint && known.closingTx === closingTx;
@@ -305,6 +317,24 @@ export async function recordChainVerdict(options: {
 /** How long an answer that a verdict's transaction is buried is reused before the chain is asked again. */
 const RECHECK_AFTER = 10 * 60_000;
 
+/**
+ * Whether the fee reserve may still be needed (`needed`), and whether a finished closure still stands (`holds`).
+ *
+ * The reserve is released only when every channel is finished: by the node's own account, or because the node
+ * reports it closed and a verdict for the same channel, funding cell and closing transaction says nothing is left
+ * to claim. Before the reserve goes on the strength of a verdict, the transaction the verdict rests on is asked
+ * about once more: if it is no longer buried (a deep reorganization, or a wrong answer when the verdict was
+ * written), the verdict doesn't count. `needed({ fresh: true })`, which the sweep uses when it decides whether to
+ * move the reserve, asks the chain every time; otherwise an answer had in the last ten minutes, and since the last
+ * `reset` (each start), is used, which is enough to notice that the reserve may be due and to drop a channel Fiber
+ * hands over again. A
+ * channel being opened keeps the reserve too: the node lists it only once the peer has answered. If anything can't
+ * be read, the reserve stays.
+ *
+ * A verdict found wanting is not just passed over: `revoke` takes it out of storage (`revokeVerdict`), so the
+ * channel reads as closing again, here and after a reload, and the watchtower looks at it again. Only the chain's
+ * own answer does that; an RPC that can't be reached keeps the reserve and leaves the verdict for the next ask.
+ */
 export function createReserveGate(deps: {
   /** Every channel the node knows, closed ones included. */
   listChannels(): Promise<Array<Parameters<typeof needsFeeReserve>[0][number]>>;

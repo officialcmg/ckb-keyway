@@ -473,6 +473,8 @@ function fakeChain(options: {
     channel, settle, sent, liveCell, ready, funding, commitmentTx, penaltyTx, client, watched,
     setTip: (epoch: ccc.EpochLike) => { tip = epoch; },
     reopen: () => live.add(key({ txHash: funding.hash(), index: 0 })),
+    /** The funding cell reads as spent again (the "live" answer was a stale one). */
+    respend: () => live.delete(key({ txHash: funding.hash(), index: 0 })),
     /** A transaction the node sent is mined, at the tip. */
     mine: (tx: ccc.Transaction) => add(tx, tip),
     /** `count` more blocks are mined on top. */
@@ -793,13 +795,14 @@ function walletOver(chain: ReturnType<typeof fakeChain>, prefix?: string, option
   let gate: Awaited<ReturnType<typeof makeGate>> | undefined;
   let node: ReturnType<typeof chain.listed>[] = [];
   let closuresFail = false;
+  let buriedFail = false;
   async function makeGate() {
     const { createReserveGate, openClosureStore } = await closureModule();
     const { isBuried } = await import("../src/sdk/browser/watchtower-settle.ts");
     return createReserveGate({
       listChannels: async () => node,
       listClosures: async () => { if (closuresFail) throw new Error("IndexedDB is unavailable"); return openClosureStore(at).list(); },
-      isBuried: (txHash) => isBuried(chain.client, txHash),
+      isBuried: async (txHash) => { if (buriedFail) throw new Error("the RPC timed out"); return isBuried(chain.client, txHash); },
       opening: () => opening,
       // As create-keyway.ts wires it: a verdict the chain no longer bears out is taken out of storage.
       revoke: async (closure) => (await closureModule()).revokeVerdict({ closure, closures: openClosureStore(at), watchtower: store }),
@@ -809,6 +812,8 @@ function walletOver(chain: ReturnType<typeof fakeChain>, prefix?: string, option
     prefix: at, removed,
     setOpening: (value: boolean) => { opening = value; },
     failClosures: (value: boolean) => { closuresFail = value; },
+    /** Requests for a transaction's depth fail (a timeout), in the gate and in the pass. */
+    failBuried: (value: boolean) => { buriedFail = value; },
     /** Whether the watchtower still holds the channel's record. */
     async watching() {
       await seeded;
@@ -846,7 +851,7 @@ function walletOver(chain: ReturnType<typeof fakeChain>, prefix?: string, option
           }
         },
         follow: (outPoint) => forceCloseSettled(chain.client, "testnet", ccc.OutPoint.decode(outPoint)),
-        isBuried: (txHash: string) => isBuried(chain.client, txHash),
+        isBuried: async (txHash: string) => { if (buriedFail) throw new Error("the RPC timed out"); return isBuried(chain.client, txHash); },
       });
       const status = looked?.status ?? (failure ? `failed: ${failure.message}` : had ? "finished for good: not looked at again" : "no record: not looked at");
       return { ...(looked ?? { channelId: chain.watched.channelId }), status, finishedNow: finished };
@@ -1570,4 +1575,54 @@ test("without a record, nothing weaker than an empty commitment lock finishes a 
   assert.deepEqual(await forceCloseSettled(open.client, "testnet", { txHash: open.funding.hash(), index: 0 }), { notForceClosed: true });
   assert.deepEqual(await forceCloseSettled(punished.client, "testnet", { txHash: punished.funding.hash(), index: 0 }), { closingTx: punished.commitmentTx.hash(), settledBy: punished.penaltyTx!.hash() });
   assert.deepEqual(await forceCloseSettled(claimed.client, "testnet", { txHash: claimed.funding.hash(), index: 0 }), { closingTx: claimed.commitmentTx.hash() });
+});
+
+test("the kept copy of a record is never dropped on what the chain alone says: a failed depth request and a stale \"funding live\" answer in one pass leave it where it is", async () => {
+  // An old-format channel, claimed, buried and agreed: the record is out of the watchtower's store, its copy kept
+  // with the verdict. Fiber does not hand this channel over again.
+  const chain = fakeChain({ byPeer: true });
+  const wallet = walletOver(chain);
+  chain.setTip([101, 0, 1000]);
+  await wallet.pass("CLOSED", WAITING);
+  chain.mine(chain.sent[0]);
+  chain.bury(FINAL_DEPTH);
+  assert.equal((await wallet.pass("CLOSED", WAITING)).finishedNow, true);
+  assert.equal(await wallet.watching(), false);
+  assert.deepEqual((await wallet.stored())[0].record, chain.watched);
+  // A later start. The depth request times out, and the node answers that the funding cell is live.
+  const later = walletOver(chain, wallet.prefix);
+  later.failBuried(true);
+  chain.reopen();
+  await later.pass("CLOSED", WAITING);
+  const [after] = await later.stored();
+  assert.ok(after, "the closure is still there");
+  assert.deepEqual(after.record, chain.watched, "and with it the only copy of the channel's keys");
+  assert.equal(await later.reserveHeld("CLOSED", WAITING), true);
+  // The answer was a stale one. The record goes back to the watchtower, which reads the chain with it and comes
+  // to the same verdict as before.
+  later.failBuried(false);
+  chain.respend();
+  const again = await later.pass("CLOSED", WAITING);
+  assert.equal(again.status, "the user's share is already claimed");
+  assert.equal(again.finishedNow, true);
+  assert.equal(await later.reserveHeld("CLOSED", WAITING), false);
+  assert.deepEqual((await later.stored())[0].record, chain.watched);
+});
+
+test("a closure rewritten by a later pass keeps the copy of the record it carries", async () => {
+  const { openClosureStore, recordSettleResult } = await closureModule();
+  const closures = openClosureStore(`/wasm-test-${crypto.randomUUID()}`);
+  const kept = fakeChain().watched;
+  const channelId = kept.channelId;
+  const fundingOutPoint = "0x" + "0b".repeat(32) + "00000000";
+  const closingTx: `0x${string}` = `0x${"0d".repeat(32)}`;
+  await closures.put({ channelId, fundingOutPoint, closingTx, seenAt: 1, finished: { status: "settled", evidence: "0x" + "c1".repeat(32) }, record: kept });
+  const watchtower = { get: async () => kept, restore: async () => undefined, remove: async () => assert.fail("nothing ends the watch here") };
+  // A pass reads a live commitment cell with something still to settle: the verdict goes, the copy stays.
+  await recordSettleResult({ result: { channelId, status: "waiting for the commitment delay", closingTx, unsettled: true }, fundingOutPoint, closures, watchtower, isBuried: async () => false });
+  assert.deepEqual(await closures.list(), [{ channelId, fundingOutPoint, closingTx, seenAt: 1, record: kept }]);
+  // Another commitment closes the channel (a reorganization replaced the first): a new closure, the same copy.
+  const other: `0x${string}` = `0x${"0e".repeat(32)}`;
+  await recordSettleResult({ result: { channelId, status: "waiting for the commitment delay", closingTx: other, unsettled: true }, fundingOutPoint, closures, watchtower, isBuried: async () => false, now: 2 });
+  assert.deepEqual(await closures.list(), [{ channelId, fundingOutPoint, closingTx: other, seenAt: 2, record: kept }]);
 });
