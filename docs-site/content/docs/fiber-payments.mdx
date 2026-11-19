@@ -95,7 +95,7 @@ Each channel has:
 
 `fiber.channels` refreshes every ten seconds while the node runs; call `refreshChannels()` to read it now. Reserves, in-flight payments and route liquidity can limit what is payable at a given moment.
 
-With a browser node, the SDK also reads the chain itself. When a channel's funding cell has been spent by a force close (for example the peer closed it while the wallet was shut), the channel is `closing` with `canSend` and `canReceive` at zero, and stays in `fiber.channels` that way until nothing is left to claim on-chain, whatever Fiber's own `raw.state` says meanwhile (`CHANNEL_READY` for up to ten minutes after the wallet is reopened, then `CLOSED`). After that it is `closed` and, like every closed channel, no longer in `fiber.channels`.
+With a browser node, the SDK also reads the chain itself. When a channel's funding cell has been spent by a force close (for example the peer closed it while the wallet was shut), the channel is `closing` with `canSend` and `canReceive` at zero, and stays in `fiber.channels` that way until nothing is left to claim on-chain, whatever Fiber's own `raw.state` says meanwhile (`CHANNEL_READY` for up to ten minutes after the wallet is reopened, then `CLOSED`). After that it is `closed` and, like every closed channel, no longer in `fiber.channels`. A channel Fiber itself reports as closed by force and still waiting for its settlement (`CLOSED` with `WAITING_ONCHAIN_SETTLEMENT`) reads the same way, `closing` with nothing to send, until the SDK has found on-chain that nothing is left to claim.
 
 ## Create an invoice
 

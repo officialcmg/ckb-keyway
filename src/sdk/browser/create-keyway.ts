@@ -36,8 +36,8 @@ import { sweepSettlement } from "./settlement-sweep";
 import { fiberWasmFactory } from "./fiber-wasm";
 import { listenForWatchtowerCalls } from "./watchtower-bridge";
 import { openWatchtowerStore } from "./watchtower-store";
-import { isBuried, settleChannel, trackNodeKeySends } from "./watchtower-settle";
-import { createReserveGate, openClosureStore, presentChannels, type ChannelClosure } from "./channel-closures";
+import { forceCloseSettled, isBuried, settleChannel, trackNodeKeySends } from "./watchtower-settle";
+import { createReserveGate, openClosureStore, presentChannels, revokeVerdict, type ChannelClosure } from "./channel-closures";
 import { watchChannels } from "./watchtower-pass";
 import { createRemoteWatchtower, remoteWatchUpdate, updatesForStoredChannel } from "./watchtower-remote";
 import { createNodeLifecycle } from "./node-lifecycle";
@@ -338,6 +338,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     listClosures: () => closures.list(),
     isBuried: (txHash) => isBuried(nodeKeyClient, txHash),
     opening: () => openings.current() !== undefined,
+    // A verdict the chain no longer bears out is taken out of storage, and its channel is watched again.
+    revoke: (closure) => revokeVerdict({ closure, closures, watchtower }),
   });
   function startSweeping() {
     // A stop() that ran while start() was finishing leaves the node stopped: don't start the timers then.
@@ -412,6 +414,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
               preimage: (paymentHash) => watchtower.preimage(paymentHash),
             });
           },
+          follow: (outpoint) => forceCloseSettled(nodeKeyClient, network, ccc.OutPoint.decode(outpoint)),
           isBuried: (txHash) => isBuried(nodeKeyClient, txHash),
           onClaim: (txHash) => {
             nodeKeySends.record(txHash);

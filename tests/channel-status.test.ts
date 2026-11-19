@@ -64,10 +64,32 @@ test("once the node reports the force close, the channel stays closing with noth
   // A channel the node itself calls settled is closed whatever the closure says.
   const settled = normalizeChannel(funded("CLOSED", "UNCOOPERATIVE_REMOTE"));
   assert.deepEqual(presentChannels([settled], seen, true).map(({ status }) => status), ["closed"]);
-  // Channels without a closure are listed as the node has them: open ones always, closed ones when asked for.
+  // Channels without a closure that the node has no on-chain settlement to wait for are listed as the node has
+  // them: open ones always, closed ones when asked for.
   const ready = normalizeChannel({ ...funded("CHANNEL_READY"), channel_id: `0x${"ab".repeat(32)}` } as never);
-  assert.deepEqual(presentChannels([ready, waiting], [], false), [ready]);
-  assert.deepEqual(presentChannels([ready, waiting], [], true), [ready, waiting]);
+  const cooperative = normalizeChannel({ ...funded("CLOSED", "COOPERATIVE"), channel_id: `0x${"ac".repeat(32)}` } as never);
+  assert.deepEqual(presentChannels([ready, cooperative], [], false), [ready]);
+  assert.deepEqual(presentChannels([ready, cooperative], [], true), [ready, cooperative]);
+});
+
+test("a channel the node reports closed by force and waiting is closing, listed, with nothing to send, when nothing is recorded about it", async () => {
+  // The first start after an upgrade, a first pass that failed, closures that can't be read: no closure record.
+  // Fiber's browser node keeps this state for good, with the balance the channel had, whether or not the user's
+  // share has been claimed. It says a force close happened, not that anything is finished.
+  const { presentChannels } = await import("../src/sdk/browser/channel-closures.ts");
+  for (const flags of ["UNCOOPERATIVE_REMOTE|WAITING_ONCHAIN_SETTLEMENT", "UNCOOPERATIVE_LOCAL | WAITING_ONCHAIN_SETTLEMENT"]) {
+    const waiting = normalizeChannel(funded("CLOSED", flags));
+    assert.deepEqual(presentChannels([waiting], [], false).map(({ status, canSend, canReceive }) => [status, canSend, canReceive]), [["closing", 0n, 0n]], flags);
+    assert.equal(presentChannels([waiting], [], false)[0].raw, waiting.raw, "Fiber's own channel object is untouched");
+    // A closure for another channel changes nothing about this one.
+    assert.equal(presentChannels([waiting], [{ ...finished[0], channelId: `0x${"ab".repeat(32)}` }], false)[0].status, "closing");
+  }
+  // Only a standing verdict for this channel, on this funding cell, makes it closed.
+  const waiting = normalizeChannel(funded("CLOSED", "UNCOOPERATIVE_REMOTE|WAITING_ONCHAIN_SETTLEMENT"));
+  assert.deepEqual(presentChannels([waiting], finished, false), []);
+  assert.deepEqual(presentChannels([waiting], finished, true).map(({ status }) => status), ["closed"]);
+  // A channel the node itself calls settled stays closed.
+  assert.deepEqual(presentChannels([normalizeChannel(funded("CLOSED", "UNCOOPERATIVE_REMOTE"))], [], false), []);
 });
 
 test("a closure applies only to its own channel and funding cell", async () => {

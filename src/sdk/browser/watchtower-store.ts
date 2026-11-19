@@ -38,6 +38,11 @@ export type WatchtowerStore = {
   list(): Promise<WatchedChannel[]>;
   get(channelId: string): Promise<WatchedChannel | undefined>;
   remove(channelId: string): Promise<void>;
+  /**
+   * Puts back a record that was removed when its channel was found finished (channel-closures.ts keeps a copy),
+   * unless the node has handed the channel over again meanwhile: a record already there is left as it is.
+   */
+  restore(channel: WatchedChannel): Promise<void>;
   /** The preimage the node handed over for a payment hash (`create_preimage`), if it still has one. */
   preimage(paymentHash: string): Promise<string | undefined>;
   close(): void;
@@ -166,6 +171,13 @@ export function openWatchtowerStore(databasePrefix: string): WatchtowerStore {
       const tx = (await db()).transaction(STORE, "readwrite");
       tx.objectStore(STORE).delete(channelId.toLowerCase());
       await new Promise<void>((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); });
+    },
+    async restore(channel) {
+      const tx = (await db()).transaction(STORE, "readwrite");
+      // `add`, not `put`: it fails for a key that is already there, and that failure is the answer wanted.
+      const adding = tx.objectStore(STORE).add({ ...channel, channelId: channel.channelId.toLowerCase() });
+      adding.onerror = (event) => { event.preventDefault(); event.stopPropagation(); };
+      await new Promise<void>((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error); });
     },
     async preimage(paymentHash) {
       const tx = (await db()).transaction(PREIMAGES, "readonly");

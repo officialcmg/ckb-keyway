@@ -1,29 +1,41 @@
-import { closureOf, recordSettleResult, type ChannelClosure, type ClosureStore } from "./channel-closures";
-import { closedBy } from "./settlement-sweep";
-import type { SettleFailure, SettleResult } from "./watchtower-settle";
+import {
+  closureOf, endWatch, recordChainVerdict, recordSettleResult, restoreWatch,
+  type ChannelClosure, type ClosureStore, type WatchRecords,
+} from "./channel-closures";
+import { channelKey, closedBy, waitingOnChain } from "./settlement-sweep";
+import type { ForceCloseOnChain, SettleFailure, SettleResult } from "./watchtower-settle";
 import type { WatchedChannel } from "./watchtower-store";
 
 /** A channel as the node lists it, as far as a pass reads it. */
 type NodeChannel = { channel_id?: unknown; channel_outpoint?: unknown; shutdown_transaction_hash?: unknown; state: { state_name: string; state_flags?: unknown } };
 
 /**
- * One pass of the in-page watchtower over every channel it holds a record of: what create-keyway.ts runs each
- * minute, kept apart from the node so it can be run against a chain alone.
+ * One pass of the in-page watchtower over every channel: what create-keyway.ts runs each minute, kept apart from
+ * the node so it can be run against a chain alone.
  *
- * A channel whose verdict stands and which the node reports closed by the same transaction is dropped again (Fiber
- * hands a force-closed Channel V2 channel over at every start); every other one is looked at on-chain (`settle`), a
- * claim is sent if one is due, and what was seen is recorded (`recordSettleResult`).
+ * - Channels the watchtower holds a record of: one whose verdict stands and which the node reports closed by the
+ *   same transaction is dropped again (Fiber hands a force-closed Channel V2 channel over at every start); every
+ *   other one is looked at on-chain (`settle`), a claim is sent if one is due, and what was seen is recorded
+ *   (`recordSettleResult`).
+ * - Before that, records that were removed on a verdict since taken back are put back (`restoreWatch`).
+ * - After it, channels the node reports closed by force and waiting, of which there is no record at all (an earlier
+ *   SDK removed it), are followed on-chain without one (`recordChainVerdict`).
  *
  * Returns whether this pass finished a channel, which is when the fee reserve may have become returnable.
  */
 export async function watchChannels(deps: {
-  watchtower: { list(): Promise<WatchedChannel[]>; remove(channelId: string): Promise<void> };
+  watchtower: WatchRecords & { list(): Promise<WatchedChannel[]> };
   closures: ClosureStore;
   /** Every channel the node knows, closed ones included. */
   channels: NodeChannel[];
-  gate: { settledForGood(closure: ChannelClosure | undefined, channel: NodeChannel): Promise<boolean> };
+  gate: {
+    settledForGood(closure: ChannelClosure | undefined, channel: NodeChannel): Promise<boolean>;
+    holds(closure: ChannelClosure): Promise<boolean>;
+  };
   /** One look at a watched channel on-chain, sending the claim that is due (watchtower-settle.ts `settleChannel`). */
   settle(channel: WatchedChannel, fundingOutPoint: string): Promise<SettleResult>;
+  /** What the chain alone shows of a channel's close (watchtower-settle.ts `forceCloseSettled`). */
+  follow(fundingOutPoint: string): Promise<ForceCloseOnChain>;
   isBuried(txHash: string): Promise<boolean>;
   /** True once the node is stopping: the pass ends at the next channel. */
   stopped?(): boolean;
@@ -42,14 +54,17 @@ export async function watchChannels(deps: {
   };
   let finished = false;
 
-  const watched = await watchtower.list();
+  const seen: ChannelClosure[] = await closures.list().catch(() => []);
+  // A verdict that was taken back after the watchtower's record had been removed: the watch starts again.
+  await restoreWatch({ closures: seen, watchtower }).catch((error) => console.warn("[keyway] watchtower: could not put back a channel whose verdict was taken back; the next pass tries again", error));
   if (stopped()) return { finished };
-  const seen: ChannelClosure[] = watched.length > 0 ? await closures.list().catch(() => []) : [];
+  const watched = await watchtower.list();
+  const recorded = new Set(watched.map((channel) => channel.channelId));
 
   /** Records what was seen of a channel on-chain (channel-closures.ts); true when that finished the channel. */
-  const note = async (channelId: string, result: SettleResult, fundingOutPoint: string, raw: NodeChannel | undefined): Promise<boolean> => {
+  const note = async (channelId: string, result: SettleResult, fundingOutPoint: string, raw: NodeChannel): Promise<boolean> => {
     try {
-      const done = await recordSettleResult({ result, fundingOutPoint, closures, watchtower, nodeClosedBy: raw ? closedBy(raw) : undefined, isBuried: deps.isBuried });
+      const done = await recordSettleResult({ result, fundingOutPoint, closures, watchtower, nodeClosedBy: closedBy(raw), isBuried: deps.isBuried });
       if (done) console.info(`[keyway] watchtower: channel ${channelId} is finished on-chain (${result.status}); nothing is left to claim`);
       return done;
     } catch (error) {
@@ -63,11 +78,12 @@ export async function watchChannels(deps: {
     const raw = channels.find((item) => String(item.channel_id).toLowerCase() === channel.channelId);
     const outpoint = raw?.channel_outpoint ? String(raw.channel_outpoint) : undefined;
     // Fiber hands a force-closed channel over again at every start; one finished for good needs no second look.
-    if (raw && await deps.gate.settledForGood(closureOf(seen, raw), raw)) {
-      await watchtower.remove(channel.channelId).catch(() => undefined);
+    const closure = raw ? closureOf(seen, raw) : undefined;
+    if (raw && closure && await deps.gate.settledForGood(closure, raw)) {
+      await endWatch({ closure, closures, watchtower }).catch(() => undefined);
       continue;
     }
-    if (!outpoint) {
+    if (!raw || !outpoint) {
       say(channel.channelId, "missing", () => console.warn(`[keyway] watchtower: channel ${channel.channelId} is not in the node's channel list; it can't be checked until it is`));
       continue;
     }
@@ -85,6 +101,29 @@ export async function watchChannels(deps: {
       if (failure?.closingTx) {
         await note(channel.channelId, { channelId: channel.channelId, status: "could not be settled yet", closingTx: failure.closingTx, ...(failure.unsettled ? { unsettled: true as const } : {}) }, outpoint, raw);
       }
+    }
+  }
+  if (stopped()) return { finished };
+
+  // Channels the node reports closed by force and waiting, of which the watchtower has no record: followed on the
+  // chain alone, and finished only when nothing is left under the commitment lock.
+  const now = await closures.list().catch(() => undefined);
+  if (!now) return { finished };
+  for (const raw of channels) {
+    if (stopped()) return { finished };
+    const channelId = channelKey(raw.channel_id);
+    if (channelId === undefined || recorded.has(channelId) || !waitingOnChain(raw) || closedBy(raw) === undefined) continue;
+    const closure = closureOf(now, raw);
+    // Its record is kept and on its way back to the watchtower, which can do more than follow.
+    if (closure?.record && !closure.finished) continue;
+    if (closure?.finished && closure.closingTx === closedBy(raw) && await deps.gate.holds(closure)) continue;
+    try {
+      if (await recordChainVerdict({ channel: raw, follow: deps.follow, closures, isBuried: deps.isBuried })) {
+        finished = true;
+        console.info(`[keyway] watchtower: channel ${channelId}, of which no record is left, has nothing under its commitment lock any more; it is finished on-chain`);
+      }
+    } catch (error) {
+      console.warn(`[keyway] watchtower: channel ${channelId} could not be followed on-chain yet`, error);
     }
   }
   return { finished };

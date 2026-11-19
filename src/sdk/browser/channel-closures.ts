@@ -1,6 +1,7 @@
 import type { KeyWayChannel } from "./create-keyway";
-import { channelFinished, channelKey, closedBy, needsFeeReserve, outPointKey } from "./settlement-sweep";
-import { FINISHED, type SettleResult } from "./watchtower-settle";
+import { channelFinished, channelKey, closedBy, needsFeeReserve, outPointKey, waitingOnChain } from "./settlement-sweep";
+import { FINISHED, type ForceCloseOnChain, type SettleResult } from "./watchtower-settle";
+import type { WatchedChannel } from "./watchtower-store";
 
 /**
  * What the in-page watchtower has seen happen to a channel on-chain, kept apart from what the node says about it.
@@ -17,7 +18,11 @@ import { FINISHED, type SettleResult } from "./watchtower-settle";
  * A finished channel's watchtower record is removed in the end, so the verdict is kept here, where it outlives the
  * page. It stays open to correction for as long as anything can correct it: until the node itself reports the
  * channel closed by the same transaction, every pass reads the chain again, and a pass that finds the funding cell
- * live, another closing transaction, or something still to settle takes the verdict back.
+ * live, another closing transaction, or something still to settle takes the verdict back. After that, the
+ * transaction the verdict rests on is still asked about before anything is done on its strength; if the chain no
+ * longer has it buried, the verdict is taken out of storage (`revokeVerdict`), the channel shows as closing again,
+ * and the watchtower's record, a copy of which is kept here from the moment it was removed, goes back to the
+ * watchtower so it can claim again.
  */
 export type ChannelClosure = {
   channelId: string;
@@ -31,6 +36,13 @@ export type ChannelClosure = {
    * session, before the fee reserve is released on it: `createReserveGate`).
    */
   finished?: { status: string; evidence: string };
+  /**
+   * The watchtower's record of the channel (its settlement key and data), kept from the moment a verdict removed it
+   * from the watchtower's own store. If the verdict is ever taken back, the record is put back and the watchtower
+   * can claim again. Absent for a channel whose record an earlier SDK had already removed: that one can only be
+   * followed on-chain (`recordChainVerdict`).
+   */
+  record?: WatchedChannel;
   seenAt: number;
 };
 
@@ -94,13 +106,18 @@ export function closureOf(closures: readonly ChannelClosure[], channel: { channe
  * the same before and after the node notices the close, and stays in the list of open channels while the user's
  * share is still to be claimed. A verdict reached on another closing transaction than the one the node has seen
  * close the channel (a reorganization replaced it) says nothing about this close: the channel stays closing.
+ *
+ * The same goes for a channel the node itself reports closed by force and still waiting for its settlement, when
+ * nothing has been recorded about it (the first start after an upgrade, a first pass that failed, closures that
+ * can't be read): Fiber's browser node keeps that state for good, whether or not the user's share has been
+ * claimed, so it is no evidence that anything is finished. Only a standing verdict makes such a channel closed.
  */
 export function withClosure(channel: KeyWayChannel, closure: Pick<ChannelClosure, "finished" | "closingTx"> | undefined): KeyWayChannel {
-  if (!closure) return channel;
+  const closing = (finished: boolean): KeyWayChannel => ({ ...channel, status: finished ? "closed" : "closing", canSend: 0n, canReceive: 0n });
+  if (!closure) return waitingOnChain(channel.raw as never) ? closing(false) : channel;
   const nodeClosing = closedBy(channel.raw as never);
   const verdict = closure.finished !== undefined && (nodeClosing === undefined || nodeClosing === closure.closingTx);
-  const finished = verdict || channelFinished(channel.raw as never);
-  return { ...channel, status: finished ? "closed" : "closing", canSend: 0n, canReceive: 0n };
+  return closing(verdict || channelFinished(channel.raw as never));
 }
 
 /**
@@ -120,10 +137,11 @@ export function presentChannels(channels: KeyWayChannel[], closures: readonly Ch
  *   channel stops showing as ready, now and after a reload.
  * - A status in FINISHED whose transaction is buried (`isBuried`): the verdict is written.
  * - The watchtower's record is removed only once there is a verdict and the node reports the channel closed by the
- *   same transaction (`nodeClosedBy`). Until then every pass reads the chain again, and what it finds wins:
- *   the funding cell live, or spent by something that is no commitment, forgets the closure; another commitment
- *   starts it over; a live commitment cell with something still to settle (`unsettled`) takes the verdict back;
- *   a finished status resting on another transaction than the verdict's replaces it, once that one is buried.
+ *   same transaction (`nodeClosedBy`), and a copy of it is kept with the verdict first (`endWatch`). Until then
+ *   every pass reads the chain again, and what it finds wins: the funding cell live, or spent by something that is
+ *   no commitment, forgets the closure; another commitment starts it over; a live commitment cell with something
+ *   still to settle (`unsettled`) takes the verdict back; a finished status resting on another transaction than the
+ *   verdict's replaces it, once that one is buried.
  *
  * Returns true when this result finished the channel.
  */
@@ -134,7 +152,7 @@ export async function recordSettleResult(options: {
   /** The transaction the node says closed the channel, if it reports it closed (settlement-sweep.ts `closedBy`). */
   nodeClosedBy?: string;
   closures: ClosureStore;
-  watchtower: { remove(channelId: string): Promise<void> };
+  watchtower: WatchRecords;
   isBuried: (txHash: string) => Promise<boolean>;
   now?: number;
 }): Promise<boolean> {
@@ -152,7 +170,11 @@ export async function recordSettleResult(options: {
     return false;
   }
   const same = known !== undefined && known.fundingOutPoint === fundingOutPoint && known.closingTx === closingTx;
-  const closure: ChannelClosure = { channelId, fundingOutPoint, closingTx, seenAt: same ? known.seenAt : options.now ?? Date.now() };
+  const closure: ChannelClosure = {
+    channelId, fundingOutPoint, closingTx, seenAt: same ? known.seenAt : options.now ?? Date.now(),
+    // The kept copy of the watchtower's record belongs to the channel, whatever closed it.
+    ...(known?.record ? { record: known.record } : {}),
+  };
   let finished = same && !result.unsettled ? known.finished : undefined;
   // The chain now rests the same conclusion on another transaction (a reorganization replaced the claim, say):
   // the old verdict is void, and the new transaction has its own depth to reach.
@@ -167,8 +189,103 @@ export async function recordSettleResult(options: {
     await closures.put({ ...closure, finished });
     finishedNow = true;
   }
-  if (finished && options.nodeClosedBy === closingTx) await options.watchtower.remove(channelId);
+  if (finished && options.nodeClosedBy === closingTx) await endWatch({ closure: { ...closure, finished }, closures, watchtower: options.watchtower });
   return finishedNow;
+}
+
+/** The watchtower's records, as far as the closures need them (watchtower-store.ts). */
+export type WatchRecords = {
+  get(channelId: string): Promise<WatchedChannel | undefined>;
+  remove(channelId: string): Promise<void>;
+  restore(channel: WatchedChannel): Promise<void>;
+};
+
+/**
+ * Ends the watch of a channel finished for good: the watchtower's record is removed from its store, after a copy
+ * has been put with the verdict. The copy is what lets the watchtower act again if the verdict is ever taken back
+ * (`revokeVerdict`); a copy already kept (the node handed the channel over again at a later start, with less than
+ * the watchtower had gathered) is left as it is.
+ */
+export async function endWatch(options: { closure: ChannelClosure; closures: ClosureStore; watchtower: WatchRecords }): Promise<void> {
+  const { closure, closures, watchtower } = options;
+  if (!closure.record) {
+    const record = await watchtower.get(closure.channelId);
+    if (record) await closures.put({ ...closure, record });
+  }
+  await watchtower.remove(closure.channelId);
+}
+
+/**
+ * Takes a verdict back for good: the transaction it rested on is no longer buried (a reorganization deeper than
+ * FINAL_DEPTH, or the verdict was written on a wrong answer). The stored closure loses its `finished`, so the
+ * channel shows as closing again and holds the reserve after a reload too, and the watchtower gets its record back
+ * (`restoreWatch`), so the next pass reads the chain and claims whatever is the user's again.
+ *
+ * What it can't do: for a channel whose record an earlier SDK removed without keeping a copy, and which Fiber
+ * doesn't hand over again (it does so only for Channel V2 channels, at each start), there is no key left to
+ * claim with. That channel is then only followed on-chain: it shows as closing and holds the reserve until the
+ * chain shows nothing left under its commitment lock (`recordChainVerdict`).
+ */
+export async function revokeVerdict(options: { closure: ChannelClosure; closures: ClosureStore; watchtower: Pick<WatchRecords, "restore"> }): Promise<void> {
+  const { closure, closures, watchtower } = options;
+  const stored = (await closures.list()).find((item) => item.channelId === closure.channelId);
+  // Only the verdict that was found wanting: one written since, on other evidence, has its own check to face.
+  if (!stored?.finished || stored.closingTx !== closure.closingTx || stored.finished.evidence !== closure.finished?.evidence) return;
+  const { finished: _revoked, ...rest } = stored;
+  await closures.put(rest);
+  await restoreWatch({ closures: [rest], watchtower });
+}
+
+/**
+ * Gives the watchtower back the record of every channel that is force-closed, not finished, and whose record is
+ * kept here: after a verdict was taken back, the watch has to start again. Run at the start of every pass too, so
+ * a restore that failed is tried again. A record the watchtower already holds is left alone (`restore`).
+ */
+export async function restoreWatch(options: { closures: readonly ChannelClosure[]; watchtower: Pick<WatchRecords, "restore"> }): Promise<void> {
+  for (const closure of options.closures) {
+    if (closure.record && !closure.finished) await options.watchtower.restore(closure.record);
+  }
+}
+
+/**
+ * The verdict for a channel the watchtower holds no record of, from the chain alone.
+ *
+ * An earlier SDK removed a channel's record as soon as it found the channel settled, and wrote nothing down; Fiber
+ * hands only Channel V2 channels over again at a start. Such a channel, which the node keeps reporting as closed by
+ * force and waiting, would hold the fee reserve for good. Without the record nothing can be claimed and nobody can
+ * tell whose the funds under the commitment lock are, so only one thing counts as finished: nothing is left there.
+ * The verdict is written when the chain shows all of this: the funding cell was spent by a commitment transaction,
+ * that transaction is the one the node names as having closed the channel, the commitment cell and every successor
+ * are spent with none left (`follow`, watchtower-settle.ts `forceCloseSettled`), and the transaction that spent
+ * the last one is buried (`isBuried`). Anything less, a live cell under the lock or a transaction not yet deep
+ * enough, writes nothing. Returns true when it wrote the verdict.
+ */
+export async function recordChainVerdict(options: {
+  /** The channel as the node lists it. */
+  channel: { channel_id?: unknown; channel_outpoint?: unknown; shutdown_transaction_hash?: unknown; state: { state_name: string; state_flags?: unknown } };
+  follow: (fundingOutPoint: string) => Promise<ForceCloseOnChain>;
+  closures: ClosureStore;
+  isBuried: (txHash: string) => Promise<boolean>;
+  now?: number;
+}): Promise<boolean> {
+  const { channel, closures } = options;
+  const channelId = channelKey(channel.channel_id);
+  const fundingOutPoint = outPointKey(channel.channel_outpoint);
+  const named = closedBy(channel);
+  // Only a channel the node itself reports closed by force and waiting, by a transaction it names.
+  if (channelId === undefined || fundingOutPoint === undefined || named === undefined || !waitingOnChain(channel)) return false;
+  const seen = await options.follow(fundingOutPoint);
+  const closingTx = channelKey(seen.closingTx);
+  const evidence = channelKey(seen.settledBy);
+  if (closingTx === undefined || closingTx !== named || evidence === undefined) return false;
+  if (!await options.isBuried(evidence)) return false;
+  const known = (await closures.list()).find((closure) => closure.channelId === channelId);
+  await closures.put({
+    channelId, fundingOutPoint, closingTx, finished: { status: "settled", evidence },
+    seenAt: known && known.fundingOutPoint === fundingOutPoint && known.closingTx === closingTx ? known.seenAt : options.now ?? Date.now(),
+    ...(known?.record ? { record: known.record } : {}),
+  });
+  return true;
 }
 
 /**
@@ -183,6 +300,10 @@ export async function recordSettleResult(options: {
  * is used, which is enough to notice that the reserve may be due and to drop a channel Fiber hands over again. A
  * channel being opened keeps the reserve too: the node lists it only once the peer has answered. If anything can't
  * be read, the reserve stays.
+ *
+ * A verdict found wanting is not just passed over: `revoke` takes it out of storage (`revokeVerdict`), so the
+ * channel reads as closing again, here and after a reload, and the watchtower looks at it again. Only the chain's
+ * own answer does that; an RPC that can't be reached keeps the reserve and leaves the verdict for the next ask.
  */
 export function createReserveGate(deps: {
   /** Every channel the node knows, closed ones included. */
@@ -191,14 +312,24 @@ export function createReserveGate(deps: {
   isBuried(txHash: string): Promise<boolean>;
   /** Whether a channel open is in progress. */
   opening(): boolean;
+  /** Takes back, in storage, a verdict whose transaction the chain no longer has buried. */
+  revoke?(closure: ChannelClosure): Promise<void>;
 }) {
   const stood = new Set<string>();
   async function holds(closure: ChannelClosure, fresh = false): Promise<boolean> {
     if (!closure.finished) return false;
     const key = `${closure.channelId}:${closure.closingTx}:${closure.finished.evidence}`;
     if (!fresh && stood.has(key)) return true;
-    if (!await deps.isBuried(closure.finished.evidence).catch(() => false)) {
-      stood.delete(key);
+    stood.delete(key);
+    let buried: boolean;
+    try {
+      buried = await deps.isBuried(closure.finished.evidence);
+    } catch {
+      // Not an answer: nothing is released on it, and nothing is taken back.
+      return false;
+    }
+    if (!buried) {
+      await deps.revoke?.(closure).catch((error) => console.warn(`[keyway] could not take back the verdict for channel ${closure.channelId}; it is asked about again before anything rests on it`, error));
       return false;
     }
     stood.add(key);
