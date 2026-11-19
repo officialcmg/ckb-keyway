@@ -222,6 +222,22 @@ test("a sweep that moves only tokens never pays its fee from the kept reserve, a
   assert.equal(released.sent.length, 1);
 });
 
+test("when the top-ups leave nothing to pay the fee with, the sweep moves one token cell fewer instead of waiting", async () => {
+  for (const [who, options] of SWEEPS) {
+    // Exactly two top-ups' worth beyond the reserve, two token cells at their minimum: topping both up would leave
+    // no payer but the reserve. One moves, and what would have topped up the other pays the fee from beside the reserve.
+    const key = await nodeKeyWith([FEE_RESERVE + 68n * CKB], [142n * CKB, 142n * CKB]);
+    await sweepSettlement(key.client, settlementKey, omnilock, FEE_RESERVE, options);
+    assert.equal(key.sent.length, 1, who);
+    assert.equal(key.sent[0].outputs.filter((output) => output.type).length, 1, who);
+    assert.ok(key.kept(key.sent[0]) >= FEE_RESERVE, `${who}: ${key.kept(key.sent[0])} kept`);
+    // One token cell and exactly its top-up beyond the reserve: nothing smaller is left to try, so it waits.
+    const one = await nodeKeyWith([FEE_RESERVE + 34n * CKB], [142n * CKB]);
+    assert.equal(await sweepSettlement(one.client, settlementKey, omnilock, FEE_RESERVE, options), undefined, who);
+    assert.equal(one.sent.length, 0, who);
+  }
+});
+
 test("a settlement passing through the node's key still reaches the user with the reserve kept whole", async () => {
   const secp = await secp256k1Lock(new ccc.ClientPublicTestnet({ url: "http://127.0.0.1:9/" }), ccc.hexFrom(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true)));
   for (const [who, options] of SWEEPS) {

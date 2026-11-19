@@ -1429,6 +1429,38 @@ test("what the previous SDK left behind (no watchtower record, no closures, the 
   assert.equal((await later.shown("CLOSED", WAITING))[0].status, "closing");
 });
 
+test("a channel without a record that the node still calls ready is shown as closing once a commitment has spent its funding cell", async () => {
+  // The peer closed by force while the wallet was shut; the earlier SDK had no record of this channel (or removed
+  // it), and Fiber's own check hasn't run yet.
+  const chain = fakeChain({ byPeer: true });
+  const wallet = walletOver(chain, undefined, { record: false });
+  assert.deepEqual((await wallet.shown("CHANNEL_READY")).map(({ status, canSend }) => [status, canSend]), [["ready", 360n * CKB]], "before the pass has looked");
+  assert.equal((await wallet.pass("CHANNEL_READY")).finishedNow, false);
+  assert.deepEqual((await wallet.shown("CHANNEL_READY")).map(({ status, canSend, canReceive }) => [status, canSend, canReceive]), [["closing", 0n, 0n]]);
+  assert.equal((await wallet.stored())[0].closingTx, chain.commitmentTx.hash());
+  assert.equal((await wallet.stored())[0].finished, undefined);
+  assert.equal(await wallet.reserveHeld("CHANNEL_READY"), true);
+  // However deep, and even with nothing left under the lock, there is no verdict until the node reports the close.
+  const punished = fakeChain({ revoked: true, penalized: true });
+  punished.bury(100n);
+  const early = walletOver(punished, undefined, { record: false });
+  assert.equal((await early.pass("CHANNEL_READY")).finishedNow, false);
+  assert.equal((await early.stored())[0].finished, undefined);
+  assert.equal((await early.shown("CHANNEL_READY"))[0].status, "closing");
+  assert.equal((await early.pass("CLOSED", WAITING)).finishedNow, true);
+  // A reorganization undoes the close: the funding cell is live again, and the channel reads as the node has it.
+  chain.reopen();
+  await wallet.pass("CHANNEL_READY");
+  assert.deepEqual(await wallet.stored(), []);
+  assert.equal((await wallet.shown("CHANNEL_READY"))[0].status, "ready");
+  // A channel that is simply open is left alone.
+  const open = fakeChain();
+  open.reopen();
+  const untouched = walletOver(open, undefined, { record: false });
+  await untouched.pass("CHANNEL_READY");
+  assert.deepEqual(await untouched.stored(), []);
+});
+
 test("a verdict is asked about again after ten minutes, even while another channel keeps the reserve and no sweep asks", async () => {
   const { createReserveGate } = await closureModule();
   const id = "0x" + "0a".repeat(32);
@@ -1486,15 +1518,23 @@ test("a finished status that rests on another transaction than the stored verdic
   assert.deepEqual((await closures.list())[0].finished, { status: "the user's share is already claimed", evidence: second });
 });
 
-test("a record put back never replaces one the node has handed over since", async () => {
+test("a record put back never replaces what the node has handed over since, and fills in what that record lacks", async () => {
   const store = openWatchtowerStore(`/wasm-test-${crypto.randomUUID()}`);
-  const kept = { ...fakeChain().watched, updatedAt: 1 };
+  const kept = { ...fakeChain().watched, updatedAt: 1, revocation: { version: "0x2" } };
+  assert.ok(kept.remoteSettlement, "the kept copy has the peer's settlement data");
   await store.restore(kept);
   assert.deepEqual(await store.get(kept.channelId), kept, "nothing there: the kept copy goes back");
-  await store.restore({ ...kept, updatedAt: 2, localSettlementKey: "0x" + "99".repeat(32) });
-  assert.deepEqual(await store.get(kept.channelId), kept, "a record already there is left as it is");
+  // A record already there is not replaced: nothing it holds changes.
+  await store.restore({ ...kept, updatedAt: 2, localSettlementKey: "0x" + "99".repeat(32), remoteSettlement: { local_amount: "0x1", remote_amount: "0x1", tlcs: [] } });
+  assert.deepEqual(await store.get(kept.channelId), kept);
+  // The node hands the channel over again at a start, so far with its registration only: its record has the
+  // settlement it was funded with and nothing of the peer's. The kept copy fills in what is missing, no more.
   await store.remove(kept.channelId);
   assert.equal(await store.get(kept.channelId), undefined);
+  const { remoteSettlement: _peer, revocation: _revocation, ...registered } = { ...kept, updatedAt: 3, localSettlement: { local_amount: "0x7", remote_amount: "0x7", tlcs: [] } };
+  await store.restore(registered as WatchedChannel);
+  await store.restore(kept);
+  assert.deepEqual(await store.get(kept.channelId), { ...registered, remoteSettlement: kept.remoteSettlement, revocation: kept.revocation }, "the node's own data stays; the peer's settlement and the revocation come from the kept copy");
   store.close();
 });
 
@@ -1520,13 +1560,14 @@ test("without a record, nothing weaker than an empty commitment lock finishes a 
   assert.equal((await other.pass("CLOSED", WAITING, null)).finishedNow, false);
   assert.equal((await other.pass("CHANNEL_READY")).finishedNow, false);
   assert.equal((await other.pass("SHUTTING_DOWN", "WAITING_COMMITMENT_CONFIRMATION")).finishedNow, false);
-  assert.deepEqual(await other.stored(), []);
+  assert.deepEqual((await other.stored()).map(({ closingTx, finished }) => [closingTx, finished]), [[punished.commitmentTx.hash(), undefined]], "the close is noted, no verdict");
   assert.equal(await other.reserveHeld("CLOSED", WAITING, [], "0x" + "cc".repeat(32)), true);
+  assert.equal(await other.reserveHeld("CHANNEL_READY"), true);
   // A cooperative close, or a channel still open, is none of this function's business.
   const { forceCloseSettled } = await import("../src/sdk/browser/watchtower-settle.ts");
   const open = fakeChain();
   open.reopen();
-  assert.deepEqual(await forceCloseSettled(open.client, "testnet", { txHash: open.funding.hash(), index: 0 }), {});
+  assert.deepEqual(await forceCloseSettled(open.client, "testnet", { txHash: open.funding.hash(), index: 0 }), { notForceClosed: true });
   assert.deepEqual(await forceCloseSettled(punished.client, "testnet", { txHash: punished.funding.hash(), index: 0 }), { closingTx: punished.commitmentTx.hash(), settledBy: punished.penaltyTx!.hash() });
   assert.deepEqual(await forceCloseSettled(claimed.client, "testnet", { txHash: claimed.funding.hash(), index: 0 }), { closingTx: claimed.commitmentTx.hash() });
 });

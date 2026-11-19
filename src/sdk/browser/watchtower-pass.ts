@@ -2,7 +2,7 @@ import {
   closureOf, endWatch, recordChainVerdict, recordSettleResult, restoreWatch,
   type ChannelClosure, type ClosureStore, type WatchRecords,
 } from "./channel-closures";
-import { channelKey, closedBy, waitingOnChain } from "./settlement-sweep";
+import { channelFinished, channelKey, closedBy } from "./settlement-sweep";
 import type { ForceCloseOnChain, SettleFailure, SettleResult } from "./watchtower-settle";
 import type { WatchedChannel } from "./watchtower-store";
 
@@ -18,8 +18,9 @@ type NodeChannel = { channel_id?: unknown; channel_outpoint?: unknown; shutdown_
  *   other one is looked at on-chain (`settle`), a claim is sent if one is due, and what was seen is recorded
  *   (`recordSettleResult`).
  * - Before that, records that were removed on a verdict since taken back are put back (`restoreWatch`).
- * - After it, channels the node reports closed by force and waiting, of which there is no record at all (an earlier
- *   SDK removed it), are followed on-chain without one (`recordChainVerdict`).
+ * - After it, channels of which there is no record at all (an earlier SDK removed it) are followed on-chain
+ *   without one (`recordChainVerdict`): shown as closing once a commitment has spent their funding cell, and
+ *   finished only when the node reports the close and nothing is left under the commitment lock.
  *
  * Returns whether this pass finished a channel, which is when the fee reserve may have become returnable.
  */
@@ -105,14 +106,15 @@ export async function watchChannels(deps: {
   }
   if (stopped()) return { finished };
 
-  // Channels the node reports closed by force and waiting, of which the watchtower has no record: followed on the
-  // chain alone, and finished only when nothing is left under the commitment lock.
+  // Channels the watchtower has no record of (an earlier SDK removed it, or the channel predates the in-page
+  // watchtower): followed on the chain alone. A commitment that spent the funding cell is recorded, so the channel
+  // stops showing as ready; finished only when the node reports the close and nothing is left under the commitment lock.
   const now = await closures.list().catch(() => undefined);
   if (!now) return { finished };
   for (const raw of channels) {
     if (stopped()) return { finished };
     const channelId = channelKey(raw.channel_id);
-    if (channelId === undefined || recorded.has(channelId) || !waitingOnChain(raw) || closedBy(raw) === undefined) continue;
+    if (channelId === undefined || recorded.has(channelId) || channelFinished(raw) || !raw.channel_outpoint) continue;
     const closure = closureOf(now, raw);
     // Its record is kept and on its way back to the watchtower, which can do more than follow.
     if (closure?.record && !closure.finished) continue;

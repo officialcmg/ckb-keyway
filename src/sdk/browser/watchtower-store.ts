@@ -39,8 +39,9 @@ export type WatchtowerStore = {
   get(channelId: string): Promise<WatchedChannel | undefined>;
   remove(channelId: string): Promise<void>;
   /**
-   * Puts back a record that was removed when its channel was found finished (channel-closures.ts keeps a copy),
-   * unless the node has handed the channel over again meanwhile: a record already there is left as it is.
+   * Puts back a record that was removed when its channel was found finished (channel-closures.ts keeps a copy).
+   * If the node has handed the channel over again meanwhile, nothing it gave is replaced: the kept copy only
+   * fills in what the record there doesn't have (`mergeKept`).
    */
   restore(channel: WatchedChannel): Promise<void>;
   /** The preimage the node handed over for a payment hash (`create_preimage`), if it still has one. */
@@ -111,6 +112,19 @@ export function applyWatchtowerCall(existing: WatchedChannel | undefined, call: 
   }
 }
 
+/**
+ * A record the node has handed over again, completed from the copy kept when the watch ended: the peer's settlement
+ * data and the revocation, where the record has none. Nothing the record holds is replaced. Undefined when there is
+ * nothing to add. Pure, for testing.
+ */
+export function mergeKept(existing: WatchedChannel, kept: WatchedChannel): WatchedChannel | undefined {
+  const added: Partial<WatchedChannel> = {};
+  if (existing.remoteSettlement === undefined && kept.remoteSettlement !== undefined) added.remoteSettlement = kept.remoteSettlement;
+  if (existing.pendingRemoteSettlement === undefined && kept.pendingRemoteSettlement !== undefined) added.pendingRemoteSettlement = kept.pendingRemoteSettlement;
+  if (existing.revocation === undefined && kept.revocation !== undefined) added.revocation = kept.revocation;
+  return Object.keys(added).length > 0 ? { ...existing, ...added } : undefined;
+}
+
 function parseChannelFeatures(value: unknown): 0 | 1 {
   if (value === undefined || value === "0x0") return 0;
   if (value === "0x1") return 1;
@@ -174,11 +188,19 @@ export function openWatchtowerStore(databasePrefix: string): WatchtowerStore {
       await new Promise<void>((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error ?? new Error("The watchtower's store aborted a write")); });
     },
     async restore(channel) {
+      const kept = { ...channel, channelId: channel.channelId.toLowerCase() };
       const tx = (await db()).transaction(STORE, "readwrite");
-      // `add`, not `put`: it fails for a key that is already there, and that failure is the answer wanted.
-      const adding = tx.objectStore(STORE).add({ ...channel, channelId: channel.channelId.toLowerCase() });
-      adding.onerror = (event) => { event.preventDefault(); event.stopPropagation(); };
-      await new Promise<void>((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error); });
+      const store = tx.objectStore(STORE);
+      const reading = store.get(kept.channelId);
+      reading.onsuccess = () => {
+        const existing = reading.result as WatchedChannel | undefined;
+        if (!existing) { store.put(kept); return; }
+        // The node has handed the channel over again. What it gave stays; only what its record lacks so far (it
+        // sends the peer's settlements after the registration, if at all) is filled in from the kept copy.
+        const merged = mergeKept(existing, kept);
+        if (merged) store.put(merged);
+      };
+      await new Promise<void>((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error ?? new Error("The watchtower's store aborted a write")); });
     },
     async preimage(paymentHash) {
       const tx = (await db()).transaction(PREIMAGES, "readonly");

@@ -248,17 +248,24 @@ export async function restoreWatch(options: { closures: readonly ChannelClosure[
 }
 
 /**
- * The verdict for a channel the watchtower holds no record of, from the chain alone.
+ * What the chain alone says about a channel the watchtower holds no record of: that it is force-closed, and, when
+ * everything below holds, that it is finished.
  *
  * An earlier SDK removed a channel's record as soon as it found the channel settled, and wrote nothing down; Fiber
- * hands only Channel V2 channels over again at a start. Such a channel, which the node keeps reporting as closed by
- * force and waiting, would hold the fee reserve for good. Without the record nothing can be claimed and nobody can
- * tell whose the funds under the commitment lock are, so only one thing counts as finished: nothing is left there.
- * The verdict is written when the chain shows all of this: the funding cell was spent by a commitment transaction,
- * that transaction is the one the node names as having closed the channel, the commitment cell and every successor
- * are spent with none left (`follow`, watchtower-settle.ts `forceCloseSettled`), and the transaction that spent
- * the last one is buried (`isBuried`). Anything less, a live cell under the lock or a transaction not yet deep
- * enough, writes nothing. Returns true when it wrote the verdict.
+ * hands only Channel V2 channels over again at a start. Such a channel would read as ready until the node noticed
+ * the close, and would then hold the fee reserve for good.
+ *
+ * - A commitment transaction spent the funding cell: recorded, so the channel shows as closing, whatever the node
+ *   still says (as `recordSettleResult` does for a channel with a record). The funding cell live again, or spent
+ *   by a cooperative close, forgets it.
+ * - Finished: without the record nothing can be claimed and nobody can tell whose the funds under the commitment
+ *   lock are, so only one thing counts: nothing is left there. The verdict is written when the node itself reports
+ *   the channel closed by force and waiting, the commitment found is the closing transaction the node names, the
+ *   commitment cell and every successor are spent with none left (`follow`, watchtower-settle.ts
+ *   `forceCloseSettled`), and the transaction that spent the last one is buried (`isBuried`). Anything less, a live
+ *   cell under the lock or a transaction not yet deep enough, writes no verdict.
+ *
+ * Returns true when it wrote the verdict.
  */
 export async function recordChainVerdict(options: {
   /** The channel as the node lists it. */
@@ -271,41 +278,30 @@ export async function recordChainVerdict(options: {
   const { channel, closures } = options;
   const channelId = channelKey(channel.channel_id);
   const fundingOutPoint = outPointKey(channel.channel_outpoint);
-  const named = closedBy(channel);
-  // Only a channel the node itself reports closed by force and waiting, by a transaction it names.
-  if (channelId === undefined || fundingOutPoint === undefined || named === undefined || !waitingOnChain(channel)) return false;
+  if (channelId === undefined || fundingOutPoint === undefined) return false;
   const seen = await options.follow(fundingOutPoint);
   const closingTx = channelKey(seen.closingTx);
-  const evidence = channelKey(seen.settledBy);
-  if (closingTx === undefined || closingTx !== named || evidence === undefined) return false;
-  if (!await options.isBuried(evidence)) return false;
   const known = (await closures.list()).find((closure) => closure.channelId === channelId);
-  await closures.put({
-    channelId, fundingOutPoint, closingTx, finished: { status: "settled", evidence },
-    seenAt: known && known.fundingOutPoint === fundingOutPoint && known.closingTx === closingTx ? known.seenAt : options.now ?? Date.now(),
+  if (closingTx === undefined) {
+    if (known && seen.notForceClosed) await closures.remove(channelId);
+    return false;
+  }
+  const same = known !== undefined && known.fundingOutPoint === fundingOutPoint && known.closingTx === closingTx;
+  const closure: ChannelClosure = {
+    channelId, fundingOutPoint, closingTx, seenAt: same ? known.seenAt : options.now ?? Date.now(),
     ...(known?.record ? { record: known.record } : {}),
-  });
+  };
+  // The observation first, as for a channel with a record. A verdict about another close is dropped with it.
+  if (!same) await closures.put(closure);
+  // The verdict: only for a channel the node itself reports closed by force and waiting, by this transaction.
+  const evidence = channelKey(seen.settledBy);
+  if (!waitingOnChain(channel) || closedBy(channel) !== closingTx || evidence === undefined) return false;
+  if (same && known.finished?.evidence === evidence) return false;
+  if (!await options.isBuried(evidence)) return false;
+  await closures.put({ ...closure, finished: { status: "settled", evidence } });
   return true;
 }
 
-/**
- * Whether the fee reserve may still be needed (`needed`), and whether a finished closure still stands (`holds`).
- *
- * The reserve is released only when every channel is finished: by the node's own account, or because the node
- * reports it closed and a verdict for the same channel, funding cell and closing transaction says nothing is left
- * to claim. Before the reserve goes on the strength of a verdict, the transaction the verdict rests on is asked
- * about once more: if it is no longer buried (a deep reorganization, or a wrong answer when the verdict was
- * written), the verdict doesn't count. `needed({ fresh: true })`, which the sweep uses when it decides whether to
- * move the reserve, asks the chain every time; otherwise an answer had in the last ten minutes, and since the last
- * `reset` (each start), is used, which is enough to notice that the reserve may be due and to drop a channel Fiber
- * hands over again. A
- * channel being opened keeps the reserve too: the node lists it only once the peer has answered. If anything can't
- * be read, the reserve stays.
- *
- * A verdict found wanting is not just passed over: `revoke` takes it out of storage (`revokeVerdict`), so the
- * channel reads as closing again, here and after a reload, and the watchtower looks at it again. Only the chain's
- * own answer does that; an RPC that can't be reached keeps the reserve and leaves the verdict for the next ask.
- */
 /** How long an answer that a verdict's transaction is buried is reused before the chain is asked again. */
 const RECHECK_AFTER = 10 * 60_000;
 

@@ -588,6 +588,8 @@ async function commitmentFate(client: ccc.Client, network: "testnet" | "mainnet"
 
 /** What the chain alone shows of a channel's close, read without any of the channel's data. */
 export type ForceCloseOnChain = {
+  /** Set when the chain says the channel is not force-closed: its funding cell is live, or was spent by a cooperative close. */
+  notForceClosed?: true;
   /** The commitment transaction that spent the funding cell, if one did. */
   closingTx?: ccc.Hex;
   /** Set once nothing is left under the commitment lock: the transaction that spent its last cell. */
@@ -600,11 +602,12 @@ export type ForceCloseOnChain = {
  * record of (an earlier SDK removed it, and Fiber hands only Channel V2 channels over again), this is all that
  * can be known: who the remaining funds belong to can't be told without the record, so nothing short of "nothing
  * is left" (`settledBy`) says the channel is finished. Anything else (open, closed cooperatively, a transaction
- * the indexer doesn't show yet, a live commitment cell) leaves `settledBy` unset.
+ * the indexer doesn't show yet, a live commitment cell) leaves `settledBy` unset. `closingTx` alone says the
+ * channel is force-closed, which is enough to stop showing it as ready.
  */
 export async function forceCloseSettled(client: ccc.Client, network: "testnet" | "mainnet", fundingOutPoint: ccc.OutPointLike): Promise<ForceCloseOnChain> {
   const funding = await fundingFate(client, network, fundingOutPoint);
-  if (!("commitmentTx" in funding)) return {};
+  if (!("commitmentTx" in funding)) return funding.status === "open" || funding.status === "closed cooperatively" ? { notForceClosed: true } : {};
   const closingTx = funding.commitmentTx.hash();
   const fate = await commitmentFate(client, network, funding.commitmentTx);
   return { closingTx, ...("settledBy" in fate ? { settledBy: fate.settledBy } : {}) };
