@@ -170,7 +170,8 @@ export function openWatchtowerStore(databasePrefix: string): WatchtowerStore {
     async remove(channelId) {
       const tx = (await db()).transaction(STORE, "readwrite");
       tx.objectStore(STORE).delete(channelId.toLowerCase());
-      await new Promise<void>((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); });
+      // An aborted transaction must end the wait too: passes, sweeps and channel opens take turns behind this.
+      await new Promise<void>((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error ?? new Error("The watchtower's store aborted a write")); });
     },
     async restore(channel) {
       const tx = (await db()).transaction(STORE, "readwrite");

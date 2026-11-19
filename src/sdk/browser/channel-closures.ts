@@ -296,8 +296,9 @@ export async function recordChainVerdict(options: {
  * to claim. Before the reserve goes on the strength of a verdict, the transaction the verdict rests on is asked
  * about once more: if it is no longer buried (a deep reorganization, or a wrong answer when the verdict was
  * written), the verdict doesn't count. `needed({ fresh: true })`, which the sweep uses when it decides whether to
- * move the reserve, asks the chain every time; otherwise an answer already had since the last `reset` (each start)
- * is used, which is enough to notice that the reserve may be due and to drop a channel Fiber hands over again. A
+ * move the reserve, asks the chain every time; otherwise an answer had in the last ten minutes, and since the last
+ * `reset` (each start), is used, which is enough to notice that the reserve may be due and to drop a channel Fiber
+ * hands over again. A
  * channel being opened keeps the reserve too: the node lists it only once the peer has answered. If anything can't
  * be read, the reserve stays.
  *
@@ -305,6 +306,9 @@ export async function recordChainVerdict(options: {
  * channel reads as closing again, here and after a reload, and the watchtower looks at it again. Only the chain's
  * own answer does that; an RPC that can't be reached keeps the reserve and leaves the verdict for the next ask.
  */
+/** How long an answer that a verdict's transaction is buried is reused before the chain is asked again. */
+const RECHECK_AFTER = 10 * 60_000;
+
 export function createReserveGate(deps: {
   /** Every channel the node knows, closed ones included. */
   listChannels(): Promise<Array<Parameters<typeof needsFeeReserve>[0][number]>>;
@@ -314,12 +318,17 @@ export function createReserveGate(deps: {
   opening(): boolean;
   /** Takes back, in storage, a verdict whose transaction the chain no longer has buried. */
   revoke?(closure: ChannelClosure): Promise<void>;
+  now?(): number;
 }) {
-  const stood = new Set<string>();
+  /** When each verdict was last borne out by the chain. */
+  const stood = new Map<string, number>();
   async function holds(closure: ChannelClosure, fresh = false): Promise<boolean> {
     if (!closure.finished) return false;
     const key = `${closure.channelId}:${closure.closingTx}:${closure.finished.evidence}`;
-    if (!fresh && stood.has(key)) return true;
+    // An answer is reused only for a while: a page left open for days asks again, so a verdict that stops holding
+    // is taken back, and its channel watched again, even while another channel keeps the sweep from asking.
+    const last = stood.get(key);
+    if (!fresh && last !== undefined && (deps.now ?? Date.now)() - last < RECHECK_AFTER) return true;
     stood.delete(key);
     let buried: boolean;
     try {
@@ -332,7 +341,7 @@ export function createReserveGate(deps: {
       await deps.revoke?.(closure).catch((error) => console.warn(`[keyway] could not take back the verdict for channel ${closure.channelId}; it is asked about again before anything rests on it`, error));
       return false;
     }
-    stood.add(key);
+    stood.set(key, (deps.now ?? Date.now)());
     return true;
   }
   async function needed(options: { fresh?: boolean } = {}): Promise<boolean> {

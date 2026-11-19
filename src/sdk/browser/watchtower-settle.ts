@@ -162,13 +162,14 @@ export type ClaimDecision = { claim: ClaimPlan } | { skip: string };
 /** One of the commitment's pending TLCs, as far as this node can claim it. */
 type PendingTlc = {
   index: number;
-  /** Whether the TLC is in the node's settlement data at all. One that isn't can't be told the peer's from the user's. */
-  known: boolean;
   amount: bigint;
   /** The TLC's expiry as an absolute timestamp `since`, and in milliseconds. */
   expirySince: bigint;
   expiryMs: number;
-  /** How this node can claim it, with which key: with the preimage (before the peer reclaims it) or once expired. */
+  /**
+   * How this node can claim it, with which key: with the preimage (before the peer reclaims it) or once expired.
+   * Unset for a TLC that matches none of the node's settlement data: it can't be told the peer's from the user's.
+   */
   ours?: { path: "preimage" | "expiry"; key: ccc.Hex; paymentHash: ccc.Hex; hashAlgorithm: string };
 };
 
@@ -232,7 +233,7 @@ function pendingTlcs(channel: ClaimChannel, state: SettlementWitness): PendingTl
   return state.pendingTlcs.map((bytes, index) => {
     const expirySince = readLe(bytes.slice(tlcLength - 8, tlcLength));
     const match = known.find((item) => equal(item.bytes, bytes));
-    const pending: PendingTlc = { index, known: Boolean(match), amount: readLe(bytes.slice(1, 17)), expirySince, expiryMs: Number(expirySince & 0x00ff_ffff_ffff_ffffn) * 1000 };
+    const pending: PendingTlc = { index, amount: readLe(bytes.slice(1, 17)), expirySince, expiryMs: Number(expirySince & 0x00ff_ffff_ffff_ffffn) * 1000 };
     if (!match) return pending;
     const key = ccc.hexFrom(`0x${match.tlc.local_key.replace(/^0x/, "")}`);
     const mine = blake160(pubkeyOf(key));
@@ -623,12 +624,12 @@ async function settle(options: SettleOptions, seen: { closingTx?: ccc.Hex; claim
   const { commitmentTx } = funding;
   // From here the channel is force-closed on-chain, whatever the node itself still says about it.
   closingTx = seen.closingTx = commitmentTx.hash();
-  // A token channel's close is seen (above: reads only), but its claim is not built here.
-  if (channel.fundingUdtTypeScript || commitmentTx.outputs[0].type) return result("token channels are not settled by the in-page watchtower");
-
   // Follow the commitment cell through any settlements to the one that is live now.
   const fate = await commitmentFate(client, options.network, commitmentTx);
+  // Nothing left under the commitment lock: that is read off the chain alone, whatever the channel carried.
   if ("settledBy" in fate) return result("settled", undefined, fate.settledBy);
+  // A token channel's close is seen and followed (reads only), but its claim is not built here.
+  if (channel.fundingUdtTypeScript || commitmentTx.outputs[0].type) return result("token channels are not settled by the in-page watchtower");
   if (!("live" in fate)) return result(fate.status);
   const { cell, output, previousWitness } = fate.live;
 

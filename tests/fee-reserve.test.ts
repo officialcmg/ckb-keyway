@@ -236,6 +236,30 @@ test("a settlement passing through the node's key still reaches the user with th
   }
 });
 
+test("whatever the fee rate, a sweep that would cut into the kept reserve or a cell's own minimum isn't sent", async () => {
+  const secp = await secp256k1Lock(new ccc.ClientPublicTestnet({ url: "http://127.0.0.1:9/" }), ccc.hexFrom(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true)));
+  // A fee rate at which this sweep costs more than the 0.01 CKB every payer is asked to have to spare.
+  const dear = async (plain: bigint[], tokens: bigint[]) => {
+    const key = await nodeKeyWith(plain, tokens);
+    Object.assign(key.client, { getFeeRate: async () => 100_000_000n });
+    return key;
+  };
+  for (const [who, options] of SWEEPS) {
+    // The payer would be the kept output, which holds 0.02 CKB beyond the reserve.
+    const dust = await dear([FEE_RESERVE + 2_000_000n], [142n * CKB]);
+    assert.equal(await sweepSettlement(dust.client, settlementKey, secp, FEE_RESERVE, options), undefined, who);
+    assert.equal(dust.sent.length, 0, who);
+    // The payer would be a token cell with 0.02 CKB to spare.
+    const token = await dear([FEE_RESERVE], [142n * CKB + 2_000_000n]);
+    assert.equal(await sweepSettlement(token.client, settlementKey, secp, FEE_RESERVE, options), undefined, who);
+    assert.equal(token.sent.length, 0, who);
+  }
+  // At the ordinary rate both go through, the reserve whole.
+  const dust = await nodeKeyWith([FEE_RESERVE + 2_000_000n], [142n * CKB]);
+  await sweepSettlement(dust.client, settlementKey, secp, FEE_RESERVE);
+  assert.ok(dust.kept(dust.sent[0]) >= FEE_RESERVE && dust.kept(dust.sent[0]) < FEE_RESERVE + 2_000_000n);
+});
+
 test("a reserve cell counts for a channel open only if the node says it is live", async () => {
   const { hasFeeReserve } = await import("../src/sdk/browser/fee-reserve.ts");
   /** The node key's client: its indexer lists one 62 CKB cell; the node answers for it as given. */

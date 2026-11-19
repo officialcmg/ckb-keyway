@@ -463,8 +463,9 @@ function fakeChain(options: {
     ...channel, channelId: "0x" + "01".repeat(32), localFundingPubkey: "", remoteFundingPubkey: "", createdAt: 0, updatedAt: 0,
     ...(options.token ? { fundingUdtTypeScript: { code_hash: "0x00", hash_type: "type", args: "0x" } } : {}),
   } as WatchedChannel;
-  const settle = (dryRun?: { submit: (tx: ccc.Transaction) => Promise<ccc.Hex> }) => settleChannel({
-    client, network: "testnet", nodeKey, channel: watched,
+  /** `record`: the watchtower's record to settle with, when it is not the one the node handed over (`watched`). */
+  const settle = (dryRun?: { submit: (tx: ccc.Transaction) => Promise<ccc.Hex> }, record: WatchedChannel = watched) => settleChannel({
+    client, network: "testnet", nodeKey, channel: record,
     ref: { channelId: watched.channelId, fundingOutPoint: { txHash: funding.hash(), index: 0 } }, ...(dryRun ? { dryRun } : {}),
     preimage: async (hash) => options.preimages?.get(hash), now: options.now,
   });
@@ -734,8 +735,18 @@ test("a token channel's force close is seen and keeps the reserve, but no claim 
   closed.bury(100n);
   await wallet.pass("CHANNEL_READY");
   assert.equal((await wallet.shown("CHANNEL_READY"))[0].status, "closing");
-  // The page never reaches a verdict for it, so it holds the reserve, as before.
+  // While anything is under its commitment lock the page reaches no verdict for it, so it holds the reserve.
   assert.equal(await wallet.reserveHeld("CLOSED", WAITING), true);
+  // Once nothing is left there (here: the peer had published a revoked state and was punished), that is read off
+  // the chain like for any channel: it stops holding the reserve and leaves the list.
+  const emptied = fakeChain({ token: true, revoked: true, penalized: true });
+  emptied.bury(FINAL_DEPTH);
+  const after = walletOver(emptied);
+  const settled = await after.pass("CLOSED", WAITING);
+  assert.equal(settled.status, "settled");
+  assert.equal(settled.finishedNow, true);
+  assert.equal(await after.reserveHeld("CLOSED", WAITING), false);
+  assert.deepEqual(await after.shown("CLOSED", WAITING), []);
 });
 
 // What the in-page watchtower has seen of a channel's close, kept apart from what the node says (channel-closures.ts).
@@ -825,9 +836,10 @@ function walletOver(chain: ReturnType<typeof fakeChain>, prefix?: string, option
       const { finished } = await watchChannels({
         watchtower: { ...store, remove: async (channelId: string) => { removed.push(channelId); await store.remove(channelId); } },
         closures: openClosureStore(at), channels: [raw as never], gate,
-        settle: async () => {
+        // With the record the pass read from the watchtower's store, as the wallet does.
+        settle: async (record) => {
           try {
-            return looked = await chain.settle();
+            return looked = await chain.settle(undefined, record);
           } catch (error) {
             failure = error as Error;
             throw error;
@@ -1331,10 +1343,13 @@ test("a verdict the chain no longer bears out is taken out of storage: after a r
   assert.equal((await reloaded.stored())[0].finished, undefined, "the stored verdict is revoked, not just passed over");
   assert.deepEqual((await reloaded.shown("CLOSED", WAITING)).map(({ status, canSend }) => [status, canSend]), [["closing", 0n]]);
   assert.equal(await reloaded.reserveHeld("CLOSED", WAITING), true);
-  // The watchtower acts again: the record kept with the verdict is back, and the share is claimed again.
+  // The watchtower acts again: the record kept with the verdict is back, exactly as it was, and the share is
+  // claimed again with it (the pass settles with the record it reads from the store).
   const again = await reloaded.pass("CLOSED", WAITING);
   assert.equal(again.status, "claimed");
   assert.equal(await reloaded.watching(), true);
+  assert.deepEqual(await openWatchtowerStore(reloaded.prefix).get(chain.watched.channelId), chain.watched);
+  assert.deepEqual((await reloaded.stored())[0].record, chain.watched, "the kept copy survives the closure being rewritten");
   assert.equal(chain.sent.length, 2);
   // Mined and buried, the channel is finished again, on the new claim.
   chain.mine(chain.sent[1]);
@@ -1404,12 +1419,83 @@ test("what the previous SDK left behind (no watchtower record, no closures, the 
   const reloaded = walletOver(chain, wallet.prefix);
   assert.equal(await reloaded.reserveHeld("CLOSED", WAITING), false);
   assert.equal((await reloaded.pass("CLOSED", WAITING)).finishedNow, false);
-  // If the chain later drops the penalty, the verdict goes and the channel is followed again.
+  // If the chain later drops the penalty, the next start's pass finds the verdict wanting by itself (no sweep has
+  // to ask first): the verdict goes and the channel is followed again.
   chain.drop(chain.penaltyTx!);
-  assert.equal(await reloaded.reserveHeld("CLOSED", WAITING), true);
-  assert.equal((await reloaded.stored())[0].finished, undefined);
-  assert.equal((await reloaded.pass("CLOSED", WAITING)).finishedNow, false, "a live commitment cell: nothing is finished");
-  assert.equal((await reloaded.shown("CLOSED", WAITING))[0].status, "closing");
+  const later = walletOver(chain, wallet.prefix);
+  assert.equal((await later.pass("CLOSED", WAITING)).finishedNow, false, "a live commitment cell: nothing is finished");
+  assert.equal((await later.stored())[0].finished, undefined);
+  assert.equal(await later.reserveHeld("CLOSED", WAITING), true);
+  assert.equal((await later.shown("CLOSED", WAITING))[0].status, "closing");
+});
+
+test("a verdict is asked about again after ten minutes, even while another channel keeps the reserve and no sweep asks", async () => {
+  const { createReserveGate } = await closureModule();
+  const id = "0x" + "0a".repeat(32);
+  const outPoint = "0x" + "0b".repeat(32) + "00000000";
+  const closingTx = "0x" + "0d".repeat(32);
+  const closure = { channelId: id, fundingOutPoint: outPoint, closingTx, seenAt: 0, finished: { status: "settled", evidence: "0x" + "0c".repeat(32) } };
+  const listed = { channel_id: id, channel_outpoint: outPoint, shutdown_transaction_hash: closingTx, state: { state_name: "CLOSED", state_flags: WAITING } };
+  const other = { ...listed, channel_id: "0x" + "1a".repeat(32), shutdown_transaction_hash: null, state: { state_name: "CHANNEL_READY" } };
+  let clock = 1_000_000;
+  let buried = true;
+  const revoked: string[] = [];
+  const gate = createReserveGate({
+    listChannels: async () => [listed, other], listClosures: async () => [closure], opening: () => false,
+    isBuried: async () => buried, now: () => clock,
+    revoke: async (item: { channelId: string }) => { revoked.push(item.channelId); },
+  } as never);
+  assert.equal(await gate.holds(closure as never), true);
+  // A deep reorganization drops the verdict's transaction. The other channel keeps the reserve needed, so the
+  // sweep never gets as far as asking about this verdict.
+  buried = false;
+  assert.equal(await gate.needed({ fresh: true }), true);
+  assert.deepEqual(revoked, []);
+  clock += 9 * 60_000;
+  assert.equal(await gate.holds(closure as never), true, "within ten minutes the earlier answer is reused");
+  clock += 2 * 60_000;
+  assert.equal(await gate.holds(closure as never), false, "after ten minutes the pass asks again");
+  assert.deepEqual(revoked, [id]);
+});
+
+test("a finished status that rests on another transaction than the stored verdict voids the verdict until that one is buried", async () => {
+  const { openClosureStore, recordSettleResult } = await closureModule();
+  const prefix = `/wasm-test-${crypto.randomUUID()}`;
+  const closures = openClosureStore(prefix);
+  const channelId = "0x" + "0a".repeat(32);
+  const fundingOutPoint = "0x" + "0b".repeat(32) + "00000000";
+  const closingTx = "0x" + "0d".repeat(32);
+  const [first, second]: Array<`0x${string}`> = [`0x${"c1".repeat(32)}`, `0x${"c2".repeat(32)}`];
+  const removed: string[] = [];
+  const buried = new Set<string>([first]);
+  const record = (evidence: `0x${string}`) => recordSettleResult({
+    result: { channelId, status: "the user's share is already claimed", closingTx: closingTx as `0x${string}`, evidence },
+    fundingOutPoint, nodeClosedBy: closingTx, closures,
+    watchtower: { get: async () => undefined, restore: async () => undefined, remove: async (id) => { removed.push(id); } },
+    isBuried: async (txHash) => buried.has(txHash),
+  });
+  assert.equal(await record(first), true);
+  assert.deepEqual(removed, [channelId]);
+  // The same status now rests on another transaction, one block deep.
+  removed.length = 0;
+  assert.equal(await record(second), false);
+  assert.equal((await closures.list())[0].finished, undefined, "the verdict on the first transaction is void");
+  assert.deepEqual(removed, [], "and nothing ends the watch on it");
+  buried.add(second);
+  assert.equal(await record(second), true);
+  assert.deepEqual((await closures.list())[0].finished, { status: "the user's share is already claimed", evidence: second });
+});
+
+test("a record put back never replaces one the node has handed over since", async () => {
+  const store = openWatchtowerStore(`/wasm-test-${crypto.randomUUID()}`);
+  const kept = { ...fakeChain().watched, updatedAt: 1 };
+  await store.restore(kept);
+  assert.deepEqual(await store.get(kept.channelId), kept, "nothing there: the kept copy goes back");
+  await store.restore({ ...kept, updatedAt: 2, localSettlementKey: "0x" + "99".repeat(32) });
+  assert.deepEqual(await store.get(kept.channelId), kept, "a record already there is left as it is");
+  await store.remove(kept.channelId);
+  assert.equal(await store.get(kept.channelId), undefined);
+  store.close();
 });
 
 test("without a record, nothing weaker than an empty commitment lock finishes a channel", async () => {
