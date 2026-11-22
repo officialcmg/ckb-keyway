@@ -839,6 +839,8 @@ function walletOver(chain: ReturnType<typeof fakeChain>, prefix?: string, option
       looks?: { listed(channelIds: string[]): void; seenOpen(channelId: string): void };
       /** Runs before the pass looks at the channel on-chain: a slow RPC, or one that fails. */
       beforeLook?: () => Promise<void>;
+      /** What the passes have said about each channel so far, as create-keyway.ts keeps it from pass to pass. */
+      statuses?: Map<string, string>;
     } = {}): Promise<PassResult> {
       await seeded;
       const { openClosureStore } = await closureModule();
@@ -864,6 +866,7 @@ function walletOver(chain: ReturnType<typeof fakeChain>, prefix?: string, option
         },
         follow: async (outPoint) => { await extra.beforeLook?.(); return forceCloseSettled(chain.client, "testnet", ccc.OutPoint.decode(outPoint)); },
         ...(extra.looks ? { looks: extra.looks } : {}),
+        ...(extra.statuses ? { statuses: extra.statuses } : {}),
         isBuried: async (txHash: string) => { if (buriedFail) throw new Error("the RPC timed out"); return isBuried(chain.client, txHash); },
       });
       const status = looked?.status ?? (failure ? `failed: ${failure.message}` : had ? "finished for good: not looked at again" : "no record: not looked at");
@@ -1760,15 +1763,29 @@ test("a claim that can't be built because the node's key holds no fee cell says 
   await later.pass("CLOSED", WAITING);
   assert.equal((await later.stored())[0].finished, undefined);
   assert.equal(await later.watching(), true);
-  // ...and the claim the next pass tries has nothing to pay its fee with.
+  // ...and the claim the next pass tries has nothing to pay its fee with. The passes after it (one a minute) find
+  // the same, and say nothing more: the warning is given once, not every minute.
   let result!: PassResult;
-  const warnings = await warningsOf(async () => { result = await later.pass("CLOSED", WAITING); });
+  const said = new Map<string, string>();
+  const warnings = await warningsOf(async () => {
+    result = await later.pass("CLOSED", WAITING, undefined, { statuses: said });
+    await later.pass("CLOSED", WAITING, undefined, { statuses: said });
+    await later.pass("CLOSED", WAITING, undefined, { statuses: said });
+  });
   assert.match(result.status, /^failed: The node's key \(ckt1\w+\) holds no cell to pay the claim's fee/);
   const about = warnings.filter((line) => line.includes(chain.watched.channelId));
   assert.equal(about.length, 1, `one warning about the channel, got: ${JSON.stringify(warnings)}`);
   assert.match(about[0], /the node's key \(ckt1\w+\) holds no CKB cell to pay its fee/);
   assert.match(about[0], /fee cell/);
   assert.ok(!warnings.some((line) => line.includes("could not be settled yet")), "not the general warning");
+  // Once a pass has had something else to say about the channel, a fee cell that is missing again is news again.
+  const again = await warningsOf(async () => {
+    await later.pass("CLOSED", WAITING, undefined, { statuses: said, beforeLook: async () => { throw new Error("the RPC timed out"); } });
+    await later.pass("CLOSED", WAITING, undefined, { statuses: said });
+    await later.pass("CLOSED", WAITING, undefined, { statuses: said });
+  });
+  assert.equal(again.filter((line) => line.includes("could not be settled yet")).length, 1, JSON.stringify(again));
+  assert.equal(again.filter((line) => line.includes("holds no CKB cell to pay its fee")).length, 1, `said again after another failure, once: ${JSON.stringify(again)}`);
   // The channel shows as closing and holds whatever reserve the key is given next.
   assert.equal((await later.shown("CLOSED", WAITING))[0].status, "closing");
   assert.equal(await later.reserveHeld("CLOSED", WAITING), true);
@@ -1929,6 +1946,50 @@ test("a first pass slower than the wait: the list comes back on time with the ch
   assert.deepEqual((await d.list()).shown, HELD);
   await d.wallet.pass("CHANNEL_READY", undefined, undefined, { looks: d.looks });
   assert.deepEqual((await d.list()).shown, READY);
+});
+
+test("a list that holds a channel back while a pass is running asks for one more pass behind it, which runs only if the channel is still waiting", async () => {
+  const { createFirstLooks, lookAgain } = await import("../src/sdk/browser/first-look.ts");
+  const looks = createFirstLooks({ wait: 0 });
+  looks.begin(Promise.resolve());
+  const id = `0x${"0a".repeat(32)}`;
+  const other = `0x${"0b".repeat(32)}`;
+  // The wallet's passes, one at a time: `end` ends the one running.
+  let running: Promise<void> | undefined;
+  let end!: () => void;
+  let passes = 0;
+  const pass = () => running ?? (passes++, running = new Promise<void>((resolve) => { end = () => { running = undefined; resolve(); }; }));
+  const settle = async () => { for (let turn = 0; turn < 5; turn++) await new Promise((resolve) => setImmediate(resolve)); };
+  const ask = lookAgain({ looks, running: () => running, pass });
+
+  // No pass is running: one is started at once.
+  ask([id]);
+  assert.equal(passes, 1);
+  // That pass had the node's channel list before the channel could be looked at. Lists keep asking while it
+  // runs: nothing more starts yet, and however many ask, one pass is queued.
+  ask([id]);
+  ask([other]);
+  ask([id]);
+  assert.equal(passes, 1);
+  // The pass ends without having looked at the channel: the queued one runs, without waiting for the next minute.
+  end();
+  await settle();
+  assert.equal(passes, 2, "one more pass, and only one");
+  // Asked again during it; this pass looks at both channels. Nothing is waiting when it ends: no third pass.
+  ask([id]);
+  looks.seenOpen(id);
+  looks.seenOpen(other);
+  end();
+  await settle();
+  assert.equal(passes, 2, "a pass that looked at the channels is not followed by another");
+  // A channel asked for by a later list than the first is not forgotten.
+  const third = `0x${"0c".repeat(32)}`;
+  ask([id]);
+  assert.equal(passes, 3);
+  ask([third]);
+  end();
+  await settle();
+  assert.equal(passes, 4, "the channel a later list held back still waits");
 });
 
 // From the review of this round's own changes.

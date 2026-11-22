@@ -57,10 +57,38 @@ export function createFirstLooks(options: { /** How long after a start a list wa
 export type FirstLooks = ReturnType<typeof createFirstLooks>;
 
 /**
+ * What a list does about the channels it holds back (`listPresented`'s `lookNow`): asks for a pass now. If one is
+ * already running, it may have listed the node's channels before one of these could be looked at, and asking for a
+ * pass would only join it. So one more pass is queued behind it, and runs if any channel a list has asked about is
+ * still waiting when the running pass ends: such a channel doesn't wait for the next minute's pass. However many
+ * lists ask meanwhile, one pass is queued. `pass` starts a pass, or returns the one running, and does nothing once
+ * the node has stopped (create-keyway.ts `watchNow`), so nothing queued here outlives a stop.
+ */
+export function lookAgain(deps: { looks: FirstLooks; /** The pass in progress, if any. */ running(): Promise<unknown> | undefined; pass(): Promise<unknown> }): (held: string[]) => void {
+  let wanted: Set<string> | undefined;
+  return (held) => {
+    const active = deps.running();
+    if (!active) {
+      void deps.pass().catch(() => undefined);
+      return;
+    }
+    if (wanted) {
+      for (const id of held) wanted.add(id.toLowerCase());
+      return;
+    }
+    const mine = wanted = new Set(held.map((id) => id.toLowerCase()));
+    void active.catch(() => undefined).then(() => {
+      wanted = undefined;
+      if ([...mine].some((id) => deps.looks.awaited(id))) return deps.pass();
+    }).catch(() => undefined);
+  };
+}
+
+/**
  * The channel list as the wallet gives it out (create-keyway.ts `getChannels`): waits for the first pass of this
  * run as long as `looks` allows, then lists the node's channels corrected by what the watchtower has recorded, with
- * those still waiting for their first look held back. When one is held back, a pass is asked for now (`lookNow`),
- * so it doesn't wait for the next minute's.
+ * those still waiting for their first look held back. When one is held back, a pass is asked for now (`lookNow`,
+ * in the wallet `lookAgain` below), so it doesn't wait for the next minute's.
  */
 export async function listPresented(deps: {
   looks: FirstLooks;
@@ -68,7 +96,8 @@ export async function listPresented(deps: {
   channels(): Promise<KeyWayChannel[]>;
   closures(): Promise<ChannelClosure[]>;
   includeClosed: boolean;
-  lookNow?(): void;
+  /** Told which channels were held back. */
+  lookNow?(held: string[]): void;
 }): Promise<KeyWayChannel[]> {
   await deps.looks.settled();
   const channels = await deps.channels();
@@ -76,6 +105,7 @@ export async function listPresented(deps: {
   const presented = presentChannels(channels, seen, deps.includeClosed, deps.looks.awaited);
   // Held back: ready by the node's word, pending as listed.
   const ready = new Set(channels.filter((channel) => channel.status === "ready").map((channel) => channel.id));
-  if (presented.some((channel) => channel.status === "pending" && ready.has(channel.id))) deps.lookNow?.();
+  const held = presented.filter((channel) => channel.status === "pending" && ready.has(channel.id)).map((channel) => channel.id);
+  if (held.length > 0) deps.lookNow?.(held);
   return presented;
 }

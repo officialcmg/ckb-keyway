@@ -104,10 +104,16 @@ export async function watchChannels(deps: {
       if (await note(channel.channelId, result, outpoint, raw)) finished = true;
     } catch (error) {
       const failure = error as SettleFailure | undefined;
-      // No cell on the node's key to pay the fee with is not a passing failure: said once, in so many words.
+      // No cell on the node's key to pay the fee with is not a passing failure: said in so many words, and once,
+      // not by every pass that finds the same (the next thing a pass has to say about the channel is said again).
       if (failure?.noFeeCell) {
-        console.warn(`[keyway] watchtower: channel ${channel.channelId} has funds to claim on-chain, but the claim can't be sent: the node's key (${failure.noFeeCell.address}) holds no CKB cell to pay its fee with. The claim is tried again every minute and goes through once the node's key holds a fee cell; opening a channel sends one (the 62 CKB fee reserve).`);
-      } else console.warn(`[keyway] watchtower: channel ${channel.channelId} could not be settled yet`, error);
+        const address = failure.noFeeCell.address;
+        say(channel.channelId, "no fee cell", () => console.warn(`[keyway] watchtower: channel ${channel.channelId} has funds to claim on-chain, but the claim can't be sent: the node's key (${address}) holds no CKB cell to pay its fee with. The claim is tried again every minute and goes through once the node's key holds a fee cell; opening a channel sends one (the 62 CKB fee reserve).`));
+      } else {
+        // Said by every pass that fails, with its cause; and remembered, so a fee cell missing again is said again.
+        statuses.set(channel.channelId, "could not be settled yet");
+        console.warn(`[keyway] watchtower: channel ${channel.channelId} could not be settled yet`, error);
+      }
       // A claim that couldn't be built or sent (no fee cell, an RPC error) doesn't unsee the close.
       // And a claim that was due contradicts any verdict that nothing is left.
       if (failure?.closingTx) {

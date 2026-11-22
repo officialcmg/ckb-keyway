@@ -38,7 +38,7 @@ import { listenForWatchtowerCalls } from "./watchtower-bridge";
 import { openWatchtowerStore } from "./watchtower-store";
 import { forceCloseSettled, isBuried, settleChannel, trackNodeKeySends } from "./watchtower-settle";
 import { createReserveGate, openClosureStore, revokeVerdict, type ChannelClosure } from "./channel-closures";
-import { createFirstLooks, listPresented } from "./first-look";
+import { createFirstLooks, listPresented, lookAgain } from "./first-look";
 import { watchChannels } from "./watchtower-pass";
 import { createRemoteWatchtower, remoteWatchUpdate, updatesForStoredChannel } from "./watchtower-remote";
 import { createNodeLifecycle } from "./node-lifecycle";
@@ -629,6 +629,9 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     return getLockBalance(address.script);
   }
 
+  /** What a channel list does about the channels it holds back: a pass now, or one more behind the one running. */
+  const lookNow = lookAgain({ looks: firstLooks, running: () => watchPass, pass: watchNow });
+
   /**
    * The node's channels, corrected by what the in-page watchtower has seen on-chain: a channel whose funding cell a
    * force close has spent isn't ready and has nothing to send, whatever the node still says, and stays listed as
@@ -638,7 +641,8 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   async function getChannels(options?: { includeClosed?: boolean }): Promise<KeyWayChannel[]> {
     // Right after a start the watchtower may not have looked yet: its first pass gets a moment, FIRST_WATCH_WAIT
     // from the start at most, however many lists are asked for meanwhile. A channel no pass has looked at by then
-    // is listed as pending with nothing to send, not as ready, and a pass is asked for at once.
+    // is listed as pending with nothing to send, not as ready, and a pass is asked for at once: a new one, or one
+    // more behind the pass that is running, in case that one came by too early for the channel.
     return listPresented({
       looks: firstLooks,
       includeClosed: options?.includeClosed ?? false,
@@ -648,7 +652,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
         console.warn("[keyway] could not read what the watchtower has seen; showing the node's own channel states", error);
         return [];
       }),
-      lookNow: () => void watchNow().catch(() => undefined),
+      lookNow,
     });
   }
 

@@ -64,7 +64,9 @@ export async function sendFeeReserve(options: {
 /**
  * Whether a reserve this page sent (transaction `txHash`, the reserve at its output 0) still stands although the
  * node key's view of the chain doesn't list it yet: on its way in (pending), or committed and live but not indexed.
- * Not if the node key's own client has already spent it (a sweep returning it), or the chain doesn't know it.
+ * Not if a transaction on its way spends it: one of the node key's own client (the page's sweep returning it), or
+ * anyone else's that the node has in its transaction pool (in hosted mode the server sweeps the key, and the page's
+ * client has no mark for that). Nor if the chain doesn't know it.
  */
 export async function sentReserveStands(options: { client: ccc.Client; viewer: ccc.Client; txHash: ccc.HexLike }): Promise<boolean> {
   const outPoint = ccc.OutPoint.from({ txHash: options.txHash, index: 0 });
@@ -72,7 +74,7 @@ export async function sentReserveStands(options: { client: ccc.Client; viewer: c
   const found = await options.client.getTransactionNoCache(options.txHash);
   if (found?.status === "pending" || found?.status === "proposed") return true;
   if (found?.status !== "committed") return false;
-  return Boolean(await options.viewer.getCellLiveNoCache(outPoint, false));
+  return Boolean(await options.viewer.getCellLiveNoCache(outPoint, false, true));
 }
 
 /**

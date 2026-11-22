@@ -96,8 +96,6 @@ export function planSweep(plainTotal: bigint, tokenCells: number, keepReserve: b
 
 /** The cells one sweep spends at most: the key's plain cells first, then token cells in the room that is left. */
 const MAX_CELLS = 50;
-/** The cells with a type script one sweep looks at, at most, to find token cells it can move. */
-const MAX_TYPED_SCANNED = 500;
 const SWEEP_FEE_MARGIN = 1_000_000n;
 
 /**
@@ -120,8 +118,14 @@ const SWEEP_FEE_MARGIN = 1_000_000n;
  *
  * The key's plain cells and its token cells are asked for separately, so neither kind can crowd the other out of a
  * sweep, however many cells sit on the key: plain cells are always found (up to MAX_CELLS of them go into one
- * sweep), and the token cells of one sweep are chosen among every movable one found (MAX_TYPED_SCANNED cells with a
- * type script are looked at), so a token cell that is put off for now takes no other cell's place.
+ * sweep), and the token cells of one sweep are chosen among every movable one on the key (cells with a type script
+ * the sweep doesn't move are passed over), so a token cell that is put off for now takes no other cell's place.
+ *
+ * A key with more cells than one sweep spends is emptied over several, and the CKB must last until the last of
+ * them: a token cell can need a top-up, and at its minimum it can't pay a fee. So while token cells that the CKB
+ * could move are still waiting for room, a sweep pays no plain CKB to the user: what isn't spent on top-ups stays
+ * on the key, with the reserve or as one cell of its own, and leaves with the sweep that leaves no such token cell
+ * behind. (Less than a cell's minimum and a fee can't be kept as a cell, and goes on as it would have.)
  *
  * `live`: asked right before the transaction is sent. When it answers false (the node this sweep was started for
  * has been stopped since, create-keyway.ts), nothing is sent.
@@ -145,13 +149,13 @@ export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.Hex
     allPlain.push(cell);
     if (allPlain.length >= MAX_CELLS) break;
   }
-  // Token cells: every movable one among the cells with a type script that are looked at is a candidate.
+  // Token cells: every movable one on the key is a candidate, and all of them are read. Anyone can send cells to
+  // the key, and a search that stopped after so many cells, of whatever kind, would stop at the same place every
+  // time, before the token cells listed behind them; and what a sweep may pay out depends on whether any token cell
+  // is still waiting (below), which it can only know of the cells it has read.
   const tokenCells: ccc.Cell[] = [];
-  let scanned = 0;
   for await (const cell of client.findCells({ ...underKey, filter: { scriptLenRange: [1, 0xffff_ffff] } }, undefined, 100)) {
-    if (!cell.cellOutput.type) continue;
-    if (movable(cell.cellOutput.type)) tokenCells.push(cell);
-    if (++scanned >= MAX_TYPED_SCANNED) break;
+    if (cell.cellOutput.type && movable(cell.cellOutput.type)) tokenCells.push(cell);
   }
   if (allPlain.length === 0 && tokenCells.length === 0) return undefined;
 
@@ -176,11 +180,15 @@ export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.Hex
   // The token cells of this sweep: those the CKB beyond the reserve can top up, the smallest top-ups first, as many
   // as fit beside the plain cells. One that is put off (too dear for now, or beyond the room) is simply not among
   // them: the next sweep chooses again.
-  const affordable = sized.filter(({ extra: needed }) => {
+  const fundable = sized.filter(({ extra: needed }) => {
     if (budget + needed > spendable) return false;
     budget += needed;
     return true;
-  }).slice(0, MAX_CELLS - plainCells.length);
+  });
+  const affordable = fundable.slice(0, MAX_CELLS - plainCells.length);
+  // Token cells the CKB could top up, but for which this sweep has no room, move with a later sweep, and that one
+  // needs CKB for their top-ups and its fee. Until none is waiting, no plain CKB is paid out.
+  const waiting = fundable.length > affordable.length;
   // Too little for a plain cell of its own at the destination (95 CKB at an Omnilock): it joins the reserve, or
   // rides in the first token cell, or waits for a later sweep.
   const minimumPlain = ccc.fixedPointFrom(ccc.CellOutput.from({ lock: to, capacity: 0n }).occupiedSize);
@@ -204,14 +212,24 @@ export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.Hex
     const plan = planSweep(rest, tokens.length, keep);
     if (!plan) continue;
     let { toUser, reserve } = plan;
+    // Token cells are waiting for room: what would go to the user stays on the key for them, on top of a reserve
+    // that stays anyway, else as a cell of its own, which takes a cell's minimum and what a fee can be paid from
+    // (less than that can't be kept as a cell, and goes on as it would have).
+    let held = false;
+    if (waiting && toUser > 0n && (reserve > 0n || toUser >= MIN_PLAIN_CELL + SWEEP_FEE_MARGIN)) {
+      reserve += toUser;
+      toUser = 0n;
+      held = true;
+    }
     if (toUser > 0n && toUser < minimumPlain + SWEEP_FEE_MARGIN) {
       if (reserve > 0n) reserve += toUser;
       else if (tokens.length > 0) tokens[0].output.capacity += toUser;
       else continue;
       toUser = 0n;
     }
-    // Nothing leaves the key: no transaction that only turns the key's cells into one of its own, at a fee.
-    if (toUser === 0n && tokens.length === 0) continue;
+    // Nothing leaves the key: no transaction that only turns the key's cells into one of its own, at a fee. Except
+    // when token cells wait for room that the key's plain cells take up: then turning those into one makes the room.
+    if (toUser === 0n && tokens.length === 0 && !(held && plainCells.length > 1)) continue;
     const plainOutputs = [
       ...(toUser > 0n ? [{ lock: to, capacity: toUser }] : []),
       ...(reserve > 0n ? [{ lock: from, capacity: reserve }] : []),
@@ -223,7 +241,8 @@ export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.Hex
     });
     const userIndex = toUser > 0n ? tokens.length : undefined;
     const reserveIndex = reserve > 0n ? tokens.length + (toUser > 0n ? 1 : 0) : undefined;
-    const floor = (index: number) => index === reserveIndex ? keep : index === userIndex ? minimumPlain : tokens[index].minimum;
+    // What stays on the key is a cell there, whether or not a reserve is kept in it.
+    const floor = (index: number) => index === reserveIndex ? ccc.numMax(keep, MIN_PLAIN_CELL) : index === userIndex ? minimumPlain : tokens[index].minimum;
     const spare = (index: number) => tx.outputs[index].capacity - floor(index);
     const payer = [userIndex, reserveIndex, ...tokens.map((_token, index) => index).sort((x, y) => spare(x) > spare(y) ? -1 : spare(x) < spare(y) ? 1 : 0)]
       .find((index): index is number => index !== undefined && spare(index) >= SWEEP_FEE_MARGIN);
