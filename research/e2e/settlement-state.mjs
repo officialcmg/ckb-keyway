@@ -19,10 +19,12 @@ export function loadSettlementState(text) {
 
 /**
  * An unfinished run that got as far as opening its channel: a restart signs in to the same account and carries on with
- * the same channel (force-closing it if that hadn't happened yet) instead of setting up new ones.
+ * the same channel (waiting for it to become ready, or force-closing it, if that hadn't happened yet) instead of
+ * setting up new ones. The channel counts from the moment it is opened, before its funding is known: a run stopped
+ * while waiting for it must not open a second one and leave the first, with its funds, behind.
  */
 export function resumableRun(state) {
-  return !state.finished && Boolean(state.email && state.password && state.address && state.channelId && state.funding);
+  return !state.finished && Boolean(state.email && state.password && state.address && state.channelId);
 }
 
 /**
@@ -30,8 +32,10 @@ export function resumableRun(state) {
  * ID and the node's channel databases) or start fresh, and which setup steps still have to run.
  */
 export function startupPlan(state) {
-  if (!resumableRun(state)) return { resume: false, keepProfile: false, setUp: true, forceClose: true };
-  return { resume: true, keepProfile: true, setUp: false, forceClose: !state.forceCloseAt };
+  if (!resumableRun(state)) return { resume: false, keepProfile: false, setUp: true, awaitReady: true, forceClose: true };
+  // `awaitReady`: the channel is open but its funding isn't recorded yet, so the wait for it to be ready (and what
+  // follows it: the watchtower check, the payments) still has to run.
+  return { resume: true, keepProfile: true, setUp: false, awaitReady: !state.funding, forceClose: !state.forceCloseAt };
 }
 
 /** Records the run's account. A different account than the saved one starts from nothing. */
