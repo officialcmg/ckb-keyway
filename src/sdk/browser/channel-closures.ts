@@ -6,9 +6,9 @@ import type { WatchedChannel } from "./watchtower-store";
 /**
  * What the in-page watchtower has seen happen to a channel on-chain, kept apart from what the node says about it.
  *
- * Fiber 0.10.1's browser node learns of a close the peer put on-chain only from a check it runs every five minutes
- * (`CHECK_CHANNELS_SHUTDOWN_INTERVAL`, fiber/network.rs), so a reopened wallet's node can call a channel ready
- * while its funding cell is already spent. And it never finishes a force-closed channel: it keeps
+ * Fiber 0.10.1's browser node learns of a close the peer put on-chain only from a check it runs every five minutes,
+ * the first one ten minutes after a start (`CHECK_CHANNELS_SHUTDOWN_INTERVAL`, fiber/network.rs), so a reopened
+ * wallet's node can call a channel ready while its funding cell is already spent. And it never finishes a force-closed channel: it keeps
  * `WAITING_ONCHAIN_SETTLEMENT` until it has a settlement record for the close, which only a build with the
  * `watchtower` feature writes (`has_unresolved_onchain_tlcs`, fiber/onchain_tlc_reconcile.rs; fiber-wasm builds
  * without it). The page's watchtower reads the chain itself, so the SDK goes by what it found: a channel whose
@@ -178,7 +178,13 @@ export async function recordSettleResult(options: {
   if (closingTx === undefined) {
     // "open", or a close that isn't a commitment: nothing here says the channel is force-closed (any more),
     // whatever was recorded before. Other statuses (the indexer is behind, say) decide nothing.
-    if (known && (result.status === "open" || result.status === "closed cooperatively")) await closures.remove(channelId);
+    if (known && (result.status === "open" || result.status === "closed cooperatively")) {
+      // The answer may be a stale one, and the closure may carry the kept copy of the watchtower's record, with
+      // more in it than the record the node has handed over again since: the copy goes into that record first
+      // (it fills in what the record lacks), and only then is the closure forgotten.
+      if (known.record) await options.watchtower.restore(known.record);
+      await closures.remove(channelId);
+    }
     return false;
   }
   const same = known !== undefined && known.fundingOutPoint === fundingOutPoint && known.closingTx === closingTx;
@@ -277,9 +283,10 @@ export async function restoreWatch(options: { closures: readonly ChannelClosure[
  *   commitment cell and every successor are spent with none left (`follow`, watchtower-settle.ts
  *   `forceCloseSettled`), and the transaction that spent the last one is buried (`isBuried`). Anything less, a live
  *   cell under the lock or a transaction not yet deep enough, writes no verdict.
- * - A verdict already stored for the same close is taken back as soon as the chain is seen to contradict it: a
- *   live cell under the commitment lock (a reorganization undid the transaction the verdict rested on), or the
- *   lock emptied by another transaction. That needs no answer about the old transaction's depth, which may not come.
+ * - A verdict already stored for the same close is taken back as soon as the chain is seen to contradict it
+ *   (`contradicts`): a reorganization undid the transaction the verdict rested on. That needs no answer about the
+ *   old transaction's depth, which may not come. A verdict the chain still agrees with is left alone here, however
+ *   the depth request fares.
  *
  * Returns true when it wrote the verdict.
  */
@@ -323,12 +330,11 @@ export async function recordChainVerdict(options: {
   // The observation first, as for a channel with a record. A verdict about another close is dropped with it.
   if (!same) await closures.put(closure);
   const evidence = channelKey(seen.settledBy);
-  // A verdict stored for this very close, and the chain, read to the end just now, doesn't bear it out: a cell is
-  // live under the commitment lock, or nothing is left but by another transaction than the verdict rests on. What
-  // was seen decides, whatever a request for the old transaction's depth would say or fail to say: the verdict is
+  // A verdict stored for this very close, and the chain, read to the end just now, doesn't bear it out. What was
+  // seen decides, whatever a request for the old transaction's depth would say or fail to say: the verdict is
   // taken out of storage, so the channel shows as closing and holds the reserve, and a kept copy of the record
   // goes back to the watchtower, which can claim with it. (An answer that couldn't be read to the end decides nothing.)
-  if (same && known.finished && !seen.unfollowed && channelKey(known.finished.evidence) !== evidence) {
+  if (same && known.finished && contradicts(seen, known.finished)) {
     await closures.put(closure);
     if (options.watchtower) {
       await restoreWatch({ closures: [closure], watchtower: options.watchtower })
@@ -341,6 +347,24 @@ export async function recordChainVerdict(options: {
   if (!await options.isBuried(evidence)) return false;
   await closures.put({ ...closure, finished: { status: "settled", evidence } });
   return true;
+}
+
+/**
+ * Whether what the chain shows of a close, read to the end, contradicts a verdict stored for it.
+ *
+ * - "settled" said nothing was left under the commitment lock, emptied by the verdict's transaction: a live cell
+ *   there, or the lock emptied by another transaction, contradicts it.
+ * - The other verdicts (the user's share already claimed, no share for the user) were read off a cell that may well
+ *   still be live, holding what is the peer's: only a live cell made by another transaction than the one the
+ *   verdict rests on contradicts them (a reorganization undid the claim, and the cell is an earlier one again). The
+ *   same cell still live, or the lock emptied since, is what such a verdict expects.
+ */
+function contradicts(seen: ForceCloseOnChain, verdict: NonNullable<ChannelClosure["finished"]>): boolean {
+  if (seen.unfollowed) return false;
+  const rested = channelKey(verdict.evidence);
+  if (verdict.status === "settled") return channelKey(seen.settledBy) !== rested;
+  const live = channelKey(seen.liveIn);
+  return live !== undefined && live !== rested;
 }
 
 /** How long an answer that a verdict's transaction is buried is reused before the chain is asked again. */

@@ -622,10 +622,14 @@ export type ForceCloseOnChain = {
   settledBy?: ccc.Hex;
   /**
    * Set when the commitment cell is spent but what became of it can't be read to the end right now (a settlement the
-   * indexer doesn't show yet, one that can't be read): nothing follows from this answer. With `closingTx` and
-   * neither this nor `settledBy`, a cell under the commitment lock was seen live.
+   * indexer doesn't show yet, one that can't be read): nothing follows from this answer.
    */
   unfollowed?: true;
+  /**
+   * Set when a cell under the commitment lock was seen live: the transaction that created it (the commitment
+   * itself, or the last settlement so far).
+   */
+  liveIn?: ccc.Hex;
 };
 
 /**
@@ -635,15 +639,16 @@ export type ForceCloseOnChain = {
  * can be known: who the remaining funds belong to can't be told without the record, so nothing short of "nothing
  * is left" (`settledBy`) says the channel is finished. Anything else (open, closed cooperatively, a transaction
  * the indexer doesn't show yet, a live commitment cell) leaves `settledBy` unset. `closingTx` alone says the
- * channel is force-closed, which is enough to stop showing it as ready; with neither `settledBy` nor `unfollowed`
- * it also says a cell under the commitment lock is live, which contradicts any earlier verdict about this close.
+ * channel is force-closed, which is enough to stop showing it as ready. `liveIn` says a cell under the commitment
+ * lock is live and which transaction made it: that contradicts a verdict that nothing was left there, and one that
+ * rested on another cell than this one.
  */
 export async function forceCloseSettled(client: ccc.Client, network: "testnet" | "mainnet", fundingOutPoint: ccc.OutPointLike): Promise<ForceCloseOnChain> {
   const funding = await fundingFate(client, network, fundingOutPoint);
   if (!("commitmentTx" in funding)) return funding.status === "open" || funding.status === "closed cooperatively" ? { notForceClosed: true } : {};
   const closingTx = funding.commitmentTx.hash();
   const fate = await commitmentFate(client, network, funding.commitmentTx);
-  return { closingTx, ...("settledBy" in fate ? { settledBy: fate.settledBy } : "live" in fate ? {} : { unfollowed: true as const }) };
+  return { closingTx, ...("settledBy" in fate ? { settledBy: fate.settledBy } : "live" in fate ? { liveIn: fate.live.cell.txHash } : { unfollowed: true as const }) };
 }
 
 async function settle(options: SettleOptions, seen: { closingTx?: ccc.Hex; claiming?: boolean }): Promise<SettleResult> {

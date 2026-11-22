@@ -333,7 +333,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       // While the reserve stays, it stays at a size that can be returned to this account's address later.
       const swept = await sweepSettlement(nodeKeyClient, ccc.hexFrom(key), destination, keep, { returnableReserve: true, live });
       if (swept) nodeKeySends.record(swept as ccc.Hex);
-      else if (returning && keep === 0n) {
+      else if (returning && keep === 0n && live()) {
         const nodeLock = (await new ccc.SignerCkbPrivateKey(nodeKeyClient, ccc.hexFrom(key)).getRecommendedAddressObj()).script;
         if (await hasFeeReserve(nodeKeyClient, nodeLock)) {
           console.info("[keyway] the fee reserve is no longer needed, but it is smaller than the smallest cell the account's address can hold, so it stays on the node's key: the next channel uses it, and the next settlement carries it back");
