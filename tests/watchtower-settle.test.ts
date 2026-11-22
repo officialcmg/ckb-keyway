@@ -1989,3 +1989,28 @@ test("a kept copy of a record goes into the record the node has handed over agai
   assert.equal(again.status, "the user's share is already claimed");
   assert.equal(again.finishedNow, true);
 });
+
+test("a transaction is buried only if it is still in the same block after the tip was read", async () => {
+  const { isBuried } = await import("../src/sdk/browser/watchtower-settle.ts");
+  const txHash = `0x${"e1".repeat(32)}`;
+  const tx = ccc.Transaction.from({ outputs: [], outputsData: [] });
+  const [first, other] = [`0x${"b1".repeat(32)}`, `0x${"b2".repeat(32)}`];
+  /** A node that answers each read of the transaction with the next of `answers` (the last one from then on). */
+  const node = (answers: Array<{ status: string; blockHash?: string; blockNumber?: bigint } | undefined>, tip: bigint) => {
+    let read = 0;
+    const client = new ccc.ClientPublicTestnet({ url: "http://127.0.0.1:9/" });
+    Object.assign(client, {
+      getTransactionNoCache: async () => { const answer = answers[Math.min(read++, answers.length - 1)]; return answer && { transaction: tx, ...answer }; },
+      getTip: async () => tip,
+    });
+    return client;
+  };
+  const inFirst = { status: "committed", blockHash: first, blockNumber: 100n };
+  assert.equal(await isBuried(node([inFirst], 124n), txHash), true, "the same block before and after the tip was read");
+  assert.equal(await isBuried(node([inFirst], 123n), txHash), false);
+  // Between the two reads a reorganization moved the transaction to another block, or dropped it: the depth was
+  // counted against a chain it is no longer on.
+  assert.equal(await isBuried(node([inFirst, { status: "committed", blockHash: other, blockNumber: 123n }], 124n), txHash), false);
+  assert.equal(await isBuried(node([inFirst, { status: "pending" }], 124n), txHash), false);
+  assert.equal(await isBuried(node([inFirst, undefined], 124n), txHash), false);
+});

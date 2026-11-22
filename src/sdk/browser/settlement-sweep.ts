@@ -235,9 +235,11 @@ export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.Hex
     // Whatever the fee rate turned out to be: the payer still holds what it must, and the reserve is whole.
     if (tx.outputs[payer].capacity < floor(payer)) return undefined;
     if (reserveIndex !== undefined && tx.outputs[reserveIndex].capacity < keep) return undefined;
-    // The node this sweep was started for has stopped meanwhile: whoever holds the device now decides about the key.
+    // Signed first, so that nothing but the send itself comes after the last question: has the node this sweep was
+    // started for stopped meanwhile? Then whoever holds the device now decides about the key.
+    const signed = await signer.signTransaction(tx);
     if (options.live && !options.live()) return undefined;
-    return signer.sendTransaction(tx);
+    return client.sendTransaction(signed);
   }
   return undefined;
 }

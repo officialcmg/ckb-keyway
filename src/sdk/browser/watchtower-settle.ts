@@ -506,7 +506,8 @@ export const FINISHED: ReadonlySet<string> = new Set(["settled", "the user's sha
 export const FINAL_DEPTH = 24n;
 
 /**
- * Whether a transaction is on-chain with FINAL_DEPTH blocks on top of it. A verdict that a channel is finished
+ * Whether a transaction is on-chain with FINAL_DEPTH blocks on top of it, in one view of the chain: the transaction
+ * is read again after the tip, and must still be in the block its depth was counted from. A verdict that a channel is finished
  * is acted on (its watchtower record dropped, its fee reserve released) only once the transaction it rests on is,
  * so a reorganization that undoes the transaction finds the watchtower still able to claim.
  */
@@ -515,7 +516,11 @@ export async function isBuried(client: ccc.Client, txHash: ccc.HexLike): Promise
   if (found?.status !== "committed") return false;
   const number = found.blockNumber ?? (found.blockHash ? (await client.getHeaderByHash(found.blockHash))?.number : undefined);
   if (number === undefined) return false;
-  return (await client.getTip()) - number >= FINAL_DEPTH;
+  if ((await client.getTip()) - number < FINAL_DEPTH) return false;
+  // The block and the tip came from two reads. Deep enough counts only if the transaction is still in the same
+  // block after the tip was read: otherwise the depth was measured against a chain the transaction is no longer on.
+  const still = await client.getTransactionNoCache(txHash);
+  return still?.status === "committed" && still.blockHash === found.blockHash;
 }
 
 /**
