@@ -10,13 +10,23 @@ import { commitmentLockCellDeps, parseCommitmentArgs, planClaim, signSettlement,
 import type { WatchedChannel } from "../../src/sdk/browser/watchtower-store";
 
 async function claimDryRun(channelId: string, commitment: string, payTo: string) {
-  const name = (await indexedDB.databases()).map((d) => d.name).find((n) => n?.endsWith("-keyway-watchtower"));
-  if (!name) return { error: "no watchtower database in this page" };
-  const db = await new Promise<IDBDatabase>((resolve, reject) => { const r = indexedDB.open(name); r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
-  const rows = await new Promise<WatchedChannel[]>((resolve) => { const r = db.transaction("channels").objectStore("channels").getAll(); r.onsuccess = () => resolve(r.result); });
-  db.close();
-  const channel = rows.find((row) => row.channelId === channelId);
-  if (!channel) return { error: "the watchtower holds no data for the channel" };
+  // A page can hold more than one watchtower database (an earlier node's is kept beside the current one): the
+  // channel is looked for in each.
+  const names = (await indexedDB.databases()).map((d) => d.name).filter((n): n is string => Boolean(n?.endsWith("-keyway-watchtower")));
+  if (names.length === 0) return { error: "no watchtower database in this page" };
+  let channel: WatchedChannel | undefined;
+  for (const name of names) {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => { const r = indexedDB.open(name); r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
+    try {
+      if (!db.objectStoreNames.contains("channels")) continue;
+      const rows = await new Promise<WatchedChannel[]>((resolve, reject) => { const r = db.transaction("channels").objectStore("channels").getAll(); r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
+      channel = rows.find((row) => row.channelId === channelId);
+    } finally {
+      db.close();
+    }
+    if (channel) break;
+  }
+  if (!channel) return { error: `the watchtower holds no data for the channel (${names.length} database${names.length === 1 ? "" : "s"} looked at)` };
 
   const client = new ccc.ClientPublicTestnet();
   const outPoint = ccc.OutPoint.from({ txHash: commitment, index: 0 });

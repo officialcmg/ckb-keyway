@@ -278,7 +278,8 @@ try {
     let raw;
     for (let i = 0; ; i++) {
       raw = await rawChannel();
-      if (raw?.channel_outpoint && /ready/i.test(raw.state?.state_name ?? "")) break;
+      // CHANNEL_READY exactly: AWAITING_CHANNEL_READY can already have its funding outpoint and is not ready yet.
+      if (raw?.channel_outpoint && String(raw.state?.state_name ?? "").replaceAll("_", "").toLowerCase() === "channelready") break;
       if (i > 120) throw new Error(`the channel did not become ready: ${describeChannel(raw)}`);
       await sleep(5000);
     }
