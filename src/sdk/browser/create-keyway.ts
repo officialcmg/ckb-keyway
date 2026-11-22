@@ -37,7 +37,8 @@ import { fiberWasmFactory } from "./fiber-wasm";
 import { listenForWatchtowerCalls } from "./watchtower-bridge";
 import { openWatchtowerStore } from "./watchtower-store";
 import { forceCloseSettled, isBuried, settleChannel, trackNodeKeySends } from "./watchtower-settle";
-import { createReserveGate, openClosureStore, presentChannels, revokeVerdict, type ChannelClosure } from "./channel-closures";
+import { createReserveGate, openClosureStore, revokeVerdict, type ChannelClosure } from "./channel-closures";
+import { createFirstLooks, listPresented } from "./first-look";
 import { watchChannels } from "./watchtower-pass";
 import { createRemoteWatchtower, remoteWatchUpdate, updatesForStoredChannel } from "./watchtower-remote";
 import { createNodeLifecycle } from "./node-lifecycle";
@@ -97,7 +98,8 @@ export type KeyWayChannel = {
   asset: KeyWayAsset;
   /**
    * What the user can still send through this channel, in the asset's smallest unit (shannons for CKB). Zero once
-   * the channel's funding cell is seen spent on-chain by a force close.
+   * the channel's funding cell is seen spent on-chain by a force close, and, with a browser node, right after a
+   * start until the SDK has checked the funding cell on-chain (the channel is `pending` until then).
    */
   canSend: bigint;
   /** What the user can still receive through this channel. */
@@ -200,6 +202,12 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   // sweeps take turns with it, so no send lands while a pass rebuilds the cache.
   const nodeKeyClient = new ccc.ClientPublicTestnet();
   const nodeKeySends = trackNodeKeySends(nodeKeyClient);
+  /**
+   * Whether the run of the node that a pass or sweep was queued in is still going (`nodeKeySends.lifetime`, taken
+   * at each start; a stop ends it). Asked before anything is sent with the node's key: once this page has begun to
+   * let go of the device, the node's key is for the next holder to decide about.
+   */
+  let nodeKeyLive: () => boolean = () => false;
   // The node settles force-closed channels with the key derived from the Fiber key, so the reserve goes there.
   const feeReserve = createFeeReserve({
     reserveClient: nodeKeyClient,
@@ -307,17 +315,23 @@ export function createKeyWay(options: CreateKeyWayOptions) {
    * derived from the user's Fiber key, and this moves anything there to the user's own address.
    */
   let sweepTimer: ReturnType<typeof setInterval> | undefined;
-  const sweepNow = () => nodeKeySends.exclusive(() => sweepWithNodeKey());
-  /** `returning`: the sweep that follows the reserve no longer being needed; says so if the reserve can't leave. */
-  async function sweepWithNodeKey(returning = false) {
-    if (!node.isRunning || !credential.isUnlocked()) return;
+  const sweepNow = () => {
+    const live = nodeKeyLive;
+    return nodeKeySends.exclusive(() => sweepWithNodeKey(live));
+  };
+  /**
+   * `live`: whether the run this sweep was queued in is still going; a sweep of a run that has stopped does nothing.
+   * `returning`: the sweep that follows the reserve no longer being needed; says so if the reserve can't leave.
+   */
+  async function sweepWithNodeKey(live: () => boolean, returning = false) {
+    if (!live() || !node.isRunning || !credential.isUnlocked()) return;
     const key = await credential.getCkbSecretKey();
     try {
       const destination = (await fundingSigner.getRecommendedAddressObj()).script;
       // The decision that can move the reserve: every verdict it rests on is asked about again now.
       const keep = await reserve.needed({ fresh: true }) ? FEE_RESERVE : 0n;
       // While the reserve stays, it stays at a size that can be returned to this account's address later.
-      const swept = await sweepSettlement(nodeKeyClient, ccc.hexFrom(key), destination, keep, { returnableReserve: true });
+      const swept = await sweepSettlement(nodeKeyClient, ccc.hexFrom(key), destination, keep, { returnableReserve: true, live });
       if (swept) nodeKeySends.record(swept as ccc.Hex);
       else if (returning && keep === 0n) {
         const nodeLock = (await new ccc.SignerCkbPrivateKey(nodeKeyClient, ccc.hexFrom(key)).getRecommendedAddressObj()).script;
@@ -346,11 +360,12 @@ export function createKeyWay(options: CreateKeyWayOptions) {
     if (!node.isRunning) return;
     watchStopped = false;
     reserveHeld = undefined;
+    nodeKeyLive = nodeKeySends.lifetime();
     // What the chain said in an earlier run of the node is asked again in this one.
     reserve.reset();
-    // The first pass goes before the first sweep, so the first channel list waits for as little as it can.
-    const first = watchNow().catch(() => undefined).finally(() => { if (firstWatch?.pass === first) firstWatch = undefined; });
-    firstWatch = { pass: first, until: Date.now() + FIRST_WATCH_WAIT };
+    // The first pass goes before the first sweep, so the first channel list waits for as little as it can. Until
+    // a pass has looked at a channel, the list doesn't call it ready (first-look.ts).
+    firstLooks.begin(watchNow());
     watchTimer ??= setInterval(() => void watchNow().catch(() => undefined), WATCH_INTERVAL);
     void sweepNow().catch(() => undefined);
     sweepTimer ??= setInterval(() => void sweepNow().catch(() => undefined), 10 * 60_000);
@@ -367,18 +382,20 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   const claimsToSweep = new Set<ccc.Hex>();
   const watchStatus = new Map<string, string>();
   /**
-   * The first pass after a start, while it runs: until it has looked, a channel the peer closed while the page was
-   * shut reads as ready. Channel lists wait for it, but not past `until`.
+   * Which channels a pass has looked at since the last start. Until one has, a channel the peer closed while the
+   * page was shut would read as ready: channel lists wait for the first pass, FIRST_WATCH_WAIT at most, and hold
+   * back what hasn't been looked at by then (first-look.ts).
    */
-  let firstWatch: { pass: Promise<void>; until: number } | undefined;
+  const firstLooks = createFirstLooks({ wait: FIRST_WATCH_WAIT });
   /** Whether the last pass found the fee reserve still needed; the pass that finds it no longer is returns it. */
   let reserveHeld: boolean | undefined;
   function watchNow(): Promise<void> {
     if (watchPass || watchStopped || !node.isRunning || !credential.isUnlocked()) return watchPass ?? Promise.resolve();
-    watchPass = nodeKeySends.exclusive(watchOnce).finally(() => { watchPass = undefined; });
+    const live = nodeKeyLive;
+    watchPass = nodeKeySends.exclusive(() => watchOnce(live)).finally(() => { watchPass = undefined; });
     return watchPass;
   }
-  async function watchOnce() {
+  async function watchOnce(live: () => boolean) {
     {
       // A claim or sweep the chain dropped would otherwise stay in ccc's cache, its payout usable and its fee
       // reserve spent, and break every later claim: start each pass from what the chain says.
@@ -394,7 +411,7 @@ export function createKeyWay(options: CreateKeyWayOptions) {
         if (found?.status !== "committed") continue;
         claimsToSweep.delete(txHash);
         // Already this pass's turn with the node key.
-        await sweepWithNodeKey().catch((error) => console.warn("[keyway] could not sweep the claimed funds yet", error));
+        await sweepWithNodeKey(live).catch((error) => console.warn("[keyway] could not sweep the claimed funds yet", error));
       }
       if (watchStopped) return;
       const { channels } = await node.listChannels({ include_closed: true });
@@ -404,14 +421,15 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       let finishedThisPass = false;
       try {
         ({ finished: finishedThisPass } = await watchChannels({
-          watchtower, closures, channels, gate: reserve, statuses: watchStatus,
-          stopped: () => watchStopped,
+          watchtower, closures, channels, gate: reserve, statuses: watchStatus, looks: firstLooks,
+          stopped: () => watchStopped || !live(),
           settle: async (channel, outpoint) => {
             key ??= await credential.getCkbSecretKey();
             return settleChannel({
               client: nodeKeyClient, network, channel, nodeKey: ccc.hexFrom(key),
               ref: { channelId: channel.channelId, fundingOutPoint: ccc.OutPoint.decode(outpoint) },
               preimage: (paymentHash) => watchtower.preimage(paymentHash),
+              live,
             });
           },
           follow: (outpoint) => forceCloseSettled(nodeKeyClient, network, ccc.OutPoint.decode(outpoint)),
@@ -429,18 +447,25 @@ export function createKeyWay(options: CreateKeyWayOptions) {
       // that first finds no channel needing the reserve any more returns it, instead of the next 10-minute sweep.
       const held = await reserve.needed();
       if ((reserveHeld === true || finishedThisPass) && !held && !watchStopped) {
-        await sweepWithNodeKey(true).catch((error) => console.warn("[keyway] could not return the fee reserve yet", error));
+        await sweepWithNodeKey(live, true).catch((error) => console.warn("[keyway] could not return the fee reserve yet", error));
       }
       reserveHeld = held;
     }
   }
 
-  /** Stops the watchtower passes and waits for one in progress, so none runs after the node stops. */
+  /**
+   * Stops the watchtower passes, and waits for everything queued for the node's key: the pass in progress, and
+   * every sweep queued or running (the one at start, the ten-minute one, one behind a pass). Before this a stop
+   * waited for a pass only, so a sweep could still be at work, and send, after a logout had let go of the device:
+   * the device that took over would open a channel, find the reserve on the node's key and send none, and the old
+   * device's late sweep would then take that reserve away. From here on nothing of this run sends (`nodeKeyLive`),
+   * and when this resolves nothing of it is still running.
+   */
   async function stopWatching() {
     if (watchTimer) clearInterval(watchTimer);
     watchTimer = undefined;
     watchStopped = true;
-    await watchPass?.catch(() => undefined);
+    await nodeKeySends.stop();
   }
 
   async function stop() {
@@ -607,25 +632,24 @@ export function createKeyWay(options: CreateKeyWayOptions) {
   /**
    * The node's channels, corrected by what the in-page watchtower has seen on-chain: a channel whose funding cell a
    * force close has spent isn't ready and has nothing to send, whatever the node still says, and stays listed as
-   * closing until nothing is left to claim (channel-closures.ts).
+   * closing until nothing is left to claim (channel-closures.ts). After a start, a channel the node calls ready is
+   * pending, with nothing to send, until the watchtower has looked at its funding cell (first-look.ts).
    */
   async function getChannels(options?: { includeClosed?: boolean }): Promise<KeyWayChannel[]> {
-    // Right after a start the watchtower may not have looked yet; give its first pass a moment, FIRST_WATCH_WAIT
-    // from the start at most, however many lists are asked for meanwhile.
-    const first = firstWatch;
-    const wait = first ? first.until - Date.now() : 0;
-    if (first && wait > 0) {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([first.pass, new Promise((resolve) => { timer = setTimeout(resolve, wait); })]);
-      clearTimeout(timer);
-    }
-    // Closed ones too: the node calls a force-closed channel closed while the user's share is still to be claimed.
-    const { channels } = await node.listChannels({ include_closed: true });
-    const seen: ChannelClosure[] = await closures.list().catch((error) => {
-      console.warn("[keyway] could not read what the watchtower has seen; showing the node's own channel states", error);
-      return [];
+    // Right after a start the watchtower may not have looked yet: its first pass gets a moment, FIRST_WATCH_WAIT
+    // from the start at most, however many lists are asked for meanwhile. A channel no pass has looked at by then
+    // is listed as pending with nothing to send, not as ready, and a pass is asked for at once.
+    return listPresented({
+      looks: firstLooks,
+      includeClosed: options?.includeClosed ?? false,
+      // Closed ones too: the node calls a force-closed channel closed while the user's share is still to be claimed.
+      channels: async () => (await node.listChannels({ include_closed: true })).channels.map((channel) => normalizeChannel(channel)),
+      closures: () => closures.list().catch((error): ChannelClosure[] => {
+        console.warn("[keyway] could not read what the watchtower has seen; showing the node's own channel states", error);
+        return [];
+      }),
+      lookNow: () => void watchNow().catch(() => undefined),
     });
-    return presentChannels(channels.map((channel) => normalizeChannel(channel)), seen, options?.includeClosed ?? false);
   }
 
   async function closeChannel(channelId: ChannelId, closeOptions?: { force?: boolean; feeRate?: bigint }): Promise<void> {

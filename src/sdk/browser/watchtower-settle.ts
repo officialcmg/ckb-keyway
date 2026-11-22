@@ -472,7 +472,16 @@ export type SettleResult = {
  * A pass that failed after it had seen a commitment spend the funding cell still says so (`closingTx`), and, if it
  * failed while building or sending a claim, that there is something still to settle (`unsettled`).
  */
-export type SettleFailure = Error & { closingTx?: ccc.Hex; unsettled?: true };
+export type SettleFailure = Error & {
+  closingTx?: ccc.Hex;
+  unsettled?: true;
+  /**
+   * The claim was due and could not be built because the node's key (at this address) holds no plain cell to pay
+   * its fee with. That is how a channel stands whose fee reserve has already been returned when a reorganization
+   * deeper than FINAL_DEPTH undoes the transaction that finished it.
+   */
+  noFeeCell?: { address: string };
+};
 
 /**
  * Statuses after which the channel needs nothing more from the watchtower: nothing is left under its commitment
@@ -481,7 +490,19 @@ export type SettleFailure = Error & { closingTx?: ccc.Hex; unsettled?: true };
  */
 export const FINISHED: ReadonlySet<string> = new Set(["settled", "the user's share is already claimed", "the user has no share in this channel"]);
 
-/** Blocks a transaction must be under before a verdict resting on it is kept for good (as the server watchtower's REORG_DEPTH). */
+/**
+ * Blocks a transaction must be under before a verdict resting on it is acted on: the watchtower's record dropped
+ * (a copy is kept), the fee reserve released.
+ *
+ * Every verdict assumes that the chain reorganizes at most this deep, the same depth KeyWay's server watchtower
+ * assumes (server/watchtower.ts `REORG_DEPTH`). A reorganization within it is absorbed: nothing has been given up
+ * yet. One deeper than it, undoing a penalty or a claim that was already FINAL_DEPTH blocks down, is noticed (the
+ * verdict is asked about again before anything rests on it, and every ten minutes: channel-closures.ts
+ * `createReserveGate`), the verdict is taken back and the watchtower's record restored, so the channel shows as
+ * closing again and is claimed again. But the fee reserve may already have been returned to the user by then, and
+ * nothing sends it back: the claim then has no cell to pay its fee with and waits, saying so in the console
+ * (`SettleFailure.noFeeCell`), until the node's key holds one again (the next channel open sends a reserve).
+ */
 export const FINAL_DEPTH = 24n;
 
 /**
@@ -513,6 +534,11 @@ type SettleOptions = {
   now?: number;
   /** For checks only: builds the claim before the delay has passed and hands it to `submit` instead of sending it. */
   dryRun?: { submit: (tx: ccc.Transaction) => Promise<ccc.Hex> };
+  /**
+   * Asked right before a claim is sent. When it answers false (the node this pass was started for has been stopped
+   * since, create-keyway.ts), the claim is not sent: the pass of whoever holds the device next sends it.
+   */
+  live?: () => boolean;
 };
 
 export async function settleChannel(options: SettleOptions): Promise<SettleResult> {
@@ -594,6 +620,12 @@ export type ForceCloseOnChain = {
   closingTx?: ccc.Hex;
   /** Set once nothing is left under the commitment lock: the transaction that spent its last cell. */
   settledBy?: ccc.Hex;
+  /**
+   * Set when the commitment cell is spent but what became of it can't be read to the end right now (a settlement the
+   * indexer doesn't show yet, one that can't be read): nothing follows from this answer. With `closingTx` and
+   * neither this nor `settledBy`, a cell under the commitment lock was seen live.
+   */
+  unfollowed?: true;
 };
 
 /**
@@ -603,14 +635,15 @@ export type ForceCloseOnChain = {
  * can be known: who the remaining funds belong to can't be told without the record, so nothing short of "nothing
  * is left" (`settledBy`) says the channel is finished. Anything else (open, closed cooperatively, a transaction
  * the indexer doesn't show yet, a live commitment cell) leaves `settledBy` unset. `closingTx` alone says the
- * channel is force-closed, which is enough to stop showing it as ready.
+ * channel is force-closed, which is enough to stop showing it as ready; with neither `settledBy` nor `unfollowed`
+ * it also says a cell under the commitment lock is live, which contradicts any earlier verdict about this close.
  */
 export async function forceCloseSettled(client: ccc.Client, network: "testnet" | "mainnet", fundingOutPoint: ccc.OutPointLike): Promise<ForceCloseOnChain> {
   const funding = await fundingFate(client, network, fundingOutPoint);
   if (!("commitmentTx" in funding)) return funding.status === "open" || funding.status === "closed cooperatively" ? { notForceClosed: true } : {};
   const closingTx = funding.commitmentTx.hash();
   const fate = await commitmentFate(client, network, funding.commitmentTx);
-  return { closingTx, ...("settledBy" in fate ? { settledBy: fate.settledBy } : {}) };
+  return { closingTx, ...("settledBy" in fate ? { settledBy: fate.settledBy } : "live" in fate ? {} : { unfollowed: true as const }) };
 }
 
 async function settle(options: SettleOptions, seen: { closingTx?: ccc.Hex; claiming?: boolean }): Promise<SettleResult> {
@@ -685,14 +718,35 @@ async function settle(options: SettleOptions, seen: { closingTx?: ccc.Hex; claim
   });
   await tx.addCellDepsOfKnownScripts(client, ccc.KnownScript.Secp256k1Blake160);
   // As Fiber does, the node's own key adds at least one plain cell (its fee reserve) and pays the fee.
-  await tx.completeInputsAddOne(signer);
+  try {
+    await tx.completeInputsAddOne(signer);
+  } catch (cause) {
+    // No cell on the key is a state of its own, not a passing failure: it lasts until someone sends the key a cell.
+    // Told apart from an RPC error by asking for the key's plain cells once more; if that can't be asked either,
+    // the failure stays what it was.
+    const none = await holdsNoPlainCell(client, nodeLock).catch(() => false);
+    if (!none) throw cause;
+    const address = ccc.Address.fromScript(nodeLock, client).toString();
+    const failure: SettleFailure = new Error(`The node's key (${address}) holds no cell to pay the claim's fee`, { cause });
+    failure.noFeeCell = { address };
+    throw failure;
+  }
   await tx.completeFeeChangeToOutput(signer, tx.outputs.length - 1, 1000);
   // A TLC claimed after its expiry: the lock reads the expiry off an input's absolute timestamp `since`, which the
   // node's own fee inputs carry (as in Fiber). Setting it changes no size, so the fee stands.
   if (plan.feeSince !== undefined) for (const input of tx.inputs.slice(1)) input.since = plan.feeSince;
   signSettlement(tx, plan.signingKey, Boolean(plan.preimage));
   const signed = await signer.signOnlyTransaction(tx);
+  // The node this pass was started for has stopped meanwhile: the claim is left to whoever holds the device next.
+  if (!options.dryRun && options.live && !options.live()) return result("the node stopped before the claim was sent", undefined, undefined, true);
   return result("claimed", await (options.dryRun?.submit(signed) ?? client.sendTransaction(signed)), undefined, true);
+}
+
+/** Whether a key holds no plain cell at all (no type script, no data): nothing a claim's fee could come from. */
+async function holdsNoPlainCell(client: ccc.Client, lock: ccc.Script): Promise<boolean> {
+  const plain = { script: lock, scriptType: "lock" as const, scriptSearchMode: "exact" as const, filter: { scriptLenRange: [0, 1] as [number, number], outputDataLenRange: [0, 1] as [number, number] }, withData: true };
+  for await (const _cell of client.findCells(plain)) return false;
+  return true;
 }
 
 /**
@@ -708,10 +762,15 @@ async function settle(options: SettleOptions, seen: { closingTx?: ccc.Hex; claim
  * Everything that uses the client (a pass with its refresh and claims, a sweep) runs through `exclusive`, one at a
  * time: a send that lands while a refresh is rebuilding the cache would otherwise have its spent marks overwritten
  * (ccc's `markUsable` clears a cell's spent flag), and the next claim would pick a cell that is already spent.
+ *
+ * The queue is also what a stop of the node waits for (`stop`): a sweep or a pass that was queued or running when
+ * the node stopped must not finish, let alone send, after the device has been let go.
  */
 export function trackNodeKeySends(client: ccc.Client) {
   const sent = new Set<ccc.Hex>();
   let queue: Promise<unknown> = Promise.resolve();
+  /** Counts the stops: work keeps the number it was queued under (`lifetime`). */
+  let life = 0;
   return {
     record(hash: ccc.Hex) {
       sent.add(hash);
@@ -721,6 +780,27 @@ export function trackNodeKeySends(client: ccc.Client) {
       const run = queue.then(task);
       queue = run.catch(() => undefined);
       return run;
+    },
+    /**
+     * The life of the node that work is queued for, from now until the next `stop`: the function returned says
+     * whether that life is still going. A sweep or a claim asks it right before it sends (`live`).
+     */
+    lifetime(): () => boolean {
+      const mine = life;
+      return () => mine === life;
+    },
+    /**
+     * Ends the current life, and waits until everything queued so far has finished, whatever was queued while
+     * waiting included. Nothing of the life that ended sends after this has begun, and nothing of it is still
+     * running once it resolves: only then may the device be let go (create-keyway.ts `stopTimers`), because the
+     * device that takes over decides about the node's key from what it finds there.
+     */
+    async stop(): Promise<void> {
+      life++;
+      for (let seen: Promise<unknown> | undefined; seen !== queue;) {
+        seen = queue;
+        await seen;
+      }
     },
     async refresh() {
       await client.cache.clear();

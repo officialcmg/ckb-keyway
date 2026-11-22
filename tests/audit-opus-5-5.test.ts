@@ -32,7 +32,15 @@ async function offlineClient(cells: ccc.Cell[] = [], transactions: ccc.Transacti
       const transaction = transactions.find((candidate) => candidate.hash() === ccc.hexFrom(hash));
       return transaction ? { transaction, status: "committed" } : undefined;
     },
-    findCells: async function* () {},
+    // As the indexer answers: by lock, and by whether a cell has a type script (`scriptLenRange`, which the
+    // settlement sweep asks with: [0, 1] for plain cells, [1, ...] for cells with a type script).
+    findCells: async function* (key: Parameters<ccc.Client["findCells"]>[0]) {
+      const [from, to] = (key.filter?.scriptLenRange ?? [0, Number.MAX_SAFE_INTEGER]).map(Number);
+      for (const cell of [...cells].reverse()) {
+        const typeLength = cell.cellOutput.type ? 65 : 0;
+        if (cell.cellOutput.lock.eq(ccc.Script.from(key.script)) && typeLength >= from && typeLength < to) yield cell;
+      }
+    },
     findCellsByLock: async function* (lock: ccc.ScriptLike) {
       for (const cell of [...cells].reverse()) if (cell.cellOutput.lock.eq(ccc.Script.from(lock))) yield cell;
     },

@@ -44,6 +44,11 @@ export async function watchChannels(deps: {
   onClaim?(txHash: NonNullable<SettleResult["txHash"]>): void;
   /** The status last logged for each channel, so a pass says only what changed. */
   statuses?: Map<string, string>;
+  /**
+   * Told which channels the node lists, and each one whose funding cell this pass read and found no force close
+   * on (live, or spent by a cooperative close): until then the channel list holds a ready channel back (first-look.ts).
+   */
+  looks?: { listed(channelIds: string[]): void; seenOpen(channelId: string): void };
 }): Promise<{ finished: boolean }> {
   const { watchtower, closures, channels } = deps;
   const stopped = deps.stopped ?? (() => false);
@@ -54,6 +59,8 @@ export async function watchChannels(deps: {
     log();
   };
   let finished = false;
+  deps.looks?.listed(channels.map((channel) => channelKey(channel.channel_id)).filter((id): id is string => id !== undefined));
+  const NOT_FORCE_CLOSED: ReadonlySet<string> = new Set(["open", "closed cooperatively"]);
 
   const seen: ChannelClosure[] = await closures.list().catch(() => []);
   // A verdict that was taken back after the watchtower's record had been removed: the watch starts again.
@@ -92,13 +99,17 @@ export async function watchChannels(deps: {
       const result = await deps.settle(channel, outpoint);
       say(channel.channelId, result.status, () => console.info(`[keyway] watchtower: channel ${channel.channelId}: ${result.status}${result.txHash ? ` ${result.txHash}` : ""}`));
       if (result.txHash) deps.onClaim?.(result.txHash);
+      if (result.closingTx === undefined && NOT_FORCE_CLOSED.has(result.status)) deps.looks?.seenOpen(channel.channelId);
       // Remembers a force close seen on-chain and, once the channel is finished for good, ends its watch.
       if (await note(channel.channelId, result, outpoint, raw)) finished = true;
     } catch (error) {
-      console.warn(`[keyway] watchtower: channel ${channel.channelId} could not be settled yet`, error);
+      const failure = error as SettleFailure | undefined;
+      // No cell on the node's key to pay the fee with is not a passing failure: said once, in so many words.
+      if (failure?.noFeeCell) {
+        console.warn(`[keyway] watchtower: channel ${channel.channelId} has funds to claim on-chain, but the claim can't be sent: the node's key (${failure.noFeeCell.address}) holds no CKB cell to pay its fee with. The claim is tried again every minute and goes through once the node's key holds a fee cell; opening a channel sends one (the 62 CKB fee reserve).`);
+      } else console.warn(`[keyway] watchtower: channel ${channel.channelId} could not be settled yet`, error);
       // A claim that couldn't be built or sent (no fee cell, an RPC error) doesn't unsee the close.
       // And a claim that was due contradicts any verdict that nothing is left.
-      const failure = error as SettleFailure | undefined;
       if (failure?.closingTx) {
         await note(channel.channelId, { channelId: channel.channelId, status: "could not be settled yet", closingTx: failure.closingTx, ...(failure.unsettled ? { unsettled: true as const } : {}) }, outpoint, raw);
       }
@@ -120,7 +131,12 @@ export async function watchChannels(deps: {
     if (closure?.record && !closure.finished) continue;
     if (closure?.finished && closure.closingTx === closedBy(raw) && await deps.gate.holds(closure)) continue;
     try {
-      if (await recordChainVerdict({ channel: raw, follow: deps.follow, closures, isBuried: deps.isBuried })) {
+      const follow = async (fundingOutPoint: string) => {
+        const found = await deps.follow(fundingOutPoint);
+        if (found.notForceClosed) deps.looks?.seenOpen(channelId);
+        return found;
+      };
+      if (await recordChainVerdict({ channel: raw, follow, closures, watchtower, isBuried: deps.isBuried })) {
         finished = true;
         console.info(`[keyway] watchtower: channel ${channelId}, of which no record is left, has nothing under its commitment lock any more; it is finished on-chain`);
       }

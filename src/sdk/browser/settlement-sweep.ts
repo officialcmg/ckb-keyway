@@ -94,7 +94,10 @@ export function planSweep(plainTotal: bigint, tokenCells: number, keepReserve: b
   return { toUser, reserve };
 }
 
+/** The cells one sweep spends at most: the key's plain cells first, then token cells in the room that is left. */
 const MAX_CELLS = 50;
+/** The cells with a type script one sweep looks at, at most, to find token cells it can move. */
+const MAX_TYPED_SCANNED = 500;
 const SWEEP_FEE_MARGIN = 1_000_000n;
 
 /**
@@ -114,8 +117,16 @@ const SWEEP_FEE_MARGIN = 1_000_000n;
  * `returnableReserve`: a reserve smaller than the destination's smallest cell (62 CKB against the 95 CKB of a
  * recovery account's Omnilock) could never be returned on its own. With this set, a sweep that keeps the reserve
  * keeps that smallest cell's worth instead whenever the key holds enough, so the reserve can leave later.
+ *
+ * The key's plain cells and its token cells are asked for separately, so neither kind can crowd the other out of a
+ * sweep, however many cells sit on the key: plain cells are always found (up to MAX_CELLS of them go into one
+ * sweep), and the token cells of one sweep are chosen among every movable one found (MAX_TYPED_SCANNED cells with a
+ * type script are looked at), so a token cell that is put off for now takes no other cell's place.
+ *
+ * `live`: asked right before the transaction is sent. When it answers false (the node this sweep was started for
+ * has been stopped since, create-keyway.ts), nothing is sent.
  */
-export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.HexLike, destination: ccc.ScriptLike, keepReserve = 0n, options: { returnableReserve?: boolean } = {}): Promise<string | undefined> {
+export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.HexLike, destination: ccc.ScriptLike, keepReserve = 0n, options: { returnableReserve?: boolean; live?: () => boolean } = {}): Promise<string | undefined> {
   const signer = new ccc.SignerCkbPrivateKey(client, settlementKey);
   const from = (await signer.getRecommendedAddressObj()).script;
   const to = ccc.Script.from(destination);
@@ -124,37 +135,52 @@ export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.Hex
   const xudt = await client.getKnownScript(ccc.KnownScript.XUdt);
   const movable = (type: ccc.Script | undefined) => !type
     || (((type.codeHash === xudt.codeHash && type.hashType === xudt.hashType) || isXudtCompatible(type)) && hasPlainTokenArgs(type));
-  const cells: ccc.Cell[] = [];
-  for await (const cell of client.findCellsByLock(from, undefined, true)) {
-    if (movable(cell.cellOutput.type)) cells.push(cell);
-    if (cells.length >= MAX_CELLS) break;
+  const underKey = { script: from, scriptType: "lock" as const, scriptSearchMode: "exact" as const, withData: true };
+  // Plain cells: asked for by the indexer's own filter (no type script), so they are found whatever else is listed
+  // before them. Anyone can send a cell to the key, and a sweep that read one list of everything would, behind
+  // enough cells it can't move yet, never see the CKB that could move them, nor the reserve it is there to return.
+  const allPlain: ccc.Cell[] = [];
+  for await (const cell of client.findCells({ ...underKey, filter: { scriptLenRange: [0, 1] } }, undefined, MAX_CELLS)) {
+    if (cell.cellOutput.type) continue;
+    allPlain.push(cell);
+    if (allPlain.length >= MAX_CELLS) break;
   }
-  if (cells.length === 0) return undefined;
+  // Token cells: every movable one among the cells with a type script that are looked at is a candidate.
+  const tokenCells: ccc.Cell[] = [];
+  let scanned = 0;
+  for await (const cell of client.findCells({ ...underKey, filter: { scriptLenRange: [1, 0xffff_ffff] } }, undefined, 100)) {
+    if (!cell.cellOutput.type) continue;
+    if (movable(cell.cellOutput.type)) tokenCells.push(cell);
+    if (++scanned >= MAX_TYPED_SCANNED) break;
+  }
+  if (allPlain.length === 0 && tokenCells.length === 0) return undefined;
 
   // Token cells move as they are, each at least at what it occupies under the destination's lock (an Omnilock
   // needs 176 CKB for a standard xUDT cell where secp256k1 needs 142); the difference comes out of the plain CKB
   // that isn't the reserve. Token cells that can't be topped up from that stay on the key for a later sweep. Plain
   // CKB is pooled: the reserve stays on the key, the rest goes to the user.
   const keeping = keepReserve > 0n;
-  const allPlain = cells.filter((cell) => !cell.cellOutput.type);
   const allPlainTotal = allPlain.reduce((total, cell) => total + cell.cellOutput.capacity, 0n);
   // Less than the reserve on the key: it is what is left of the reserve, and no part of it moves or pays for anything.
   const short = keeping && allPlainTotal < keepReserve;
   const plainCells = short ? [] : allPlain;
   const plainTotal = short ? 0n : allPlainTotal;
   const spendable = keeping ? plainTotal - (short ? 0n : keepReserve) : plainTotal;
-  const sized = cells.filter((cell) => cell.cellOutput.type).map((cell) => {
+  const sized = tokenCells.map((cell) => {
     const output = ccc.CellOutput.from({ lock: to, type: cell.cellOutput.type, capacity: 0n });
     const minimum = ccc.fixedPointFrom(output.occupiedSize + ccc.bytesFrom(cell.outputData).length);
     output.capacity = ccc.numMax(cell.cellOutput.capacity, minimum);
     return { cell, output, minimum, extra: output.capacity - cell.cellOutput.capacity };
   }).sort((a, b) => a.extra < b.extra ? -1 : a.extra > b.extra ? 1 : 0);
   let budget = 0n;
+  // The token cells of this sweep: those the CKB beyond the reserve can top up, the smallest top-ups first, as many
+  // as fit beside the plain cells. One that is put off (too dear for now, or beyond the room) is simply not among
+  // them: the next sweep chooses again.
   const affordable = sized.filter(({ extra: needed }) => {
     if (budget + needed > spendable) return false;
     budget += needed;
     return true;
-  });
+  }).slice(0, MAX_CELLS - plainCells.length);
   // Too little for a plain cell of its own at the destination (95 CKB at an Omnilock): it joins the reserve, or
   // rides in the first token cell, or waits for a later sweep.
   const minimumPlain = ccc.fixedPointFrom(ccc.CellOutput.from({ lock: to, capacity: 0n }).occupiedSize);
@@ -209,6 +235,8 @@ export async function sweepSettlement(client: ccc.Client, settlementKey: ccc.Hex
     // Whatever the fee rate turned out to be: the payer still holds what it must, and the reserve is whole.
     if (tx.outputs[payer].capacity < floor(payer)) return undefined;
     if (reserveIndex !== undefined && tx.outputs[reserveIndex].capacity < keep) return undefined;
+    // The node this sweep was started for has stopped meanwhile: whoever holds the device now decides about the key.
+    if (options.live && !options.live()) return undefined;
     return signer.sendTransaction(tx);
   }
   return undefined;

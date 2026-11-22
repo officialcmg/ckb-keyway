@@ -123,9 +123,21 @@ export function withClosure(channel: KeyWayChannel, closure: Pick<ChannelClosure
 /**
  * The node's channels (all of them, closed ones included) as the SDK lists them: each corrected by its closure,
  * and closed ones left out unless asked for.
+ *
+ * `awaited` (first-look.ts): whether a channel is still waiting for the watchtower's first look at the chain since
+ * the node started. The node's word that such a channel is ready is as old as the last time the wallet was open,
+ * and its funding cell may have been spent since. So until the look, a channel the node calls ready, and of which
+ * no close is recorded, is listed as pending with nothing to send or receive: never as ready with a balance it may
+ * not have.
  */
-export function presentChannels(channels: KeyWayChannel[], closures: readonly ChannelClosure[], includeClosed: boolean): KeyWayChannel[] {
-  const presented = channels.map((channel) => withClosure(channel, closureOf(closures, channel.raw as never)));
+export function presentChannels(channels: KeyWayChannel[], closures: readonly ChannelClosure[], includeClosed: boolean, awaited?: (channelId: string) => boolean): KeyWayChannel[] {
+  const presented = channels.map((channel) => {
+    const closure = closureOf(closures, channel.raw as never);
+    const shown = withClosure(channel, closure);
+    const id = channelKey(channel.id);
+    if (closure || shown.status !== "ready" || id === undefined || !awaited?.(id)) return shown;
+    return { ...shown, status: "pending" as const, canSend: 0n, canReceive: 0n };
+  });
   return includeClosed ? presented : presented.filter((channel) => channel.status !== "closed");
 }
 
@@ -265,6 +277,9 @@ export async function restoreWatch(options: { closures: readonly ChannelClosure[
  *   commitment cell and every successor are spent with none left (`follow`, watchtower-settle.ts
  *   `forceCloseSettled`), and the transaction that spent the last one is buried (`isBuried`). Anything less, a live
  *   cell under the lock or a transaction not yet deep enough, writes no verdict.
+ * - A verdict already stored for the same close is taken back as soon as the chain is seen to contradict it: a
+ *   live cell under the commitment lock (a reorganization undid the transaction the verdict rested on), or the
+ *   lock emptied by another transaction. That needs no answer about the old transaction's depth, which may not come.
  *
  * Returns true when it wrote the verdict.
  */
@@ -273,6 +288,8 @@ export async function recordChainVerdict(options: {
   channel: { channel_id?: unknown; channel_outpoint?: unknown; shutdown_transaction_hash?: unknown; state: { state_name: string; state_flags?: unknown } };
   follow: (fundingOutPoint: string) => Promise<ForceCloseOnChain>;
   closures: ClosureStore;
+  /** Where a kept copy of the channel's record goes back to when a stored verdict is taken back. */
+  watchtower?: Pick<WatchRecords, "restore">;
   isBuried: (txHash: string) => Promise<boolean>;
   now?: number;
 }): Promise<boolean> {
@@ -305,10 +322,22 @@ export async function recordChainVerdict(options: {
   };
   // The observation first, as for a channel with a record. A verdict about another close is dropped with it.
   if (!same) await closures.put(closure);
-  // The verdict: only for a channel the node itself reports closed by force and waiting, by this transaction.
   const evidence = channelKey(seen.settledBy);
+  // A verdict stored for this very close, and the chain, read to the end just now, doesn't bear it out: a cell is
+  // live under the commitment lock, or nothing is left but by another transaction than the verdict rests on. What
+  // was seen decides, whatever a request for the old transaction's depth would say or fail to say: the verdict is
+  // taken out of storage, so the channel shows as closing and holds the reserve, and a kept copy of the record
+  // goes back to the watchtower, which can claim with it. (An answer that couldn't be read to the end decides nothing.)
+  if (same && known.finished && !seen.unfollowed && channelKey(known.finished.evidence) !== evidence) {
+    await closures.put(closure);
+    if (options.watchtower) {
+      await restoreWatch({ closures: [closure], watchtower: options.watchtower })
+        .catch((error) => console.warn(`[keyway] watchtower: could not put back channel ${channelId}, whose verdict was taken back; the next pass tries again`, error));
+    }
+  }
+  // The verdict: only for a channel the node itself reports closed by force and waiting, by this transaction.
   if (!waitingOnChain(channel) || closedBy(channel) !== closingTx || evidence === undefined) return false;
-  if (same && known.finished?.evidence === evidence) return false;
+  if (same && channelKey(known.finished?.evidence) === evidence) return false;
   if (!await options.isBuried(evidence)) return false;
   await closures.put({ ...closure, finished: { status: "settled", evidence } });
   return true;

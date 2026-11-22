@@ -85,6 +85,17 @@ test("the reserve stays unless every channel is finished, each on positive evide
 // A recovery account's address is an Omnilock, whose smallest cell is 95 CKB: a 62 CKB reserve can't be a cell there.
 const settlementKey = ccc.hexFrom(secp256k1.utils.randomSecretKey());
 const omnilock = omnilockScript({ omnilock: KEYWAY_OMNILOCK.testnet, omnilockArgs: omnilockArgsFor(ccc.hexFrom(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true)), `0x${"42".repeat(32)}`) });
+/**
+ * `findCells` as the indexer answers it over these cells: by lock, and by whether a cell has a type script (the
+ * `scriptLenRange` filter the sweep asks with: [0, 1] for plain cells, [1, ...] for cells with a type script).
+ */
+const servedBy = (cells: () => ccc.Cell[]) => async function* (key: Parameters<ccc.Client["findCells"]>[0]) {
+  const [from, to] = (key.filter?.scriptLenRange ?? [0, Number.MAX_SAFE_INTEGER]).map(Number);
+  for (const cell of cells()) {
+    const typeLength = cell.cellOutput.type ? 65 : 0;
+    if (cell.cellOutput.lock.eq(ccc.Script.from(key.script)) && typeLength >= from && typeLength < to) yield cell;
+  }
+};
 /** A node key holding these plain cells, on a client that never reaches the network; `sent` collects its sweeps. */
 async function nodeKeyHolding(capacities: bigint[]) {
   const client = new ccc.ClientPublicTestnet({ url: "http://127.0.0.1:9/" });
@@ -92,7 +103,7 @@ async function nodeKeyHolding(capacities: bigint[]) {
   const cells = capacities.map((capacity, index) => ccc.Cell.from({ outPoint: { txHash: `0x${(index + 1).toString(16).padStart(64, "0")}`, index: 0 }, cellOutput: { lock: from, capacity }, outputData: "0x" }));
   const sent: ccc.Transaction[] = [];
   Object.assign(client, {
-    findCells: async function* () {},
+    findCells: servedBy(() => cells),
     findCellsByLock: async function* (lock: ccc.ScriptLike) { for (const cell of cells) if (cell.cellOutput.lock.eq(ccc.Script.from(lock))) yield cell; },
     getFeeRate: async () => 1000n,
     sendTransaction: async (tx: ccc.Transaction) => { sent.push(tx); return tx.hash(); },
@@ -151,7 +162,7 @@ async function nodeKeyWith(plain: bigint[], tokens: bigint[]) {
   ];
   const sent: ccc.Transaction[] = [];
   Object.assign(client, {
-    findCells: async function* () {},
+    findCells: servedBy(() => cells),
     findSingletonCellByType: async () => undefined,
     findCellsByLock: async function* (lock: ccc.ScriptLike) { for (const cell of cells) if (cell.cellOutput.lock.eq(ccc.Script.from(lock))) yield cell; },
     getFeeRate: async () => 1000n,
@@ -359,4 +370,68 @@ test("a reserve just sent counts for the next channel open until the chain lists
   const swept = clients("committed", true);
   await swept.viewer.cache.markUnusable(outPoint);
   assert.equal(await sentReserveStands(swept), false);
+});
+
+// Review round 4: how many cells sit on the node's key, and in what order the indexer lists them, must not decide
+// whether a sweep finds the key's CKB.
+
+test("the key's plain CKB is found and moved however many token cells are listed before it, and the reserve is returned", async () => {
+  const secp = await secp256k1Lock(new ccc.ClientPublicTestnet({ url: "http://127.0.0.1:9/" }), ccc.hexFrom(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true)));
+  // Fifty token cells at their exact minimum, listed before the key's plain cells (nodeKeyWith lists tokens first).
+  const crowd = Array.from({ length: 50 }, () => 142n * CKB);
+  for (const [who, options] of SWEEPS) {
+    // No channel needs the reserve any more: it goes back to the user, and pays the fee for the token cells that
+    // move with it (at their minimum they have nothing to pay with).
+    const released = await nodeKeyWith([FEE_RESERVE], crowd);
+    await sweepSettlement(released.client, settlementKey, secp, 0n, options);
+    assert.equal(released.sent.length, 1, `${who}: the reserve must not stay on the key for good`);
+    const back = released.sent[0].outputs.find((output) => output.lock.eq(secp) && !output.type);
+    assert.ok(back && back.capacity > 61n * CKB && back.capacity <= FEE_RESERVE, `${who}: the reserve reaches the user`);
+    assert.equal(released.kept(released.sent[0]), 0n, who);
+    assert.ok(released.sent[0].inputs.length <= 50, `${who}: ${released.sent[0].inputs.length} inputs`);
+
+    // The reserve is still needed and a settlement has arrived: the settlement reaches the user, the reserve stays
+    // whole, and the token cells that fit beside the two plain cells move along.
+    const kept = await nodeKeyWith([FEE_RESERVE, 300n * CKB], crowd);
+    await sweepSettlement(kept.client, settlementKey, secp, FEE_RESERVE, options);
+    assert.equal(kept.sent.length, 1, `${who}: a settlement must not wait behind token cells`);
+    assert.equal(kept.kept(kept.sent[0]), FEE_RESERVE, `${who}: ${kept.kept(kept.sent[0])} kept`);
+    const paid = kept.sent[0].outputs.find((output) => output.lock.eq(secp) && !output.type);
+    assert.ok(paid && paid.capacity > 299n * CKB && paid.capacity <= 300n * CKB, `${who}: the settlement reaches the user`);
+    assert.equal(kept.sent[0].inputs.length, 50, who);
+    assert.equal(kept.sent[0].outputs.filter((output) => output.type).length, 48, who);
+  }
+});
+
+test("token cells that are put off don't take the place of ones that can move, and one sweep spends fifty cells at most", async () => {
+  const secp = await secp256k1Lock(new ccc.ClientPublicTestnet({ url: "http://127.0.0.1:9/" }), ccc.hexFrom(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true)));
+  for (const [who, options] of SWEEPS) {
+    // Fifty token cells that nothing can top up (a recovery account's address needs 34 CKB more for each, and the
+    // only plain CKB is the reserve, which is kept), listed before two that need no top-up and can pay a fee.
+    const key = await nodeKeyWith([FEE_RESERVE], [...Array.from({ length: 50 }, () => 142n * CKB), 177n * CKB, 177n * CKB]);
+    await sweepSettlement(key.client, settlementKey, omnilock, FEE_RESERVE, options);
+    assert.equal(key.sent.length, 1, `${who}: the two cells that can move must not wait behind fifty that can't`);
+    const tokens = key.sent[0].outputs.filter((output) => output.type);
+    assert.equal(tokens.length, 2, who);
+    assert.ok(tokens.every((output) => output.lock.eq(omnilock) && output.capacity >= 176n * CKB), who);
+    assert.equal(key.kept(key.sent[0]), FEE_RESERVE, `${who}: the reserve is exactly as it was`);
+
+    // Sixty plain cells and ten token cells: one sweep takes fifty plain cells, the rest goes with the next.
+    const many = await nodeKeyWith(Array.from({ length: 60 }, () => 100n * CKB), Array.from({ length: 10 }, () => 143n * CKB));
+    await sweepSettlement(many.client, settlementKey, secp, 0n, options);
+    assert.equal(many.sent.length, 1, who);
+    assert.equal(many.sent[0].inputs.length, 50, who);
+    assert.ok(many.sent[0].outputs.find((output) => output.lock.eq(secp) && !output.type)!.capacity > 4_999n * CKB, who);
+  }
+});
+
+test("a sweep told that its node has stopped builds nothing more than it would have sent, and sends nothing", async () => {
+  const secp = await secp256k1Lock(new ccc.ClientPublicTestnet({ url: "http://127.0.0.1:9/" }), ccc.hexFrom(secp256k1.getPublicKey(secp256k1.utils.randomSecretKey(), true)));
+  const key = await nodeKeyWith([FEE_RESERVE + 500n * CKB], []);
+  let live = false;
+  assert.equal(await sweepSettlement(key.client, settlementKey, secp, 0n, { returnableReserve: true, live: () => live }), undefined);
+  assert.equal(key.sent.length, 0, "nothing is sent with the node's key once its node has stopped");
+  live = true;
+  assert.ok(await sweepSettlement(key.client, settlementKey, secp, 0n, { returnableReserve: true, live: () => live }));
+  assert.equal(key.sent.length, 1);
 });

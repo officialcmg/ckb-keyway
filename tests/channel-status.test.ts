@@ -109,3 +109,23 @@ test("a closure applies only to its own channel and funding cell", async () => {
   const odd = { ...raw, channel_outpoint: { tx_hash: `0x${"cc".repeat(32)}`, index: "0x0" } } as unknown as typeof raw;
   assert.equal(closureOf([{ channelId: `0x${"aa".repeat(32)}`, fundingOutPoint: "[object object]", closingTx: "0x", seenAt: 0 }], odd), undefined);
 });
+
+test("a channel the node calls ready is listed as pending with nothing to send while it waits for its first look on-chain", async () => {
+  const { presentChannels } = await import("../src/sdk/browser/channel-closures.ts");
+  const id = `0x${"aa".repeat(32)}`;
+  const ready = normalizeChannel(funded("CHANNEL_READY"));
+  const waiting = (channelId: string) => channelId === id;
+  const [held] = presentChannels([ready], [], false, waiting);
+  assert.deepEqual([held.status, held.canSend, held.canReceive], ["pending", 0n, 0n]);
+  assert.equal(held.capacity, 500n * 100_000_000n, "its size is still shown");
+  assert.equal(held.raw, ready.raw, "Fiber's own channel object is untouched");
+  // Looked at, and no force close found: as the node has it.
+  assert.deepEqual(presentChannels([ready], [], false, () => false).map(({ status, canSend }) => [status, canSend]), [["ready", 360n * 100_000_000n]]);
+  // A recorded close already says what the channel is, looked at in this run or not.
+  assert.deepEqual(presentChannels([ready], seen, false, waiting).map(({ status, canSend }) => [status, canSend]), [["closing", 0n]]);
+  // Only a channel the node calls ready is held back: nothing else claims a balance that could be gone.
+  const opening = normalizeChannel(funded("AWAITING_CHANNEL_READY"));
+  const shutting = normalizeChannel(funded("SHUTTING_DOWN"));
+  assert.deepEqual(presentChannels([opening, shutting], [], false, waiting).map(({ status }) => status), ["pending", "closing"]);
+  assert.equal(presentChannels([shutting], [], false, waiting)[0].canSend, shutting.canSend);
+});
