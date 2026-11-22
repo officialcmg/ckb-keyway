@@ -18,7 +18,7 @@ export type NodeLifecycleParts<Info> = {
   closeBridge(): Promise<void>;
   /** Starts what needs a running node (the sweep and watchtower timers). */
   afterStart(): void;
-  /** Stops those timers and waits for a pass in progress. */
+  /** Stops those timers and waits for everything queued with the node's key: the pass in progress, and every sweep. */
   stopTimers(): Promise<void>;
   /** Lets go of the device once the bridge has drained: closes the store and releases the lease and lock. */
   release(): Promise<void>;

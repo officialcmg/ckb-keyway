@@ -38,6 +38,12 @@ export type WatchtowerStore = {
   list(): Promise<WatchedChannel[]>;
   get(channelId: string): Promise<WatchedChannel | undefined>;
   remove(channelId: string): Promise<void>;
+  /**
+   * Puts back a record that was removed when its channel was found finished (channel-closures.ts keeps a copy).
+   * If the node has handed the channel over again meanwhile, nothing it gave is replaced: the kept copy only
+   * fills in what the record there doesn't have (`mergeKept`).
+   */
+  restore(channel: WatchedChannel): Promise<void>;
   /** The preimage the node handed over for a payment hash (`create_preimage`), if it still has one. */
   preimage(paymentHash: string): Promise<string | undefined>;
   close(): void;
@@ -84,7 +90,12 @@ export function applyWatchtowerCall(existing: WatchedChannel | undefined, call: 
         remoteSettlementKey: pubkey(p.remote_settlement_key, "remote settlement key"),
         localFundingPubkey: pubkey(p.local_funding_pubkey, "local funding key"),
         remoteFundingPubkey: pubkey(p.remote_funding_pubkey, "remote funding key"),
-        localSettlement: settlement(p.settlement_data),
+        // Fiber registers a channel again at every start, with the settlement it was funded with. As in Fiber's
+        // own store (insert_watch_channel_with_features: "never reset an already monitored channel's usable
+        // settlement/revocation snapshots"), that must not put the first settlement back in place of the latest:
+        // a pass that read it would not recognise the payments in flight on the commitment as the user's.
+        // What a repeated create carries is still checked, and refused if malformed.
+        localSettlement: ((fresh) => existing?.localSettlement ?? fresh)(settlement(p.settlement_data)),
         createdAt: existing?.createdAt ?? now,
         updatedAt: now,
       };
@@ -99,6 +110,19 @@ export function applyWatchtowerCall(existing: WatchedChannel | undefined, call: 
     default:
       return existing;
   }
+}
+
+/**
+ * A record the node has handed over again, completed from the copy kept when the watch ended: the peer's settlement
+ * data and the revocation, where the record has none. Nothing the record holds is replaced. Undefined when there is
+ * nothing to add. Pure, for testing.
+ */
+export function mergeKept(existing: WatchedChannel, kept: WatchedChannel): WatchedChannel | undefined {
+  const added: Partial<WatchedChannel> = {};
+  if (existing.remoteSettlement === undefined && kept.remoteSettlement !== undefined) added.remoteSettlement = kept.remoteSettlement;
+  if (existing.pendingRemoteSettlement === undefined && kept.pendingRemoteSettlement !== undefined) added.pendingRemoteSettlement = kept.pendingRemoteSettlement;
+  if (existing.revocation === undefined && kept.revocation !== undefined) added.revocation = kept.revocation;
+  return Object.keys(added).length > 0 ? { ...existing, ...added } : undefined;
 }
 
 function parseChannelFeatures(value: unknown): 0 | 1 {
@@ -160,7 +184,23 @@ export function openWatchtowerStore(databasePrefix: string): WatchtowerStore {
     async remove(channelId) {
       const tx = (await db()).transaction(STORE, "readwrite");
       tx.objectStore(STORE).delete(channelId.toLowerCase());
-      await new Promise<void>((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); });
+      // An aborted transaction must end the wait too: passes, sweeps and channel opens take turns behind this.
+      await new Promise<void>((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error ?? new Error("The watchtower's store aborted a write")); });
+    },
+    async restore(channel) {
+      const kept = { ...channel, channelId: channel.channelId.toLowerCase() };
+      const tx = (await db()).transaction(STORE, "readwrite");
+      const store = tx.objectStore(STORE);
+      const reading = store.get(kept.channelId);
+      reading.onsuccess = () => {
+        const existing = reading.result as WatchedChannel | undefined;
+        if (!existing) { store.put(kept); return; }
+        // The node has handed the channel over again. What it gave stays; only what its record lacks so far (it
+        // sends the peer's settlements after the registration, if at all) is filled in from the kept copy.
+        const merged = mergeKept(existing, kept);
+        if (merged) store.put(merged);
+      };
+      await new Promise<void>((resolve, reject) => { tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error ?? new Error("The watchtower's store aborted a write")); });
     },
     async preimage(paymentHash) {
       const tx = (await db()).transaction(PREIMAGES, "readonly");
