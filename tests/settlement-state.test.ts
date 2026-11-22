@@ -61,13 +61,18 @@ test("the script's startup plan: resume on the kept profile once a channel is sa
   const saved = { ...finishedRun, finished: undefined };
   const plan = (state: Record<string, unknown>) => startupPlan(loadSettlementState(JSON.stringify(state)));
   // No state, a finished run, or one stopped before its channel opened: a fresh account, channel and profile.
-  const fresh = { resume: false, keepProfile: false, setUp: true, forceClose: true };
+  const fresh = { resume: false, keepProfile: false, setUp: true, awaitReady: true, forceClose: true };
   assert.deepEqual(plan({}), fresh);
   assert.deepEqual(plan(finishedRun), fresh);
   assert.deepEqual(plan({ email: saved.email, password: saved.password, address: saved.address }), fresh);
   // Stopped after the channel opened but before the force close was recorded: same account, channel and profile,
   // and the force close still to do.
-  assert.deepEqual(plan({ ...saved, forceCloseAt: undefined, commitment: undefined }), { resume: true, keepProfile: true, setUp: false, forceClose: true });
+  assert.deepEqual(plan({ ...saved, forceCloseAt: undefined, commitment: undefined }), { resume: true, keepProfile: true, setUp: false, awaitReady: false, forceClose: true });
   // Stopped after the force close: only following remains.
-  assert.deepEqual(plan(saved), { resume: true, keepProfile: true, setUp: false, forceClose: false });
+  assert.deepEqual(plan(saved), { resume: true, keepProfile: true, setUp: false, awaitReady: false, forceClose: false });
+  // Stopped while waiting for the channel it had opened to become ready (its funding not recorded yet): the same
+  // channel is waited for again. A fresh start would open a second one and leave the first, with its funds, behind.
+  const opened = { email: saved.email, password: saved.password, address: saved.address, channelId: saved.channelId, feeReserveTxHash: null };
+  assert.equal(resumableRun(loadSettlementState(JSON.stringify(opened))), true);
+  assert.deepEqual(plan(opened), { resume: true, keepProfile: true, setUp: false, awaitReady: true, forceClose: true });
 });

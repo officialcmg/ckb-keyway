@@ -260,7 +260,11 @@ try {
 
   if (!plan.setUp) {
     // The kept profile brings the node back with its channels; if it doesn't start now, the loop below retries.
-    await startNode().then(() => record(`${mode} node running again`), (error) => log(`WARN the ${mode} node did not start yet`, error.message));
+    // A run that still has to wait for its channel to be ready needs the node now.
+    await startNode().then(() => record(`${mode} node running again`), (error) => {
+      if (plan.awaitReady) throw error;
+      log(`WARN the ${mode} node did not start yet`, error.message);
+    });
   } else {
     await json("https://faucet-api.nervos.org/claim_events", { claim_event: { address_hash: state.address, amount: "10000" } });
     for (let i = 0; ; i++) {
@@ -274,7 +278,12 @@ try {
     record(`${mode} node running, node ${await page.evaluate(async () => (await window.probe.fiber.node.nodeInfo()).pubkey)}`);
     const opened = await approved(() => window.probe.fiber.openChannel({ fundingAmount: 500n * 100_000_000n, public: true }), undefined, ["Activate", "Continue"]);
     log("open result", JSON.stringify(opened));
+    // Saved before the wait: a run stopped during it comes back to this channel instead of opening another.
     forChannel(state, opened.channelId);
+    state.feeReserveTxHash = opened.feeReserveTxHash ?? null; save();
+  }
+
+  if (plan.awaitReady) {
     let raw;
     for (let i = 0; ; i++) {
       raw = await rawChannel();
@@ -285,7 +294,7 @@ try {
     }
     const op = raw.channel_outpoint;
     state.funding = { txHash: `0x${op.slice(2, 66)}`, index: Number.parseInt(op.slice(66).match(/../g).reverse().join(""), 16) };
-    state.feeReserveTxHash = opened.feeReserveTxHash ?? null; state.peer = raw.pubkey ?? raw.peer_id ?? null; save();
+    state.peer = raw.pubkey ?? raw.peer_id ?? null; save();
     record(`channel ${state.channelId} ready with peer ${state.peer}; funding ${state.funding.txHash}:${state.funding.index}; fee reserve tx ${state.feeReserveTxHash}; ${describeChannel(raw)}`);
 
     if (!hosted) for (let i = 0; i < 30; i++) {

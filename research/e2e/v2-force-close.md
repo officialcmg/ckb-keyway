@@ -214,7 +214,11 @@ epoch, the inputs' `since` and whether each output is still live.
 
 ## Checks on this branch
 
-This branch now changes no SDK code and no test: against `main` (`cbf33bb`) it adds this write-up, the scripts under
-`research/e2e/` and one line in `docs/LIVE_TEST_2026-11-17.md`. With `main` merged in and
-`KEYWAY_AUTH_TEST_DATABASE_URL` unset: `npm test` ran 743 tests (632 passed, 0 failed,
-111 skipped), the same as `main`, and `npm run typecheck` passes.
+This branch now changes no SDK code: against `main` (`cbf33bb`) it adds this write-up, the scripts under
+`research/e2e/` with the test of the harness's saved state (`tests/settlement-state.test.ts`), and one line in
+`docs/LIVE_TEST_2026-11-17.md`. With `main` merged in and `KEYWAY_AUTH_TEST_DATABASE_URL` unset: `npm test` ran 743
+tests (632 passed, 0 failed, 111 skipped), the same counts as `main`, and `npm run typecheck` passes.
+
+Changed in the harness after the run, and not run live since: it waits for `CHANNEL_READY` exactly; a run stopped
+while waiting for its channel to become ready comes back to that channel instead of opening a second one; and the
+claim check looks for the channel in every watchtower database the page holds.
